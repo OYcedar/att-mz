@@ -58,11 +58,12 @@ use sha2::{Digest, Sha256};
 
 use super::windows::{
     ExclusiveFileLock, FileIdentity, PinnedPath, WindowsFsError,
-    create_directories_without_reparse, delete_empty_directory_if_identity,
+    create_directories_without_reparse, create_new_atomic_replace_candidate,
+    delete_empty_directory_if_identity, delete_open_atomic_replace_candidate,
     delete_regular_file_if_identity, number_of_links, open_directory,
     open_read_write_file_without_reparse, pin_directory_without_reparse, pin_path_without_reparse,
-    pin_regular_file_for_snapshot_read, rename_without_replace_if_identity,
-    validate_local_case_insensitive_ntfs_directory,
+    pin_regular_file_for_snapshot_read, rename_open_atomic_replace_candidate_without_replace,
+    rename_without_replace_if_identity, validate_local_case_insensitive_ntfs_directory,
 };
 
 const PUBLICATION_DIRECTORY_NAME: &str = ".directory-publish";
@@ -1436,30 +1437,18 @@ fn write_new_terminal_observation_file_sync(
     temporary_name.push(".tmp");
     let temporary_path = pinned_parent.resolved_path().join(temporary_name);
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)
-        .map_err(|source| io_error(OBSERVATION_CREATE_OPERATION, &temporary_path, source))?;
-    let temporary_identity = match FileIdentity::of(&file, &temporary_path) {
-        Ok(identity) => identity,
-        Err(source) => {
-            drop(file);
-            let operation = SystemFileSystemError::from(source);
-            return match fs::remove_file(&temporary_path) {
-                Ok(()) => Err(operation),
-                Err(cleanup_source) => Err(SystemFileSystemError::ObservationCleanupFailed {
-                    temporary_path: temporary_path.clone(),
-                    operation: Box::new(operation),
-                    cleanup: Box::new(io_error(
-                        OBSERVATION_CLEANUP_OPERATION,
-                        &temporary_path,
-                        cleanup_source,
-                    )),
-                }),
-            };
-        }
-    };
+    let mut file =
+        create_new_atomic_replace_candidate(&temporary_path).map_err(|source| match source {
+            WindowsFsError::Io { source, .. } => {
+                io_error(OBSERVATION_CREATE_OPERATION, &temporary_path, source)
+            }
+            source => source.into(),
+        })?;
+    let temporary_identity = terminal_observation_candidate_identity(
+        &file,
+        &temporary_path,
+        FileIdentity::of(&file, &temporary_path),
+    )?;
 
     #[cfg(test)]
     if hit_test_observation_fault(path, TestObservationFaultPoint::AfterPartialWrite) {
@@ -1467,91 +1456,82 @@ fn write_new_terminal_observation_file_sync(
         if partial_length > 0
             && let Err(source) = file.write_all(&bytes[..partial_length])
         {
-            drop(file);
             let operation = io_error(OBSERVATION_WRITE_OPERATION, &temporary_path, source);
-            return cleanup_failed_terminal_observation(
+            return Err(cleanup_open_terminal_observation(
                 path,
+                &file,
                 &temporary_path,
-                temporary_identity,
                 operation,
-            );
+            ));
         }
-        drop(file);
         let operation = io_error(
             OBSERVATION_WRITE_OPERATION,
             &temporary_path,
             io::Error::other("测试注入的部分写入故障"),
         );
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
 
     if let Err(source) = file.write_all(bytes) {
-        drop(file);
         let operation = io_error(OBSERVATION_WRITE_OPERATION, &temporary_path, source);
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
     #[cfg(test)]
     if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeFlush) {
-        drop(file);
         let operation = io_error(
             OBSERVATION_FLUSH_OPERATION,
             &temporary_path,
             io::Error::other("测试注入的 flush 故障"),
         );
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
     if let Err(source) = file.flush() {
-        drop(file);
         let operation = io_error(OBSERVATION_FLUSH_OPERATION, &temporary_path, source);
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
     #[cfg(test)]
     if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeSync) {
-        drop(file);
         let operation = io_error(
             OBSERVATION_SYNC_OPERATION,
             &temporary_path,
             io::Error::other("测试注入的 sync 故障"),
         );
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
     if let Err(source) = file.sync_all() {
-        drop(file);
         let operation = io_error(OBSERVATION_SYNC_OPERATION, &temporary_path, source);
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
-    drop(file);
-
     #[cfg(test)]
     if hit_test_observation_fault(path, TestObservationFaultPoint::BeforeRename) {
         let operation = io_error(
@@ -1559,31 +1539,74 @@ fn write_new_terminal_observation_file_sync(
             &resolved_path,
             io::Error::other("测试注入的重命名故障"),
         );
-        return cleanup_failed_terminal_observation(
+        return Err(cleanup_open_terminal_observation(
             path,
+            &file,
             &temporary_path,
-            temporary_identity,
             operation,
-        );
+        ));
     }
 
-    match rename_without_replace_if_identity(&temporary_path, &resolved_path, temporary_identity) {
+    let renamed = rename_open_atomic_replace_candidate_without_replace(
+        file,
+        &temporary_path,
+        &resolved_path,
+        temporary_identity,
+    );
+    match renamed {
         Ok(()) => Ok(()),
-        Err(source) => cleanup_failed_terminal_observation(
-            path,
-            &temporary_path,
-            temporary_identity,
-            source.into(),
-        ),
+        Err(failure) => {
+            let (source, candidate) = failure.into_parts();
+            match candidate {
+                Some(candidate) => Err(cleanup_open_terminal_observation(
+                    path,
+                    &candidate,
+                    &temporary_path,
+                    source.into(),
+                )),
+                None => {
+                    finish_terminal_observation_rename(&resolved_path, &temporary_path, Err(source))
+                }
+            }
+        }
     }
 }
 
-fn cleanup_failed_terminal_observation(
-    _requested_path: &Path,
+fn finish_terminal_observation_rename(
+    resolved_path: &Path,
     temporary_path: &Path,
-    temporary_identity: FileIdentity,
-    operation: SystemFileSystemError,
+    renamed: Result<(), WindowsFsError>,
 ) -> Result<(), SystemFileSystemError> {
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(WindowsFsError::RenameTargetUnconfirmed { .. }) => {
+            Err(SystemFileSystemError::OutcomeUnknown {
+                target_root: resolved_path.to_path_buf(),
+                artifacts: vec![temporary_path.to_path_buf()],
+                violation: FileSystemRecoveryViolation::TargetIdentityUnknown,
+            })
+        }
+        Err(source) => Err(source.into()),
+    }
+}
+
+fn terminal_observation_candidate_identity(
+    file: &File,
+    temporary_path: &Path,
+    identity: Result<FileIdentity, WindowsFsError>,
+) -> Result<FileIdentity, SystemFileSystemError> {
+    identity.map_err(|source| {
+        let operation = SystemFileSystemError::from(source);
+        cleanup_open_terminal_observation(temporary_path, file, temporary_path, operation)
+    })
+}
+
+fn cleanup_open_terminal_observation(
+    _requested_path: &Path,
+    file: &File,
+    temporary_path: &Path,
+    operation: SystemFileSystemError,
+) -> SystemFileSystemError {
     #[cfg(test)]
     let cleanup =
         if hit_test_observation_fault(_requested_path, TestObservationFaultPoint::BeforeCleanup) {
@@ -1593,19 +1616,18 @@ fn cleanup_failed_terminal_observation(
                 io::Error::other("测试注入的临时文件清理故障"),
             ))
         } else {
-            delete_regular_file_if_identity(temporary_path, temporary_identity).map_err(Into::into)
+            delete_open_atomic_replace_candidate(file, temporary_path).map_err(Into::into)
         };
     #[cfg(not(test))]
-    let cleanup =
-        delete_regular_file_if_identity(temporary_path, temporary_identity).map_err(Into::into);
+    let cleanup = delete_open_atomic_replace_candidate(file, temporary_path).map_err(Into::into);
 
     match cleanup {
-        Ok(()) => Err(operation),
-        Err(cleanup) => Err(SystemFileSystemError::ObservationCleanupFailed {
+        Ok(()) => operation,
+        Err(cleanup) => SystemFileSystemError::ObservationCleanupFailed {
             temporary_path: temporary_path.to_path_buf(),
             operation: Box::new(operation),
             cleanup: Box::new(cleanup),
-        }),
+        },
     }
 }
 
@@ -6186,6 +6208,56 @@ mod tests {
         );
 
         file_system.shutdown().await.expect("文件系统根应该可终结");
+    }
+
+    #[test]
+    fn terminal_observation_unknown_rename_outcome_preserves_the_temporary_path() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let target = directory.path().join("task-000001.md");
+        let temporary = directory.path().join(".task-000001.md.tmp");
+        fs::write(&temporary, "another writer").expect("应该可建立待保护的临时路径");
+
+        let error = finish_terminal_observation_rename(
+            &target,
+            &temporary,
+            Err(WindowsFsError::RenameTargetUnconfirmed {
+                path: target.clone(),
+            }),
+        )
+        .expect_err("重命名结果无法确认时必须保留现场");
+
+        assert!(matches!(
+            error,
+            SystemFileSystemError::OutcomeUnknown {
+                target_root,
+                artifacts,
+                violation: FileSystemRecoveryViolation::TargetIdentityUnknown,
+            } if target_root == target && artifacts == [temporary.clone()]
+        ));
+        assert_eq!(
+            fs::read_to_string(&temporary).expect("结果未知时不得清理临时路径"),
+            "another writer"
+        );
+    }
+
+    #[test]
+    fn terminal_observation_identity_failure_deletes_the_exact_open_candidate() {
+        let directory = tempfile::tempdir().expect("应该可建立测试目录");
+        let temporary = directory.path().join(".task-000001.md.tmp");
+        let file =
+            create_new_atomic_replace_candidate(&temporary).expect("应该可独占建立终态记录候选");
+        let identity_error = WindowsFsError::Io {
+            operation: "测试取得终态记录候选身份",
+            path: temporary.clone(),
+            source: io::Error::other("forced identity failure"),
+        };
+
+        let error = terminal_observation_candidate_identity(&file, &temporary, Err(identity_error))
+            .expect_err("取得 file ID 失败时必须清理精确候选");
+
+        assert!(matches!(error, SystemFileSystemError::Windows(_)));
+        drop(file);
+        assert!(!temporary.exists(), "失败后不得遗留未确认身份的候选");
     }
 
     #[tokio::test]

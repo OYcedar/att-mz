@@ -440,7 +440,7 @@ fn task_record_windows_failure(
         ),
         WindowsFsError::RenameTargetUnconfirmed { path } => (
             redacted_safe_path(path, redactor),
-            ObservabilityWriteFailure::IdentityChanged,
+            ObservabilityWriteFailure::OutcomeUnknown,
         ),
         WindowsFsError::FileIdentityChanged { path } => (
             redacted_safe_path(path, redactor),

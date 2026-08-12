@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,8 @@ use crate::diagnostic::{
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::generic::{
-    GenericCompiledPlaceholderRules, GenericPlaceholderService,
+    GenericCompiledPlaceholderRules, GenericPlaceholderService, GenericProjectError,
+    validate_current_generic_schema_with_cancellation,
     validate_translation_placeholders_with_cancellation,
 };
 use crate::i18n::{UiLocalizer, UiMessage};
@@ -29,7 +30,14 @@ use crate::language::{LanguageId, LanguageModule, LanguageModuleCatalog, Languag
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
 use crate::rpg_maker::location_codec::{RpgMakerLocationCodec, RpgMakerProjectionCodec};
+#[cfg(test)]
+use crate::rpg_maker::model::{
+    DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe,
+};
 use crate::rpg_maker::model::{TextUnitContent, TextUnitRole};
+use crate::rpg_maker::project_database::{
+    CurrentRpgMakerSchemaValidationError, validate_current_rpg_maker_schema_with_check,
+};
 use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
 use crate::rpg_maker::text::{
     RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind,
@@ -42,8 +50,13 @@ use crate::rpg_maker::translate::planner::expected_line_shape;
 use crate::rpg_maker::translate::semantics::{
     PreparedTranslationStatus, ResolvedTranslationSemantics,
 };
+#[cfg(test)]
+use crate::runtime::windows::rename_with_replace_if_identity;
 use crate::runtime::windows::{
-    PinnedPath, WindowsFsError, pin_directory_without_reparse, pin_path_without_reparse,
+    FileIdentity, PinnedPath, WindowsFsError, create_new_atomic_replace_candidate,
+    delete_open_atomic_replace_candidate, pin_directory_without_reparse, pin_path_without_reparse,
+    rename_open_atomic_replace_candidate_with_replace,
+    rename_open_atomic_replace_candidate_without_replace,
 };
 use crate::translation::candidate_validation::{
     CandidateTextShape, ProvenInvariantViolation, validate_candidate_text,
@@ -373,6 +386,10 @@ pub(crate) enum ManualDocumentError {
     ExistingTemporary {
         path: PathBuf,
     },
+    ReplaceOutcomeUnknown {
+        target: PathBuf,
+        temporary: PathBuf,
+    },
     TemporaryCleanup {
         operation: Box<ManualDocumentError>,
         temporary: PathBuf,
@@ -480,6 +497,12 @@ impl fmt::Display for ManualDocumentError {
             Self::ExistingTemporary { path } => {
                 write!(formatter, "固定临时文件已经存在：{}", public_path(path))
             }
+            Self::ReplaceOutcomeUnknown { target, temporary } => write!(
+                formatter,
+                "无法确认 {} 是否已经替换；请保留并检查 {}",
+                public_path(target),
+                public_path(temporary)
+            ),
             Self::TemporaryCleanup {
                 operation,
                 temporary,
@@ -504,7 +527,8 @@ impl Error for ManualDocumentError {
             | Self::InvalidUtf8 { .. }
             | Self::InvalidIds { .. }
             | Self::OutputTarget { .. }
-            | Self::ExistingTemporary { .. } => None,
+            | Self::ExistingTemporary { .. }
+            | Self::ReplaceOutcomeUnknown { .. } => None,
         }
     }
 }
@@ -950,45 +974,96 @@ fn atomic_replace(
     bytes: &[u8],
     cancellation: &CooperativeCancellation,
 ) -> Result<(), ManualDocumentError> {
-    drop(bind_manual_output_target(path)?);
-    let temporary = manual_temporary_path(path);
+    let target = bind_manual_output_target(path)?;
+    let temporary = manual_temporary_path(target.resolved_path());
     ensure_manual_document_running(cancellation)?;
-    let mut owns_temporary = false;
-    let write = (|| -> Result<(), ManualDocumentError> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|source| manual_temporary_open_error(path, &temporary, source))?;
-        owns_temporary = true;
-        file.write_all(bytes)
-            .map_err(|source| ManualDocumentError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        ensure_manual_document_running(cancellation)?;
-        file.sync_all()
-            .map_err(|source| ManualDocumentError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        drop(file);
-        ensure_manual_document_running(cancellation)?;
-        replace_file(&temporary, path).map_err(|source| ManualDocumentError::Write {
+    let mut file = create_new_atomic_replace_candidate(&temporary)
+        .map_err(|source| manual_temporary_open_error(path, &temporary, source))?;
+    let identity =
+        manual_temporary_identity(&file, path, &temporary, FileIdentity::of(&file, &temporary))?;
+    if let Err(source) = file.write_all(bytes) {
+        let operation = ManualDocumentError::Write {
             path: path.to_path_buf(),
             source,
-        })
-    })();
-    match write {
-        Err(operation) if owns_temporary => {
-            Err(cleanup_manual_temporary_after_failure(temporary, operation))
+        };
+        return Err(cleanup_open_manual_temporary(&file, &temporary, operation));
+    }
+    if let Err(operation) = ensure_manual_document_running(cancellation) {
+        return Err(cleanup_open_manual_temporary(&file, &temporary, operation));
+    }
+    if let Err(source) = file.sync_all() {
+        let operation = ManualDocumentError::Write {
+            path: path.to_path_buf(),
+            source,
+        };
+        return Err(cleanup_open_manual_temporary(&file, &temporary, operation));
+    }
+    if let Err(operation) = ensure_manual_document_running(cancellation) {
+        return Err(cleanup_open_manual_temporary(&file, &temporary, operation));
+    }
+    let replaced = match target.initial_identity() {
+        Some(target_identity) => rename_open_atomic_replace_candidate_with_replace(
+            file,
+            &temporary,
+            target.resolved_path(),
+            identity,
+            target_identity,
+        ),
+        None => rename_open_atomic_replace_candidate_without_replace(
+            file,
+            &temporary,
+            target.resolved_path(),
+            identity,
+        ),
+    };
+    match replaced {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            let (source, candidate) = failure.into_parts();
+            let operation = manual_replace_error(path, source);
+            match candidate {
+                Some(candidate) => Err(cleanup_open_manual_temporary(
+                    &candidate, &temporary, operation,
+                )),
+                None => Err(operation),
+            }
         }
-        result => result,
     }
 }
 
-fn bind_manual_output_target(path: &Path) -> Result<PinnedPath, ManualDocumentError> {
-    match pin_path_without_reparse(path) {
+struct BoundManualOutputTarget {
+    _parent: PinnedPath,
+    resolved_path: PathBuf,
+    initial_identity: Option<FileIdentity>,
+}
+
+impl BoundManualOutputTarget {
+    fn resolved_path(&self) -> &Path {
+        &self.resolved_path
+    }
+
+    const fn initial_identity(&self) -> Option<FileIdentity> {
+        self.initial_identity
+    }
+}
+
+fn bind_manual_output_target(path: &Path) -> Result<BoundManualOutputTarget, ManualDocumentError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| ManualDocumentError::OutputTarget {
+            problem: ManualOutputTargetProblem::MissingFileName {
+                path: path.to_path_buf(),
+            },
+        })?
+        .to_owned();
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = pin_directory_without_reparse(parent_path)
+        .map_err(|source| manual_target_error(path, source))?;
+    let resolved_path = parent.resolved_path().join(file_name);
+    let initial_identity = match pin_path_without_reparse(&resolved_path) {
         Ok(pinned) => {
             let metadata = pinned
                 .metadata()
@@ -1000,23 +1075,39 @@ fn bind_manual_output_target(path: &Path) -> Result<PinnedPath, ManualDocumentEr
                     },
                 });
             }
-            Ok(pinned)
+            Some(
+                FileIdentity::of(pinned.file(), &resolved_path)
+                    .map_err(|source| manual_target_error(path, source))?,
+            )
         }
-        Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            path.file_name()
-                .ok_or_else(|| ManualDocumentError::OutputTarget {
-                    problem: ManualOutputTargetProblem::MissingFileName {
-                        path: path.to_path_buf(),
-                    },
-                })?;
-            pin_directory_without_reparse(parent)
-                .map_err(|source| manual_target_error(path, source))
+        Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => None,
+        Err(source) => return Err(manual_target_error(path, source)),
+    };
+    Ok(BoundManualOutputTarget {
+        _parent: parent,
+        resolved_path,
+        initial_identity,
+    })
+}
+
+fn manual_output_identity_changed(path: &Path) -> ManualDocumentError {
+    ManualDocumentError::OutputTarget {
+        problem: ManualOutputTargetProblem::IdentityChanged {
+            path: path.to_path_buf(),
+        },
+    }
+}
+
+fn manual_replace_error(path: &Path, source: WindowsFsError) -> ManualDocumentError {
+    match source {
+        WindowsFsError::RenameTargetUnconfirmed { path: target } => {
+            ManualDocumentError::ReplaceOutcomeUnknown {
+                temporary: manual_temporary_path(&target),
+                target,
+            }
         }
-        Err(source) => Err(manual_target_error(path, source)),
+        WindowsFsError::FileIdentityChanged { .. } => manual_output_identity_changed(path),
+        source => manual_target_error(path, source),
     }
 }
 
@@ -1060,68 +1151,49 @@ fn manual_temporary_path(path: &Path) -> PathBuf {
 fn manual_temporary_open_error(
     target: &Path,
     temporary: &Path,
-    source: io::Error,
+    source: WindowsFsError,
 ) -> ManualDocumentError {
-    if source.kind() == io::ErrorKind::AlreadyExists {
-        ManualDocumentError::ExistingTemporary {
-            path: temporary.to_path_buf(),
+    match source {
+        WindowsFsError::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists => {
+            ManualDocumentError::ExistingTemporary {
+                path: temporary.to_path_buf(),
+            }
         }
-    } else {
-        ManualDocumentError::Write {
+        source => ManualDocumentError::Write {
             path: target.to_path_buf(),
-            source,
-        }
-    }
-}
-
-fn cleanup_manual_temporary_after_failure(
-    temporary: PathBuf,
-    operation: ManualDocumentError,
-) -> ManualDocumentError {
-    match fs::remove_file(&temporary) {
-        Ok(()) => operation,
-        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => operation,
-        Err(cleanup) => ManualDocumentError::TemporaryCleanup {
-            operation: Box::new(operation),
-            temporary,
-            cleanup,
+            source: io::Error::other(source),
         },
     }
 }
 
-#[cfg(windows)]
-fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+fn manual_temporary_identity(
+    file: &fs::File,
+    target: &Path,
+    temporary: &Path,
+    identity: Result<FileIdentity, WindowsFsError>,
+) -> Result<FileIdentity, ManualDocumentError> {
+    identity.map_err(|source| {
+        let operation = ManualDocumentError::Write {
+            path: target.to_path_buf(),
+            source: io::Error::other(source),
+        };
+        cleanup_open_manual_temporary(file, temporary, operation)
+    })
 }
 
-#[cfg(not(windows))]
-fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
-    fs::rename(source, target)
+fn cleanup_open_manual_temporary(
+    file: &fs::File,
+    temporary: &Path,
+    operation: ManualDocumentError,
+) -> ManualDocumentError {
+    match delete_open_atomic_replace_candidate(file, temporary) {
+        Ok(()) => operation,
+        Err(cleanup) => ManualDocumentError::TemporaryCleanup {
+            operation: Box::new(operation),
+            temporary: temporary.to_path_buf(),
+            cleanup: io::Error::other(cleanup),
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -1303,11 +1375,31 @@ pub(crate) fn execute_generic_manual_command(
         file,
         export_selection,
         cancellation,
-        |connection| load_generic_manual_command_snapshot(connection, language_modules),
-        |connection, writes| {
-            apply_generic_manual_translations_with_cancellation(connection, writes, cancellation)
+        ManualDatabaseOperations {
+            validate_schema: |connection: &Connection| {
+                validate_current_generic_schema_with_cancellation(connection, cancellation)
+                    .map_err(manual_generic_schema_error)
+            },
+            load_snapshot: |connection: &Connection| {
+                load_generic_manual_command_snapshot(connection, language_modules)
+            },
+            apply: |connection: &Connection, writes: &[ValidatedManualTranslation]| {
+                apply_generic_manual_translations_with_cancellation(
+                    connection,
+                    writes,
+                    cancellation,
+                )
+            },
         },
     )
+}
+
+fn manual_generic_schema_error(source: GenericProjectError) -> ManualDatabaseError {
+    match source {
+        GenericProjectError::Cancelled => ManualDatabaseError::Cancelled,
+        GenericProjectError::Sqlite { source, .. } => ManualDatabaseError::Sqlite(source),
+        source => ManualDatabaseError::InvalidProject(source.to_string()),
+    }
 }
 
 pub(crate) fn execute_rpg_maker_manual_command(
@@ -1335,11 +1427,41 @@ pub(crate) fn execute_rpg_maker_manual_command(
         file,
         export_selection,
         cancellation,
-        |connection| load_rpg_maker_manual_command_snapshot(connection, engine, language_modules),
-        |connection, writes| {
-            apply_rpg_maker_manual_translations_with_cancellation(connection, writes, cancellation)
+        ManualDatabaseOperations {
+            validate_schema: |connection: &Connection| {
+                let mut is_cancelled = || cancellation.is_requested();
+                validate_current_rpg_maker_schema_with_check(connection, &mut is_cancelled).map_err(
+                    |source| match source {
+                        CurrentRpgMakerSchemaValidationError::Cancelled => {
+                            ManualDatabaseError::Cancelled
+                        }
+                        CurrentRpgMakerSchemaValidationError::Database(source) => {
+                            ManualDatabaseError::Sqlite(source)
+                        }
+                        CurrentRpgMakerSchemaValidationError::Invalid(source) => {
+                            ManualDatabaseError::InvalidProject(source.to_string())
+                        }
+                    },
+                )
+            },
+            load_snapshot: |connection: &Connection| {
+                load_rpg_maker_manual_command_snapshot(connection, engine, language_modules)
+            },
+            apply: |connection: &Connection, writes: &[ValidatedManualTranslation]| {
+                apply_rpg_maker_manual_translations_with_cancellation(
+                    connection,
+                    writes,
+                    cancellation,
+                )
+            },
         },
     )
+}
+
+struct ManualDatabaseOperations<ValidateSchema, LoadSnapshot, Apply> {
+    validate_schema: ValidateSchema,
+    load_snapshot: LoadSnapshot,
+    apply: Apply,
 }
 
 fn execute_manual_database_command(
@@ -1348,12 +1470,17 @@ fn execute_manual_database_command(
     file: &Path,
     export_selection: Option<&ManualExportSelection>,
     cancellation: &CooperativeCancellation,
-    mut load_snapshot: impl FnMut(&Connection) -> Result<ManualProjectSnapshot, ManualDatabaseError>,
-    mut apply: impl FnMut(
-        &Connection,
-        &[ValidatedManualTranslation],
-    ) -> Result<usize, ManualDatabaseError>,
+    operations: ManualDatabaseOperations<
+        impl FnMut(&Connection) -> Result<(), ManualDatabaseError>,
+        impl FnMut(&Connection) -> Result<ManualProjectSnapshot, ManualDatabaseError>,
+        impl FnMut(&Connection, &[ValidatedManualTranslation]) -> Result<usize, ManualDatabaseError>,
+    >,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
+    let ManualDatabaseOperations {
+        mut validate_schema,
+        mut load_snapshot,
+        mut apply,
+    } = operations;
     ensure_manual_command_running(cancellation)?;
     match operation {
         ManualOperation::Export
@@ -1366,6 +1493,8 @@ fn execute_manual_database_command(
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Deferred)
                 .map_err(ManualDatabaseError::from)
+                .map_err(|source| manual_command_database_error(source, cancellation))?;
+            validate_schema(&transaction)
                 .map_err(|source| manual_command_database_error(source, cancellation))?;
             let snapshot = load_snapshot(&transaction)
                 .map_err(|source| manual_command_database_error(source, cancellation))?;
@@ -1391,6 +1520,8 @@ fn execute_manual_database_command(
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(ManualDatabaseError::from)
+                .map_err(|source| manual_command_database_error(source, cancellation))?;
+            validate_schema(&transaction)
                 .map_err(|source| manual_command_database_error(source, cancellation))?;
             let snapshot = load_snapshot(&transaction)
                 .map_err(|source| manual_command_database_error(source, cancellation))?;
@@ -1649,6 +1780,17 @@ fn manual_recovery_artifact_diagnostic(path: &Path) -> Diagnostic {
     )
 }
 
+fn manual_replace_outcome_unknown_diagnostic(target: &Path, temporary: &Path) -> Diagnostic {
+    manual_file_system_diagnostic(
+        FileSystemOperation::Write,
+        FileSystemProblem::OutcomeUnknown {
+            target_root: SafePath::new(target),
+            artifacts: vec![SafePath::new(temporary)],
+            violation: FileSystemRecoveryViolation::TargetIdentityUnknown,
+        },
+    )
+}
+
 fn manual_recovery_io_diagnostic(
     path: &Path,
     operation: FileSystemOperation,
@@ -1687,6 +1829,10 @@ fn manual_document_diagnostic_report(source: &ManualDocumentError) -> Diagnostic
         ManualDocumentError::ExistingTemporary { path } => DiagnosticReport::new(
             StateEffect::RecoveryRequired,
             manual_recovery_artifact_diagnostic(path),
+        ),
+        ManualDocumentError::ReplaceOutcomeUnknown { target, temporary } => DiagnosticReport::new(
+            StateEffect::OutcomeUnknown,
+            manual_replace_outcome_unknown_diagnostic(target, temporary),
         ),
         ManualDocumentError::TemporaryCleanup {
             operation,
@@ -1809,6 +1955,7 @@ pub(crate) fn render_manual_command_error(
                 source,
                 ManualDocumentError::OutputTarget { .. }
                     | ManualDocumentError::ExistingTemporary { .. }
+                    | ManualDocumentError::ReplaceOutcomeUnknown { .. }
                     | ManualDocumentError::TemporaryCleanup { .. }
             ) {
                 writeln!(
@@ -1856,7 +2003,8 @@ fn manual_document_issue_count(source: &ManualDocumentError) -> usize {
         | ManualDocumentError::Encode(_)
         | ManualDocumentError::Write { .. }
         | ManualDocumentError::OutputTarget { .. }
-        | ManualDocumentError::ExistingTemporary { .. } => 1,
+        | ManualDocumentError::ExistingTemporary { .. }
+        | ManualDocumentError::ReplaceOutcomeUnknown { .. } => 1,
     }
 }
 
@@ -1936,6 +2084,7 @@ fn render_manual_document_issues_with_effect(
         &help,
         match source {
             ManualDocumentError::ExistingTemporary { .. } => StateEffect::RecoveryRequired,
+            ManualDocumentError::ReplaceOutcomeUnknown { .. } => StateEffect::OutcomeUnknown,
             _ => primary_effect,
         },
         localizer,
@@ -2090,6 +2239,7 @@ fn render_manual_value(
         "cancelled" => failure("cancelled"),
         "document_read" | "document_write" | "database_access" => failure("operation_failed"),
         "publication_artifact_exists" => failure("recovery_required"),
+        "transaction_outcome_unknown" => failure("transaction_outcome_unknown"),
         "document_invalid_utf8" => failure("invalid_encoding"),
         "document_invalid_toml" => failure("invalid_syntax"),
         "document_encode" => failure("internal_invariant"),
@@ -2099,6 +2249,7 @@ fn render_manual_value(
         }
         "fix_project_then_export" => resolution("check_project_state"),
         "retry_if_needed" | "retry_or_report" => resolution("retry"),
+        "preserve_recovery_artifacts" => resolution("preserve_recovery_artifacts"),
         "keep_one_entry"
         | "use_array_lines"
         | "keep_array_length"
@@ -2150,6 +2301,11 @@ fn manual_document_issue(source: &ManualDocumentError) -> (String, &'static str,
             public_path(path),
             "publication_artifact_exists",
             "resolve_temporary_then_rerun_export",
+        ),
+        ManualDocumentError::ReplaceOutcomeUnknown { target, .. } => (
+            public_path(target),
+            "transaction_outcome_unknown",
+            "preserve_recovery_artifacts",
         ),
         ManualDocumentError::TemporaryCleanup { operation, .. } => manual_document_issue(operation),
     }
@@ -3604,6 +3760,11 @@ fn decode_windows_path(_: &[u8]) -> Result<PathBuf, ManualDatabaseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generic::create_current_generic_schema_for_test;
+    use crate::rpg_maker::project_database::create_current_rpg_maker_schema_for_test;
+    use std::fs::File;
+    use std::os::windows::ffi::OsStrExt;
+
     fn indexed_entry(kind: ManualTranslationType, source: &[&str]) -> ManualTranslationEntry {
         ManualTranslationEntry {
             id: "Skills.json:798:name".to_owned(),
@@ -3687,6 +3848,65 @@ mod tests {
                 .is_symlink()
         );
         assert!(!manual_temporary_path(&link).exists());
+    }
+
+    #[test]
+    fn manual_export_replaces_the_exact_bound_regular_file() {
+        let directory = tempfile::tempdir().expect("应建立输出替换测试根");
+        let target = directory.path().join("manual.toml");
+        fs::write(&target, "old manual").expect("应建立旧输出");
+
+        atomic_replace(&target, b"new manual", &CooperativeCancellation::default())
+            .expect("应通过固定目标句柄完成原子替换");
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new manual");
+        assert!(!manual_temporary_path(&target).exists());
+    }
+
+    #[test]
+    fn manual_export_rejects_a_target_replaced_after_binding() {
+        let directory = tempfile::tempdir().expect("应建立目标身份测试根");
+        let target = directory.path().join("manual.toml");
+        let moved = directory.path().join("original.toml");
+        fs::write(&target, "original").expect("应建立原目标");
+        let bound = bind_manual_output_target(&target).expect("应固定原目标身份");
+        let expected_target = bound.initial_identity().expect("原目标必须存在");
+
+        fs::rename(&target, &moved).expect("绑定只固定父链，不应掩盖目标身份变化测试");
+        fs::write(&target, "other writer").expect("应在同一路径换入另一文件");
+        let temporary = manual_temporary_path(bound.resolved_path());
+        fs::write(&temporary, "new manual").expect("应建立待发布临时文件");
+        let temporary_file = File::open(&temporary).expect("应打开临时文件");
+        let temporary_identity = FileIdentity::of(&temporary_file, &temporary).unwrap();
+        drop(temporary_file);
+
+        let error = rename_with_replace_if_identity(
+            &temporary,
+            bound.resolved_path(),
+            temporary_identity,
+            expected_target,
+        )
+        .expect_err("目标身份变化后不得覆盖另一文件");
+
+        assert!(matches!(error, WindowsFsError::FileIdentityChanged { .. }));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "other writer");
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&temporary).unwrap(), "new manual");
+    }
+
+    #[test]
+    fn manual_output_binding_keeps_the_parent_chain_pinned() {
+        let directory = tempfile::tempdir().expect("应建立父链固定测试根");
+        let parent = directory.path().join("stable");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&parent).expect("应建立输出父目录");
+        let bound = bind_manual_output_target(&parent.join("manual.toml"))
+            .expect("应固定缺失目标的父目录链");
+
+        fs::rename(&parent, &moved).expect_err("绑定存活期间不得替换输出父目录");
+        assert!(parent.is_dir());
+        drop(bound);
+        fs::rename(&parent, &moved).expect("释放绑定后父目录应可移动");
     }
 
     #[test]
@@ -4055,7 +4275,8 @@ mod tests {
 
         assert!(matches!(
             &error,
-            ManualDocumentError::ExistingTemporary { path } if path == &temporary
+            ManualDocumentError::ExistingTemporary { path }
+                if path == &temporary.canonicalize().unwrap()
         ));
         assert_eq!(fs::read_to_string(temporary).unwrap(), "other writer");
         assert!(!path.exists());
@@ -4079,12 +4300,10 @@ mod tests {
     fn export_preserves_the_primary_failure_when_temporary_cleanup_also_fails() {
         let directory = tempfile::tempdir().unwrap();
         let temporary = directory.path().join(".manual.toml.tmp");
-        fs::create_dir(&temporary).unwrap();
+        let file = File::create(&temporary).unwrap();
 
-        let source = cleanup_manual_temporary_after_failure(
-            temporary.clone(),
-            ManualDocumentError::Cancelled,
-        );
+        let source =
+            cleanup_open_manual_temporary(&file, &temporary, ManualDocumentError::Cancelled);
 
         let localizer = UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese);
         let expected_cleanup_reason = match &source {
@@ -4140,14 +4359,65 @@ mod tests {
     }
 
     #[test]
-    fn missing_temporary_after_failure_counts_as_successful_cleanup() {
+    fn failed_export_cleanup_keeps_the_candidate_exclusive_until_exact_deletion() {
         let directory = tempfile::tempdir().unwrap();
         let temporary = directory.path().join(".manual.toml.tmp");
+        let moved = directory.path().join("original.tmp");
+        let file = create_new_atomic_replace_candidate(&temporary).unwrap();
+        fs::rename(&temporary, &moved).expect_err("独占候选句柄存活时不得被移走");
 
         let source =
-            cleanup_manual_temporary_after_failure(temporary, ManualDocumentError::Cancelled);
+            cleanup_open_manual_temporary(&file, &temporary, ManualDocumentError::Cancelled);
 
         assert!(matches!(source, ManualDocumentError::Cancelled));
+        drop(file);
+        assert!(!temporary.exists());
+        assert!(!moved.exists());
+    }
+
+    #[test]
+    fn temporary_identity_failure_deletes_the_exact_open_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("manual.toml");
+        let temporary = manual_temporary_path(&target);
+        let file = create_new_atomic_replace_candidate(&temporary).unwrap();
+        let identity_error = WindowsFsError::Io {
+            operation: "测试读取候选身份",
+            path: temporary.clone(),
+            source: io::Error::other("forced identity failure"),
+        };
+
+        let error = manual_temporary_identity(&file, &target, &temporary, Err(identity_error))
+            .expect_err("身份读取失败必须返回原始写入错误");
+        assert!(matches!(error, ManualDocumentError::Write { .. }));
+        drop(file);
+        assert!(!temporary.exists(), "失败后不得遗留未确认身份的候选");
+    }
+
+    #[test]
+    fn replace_outcome_unknown_preserves_candidate_and_reports_unknown_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("manual.toml");
+        let temporary = manual_temporary_path(&target);
+        fs::write(&temporary, "candidate").unwrap();
+        let error = manual_replace_error(
+            &target,
+            WindowsFsError::RenameTargetUnconfirmed {
+                path: target.clone(),
+            },
+        );
+
+        assert!(matches!(
+            error,
+            ManualDocumentError::ReplaceOutcomeUnknown { .. }
+        ));
+        assert_eq!(fs::read_to_string(&temporary).unwrap(), "candidate");
+        assert_eq!(
+            ManualCommandError::from_document(error)
+                .diagnostic_report()
+                .effect(),
+            StateEffect::OutcomeUnknown
+        );
     }
 
     #[test]
@@ -4178,6 +4448,19 @@ mod tests {
 
         assert!(matches!(result, Err(ManualCommandError::Cancelled)));
         assert!(!called);
+    }
+
+    #[test]
+    fn generic_schema_sqlite_failure_remains_a_database_access_error() {
+        let error = manual_generic_schema_error(GenericProjectError::Sqlite {
+            operation: "读取 Generic schema",
+            source: rusqlite::Error::QueryReturnedNoRows,
+        });
+
+        assert!(matches!(
+            error,
+            ManualDatabaseError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
+        ));
     }
 
     #[test]
@@ -4231,38 +4514,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("应建立测试目录");
         let database = directory.path().join("project.db");
         let connection = Connection::open(&database).expect("应建立 Generic 测试数据库");
+        create_current_generic_schema_for_test(&connection).expect("应建立当前 Generic schema");
         connection
             .execute_batch(
-                "CREATE TABLE translation_resource (
-                     resource_kind TEXT PRIMARY KEY,
-                     canonical_json TEXT NOT NULL
-                 );
-                 INSERT INTO translation_resource VALUES ('placeholder_rules', '[]');
-                 CREATE TABLE generic_file (relative_path BLOB, ordinal INTEGER);
-                 CREATE TABLE generic_group (
-                     relative_path BLOB, group_id TEXT, ordinal INTEGER, kind TEXT
-                 );
-                 CREATE TABLE generic_unit (
-                     group_id TEXT, unit_id TEXT, ordinal INTEGER,
-                     source_text TEXT, translation TEXT
-                 );
-                 CREATE TABLE generic_manual_translation (
-                     group_id TEXT, unit_id TEXT, readable_id TEXT,
-                     source_json TEXT, translation_json TEXT,
-                     applicability_fingerprint BLOB
-                 );
-                 CREATE TABLE generic_rejected_translation (
-                     group_id TEXT, unit_id TEXT, readable_id TEXT,
-                     origin TEXT, source_json TEXT, candidate_json TEXT,
-                     translation_shape TEXT, group_context BLOB,
-                     violation_json TEXT, planning_state BLOB
-                 );
+                "PRAGMA ignore_check_constraints = ON;
                  INSERT INTO generic_manual_translation VALUES (
                      'detached', 'unit', 'detached-id',
                      'invalid source', 'invalid translation', X'00'
-                 );",
+                 );
+                 PRAGMA ignore_check_constraints = OFF;",
             )
-            .expect("应建立包含无效脱离记录的 Generic 数据库");
+            .expect("应写入 raw Lua 可留下的无效脱离记录");
         drop(connection);
         let document = directory.path().join("manual.toml");
         fs::write(&document, "").expect("应建立空 Manual 文件");
@@ -4292,6 +4554,92 @@ mod tests {
             applied,
             ManualCommandSummary::Applied { applied: 0, .. }
         ));
+    }
+
+    #[test]
+    fn generic_manual_commands_reject_a_trigger_attached_to_a_managed_table() {
+        let directory = tempfile::tempdir().expect("应建立 Generic schema 测试目录");
+        let database = directory.path().join("project.db");
+        let connection = Connection::open(&database).expect("应建立 Generic 测试数据库");
+        create_current_generic_schema_for_test(&connection).expect("应建立当前 Generic schema");
+        let relative_path = Path::new("input.jsonl")
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        connection
+            .execute(
+                "INSERT INTO generic_file (relative_path, ordinal) VALUES (?1, 0)",
+                [relative_path],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_group (
+                     group_id, relative_path, ordinal, kind, context_fingerprint
+                 ) SELECT 'g', relative_path, 0, 'text', zeroblob(32) FROM generic_file",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_unit (
+                     group_id, unit_id, ordinal, source_text
+                 ) VALUES ('g', 'u', 0, '原文')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER delete_unit_after_manual_insert
+                 AFTER INSERT ON generic_manual_translation
+                 BEGIN
+                     DELETE FROM generic_unit;
+                 END;",
+            )
+            .expect("raw Lua 应能留下附着于受管表的 trigger");
+        drop(connection);
+        let document = directory.path().join("manual.toml");
+        write_document(
+            &document,
+            "[[translation]]\nid = \"input.jsonl:line1:unit1:text\"\ntype = \"free\"\nsource = [\"原文\"]\ntranslation = [\"译文\"]\n",
+        );
+        let cancellation = CooperativeCancellation::default();
+
+        for operation in [ManualOperation::Check, ManualOperation::Apply] {
+            let error = execute_generic_manual_command(
+                &database,
+                operation,
+                &document,
+                None,
+                None,
+                &cancellation,
+            )
+            .expect_err("普通 Manual 命令必须拒绝被修改的精确 schema");
+            assert!(matches!(
+                error,
+                ManualCommandError::Database(ManualDatabaseError::InvalidProject(_))
+            ));
+        }
+
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM generic_unit", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM generic_manual_translation",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -4359,45 +4707,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("应建立测试目录");
         let database = directory.path().join("project.db");
         let connection = Connection::open(&database).expect("应建立 RPG Maker 测试数据库");
+        create_current_rpg_maker_schema_for_test(&connection).expect("应建立当前 RPG Maker schema");
         connection
             .execute_batch(
-                "CREATE TABLE rpg_maker_translation_resource (
-                     resource_kind TEXT PRIMARY KEY,
-                     canonical_json TEXT NOT NULL
-                 );
-                 INSERT INTO rpg_maker_translation_resource VALUES (
-                     'placeholder_rules', '[]'
-                 );
-                 CREATE TABLE rpg_maker_text_group (
-                     owner TEXT, group_id TEXT, group_location TEXT,
-                     group_kind TEXT, projection_recipe_json TEXT,
-                     semantic_order_key BLOB
-                 );
-                 CREATE TABLE rpg_maker_text_unit (
-                     owner TEXT, group_id TEXT, unit_role TEXT,
-                     rule_number INTEGER,
-                     source_content_json TEXT, source_context_json TEXT,
-                     translation_content_json TEXT, semantic_order_key BLOB
-                 );
-                 CREATE TABLE rpg_maker_manual_translation (
-                     owner TEXT, group_location TEXT, unit_role TEXT,
-                     readable_id TEXT, translation_type TEXT,
-                     source_json TEXT, translation_json TEXT,
-                     applicability_fingerprint BLOB
-                 );
-                 CREATE TABLE rpg_maker_rejected_translation (
-                     owner TEXT, group_id INTEGER, unit_role TEXT,
-                     readable_id TEXT, origin TEXT,
-                     source_content_json TEXT, source_context_json TEXT,
-                     candidate_json TEXT, translation_json TEXT,
-                     violation_json TEXT, planning_state BLOB
-                 );
+                "PRAGMA ignore_check_constraints = ON;
                  INSERT INTO rpg_maker_manual_translation VALUES (
                      'detached', 'location', 'role', 'detached-id', 'invalid',
                      'invalid source', 'invalid translation', X'00'
-                 );",
+                 );
+                 PRAGMA ignore_check_constraints = OFF;",
             )
-            .expect("应建立包含无效脱离记录的 RPG Maker 数据库");
+            .expect("应写入 raw Lua 可留下的无效脱离记录");
         drop(connection);
         let document = directory.path().join("manual.toml");
         fs::write(&document, "").expect("应建立空 Manual 文件");
@@ -4429,6 +4749,136 @@ mod tests {
             applied,
             ManualCommandSummary::Applied { applied: 0, .. }
         ));
+    }
+
+    #[test]
+    fn rpg_maker_manual_commands_reject_a_trigger_attached_to_a_managed_table() {
+        let directory = tempfile::tempdir().expect("应建立 RPG Maker schema 测试目录");
+        let database = directory.path().join("project.db");
+        let connection = Connection::open(&database).expect("应建立 RPG Maker 测试数据库");
+        create_current_rpg_maker_schema_for_test(&connection).expect("应建立当前 RPG Maker schema");
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::map(1),
+            vec![RpgMakerLocationStep::key("displayName")],
+        );
+        let group_location = RpgMakerLocationCodec::encode(&location).unwrap();
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("displayName").unwrap());
+        let readable_id = readable_rpg_maker_id(&location, TextGroupKind::Map, &role);
+        let role_json = RpgMakerProjectionCodec::encode_role(&role).unwrap();
+        let recipe_json = RpgMakerProjectionCodec::encode_recipes(&[TextProjectionRecipe::Direct(
+            DirectTextRecipe::new(
+                location.clone(),
+                "原文",
+                vec![DirectTextPart::TextSlot { role: role.clone() }],
+            )
+            .unwrap(),
+        )])
+        .unwrap();
+        let group_order = RpgMakerSemanticOrderKey::new(vec![0], 0).encode().unwrap();
+        let unit_order = RpgMakerSemanticOrderKey::new(vec![0], 1).encode().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO rpg_maker_asset_owner_state
+                     VALUES ('builtin', zeroblob(32), zeroblob(32));",
+            )
+            .expect("应建立 RPG Maker owner 状态");
+        connection
+            .execute(
+                "INSERT INTO rpg_maker_text_group (
+                     owner, group_id, group_location, semantic_order_key,
+                     group_kind, projection_recipe_json
+                 ) VALUES ('builtin', 1, ?1, ?2, 'map', ?3)",
+                params![group_location, group_order, recipe_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rpg_maker_text_unit (
+                     owner, group_id, unit_role, rule_number, semantic_order_key,
+                     source_content_json, source_context_json
+                 ) VALUES ('builtin', 1, ?1, NULL, ?2, '\"原文\"', '{}')",
+                params![role_json, unit_order],
+            )
+            .unwrap();
+        drop(connection);
+        let document = directory.path().join("manual.toml");
+        write_document(
+            &document,
+            &format!(
+                "[[translation]]\nid = {readable_id:?}\ntype = \"fixed\"\nsource = [\"原文\"]\ntranslation = [\"译文\"]\n"
+            ),
+        );
+        let cancellation = CooperativeCancellation::default();
+
+        let checked = execute_rpg_maker_manual_command(
+            &database,
+            RpgMakerEngine::Mz,
+            ManualOperation::Check,
+            &document,
+            None,
+            None,
+            &cancellation,
+        )
+        .expect("合法 RPG Maker Manual 文件应先通过普通 check");
+        assert!(matches!(
+            checked,
+            ManualCommandSummary::Checked {
+                report: ManualCheckReport {
+                    valid: 1,
+                    errors,
+                    ..
+                },
+                ..
+            } if errors.is_empty()
+        ));
+
+        let connection = Connection::open(&database).expect("应重新打开 RPG Maker 测试数据库");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER delete_unit_after_manual_insert
+                  AFTER INSERT ON rpg_maker_manual_translation
+                  BEGIN
+                      DELETE FROM rpg_maker_text_unit;
+                  END;",
+            )
+            .expect("raw Lua 应能留下附着于受管表的 trigger");
+        drop(connection);
+
+        for operation in [ManualOperation::Check, ManualOperation::Apply] {
+            let error = execute_rpg_maker_manual_command(
+                &database,
+                RpgMakerEngine::Mz,
+                operation,
+                &document,
+                None,
+                None,
+                &cancellation,
+            )
+            .expect_err("普通 Manual 命令必须拒绝被修改的精确 schema");
+            assert!(matches!(
+                error,
+                ManualCommandError::Database(ManualDatabaseError::InvalidProject(_))
+            ));
+        }
+
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM rpg_maker_text_unit", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM rpg_maker_manual_translation",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

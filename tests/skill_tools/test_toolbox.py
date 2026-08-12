@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -28,18 +28,15 @@ ROOT = Path(__file__).resolve().parents[2]
 TRANSLATE_SCRIPTS = ROOT / "skills" / "translate-with-att" / "scripts"
 TERM_SCRIPTS = ROOT / "skills" / "extract-game-terminology" / "scripts"
 TERMINOLOGY_JOB = TERM_SCRIPTS / "terminology_job.py"
-SCRIPT_ENTRIES = [
-    *(
-        TRANSLATE_SCRIPTS / name
-        for name in (
-            "summarize_att_run.py",
-            "rpg_maker_survey.py",
-            "translation_preflight.py",
-            "translation_qa.py",
-        )
-    ),
-    *(TERM_SCRIPTS / name for name in ("terminology_job.py",)),
-]
+PUBLIC_SCRIPT_RELATIVE_PATHS = (
+    Path("translate-with-att/scripts/summarize_att_run.py"),
+    Path("translate-with-att/scripts/rpg_maker_survey.py"),
+    Path("translate-with-att/scripts/translation_preflight.py"),
+    Path("translate-with-att/scripts/translation_qa.py"),
+    Path("translate-with-att/scripts/inspect_nwjs_runtime.py"),
+    Path("translate-with-att/scripts/manage_rpg_maker_fonts.py"),
+    Path("extract-game-terminology/scripts/terminology_job.py"),
+)
 _GENERIC_EVIDENCE_FOR_TEST = (
     "exact_location",
     "active_runtime_consumer",
@@ -69,6 +66,38 @@ def run_script(
     )
     assert result.returncode == expected, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     return result
+
+
+def skill_bytecode_snapshot(root: Path) -> tuple[tuple[str, str, int, int], ...]:
+    entries: list[tuple[str, str, int, int]] = []
+    for path in root.rglob("*"):
+        if path.name != "__pycache__" and path.suffix not in {".pyc", ".pyo"}:
+            continue
+        metadata = path.stat()
+        entries.append(
+            (
+                path.relative_to(root).as_posix(),
+                "directory" if path.is_dir() else "file",
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+        )
+    return tuple(sorted(entries))
+
+
+@pytest.fixture(scope="module")
+def clean_public_script_tree(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[Path, Path]]:
+    copied_skills = tmp_path_factory.mktemp("package") / "skills"
+    shutil.copytree(
+        ROOT / "skills",
+        copied_skills,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    outside = tmp_path_factory.mktemp("outside")
+    yield copied_skills, outside
+    assert skill_bytecode_snapshot(copied_skills) == ()
 
 
 def write_json(path: Path, value: object) -> None:
@@ -567,9 +596,23 @@ translation = []
     assert "处理办法：" in duplicate.stderr
 
 
-@pytest.mark.parametrize("script", SCRIPT_ENTRIES, ids=lambda path: cast(Path, path).stem)
-def test_all_script_help_entries(script: Path, tmp_path: Path) -> None:
-    result = run_script(script, ["--help"], cwd=tmp_path)
+def test_pytest_imports_do_not_write_skill_bytecode(
+    skill_bytecode_at_pytest_start: tuple[tuple[str, str, int, int], ...],
+) -> None:
+    assert skill_bytecode_snapshot(ROOT / "skills") == skill_bytecode_at_pytest_start
+
+
+@pytest.mark.parametrize(
+    "relative",
+    PUBLIC_SCRIPT_RELATIVE_PATHS,
+    ids=lambda path: cast(Path, path).stem,
+)
+def test_public_script_entry_does_not_write_skill_bytecode(
+    relative: Path,
+    clean_public_script_tree: tuple[Path, Path],
+) -> None:
+    copied_skills, outside = clean_public_script_tree
+    result = run_script(copied_skills / relative, ["--help"], cwd=outside)
     assert "usage:" in result.stdout
 
 

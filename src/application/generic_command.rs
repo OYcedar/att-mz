@@ -10487,7 +10487,7 @@ mod tests {
             &language_module,
         )
         .expect("源语言残留只进入 Review，不应丢弃合法候选");
-        assert_eq!(residual.value(), &format!("こんにちは {{name}}"));
+        assert_eq!(residual.value(), "こんにちは {name}");
         assert_eq!(residual.reviews(), &[ReviewFinding::SourceResidual]);
     }
 }

@@ -291,7 +291,10 @@ def test_translation_qa_rejects_invalid_state_field_combinations(tmp_path: Path)
         "rejected_candidate_json": "null",
     }
     cases = [
-        ("missing-candidate", {key: value for key, value in base.items() if key != "rejected_candidate_json"}),
+        (
+            "missing-candidate",
+            {key: value for key, value in base.items() if key != "rejected_candidate_json"},
+        ),
         ("rejected-translation", {**base, "translation": ["译文"]}),
         ("pending-candidate", {**base, "state": "pending", "origin": "none"}),
         ("invalid-origin", {**base, "origin": "provider"}),

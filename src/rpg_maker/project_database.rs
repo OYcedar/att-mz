@@ -1990,6 +1990,21 @@ fn expected_att_schema() -> Vec<(&'static str, &'static str, &'static str, &'sta
     ]
 }
 
+#[cfg(test)]
+pub(crate) fn create_current_rpg_maker_schema_for_test(
+    connection: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    for (_, _, _, statement) in expected_att_schema() {
+        connection.execute_batch(statement)?;
+    }
+    connection.execute_batch(
+        "INSERT INTO rpg_maker_translation_resource (resource_kind, canonical_json)
+         VALUES ('terminology', '[]'), ('placeholder_rules', '[]'),
+                ('write_back_layout_rules', '[]')",
+    )?;
+    Ok(())
+}
+
 fn validate_att_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentProjectDatabase> {
     match validate_att_schema_with_check(rows, &mut || false) {
         Ok(()) => Ok(()),
@@ -1998,6 +2013,66 @@ fn validate_att_schema(rows: Vec<SqliteRow>) -> Result<(), InvalidCurrentProject
             unreachable!("永不取消的 schema 校验闭包不得返回取消")
         }
     }
+}
+
+/// 用 Manual 持有的 `rusqlite` 连接校验当前唯一 RPG Maker schema。
+///
+/// schema 的选择范围和精确 DDL 仍由本模块现有查询与校验器唯一负责；这个适配器只把
+/// `rusqlite` 行转换成存储根接口已经使用的拥有型值。
+pub(crate) fn validate_current_rpg_maker_schema_with_check(
+    connection: &rusqlite::Connection,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), CurrentRpgMakerSchemaValidationError> {
+    if is_cancelled() {
+        return Err(CurrentRpgMakerSchemaValidationError::Cancelled);
+    }
+    let mut statement = connection
+        .prepare(SELECT_ATT_SCHEMA)
+        .map_err(CurrentRpgMakerSchemaValidationError::Database)?;
+    let mut query = statement
+        .query([])
+        .map_err(CurrentRpgMakerSchemaValidationError::Database)?;
+    let mut rows = Vec::new();
+    while let Some(row) = query
+        .next()
+        .map_err(CurrentRpgMakerSchemaValidationError::Database)?
+    {
+        if is_cancelled() {
+            return Err(CurrentRpgMakerSchemaValidationError::Cancelled);
+        }
+        rows.push(SqliteRow::new(vec![
+            SqliteValue::Text(
+                row.get(0)
+                    .map_err(CurrentRpgMakerSchemaValidationError::Database)?,
+            ),
+            SqliteValue::Text(
+                row.get(1)
+                    .map_err(CurrentRpgMakerSchemaValidationError::Database)?,
+            ),
+            SqliteValue::Text(
+                row.get(2)
+                    .map_err(CurrentRpgMakerSchemaValidationError::Database)?,
+            ),
+            SqliteValue::Text(
+                row.get(3)
+                    .map_err(CurrentRpgMakerSchemaValidationError::Database)?,
+            ),
+        ]));
+    }
+    match validate_att_schema_with_check(rows, is_cancelled) {
+        Ok(()) => Ok(()),
+        Err(AttSchemaCheckError::Cancelled) => Err(CurrentRpgMakerSchemaValidationError::Cancelled),
+        Err(AttSchemaCheckError::Invalid(source)) => {
+            Err(CurrentRpgMakerSchemaValidationError::Invalid(source))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CurrentRpgMakerSchemaValidationError {
+    Cancelled,
+    Database(rusqlite::Error),
+    Invalid(InvalidCurrentProjectDatabase),
 }
 
 enum AttSchemaCheckError {

@@ -1701,13 +1701,20 @@ pub(crate) struct RejectedTranslation {
 
 impl RejectedTranslation {
     pub(crate) fn into_write(self) -> RejectedTranslationWrite {
+        let readable_path = self
+            .locator
+            .relative_path()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let expected_manual_applicability = crate::manual::generic_manual_applicability(
+            self.key.group_id(),
+            self.key.unit_id(),
+            &readable_path,
+            self.locator.role(),
+            &self.source,
+        );
         let readable_id = self.locator.natural_position().map_or_else(
             || {
-                let readable_path = self
-                    .locator
-                    .relative_path()
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 format!(
                     "{readable_path}:{}:{}:text",
                     self.key.group_id(),
@@ -1724,6 +1731,7 @@ impl RejectedTranslation {
             expected_source_text: self.expected_source_text,
             source: self.source,
             expected_group_context: self.expected_group_context,
+            expected_manual_applicability,
             candidate_json: self.candidate_json,
             translation: self.translation,
             violation: self.violation,
