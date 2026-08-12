@@ -5,9 +5,10 @@
 
 ## 1. NW.js 实际界面观察
 
-只在可丢弃的完整游戏副本上运行。工具会为这个副本启动自己的 `Game.exe`，给它使用独立的
+只在可丢弃的完整游戏副本上运行。工具会为这个副本正常启动自己的 `Game.exe`，给它使用独立的
 NW.js 用户数据目录，通过仅监听本机回环地址的 Chrome DevTools Protocol 读取实际绘制，
-结束时只关闭自己启动并持有的进程。工具不发送键盘事件，也不查找或终止其他 NW.js 进程。
+结束时只关闭自己启动并持有的进程。工具不重新加载页面，不发送键盘事件，也不查找或终止其他
+NW.js 进程。
 
 自动检查已知场景：
 
@@ -18,7 +19,9 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py smoke `
   --confirm-isolated-copy
 ```
 
-`smoke` 依次尝试标题、新游戏、对话、菜单、任务日志、选项和存档。任务日志只有在当前菜单
+`smoke` 先等待游戏离开 `Scene_Boot`。默认 75 秒足以覆盖 RPG Maker MV 常见的 60 秒字体失败
+窗口；正常启动会立即继续，不会固定等待满 75 秒。随后依次尝试标题、新游戏、对话、菜单、
+任务日志、选项和存档。任务日志只有在当前菜单
 存在唯一的 quest、journal、mission、task 或 log 命令，并且该命令有实际 handler 时才会进入；
 它不会从全局类名猜测插件场景。对话只有实际观察到 `Window_Message` 绘制文本才算已验证。
 
@@ -34,10 +37,12 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
 `observe` 不自动切换场景。省略 `--duration` 时持续到游戏窗口关闭或按 Ctrl+C；传入秒数时才
 定时结束。应使用鼠标或游戏本身支持的正常控制方式游玩。
 
-输出目录包含 `report.json`、实际绘制 `draws.jsonl`、英文候选、像素越界、字体加载检查和
-截图。`qa_status` 解释如下：
+输出目录包含 `report.json`、实际绘制 `draws.jsonl`、英文候选、像素越界、字体加载检查、
+`runtime-errors.jsonl` 和截图。工具会记录页面未捕获异常、未处理 Promise rejection、
+`Graphics.printError`、资源加载错误和 RPG Maker 的 `ErrorPrinter` 错误画面。`qa_status` 解释如下：
 
-- `needs_review`：实际观察到英文、可测的像素越界，或请求的 font family 未加载；
+- `needs_review`：启动没有完成，或实际观察到运行时错误、英文、可测的像素越界、请求的
+  font family 未加载；
 - `unverified`：没有上述发现，但仍有未访问场景，或无法证明每个 glyph 没有回退字体；
 - `clean`：`smoke` 的必验场景都有实际绘制证据，且没有已知发现或未验证项。
 
@@ -46,6 +51,12 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
 宽度，而是在 `layout-measurement-unverified.jsonl` 中记录为未验证。`document.fonts.check` 能
 确认请求的 family 是否加载，不能证明单个字符最终来自哪个字体，因此工具不会把未知的逐字
 回退伪装成通过。
+
+部分 NW.js 包装器不接受命令行调试端口，此时工具会明确失败且不发布报告。不能因此跳过启动
+验收：仍要按玩家方式正常启动隔离副本，等待出现标题或第一个可交互画面，确认没有错误画面并
+保存截图。没有这项证据时只能交付静态候选，不能称为首次可测试译本。若译本启动失败，再对
+未修改的原版隔离副本执行相同启动检查；原版通过而译本失败时，应先调查 WriteBack、字体、
+资源和配置差异，即使最先报错的插件文件本身没有改变，也不能直接归为原版缺陷。
 
 ## 2. 递归字体调查、替换与恢复
 
@@ -68,6 +79,9 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py inspect `
 工具递归建立“字体资产 → 已声明 family/stem → 静态消费者”关系。带字体后缀的完整资源路径、
 CSS 字体声明、已识别的加载 API、MV/MZ 标准字体字段，以及键名明确表示字体的完整配置值，
 都属于已证明引用。`apply` 会一次处理这些引用，包括数字、图标和展示字体，不要求逐项确认。
+CSS `@font-face` 和字体加载 API 已注册的运行时别名会原样保留，只把它们指向的字体资源换成
+选中字体；未注册、只由旧字体文件 stem 推导出的名称仍随文件名更新。这样引擎和插件继续使用
+`GameFont` 等既有契约，不会因为更换字体文件而失去已注册 family。
 普通正文或普通字符串即使整值恰好等于字体 family/stem 也不会自动修改；动态值、部分表达式和
 无法证明消费者的字体资产进入 Review。
 

@@ -43,7 +43,7 @@ from att_toolbox.nwjs import (
     summarize_draws,
     unique_content_target,
 )
-from inspect_nwjs_runtime import scenario_action
+from inspect_nwjs_runtime import scenario_action, wait_for_runtime_start
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "skills" / "translate-with-att" / "scripts"
@@ -150,6 +150,7 @@ def font_game(tmp_path: Path) -> Path:
     )
     (game / "js" / "plugins" / "FontConsumer.js").write_text(
         "Graphics.loadFont('GameFont', 'fonts/OldBody.ttf');\n"
+        "const loaded = Graphics.isFontLoaded('GameFont');\n"
         "const styled = {fontFace: 'GameFont', caption: 'GameFont'};\n"
         "const directPath = 'fonts\\/OldBody.ttf';\n"
         "const ordinaryStem = 'OldBody';\n"
@@ -164,7 +165,7 @@ def font_game(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (game / "settings.ini").write_text(
-        "font_family=GameFont\ncaption=GameFont\nfont_file=fonts/OldBody.ttf\n",
+        "font_family=GameFont\nfont_fallback=OldBody\ncaption=GameFont\nfont_file=fonts/OldBody.ttf\n",
         encoding="utf-8",
     )
     return game
@@ -177,7 +178,7 @@ def _mutation_text(plan: FontPlan, relative: str) -> str:
     raise AssertionError(f"missing mutation: {relative}")
 
 
-def test_font_graph_rewrites_proven_contexts_but_not_matching_body_text(font_game: Path) -> None:
+def test_font_graph_preserves_registered_aliases_and_rewrites_font_assets(font_game: Path) -> None:
     selected = FONT_ROOT / "NotoSansCJKsc-Regular.otf"
     plan = build_font_plan(
         game_root=font_game.resolve(),
@@ -194,6 +195,14 @@ def test_font_graph_rewrites_proven_contexts_but_not_matching_body_text(font_gam
         "javascript_font_alias",
         "config_complete_value_font_alias",
     }
+    assert any(
+        reference.source == "js/plugins/FontConsumer.js"
+        and reference.line == 2
+        and reference.old_value == "GameFont"
+        and reference.new_value == "GameFont"
+        for reference in plan.references
+    )
+    assert not any(item.source == "js/plugins/FontConsumer.js" and item.line == 2 for item in plan.reviews)
 
     system = json.loads(_mutation_text(plan, "data/System.json"))
     assert system["advanced"]["mainFontFilename"] == selected.name
@@ -201,16 +210,18 @@ def test_font_graph_rewrites_proven_contexts_but_not_matching_body_text(font_gam
     assert system["ordinaryText"] == "GameFont"
     assert system["ordinaryStem"] == "OldBody"
 
-    plugin_config = _mutation_text(plan, "js/plugins.js")
-    assert '"fontFamily": "NotoSansCJKsc-Regular"' in plugin_config
-    assert '"caption": "GameFont"' in plugin_config
+    plugin_config = (font_game / "js" / "plugins.js").read_text(encoding="utf-8")
+    assert '"fontFamily": "GameFont"' in plugin_config
+    assert not any(mutation.relative_path == "js/plugins.js" for mutation in plan.mutations)
     active_plugin = _mutation_text(plan, "js/plugins/FontConsumer.js")
-    assert "fontFace: 'NotoSansCJKsc-Regular'" in active_plugin
+    assert "Graphics.loadFont('GameFont'" in active_plugin
+    assert "Graphics.isFontLoaded('GameFont')" in active_plugin
+    assert "fontFace: 'GameFont'" in active_plugin
     assert "caption: 'GameFont'" in active_plugin
     assert "ordinaryStem = 'OldBody'" in active_plugin
     assert f"directPath = 'fonts\\/{selected.name}'" in active_plugin
-    assert active_plugin.count('"fontFamily":"NotoSansCJKsc-Regular"') == 1
-    assert '"fontFamily" : "NotoSansCJKsc-Regular"' in active_plugin
+    assert active_plugin.count('"fontFamily":"GameFont"') == 1
+    assert '"fontFamily" : "GameFont"' in active_plugin
     assert f'"fontFile":"fonts\\/{selected.name}"' in active_plugin
     assert '"caption":"GameFont"' in active_plugin
     assert not any(mutation.relative_path == "js/plugins/InactiveFont.js" for mutation in plan.mutations)
@@ -224,14 +235,15 @@ def test_font_graph_rewrites_proven_contexts_but_not_matching_body_text(font_gam
     )
 
     settings = _mutation_text(plan, "settings.ini")
-    assert "font_family=NotoSansCJKsc-Regular" in settings
+    assert "font_family=GameFont" in settings
+    assert "font_fallback=NotoSansCJKsc-Regular" in settings
     assert "caption=GameFont" in settings
     assert f"font_file=fonts/{selected.name}" in settings
     raw_json = _mutation_text(plan, "data/Raw.json")
-    assert raw_json.count('"fontFamily":"NotoSansCJKsc-Regular"') == 1
-    assert raw_json.count('"fontFamily" : "NotoSansCJKsc-Regular"') == 1
-    assert raw_json.count('\\"fontFamily\\":\\"NotoSansCJKsc-Regular\\"') == 1
-    assert raw_json.count('\\"fontFamily\\" : \\"NotoSansCJKsc-Regular\\"') == 1
+    assert raw_json.count('"fontFamily":"GameFont"') == 1
+    assert raw_json.count('"fontFamily" : "GameFont"') == 1
+    assert raw_json.count('\\"fontFamily\\":\\"GameFont\\"') == 1
+    assert raw_json.count('\\"fontFamily\\" : \\"GameFont\\"') == 1
     assert f'\\"fontFile\\":\\"fonts\\\\/{selected.name}\\"' in raw_json
     assert '"caption":"GameFont"' in raw_json
     assert '\\"caption\\":\\"GameFont\\"' in raw_json
@@ -239,15 +251,19 @@ def test_font_graph_rewrites_proven_contexts_but_not_matching_body_text(font_gam
     css = _mutation_text(plan, "fonts/gamefont.css")
     assert "/* keep */" in css
     assert "format('opentype')" in css
+    assert "font-family: 'GameFont'" in css
+    assert "font-family: IconFamily" in css
+    assert "body { font-family: GameFont, 'IconFamily', sans-serif; }" in css
     html = _mutation_text(plan, "index.html")
     assert "<p title=GameFont>GameFont; font-family: GameFont; fonts/OldBody.ttf</p>" in html
     assert "<!-- <style>@font-face {font-family: Fake; src:url('OldBody.ttf')}</style> -->" in html
     assert f"url('fonts/{selected.name}') format('opentype')" in html
-    assert 'style="font-family: NotoSansCJKsc-Regular"' in html
+    assert "font-family: 'HtmlFont'" in html
+    assert 'style="font-family: GameFont"' in html
     assert 'title="GameFont"' in html
     assert f"href=fonts/{selected.name}" in html
     assert f"htmlPath = 'fonts\\/{selected.name}'" in html
-    assert "fontFace:'NotoSansCJKsc-Regular'" in html
+    assert "fontFace:'GameFont'" in html
     assert "caption:'GameFont'" in html
     assert any(item.reason == "unresolved_json_font_value" for item in plan.reviews)
     assert any(item.reason == "unresolved_javascript_font_value" for item in plan.reviews)
@@ -738,6 +754,10 @@ def test_nwjs_public_contract_and_observer_memory_behavior(tmp_path: Path) -> No
     assert "200000" not in OBSERVER_SCRIPT
     assert "clearInterval(state.installTimer)" in OBSERVER_SCRIPT
     assert 'window.addEventListener("load"' in OBSERVER_SCRIPT
+    assert 'window.addEventListener("error"' in OBSERVER_SCRIPT
+    assert 'window.addEventListener("unhandledrejection"' in OBSERVER_SCRIPT
+    assert 'patch(window.Graphics, "printError"' in OBSERVER_SCRIPT
+    assert "state.takeErrors" in OBSERVER_SCRIPT
     assert "Math.min(width, px + allowed)" in OBSERVER_SCRIPT
     assert "px + measuredWidth > contentsWidth" in OBSERVER_SCRIPT
     assert 'measurementStatus = "unverified_control_or_multiline"' in OBSERVER_SCRIPT
@@ -764,6 +784,42 @@ def test_nwjs_public_contract_and_observer_memory_behavior(tmp_path: Path) -> No
     assert summary["english_candidate_count"] == 1
     assert summary["pixel_overflow_count"] == 1
     assert summary["measurement_unverified_count"] == 1
+
+
+def test_runtime_start_waits_for_ready_scene_and_stops_on_error() -> None:
+    class StartupConnection:
+        def __init__(self, *, scene: str, errors: list[dict[str, object]]) -> None:
+            self.scene = scene
+            self.errors = errors
+
+        def evaluate(self, expression: str) -> object:
+            if "takeErrors" in expression:
+                errors, self.errors = self.errors, []
+                return errors
+            return {"scene": self.scene}
+
+    ready_connection = StartupConnection(scene="Scene_Title", errors=[])
+    ready = wait_for_runtime_start(
+        cast(CdpConnection, cast(object, ready_connection)),
+        timeout=1.0,
+        process_exited=lambda: False,
+        poll_seconds=0.0,
+    )
+    assert ready.status == "ready"
+    assert ready.scene == "Scene_Title"
+
+    error_connection = StartupConnection(
+        scene="Scene_Boot",
+        errors=[{"kind": "graphics_print_error", "message": "Failed to load GameFont"}],
+    )
+    failed = wait_for_runtime_start(
+        cast(CdpConnection, cast(object, error_connection)),
+        timeout=1.0,
+        process_exited=lambda: False,
+        poll_seconds=0.0,
+    )
+    assert failed.status == "runtime_error"
+    assert failed.runtime_errors[0]["message"] == "Failed to load GameFont"
 
 
 def test_smoke_keeps_running_after_one_scene_script_exception() -> None:
