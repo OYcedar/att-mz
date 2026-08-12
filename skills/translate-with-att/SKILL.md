@@ -1,6 +1,6 @@
 ---
 name: translate-with-att
-description: 使用 ATT 调查、建立、继续、诊断、修订、写回和验收 RPG Maker MV、MZ、Generic 或组合式游戏翻译。适用于用户明确要求使用 ATT、提供 ATT 项目，或要求处理 Init、Extract、Rules、Translate、Manual、Lua、WriteBack、运行错误和恢复。
+description: 使用 ATT 调查、建立、继续、诊断、修订、写回和验收 RPG Maker MV、MZ、Generic 或组合式游戏翻译，并根据用户实玩反馈处理漏翻、误译、显示问题和后续返修。适用于用户明确要求使用 ATT、提供 ATT 项目，或要求处理 Init、Extract、Rules、Translate、Manual、Lua、WriteBack、运行错误、恢复和实玩反馈。
 ---
 
 # 使用 ATT 翻译游戏
@@ -19,9 +19,10 @@ description: 使用 ATT 调查、建立、继续、诊断、修订、写回和�
 问题重新做 QA、集中 Manual、WriteBack 和受影响场景复查，可以有第二轮或更多轮；不要为了
 避免返工而阻塞首次可用版本。
 
-开始调查前读取[游戏类型经验索引](references/game-types.md)，按当前游戏的结构选择所有适用的
-经验文件；只读取选中的文件。没有符合类型时直接按本 Skill 主流程执行，不套用相似名称或
-未经验证的方法。
+开始首次调查、恢复中断任务或处理新一轮用户实玩反馈前，必须完整读取
+[游戏类型经验索引](references/game-types.md)，按当前游戏的结构选择并完整读取所有适用经验文件；
+只读取选中的文件。同一轮已经读完且文件未变化时不重复读取。没有符合类型时直接按本 Skill
+主流程执行，不套用相似名称或未经验证的方法。
 
 ## 先绑定发行与范围
 
