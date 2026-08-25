@@ -528,6 +528,92 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
         "Thinking 正文不得进入权威数据库"
     );
 
+    const GENERIC_TRANSLATION: &str = "通用译文";
+    let responses_listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("Responses 本地模型端口应可绑定");
+    let responses_base = format!(
+        "http://{}/v1",
+        responses_listener
+            .local_addr()
+            .expect("Responses 本地模型地址应可读取")
+    );
+    write_configuration_with_protocol(root, &responses_base, Some("responses"));
+    assert_success(
+        "Generic Extract",
+        &run_att(root, arguments(&["generic", "extract", "--name", PROJECT])),
+    );
+    let server = thread::spawn(move || {
+        serve_two_responses_outputs(
+            responses_listener,
+            json!({ "0": [GENERIC_TRANSLATION] }),
+            json!({
+                "0": [format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_TRANSLATION}")]
+            }),
+        )
+    });
+    let translate = run_att(
+        root,
+        arguments(&["generic", "translate", "--name", PROJECT, "local"]),
+    );
+    assert_success("Generic Responses Translate", &translate);
+    assert_eq!(
+        read_generic_units(&generic_workspace.join("project.db")),
+        vec![(
+            "同名项目隔离".to_owned(),
+            Some(GENERIC_TRANSLATION.to_owned())
+        )],
+        "Generic Responses 译文必须提交到自己的项目数据库"
+    );
+
+    let translate = run_att(
+        root,
+        arguments(&["mv", "translate", "--name", PROJECT, "local"]),
+    );
+    assert_success("MV Responses Translate", &translate);
+    let [generic_request, mv_request] = server
+        .join()
+        .expect("Responses 本地模型服务线程不得 panic")
+        .expect("Responses 本地模型服务必须完成两次请求");
+    assert!(generic_request.get("messages").is_none());
+    assert_eq!(generic_request["background"], false);
+    let input = generic_request["input"]
+        .as_array()
+        .expect("Generic Responses 请求必须包含 input 数组");
+    assert_eq!(input.len(), 2, "一次翻译请求只应包含 system 与 user");
+    let user_message = parse_user_message(
+        input[1]["content"]
+            .as_str()
+            .expect("Generic Responses user message 必须是字符串"),
+    );
+    assert!(
+        user_message_texts(&user_message).contains(&"同名项目隔离"),
+        "Responses user message 必须包含 Generic 待译原文"
+    );
+    assert!(mv_request.get("messages").is_none());
+    assert_eq!(mv_request["background"], false);
+    let input = mv_request["input"]
+        .as_array()
+        .expect("MV Responses 请求必须包含 input 数组");
+    let user_message = parse_user_message(
+        input[1]["content"]
+            .as_str()
+            .expect("MV Responses user message 必须是字符串"),
+    );
+    let expected_mv_source = format!(r"\n<{MV_SPEAKER}>{MV_BODY}");
+    assert_eq!(
+        user_message_texts(&user_message),
+        [expected_mv_source.as_str()],
+        "未配置 Speaker 投影规则时，MV Responses 请求必须保留完整对话行"
+    );
+    assert_eq!(
+        read_generic_units(&generic_workspace.join("project.db")),
+        vec![(
+            "同名项目隔离".to_owned(),
+            Some(GENERIC_TRANSLATION.to_owned())
+        )],
+        "同名 MV Responses Translate 不得改变 Generic 项目状态"
+    );
+
     assert_success(
         "MZ WriteBack",
         &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
@@ -536,6 +622,13 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
         "MV WriteBack",
         &run_att(root, arguments(&["mv", "write-back", "--name", PROJECT])),
     );
+    assert_success(
+        "Generic WriteBack",
+        &run_att(
+            root,
+            arguments(&["generic", "write-back", "--name", PROJECT]),
+        ),
+    );
 
     let mz_output: Value = serde_json::from_slice(
         &fs::read(mz_workspace.join("write_back/data/Items.json"))
@@ -543,9 +636,21 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     )
     .expect("MZ WriteBack Items.json 必须可重新解析");
     assert_eq!(mz_output[1]["description"], TRANSLATION);
+    assert_eq!(
+        read_generic_texts(&generic_workspace.join("write_back/story.jsonl")),
+        vec![GENERIC_TRANSLATION]
+    );
 
-    let mv_output = mv_workspace.join("write_back/www/data/Map001.json");
-    assert!(mv_output.is_file(), "MV WriteBack 必须保留 www 布局");
+    let mv_output_path = mv_workspace.join("write_back/www/data/Map001.json");
+    assert!(mv_output_path.is_file(), "MV WriteBack 必须保留 www 布局");
+    let mv_output: Value = serde_json::from_slice(
+        &fs::read(&mv_output_path).expect("MV WriteBack Map001.json 必须可读取"),
+    )
+    .expect("MV WriteBack Map001.json 必须可重新解析");
+    assert_eq!(
+        mv_output["events"][1]["pages"][0]["list"][1]["parameters"][0],
+        format!(r"\n<{MV_SPEAKER_TRANSLATION}>{MV_BODY_WRITE_BACK}")
+    );
     assert!(
         !mv_workspace.join("write_back/data").exists(),
         "MV WriteBack 不得把 www 内容提升到输出根"
@@ -2940,13 +3045,20 @@ fn assert_plain_progress_lines(stderr: &[u8], expected: &[&str]) {
 }
 
 fn write_configuration(root: &Path, endpoint: &str) {
+    write_configuration_with_protocol(root, endpoint, None);
+}
+
+fn write_configuration_with_protocol(root: &Path, endpoint: &str, protocol: Option<&str>) {
+    let protocol = protocol.map_or_else(String::new, |protocol| {
+        format!("protocol = \"{protocol}\"\n")
+    });
     let configuration = format!(
         r#"[prompts]
 thinking_output = true
 source_echo = false
 
 [llm.clients.primary]
-url = "{endpoint}"
+{protocol}url = "{endpoint}"
 api_key = "e2e-secret"
 model = "e2e-model"
 max_concurrent_requests = 2
@@ -3473,6 +3585,29 @@ fn serve_one_generic_translation(
     serve_one_response(listener, json!({ "0": [translation] }))
 }
 
+fn serve_one_responses_output(listener: TcpListener, translations: Value) -> Result<Value, String> {
+    let (mut stream, request) = accept_request(listener)?;
+    let json = serde_json::to_string(&json!({
+        "think": THINKING_SENTINEL,
+        "translations": translations
+    }))
+    .map_err(|error| error.to_string())?;
+    let content = format!("```json\n{json}\n```");
+    write_responses_response(&mut stream, &content)?;
+    Ok(request)
+}
+
+fn serve_two_responses_outputs(
+    listener: TcpListener,
+    first_output: Value,
+    second_output: Value,
+) -> Result<[Value; 2], String> {
+    let first_listener = listener.try_clone().map_err(|error| error.to_string())?;
+    let first_request = serve_one_responses_output(first_listener, first_output)?;
+    let second_request = serve_one_responses_output(listener, second_output)?;
+    Ok([first_request, second_request])
+}
+
 fn serve_two_responses(
     listener: TcpListener,
     first_output: Value,
@@ -3591,6 +3726,30 @@ fn write_chat_response(stream: &mut TcpStream, content: &str) -> Result<(), Stri
     .to_string();
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-request-id: request-e2e\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn write_responses_response(stream: &mut TcpStream, content: &str) -> Result<(), String> {
+    let body = json!({
+        "id": "response-e2e",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": content }]
+        }],
+        "usage": { "input_tokens": 11, "output_tokens": 3, "total_tokens": 14 }
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream

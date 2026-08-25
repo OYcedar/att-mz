@@ -2273,6 +2273,8 @@ pub(crate) enum HttpEnvelopeViolation {
     EmptyChoices,
     MissingMessage,
     MissingContent,
+    MissingOutput,
+    MissingOutputText,
     InvalidContract,
 }
 
@@ -2283,6 +2285,8 @@ impl HttpEnvelopeViolation {
             Self::EmptyChoices => "empty_choices",
             Self::MissingMessage => "missing_message",
             Self::MissingContent => "missing_content",
+            Self::MissingOutput => "missing_output",
+            Self::MissingOutputText => "missing_output_text",
             Self::InvalidContract => "invalid_contract",
         }
     }

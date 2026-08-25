@@ -116,7 +116,7 @@ journal 损坏、目标与已知旧目录都缺失、必要 backup 缺失，或�
 | Manual TOML | [Manual](../manual/README.md) | 按可读 ID 修正语法、原文、type、形状、空槽或 Placeholder |
 | Placeholder | [Placeholder](../translation/placeholders.md) | 只有系统性规则错误才修改全局规则 |
 | 术语或语言 | [术语](../translation/terminology.md)、[语言](../translation/language.md) | 区分结构错误与翻译质量问题 |
-| 模型请求 | [Chat Completions](../runtime/chat-completions.md)、[任务记录](../translation/task-records.md) | 保留已确认进度，按请求事实判断重试 |
+| 模型请求 | [OpenAI-compatible HTTP](../runtime/openai-compatible.md)、[任务记录](../translation/task-records.md) | 保留已确认进度，按请求事实判断重试 |
 | SQLite | [SQLite](../runtime/sqlite.md) | 普通命令只接受当前 schema；raw Lua 修改自行承担结果 |
 | 目录发布 | [目录发布](../runtime/directory-publishing.md) | journal 是恢复权威，不用日志重放 |
 | 日志或任务记录 | [项目日志](../runtime/project-log.md)、[任务记录](../translation/task-records.md) | 作为证据故障处理，不改写业务结果 |

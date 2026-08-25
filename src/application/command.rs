@@ -157,7 +157,7 @@ use crate::runtime::filesystem::{
     SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemConfig, SystemFileSystemError,
 };
 use crate::runtime::llm::{
-    OpenAiChatCompletionClient, OpenAiChatCompletionError, OpenAiChatCompletionExecutor,
+    OpenAiCompatibleClient, OpenAiCompatibleError, OpenAiCompatibleExecutor,
     OpenAiExecutorBuildError,
 };
 use crate::runtime::performance::RunPerformanceCounters;
@@ -2520,18 +2520,17 @@ impl ProductionRpgMakerCommandRunner {
                     return observed_construction_failure(project_log, error, shutdown).await;
                 }
             };
-        let llm = match OpenAiChatCompletionExecutor::new(
-            command.llm().with_pem_roots(additional_pem_roots),
-        )
-        .map_err(ProductionCommandError::http_client_build)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                let shutdown = roots.shutdown().await;
-                drop(project_lease_guard);
-                return observed_construction_failure(project_log, error, shutdown).await;
-            }
-        };
+        let llm =
+            match OpenAiCompatibleExecutor::new(command.llm().with_pem_roots(additional_pem_roots))
+                .map_err(ProductionCommandError::http_client_build)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let shutdown = roots.shutdown().await;
+                    drop(project_lease_guard);
+                    return observed_construction_failure(project_log, error, shutdown).await;
+                }
+            };
         let opener = PreopenedProject::new(opened_project);
         let business_log =
             ProductionBusinessLog::for_translation(&project_log, progress_observer.clone());
@@ -4877,16 +4876,16 @@ fn usize_to_u64(value: usize, name: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{name}必须能用 u64 表达"))
 }
 
-type ProductionTranslationProfile = Arc<RpgMakerTranslationProfile<OpenAiChatCompletionClient>>;
+type ProductionTranslationProfile = Arc<RpgMakerTranslationProfile<OpenAiCompatibleClient>>;
 type ProductionTranslationAssetReader =
     RpgMakerTranslationAssetReadingService<RusqliteStorage, RayonCpuExecutor>;
 type ProductionTranslationPlanner = RpgMakerTranslationTaskPlanningService<
     TranslationPlanningResourceReadingService<SystemFileSystem, RayonCpuExecutor>,
     RayonCpuExecutor,
-    OpenAiChatCompletionClient,
+    OpenAiCompatibleClient,
 >;
 type ProductionTranslationExecutor = RpgMakerTranslationTaskExecutionService<
-    OpenAiChatCompletionExecutor,
+    OpenAiCompatibleExecutor,
     TokioAsyncDelay,
     TranslationTaskResponseProcessingService<RayonCpuExecutor>,
     ProductionTranslationProfile,
@@ -5142,7 +5141,7 @@ struct ProductionSelectedTranslationExecutionBuilder<'a> {
     file_system: SystemFileSystem,
     cpu: RayonCpuExecutor,
     sqlite: RusqliteStorage,
-    llm: OpenAiChatCompletionExecutor,
+    llm: OpenAiCompatibleExecutor,
     log: ProductionBusinessLog,
     task_records: ConfiguredTranslationTaskRecordSink,
     record_translation_tasks: bool,
@@ -5392,7 +5391,7 @@ async fn build_production_translation_profile(
 }
 
 impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecutionBuilder<'_> {
-    type Client = OpenAiChatCompletionClient;
+    type Client = OpenAiCompatibleClient;
     type Translation = ProductionRpgMakerTranslation;
     type Error = ProductionTranslationExecutionBuildError;
 
@@ -5439,14 +5438,13 @@ impl SelectedTranslationExecutionBuilder for ProductionSelectedTranslationExecut
             self.cpu.clone(),
         )
         .with_cancellation(self.cancellation.clone());
-        let planner =
-            RpgMakerTranslationTaskPlanningService::<_, _, OpenAiChatCompletionClient>::new(
-                resources,
-                Arc::clone(&translation_resources),
-                placeholders,
-                self.cpu.clone(),
-            )
-            .with_cancellation(self.cancellation.clone());
+        let planner = RpgMakerTranslationTaskPlanningService::<_, _, OpenAiCompatibleClient>::new(
+            resources,
+            Arc::clone(&translation_resources),
+            placeholders,
+            self.cpu.clone(),
+        )
+        .with_cancellation(self.cancellation.clone());
         let processor =
             TranslationTaskResponseProcessingService::new(self.cpu.clone(), translation_resources)
                 .with_cancellation(self.cancellation.clone());
@@ -6256,7 +6254,7 @@ impl<R, P, E, S> ProductionExternalModelFailure
     for crate::rpg_maker::translate::pipeline::RpgMakerTranslationServiceError<
         R,
         P,
-        RpgMakerTranslationTaskExecutionError<OpenAiChatCompletionError, E>,
+        RpgMakerTranslationTaskExecutionError<OpenAiCompatibleError, E>,
         S,
     >
 where
@@ -6295,17 +6293,15 @@ where
                 diagnostic,
             } => match source {
                 RpgMakerTranslationTaskExecutionError::FatalRequest { attempt, source } => {
-                    let source: RpgMakerTranslationTaskExecutionError<
-                        OpenAiChatCompletionError,
-                        E,
-                    > = RpgMakerTranslationTaskExecutionError::FatalRequest { attempt, source };
+                    let source: RpgMakerTranslationTaskExecutionError<OpenAiCompatibleError, E> =
+                        RpgMakerTranslationTaskExecutionError::FatalRequest { attempt, source };
                     ProductionCommandError::ExternalModel(Box::new(
                         ProductionCommandError::report_diagnostic(source, diagnostic),
                     ))
                 }
                 RpgMakerTranslationTaskExecutionError::ProcessResponse { attempt, source } => {
                     let execution_error: RpgMakerTranslationTaskExecutionError<
-                        OpenAiChatCompletionError,
+                        OpenAiCompatibleError,
                         E,
                     > = RpgMakerTranslationTaskExecutionError::ProcessResponse { attempt, source };
                     map_project_diagnostic(execution_error, diagnostic)
@@ -6316,10 +6312,8 @@ where
                     ))
                 }
                 RpgMakerTranslationTaskExecutionError::InternalInvariant { invariant } => {
-                    let source: RpgMakerTranslationTaskExecutionError<
-                        OpenAiChatCompletionError,
-                        E,
-                    > = RpgMakerTranslationTaskExecutionError::InternalInvariant { invariant };
+                    let source: RpgMakerTranslationTaskExecutionError<OpenAiCompatibleError, E> =
+                        RpgMakerTranslationTaskExecutionError::InternalInvariant { invariant };
                     ProductionCommandError::Internal(Box::new(
                         ProductionCommandError::report_diagnostic(source, diagnostic),
                     ))

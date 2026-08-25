@@ -46,12 +46,15 @@ use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
 use crate::runtime::cpu::CpuExecutorConfig;
 use crate::runtime::filesystem::{DirectoryPublisherConfig, SystemFileSystemConfig};
 use crate::runtime::llm::{
-    LlmProxyConfiguration, OpenAiChatCompletionClient, OpenAiExecutorConfiguration,
+    LlmProxyConfiguration, OpenAiCompatibleClient, OpenAiEndpoint, OpenAiExecutorConfiguration,
+    OpenAiProtocol,
 };
 use crate::runtime::sqlite::RusqliteStorageConfiguration;
 use crate::translation::profile::TranslationRequestConfiguration;
 
-const RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
+const CHAT_COMPLETIONS_RESERVED_REQUEST_BODY_FIELDS: [&str; 3] = ["model", "messages", "stream"];
+const RESPONSES_RESERVED_REQUEST_BODY_FIELDS: [&str; 4] =
+    ["model", "input", "stream", "background"];
 const CONFIGURATION_FILE_NAME: &str = "config.toml";
 const PROJECTS_DIRECTORY_NAME: &str = "projects";
 const PROMPTS_DIRECTORY_NAME: &str = "prompts";
@@ -1115,7 +1118,7 @@ impl ConfiguredTranslateCommand {
     }
 
     #[cfg(test)]
-    pub(crate) fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
+    pub(crate) fn client(&self) -> &Arc<OpenAiCompatibleClient> {
         self.translation().client()
     }
 
@@ -1326,7 +1329,7 @@ pub(crate) struct TranslateConfiguration {
     source_echo: bool,
     language_modules: LanguageModuleCatalog,
     profile: TranslationProfileConfiguration,
-    client: Arc<OpenAiChatCompletionClient>,
+    client: Arc<OpenAiCompatibleClient>,
     llm: SelectedLlmExecutorConfiguration,
 }
 
@@ -1417,7 +1420,7 @@ impl TranslateConfiguration {
         &self.language_modules
     }
 
-    pub(crate) const fn client(&self) -> &Arc<OpenAiChatCompletionClient> {
+    pub(crate) const fn client(&self) -> &Arc<OpenAiCompatibleClient> {
         &self.client
     }
 
@@ -1639,7 +1642,7 @@ fn build_selected_translation_profile(
 
 struct BuiltLlmClient {
     executor: SelectedLlmExecutorConfiguration,
-    client: OpenAiChatCompletionClient,
+    client: OpenAiCompatibleClient,
     request: TranslationRequestConfiguration,
 }
 
@@ -1648,6 +1651,7 @@ fn build_llm_client(
     configuration_directory: &Path,
     raw: RawLlmClientConfiguration,
 ) -> Result<BuiltLlmClient, ConfigurationValueError> {
+    let protocol = OpenAiProtocol::from(raw.protocol);
     let url = Url::parse(&raw.url).map_err(|_| {
         invalid(
             format!("{field}.url").as_str(),
@@ -1699,7 +1703,11 @@ fn build_llm_client(
             ConfigurationValueRule::JsonObjectRequired,
         ));
     };
-    for reserved in RESERVED_REQUEST_BODY_FIELDS {
+    let reserved_fields: &[&str] = match protocol {
+        OpenAiProtocol::ChatCompletions => &CHAT_COMPLETIONS_RESERVED_REQUEST_BODY_FIELDS,
+        OpenAiProtocol::Responses => &RESPONSES_RESERVED_REQUEST_BODY_FIELDS,
+    };
+    for &reserved in reserved_fields {
         if parameters.contains_key(reserved) {
             return Err(invalid(
                 format!("{field}.parameters.{reserved}").as_str(),
@@ -1797,8 +1805,8 @@ fn build_llm_client(
             .collect(),
         Duration::from_millis(raw.max_retry_after_ms),
     );
-    let client = OpenAiChatCompletionClient::new(
-        url,
+    let client = OpenAiCompatibleClient::new_with_endpoint(
+        OpenAiEndpoint::new(url, protocol),
         raw.api_key,
         raw.model,
         max_concurrent_requests,
@@ -3048,7 +3056,10 @@ impl ConfigurationFieldContract {
             [llm, clients, _, field]
                 if llm == "llm"
                     && clients == "clients"
-                    && matches!(field.as_str(), "url" | "api_key" | "model" | "parameters") =>
+                    && matches!(
+                        field.as_str(),
+                        "url" | "protocol" | "api_key" | "model" | "parameters"
+                    ) =>
             {
                 ConfigurationTomlValueKind::String
             }
@@ -4456,6 +4467,8 @@ struct RawSelectedTranslationProfileConfiguration {
 #[serde(deny_unknown_fields)]
 struct RawLlmClientConfiguration {
     url: String,
+    #[serde(default)]
+    protocol: RawOpenAiProtocol,
     #[serde(deserialize_with = "deserialize_api_key")]
     api_key: SecretString,
     model: String,
@@ -4470,6 +4483,23 @@ struct RawLlmClientConfiguration {
     parameters: String,
     #[serde(default)]
     rate_limit: Option<RawLlmRateLimitConfiguration>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawOpenAiProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+impl From<RawOpenAiProtocol> for OpenAiProtocol {
+    fn from(value: RawOpenAiProtocol) -> Self {
+        match value {
+            RawOpenAiProtocol::ChatCompletions => Self::ChatCompletions,
+            RawOpenAiProtocol::Responses => Self::Responses,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -4511,6 +4541,112 @@ mod tests {
             project_lua_command(),
         ] {
             load_configuration(&path, command).expect("仓库示例必须满足每个命令的当前契约");
+        }
+    }
+
+    #[test]
+    fn llm_protocol_defaults_to_chat_completions_and_explicit_responses_changes_endpoint() {
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        let without_protocol = example.replacen("protocol = \"chat_completions\"\n", "", 1);
+        let path = directory.write("default-protocol.toml", &without_protocol);
+        let ConfiguredRpgMakerCommand::Translate(configured) =
+            load_configuration(&path, translate_command("primary"))
+                .expect("省略协议时应使用 Chat Completions")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert_eq!(
+            configured.client().protocol(),
+            OpenAiProtocol::ChatCompletions
+        );
+        assert_eq!(
+            configured.client().endpoint().as_str(),
+            "https://api.example.com/v1/chat/completions"
+        );
+
+        let responses = example.replacen(
+            "protocol = \"chat_completions\"",
+            "protocol = \"responses\"",
+            1,
+        );
+        let path = directory.write("responses-protocol.toml", &responses);
+        let ConfiguredRpgMakerCommand::Translate(configured) =
+            load_configuration(&path, translate_command("primary"))
+                .expect("显式 Responses 协议应建立配置")
+        else {
+            panic!("应建立 Translate 配置");
+        };
+        assert_eq!(configured.client().protocol(), OpenAiProtocol::Responses);
+        assert_eq!(
+            configured.client().endpoint().as_str(),
+            "https://api.example.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn llm_protocol_rejects_unknown_or_non_string_values() {
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        for (name, replacement) in [
+            ("unknown", "protocol = \"completions\""),
+            ("wrong-type", "protocol = []"),
+        ] {
+            let source = example.replacen("protocol = \"chat_completions\"", replacement, 1);
+            let path = directory.write(&format!("{name}.toml"), &source);
+            assert!(
+                load_configuration(&path, translate_command("primary")).is_err(),
+                "无效协议值 {replacement} 必须拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_parameters_reserve_only_the_selected_protocol_fields() {
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        for (name, protocol, reserved, allowed) in [
+            ("chat-messages", "chat_completions", "messages", "input"),
+            ("responses-input", "responses", "input", "messages"),
+            (
+                "responses-background",
+                "responses",
+                "background",
+                "messages",
+            ),
+        ] {
+            let source = example
+                .replacen(
+                    "protocol = \"chat_completions\"",
+                    format!("protocol = \"{protocol}\"").as_str(),
+                    1,
+                )
+                .replacen(
+                    EXAMPLE_CLIENT_PARAMETERS,
+                    format!("parameters = '''\n{{\"{reserved}\":[]}}\n'''").as_str(),
+                    1,
+                );
+            let path = directory.write(&format!("{name}-reserved.toml"), &source);
+            assert!(matches!(
+                load_configuration(&path, translate_command("primary")),
+                Err(ConfigurationLoadError::InvalidValue(_)
+                    | ConfigurationLoadError::InvalidValueAtPath { .. })
+            ));
+
+            let source = example
+                .replacen(
+                    "protocol = \"chat_completions\"",
+                    format!("protocol = \"{protocol}\"").as_str(),
+                    1,
+                )
+                .replacen(
+                    EXAMPLE_CLIENT_PARAMETERS,
+                    format!("parameters = '''\n{{\"{allowed}\":[]}}\n'''").as_str(),
+                    1,
+                );
+            let path = directory.write(&format!("{name}-allowed.toml"), &source);
+            load_configuration(&path, translate_command("primary"))
+                .expect("另一协议拥有的字段不应被当前协议无依据地保留");
         }
     }
 
@@ -4816,6 +4952,7 @@ mod tests {
             r#"{}
 [llm.clients.unused]
 url = []
+protocol = []
 api_key = []
 model = []
 max_concurrent_requests = []
@@ -5563,7 +5700,7 @@ api_key = "{API_KEY}" "invalid"
     fn unselected_client_api_key_never_enters_configuration_diagnostics() {
         let directory = TestDirectory::new();
         let source = format!(
-            "{}\n[llm.clients.unused]\nurl = []\napi_key = \"UNSELECTED_API_KEY_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
+            "{}\n[llm.clients.unused]\nurl = []\nprotocol = []\napi_key = \"UNSELECTED_API_KEY_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
             include_str!("../../config.example.toml")
         );
         let source = replace_thinking_output(&source, "thinking_output = []");

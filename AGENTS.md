@@ -253,7 +253,7 @@ ATT 不自行限制项目总量。文件、目录、Lua、SQLite 和 Claim、Uni
 主错误、清理错误和呈现错误在内部保持各自含义，公开时只保留使用者实际需要处理的内容。
 
 敏感信息清单、替换方式和内容边界只由
-[Chat Completions 运行根规格](docs/runtime/chat-completions.md#6-敏感信息闭集唯一权威)
+[OpenAI-compatible HTTP 运行根规格](docs/runtime/openai-compatible.md#6-敏感信息闭集唯一权威)
 规定，其他代码和文档只引用它。隐藏清单中的值时，仍保留允许公开且确实有助于处理问题的
 对象、自然路径、字段名、直接原因、修改方法和发布终态。
 
@@ -317,7 +317,7 @@ channel 呈现时，属于独立的进程呈现失败。任何用户可见诊断
 | 术语 | [术语规格](docs/translation/terminology.md) |
 | CLI 语法、输出或退出码 | [CLI 规格](docs/runtime/cli.md) |
 | 配置、配置校验或固定配置目录 | [配置规格](docs/runtime/configuration.md) |
-| HTTP、超时、重试、代理、限速或敏感信息 | [Chat Completions 规格](docs/runtime/chat-completions.md) |
+| HTTP、模型请求协议、超时、重试、代理、限速或敏感信息 | [OpenAI-compatible HTTP 规格](docs/runtime/openai-compatible.md) |
 | 项目日志、诊断、RunId 或呈现失败 | [项目日志规格](docs/runtime/project-log.md) |
 | SQLite schema、项目状态、事务或数据库诊断 | [SQLite 规格](docs/runtime/sqlite.md) |
 | 候选目录、原子发布、恢复现场或发布终态 | [目录发布规格](docs/runtime/directory-publishing.md) |
@@ -326,7 +326,7 @@ channel 呈现时，属于独立的进程呈现失败。任何用户可见诊断
 | 发行内容、发行根、禁止项或完整发行验证 | [发行物规格](docs/runtime/distribution.md) |
 | 修改、执行或诊断发行资源同步 | 先读[发行物规格](docs/runtime/distribution.md)，再检查[发行资源同步脚本](scripts/sync-dist-resources.ps1) |
 | 准备或发布公开 GitHub Release | 先读[发行物规格](docs/runtime/distribution.md)，再读[公开发行指南](maintenance/releasing.md)并检查当前 Release workflow |
-| 创建、监督、继续或复盘真实 ATT 游戏翻译任务，处理开发者实玩反馈，整理可复用经验或提出 ATT 全局改进建议 | [监督 ATT 真实翻译](maintenance/skills/supervise-att-translation/SKILL.md) |
+| 开发者明确要求创建并监督、继续跟进或复盘一个使用已打包 ATT 的真实游戏独立翻译任务，或把实玩反馈交回该任务 | [监督 ATT 真实翻译](maintenance/skills/supervise-att-translation/SKILL.md) |
 | RPG Maker Init、Extract、Rules、Translate 或 WriteBack | 对应的 [Init](docs/rpg-maker/init.md)、[Extract](docs/rpg-maker/extraction.md)、[Rules](docs/rpg-maker/rules.md)、[Translate](docs/rpg-maker/translation.md)或[WriteBack](docs/rpg-maker/write-back.md)规格 |
 | Generic JSONL、Init、Extract、Translate 或 WriteBack | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)或[WriteBack](docs/generic/write-back.md)规格 |
 | 原子数据库 Lua | [Lua 规格](docs/lua/README.md) |

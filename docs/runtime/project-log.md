@@ -182,7 +182,7 @@ JSONL 和 Markdown 都只是事后证据，不参与译文状态、提交、恢�
 ## 8. 敏感信息
 
 敏感信息唯一权威是
-[Chat Completions 规格](chat-completions.md#6-敏感信息闭集唯一权威)。API key、
+[OpenAI-compatible HTTP 规格](openai-compatible.md#6-敏感信息闭集唯一权威)。API key、
 Authorization、SQL、参数、查询结果、游戏正文、非 2xx 原始 body 和 panic payload 不进入
 项目日志。Lua 明确 `print` 的内容由脚本作者负责，并仍经过单行安全处理。
 

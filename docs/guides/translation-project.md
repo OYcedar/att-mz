@@ -219,7 +219,7 @@ Extract 或所有权，必须废弃已生成的 Placeholder 与术语作业，�
 - [TaskBlock 规划](../translation/task-planning.md)；
 - [Prompt 与模型协议](../translation/prompts.md)；
 - [模型任务记录](../translation/task-records.md)；
-- [配置](../runtime/configuration.md)与 [Chat Completions](../runtime/chat-completions.md)。
+- [配置](../runtime/configuration.md)与 [OpenAI-compatible HTTP](../runtime/openai-compatible.md)。
 
 最终 Extract 完成后、首次 Translate 前，先用 Manual export 取得本轮完整待译原文。调查
 控制符并提供有效 Placeholder 文件或明确的 `rule = []`；再从同一份稳定原文制作术语表，

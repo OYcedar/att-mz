@@ -19,7 +19,7 @@ ATT 因此把两类职责分开：程序负责可重复执行的数据处理和�
 - 从 RPG Maker 数据库、地图事件和明确指定的插件参数中提取可翻译文本；
 - 通过 Generic JSONL 接收其他引擎或自定义工具整理出的文本；
 - 使用随包 Formic 从完整游戏原文并发抓取术语候选，再由 Agent 统一筛成术语表；
-- 按语境组织任务、消除重复，并调用兼容 OpenAI Chat Completions 的模型服务；
+- 按语境组织任务、消除重复，并调用兼容 OpenAI Chat Completions 或 Responses 的模型服务；
 - 保护控制符和 Placeholder，统一应用术语表，并检查不允许的源语言残留；
 - 持久保存翻译进度，中断后从已确认的结果继续；
 - 在不修改原游戏的前提下生成译后目录，供运行和验收。
@@ -41,10 +41,14 @@ ATT 不替代游戏调查和最终验收。非标准插件数据、图片文字�
 
 ```toml
 [llm.clients.primary]
-url = "https://api.example.com/v1/chat/completions"
+protocol = "chat_completions"
+url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
 ```
+
+`protocol` 省略时同样使用 `chat_completions`；需要 Responses 时改为 `responses`。`url` 可以
+填写基础地址或完整端点，ATT 会按协议补全路径。
 
 `config.example.toml` 保存当前不含真实凭据的发行默认，供查看新字段和新默认；它不是已有活动配置
 的替代品。服务明确限制上下文、输出、并发或请求频率时，再按实际限制降低相应配置。

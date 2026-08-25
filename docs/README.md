@@ -52,7 +52,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | Init | [MV/MZ Init](rpg-maker/init.md)、[目录发布](runtime/directory-publishing.md) | [Generic Init](generic/init.md) | [SQLite](runtime/sqlite.md) |
 | Extract | [MV/MZ Extract](rpg-maker/extraction.md)、[Rules](rpg-maker/rules.md) | [Generic Extract](generic/extraction.md)、[JSONL](generic/jsonl.md) | [语言](translation/language.md)、[SQLite](runtime/sqlite.md) |
 | Translate 准备 | [MV/MZ Translate](rpg-maker/translation.md) | [Generic Translate](generic/translation.md) | [公共翻译入口](translation/README.md) |
-| 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[HTTP](runtime/chat-completions.md)、[任务记录](translation/task-records.md) |
+| 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[HTTP](runtime/openai-compatible.md)、[任务记录](translation/task-records.md) |
 | 人工或 agent 查询与修订 | [Manual](manual/README.md) | [Manual](manual/README.md) | [Lua](lua/README.md)、[SQLite](runtime/sqlite.md)、[验收指南](guides/acceptance.md) |
 | WriteBack | [MV/MZ WriteBack](rpg-maker/write-back.md) | [Generic WriteBack](generic/write-back.md) | [排版规则](translation/write-back-layout-rules.md)、[目录发布](runtime/directory-publishing.md) |
 | 验收与交付 | [全量验收指南](guides/acceptance.md) | [全量验收指南](guides/acceptance.md) | 实际外部转换和消费者说明 |
@@ -122,7 +122,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 - [运行时入口](runtime/README.md)
 - [CLI](runtime/cli.md)
 - [配置](runtime/configuration.md)
-- [Chat Completions](runtime/chat-completions.md)
+- [OpenAI-compatible HTTP](runtime/openai-compatible.md)
 - [SQLite](runtime/sqlite.md)
 - [项目日志](runtime/project-log.md)
 - [目录发布](runtime/directory-publishing.md)

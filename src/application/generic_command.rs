@@ -114,7 +114,7 @@ use crate::runtime::cpu::{
 use crate::runtime::filesystem::{
     SystemDirectoryPublisher, SystemFileSystem, SystemFileSystemBuildError, SystemFileSystemError,
 };
-use crate::runtime::llm::OpenAiChatCompletionExecutor;
+use crate::runtime::llm::OpenAiCompatibleExecutor;
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     DiagnosticScope, GenericPublicationSummary as ProjectLogGenericPublicationSummary,
@@ -1465,7 +1465,7 @@ impl ProductionGenericCommandRunner {
         let cancellation = CooperativeCancellation::default();
         let progress = generic_terminal_progress(self.locale);
         let operation_progress = progress.observer();
-        let llm_holder = Arc::new(Mutex::new(None::<OpenAiChatCompletionExecutor>));
+        let llm_holder = Arc::new(Mutex::new(None::<OpenAiCompatibleExecutor>));
         let task_record_holder = Arc::new(Mutex::new(None::<ConfiguredTranslationTaskRecordSink>));
         let operation_panic_context = self.panic_context().clone();
         let store = GenericProjectStore::for_workspace_with_cancellation(
@@ -1864,14 +1864,15 @@ impl ProductionGenericCommandRunner {
             if !tasks.is_empty() {
                 let pem_roots =
                     load_additional_pem_roots(&operation_file_system, configuration.llm()).await?;
-                let llm = OpenAiChatCompletionExecutor::new(
-                    configuration.llm().with_pem_roots(pem_roots),
-                )
-                .map_err(|source| {
-                    let report =
-                        DiagnosticReport::new(StateEffect::ProgressPreserved, source.diagnostic());
-                    GenericCommandError::reported(source, report)
-                })?;
+                let llm =
+                    OpenAiCompatibleExecutor::new(configuration.llm().with_pem_roots(pem_roots))
+                        .map_err(|source| {
+                            let report = DiagnosticReport::new(
+                                StateEffect::ProgressPreserved,
+                                source.diagnostic(),
+                            );
+                            GenericCommandError::reported(source, report)
+                        })?;
                 *operation_llm_holder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(llm.clone());
@@ -4174,8 +4175,8 @@ struct GenericTaskExecution {
     language_module: Arc<dyn LanguageModule>,
     system_prompt: String,
     response_mode: TranslationResponseMode,
-    client: Arc<crate::runtime::llm::OpenAiChatCompletionClient>,
-    llm: OpenAiChatCompletionExecutor,
+    client: Arc<crate::runtime::llm::OpenAiCompatibleClient>,
+    llm: OpenAiCompatibleExecutor,
     retry_delays: Vec<Duration>,
     max_retry_after: Duration,
     cpu: RayonCpuExecutor,
@@ -4517,8 +4518,8 @@ struct GenericTaskRequestContext {
     language_module: Arc<dyn LanguageModule>,
     system_prompt: Arc<String>,
     response_mode: TranslationResponseMode,
-    client: Arc<crate::runtime::llm::OpenAiChatCompletionClient>,
-    llm: OpenAiChatCompletionExecutor,
+    client: Arc<crate::runtime::llm::OpenAiCompatibleClient>,
+    llm: OpenAiCompatibleExecutor,
     retry_delays: Arc<Vec<Duration>>,
     max_retry_after: Duration,
     cpu: RayonCpuExecutor,
@@ -4987,8 +4988,8 @@ async fn execute_generic_task(
     language_module: Arc<dyn LanguageModule>,
     system_prompt: String,
     response_mode: TranslationResponseMode,
-    client: &crate::runtime::llm::OpenAiChatCompletionClient,
-    llm: &OpenAiChatCompletionExecutor,
+    client: &crate::runtime::llm::OpenAiCompatibleClient,
+    llm: &OpenAiCompatibleExecutor,
     retry_delays: &[Duration],
     max_retry_after: Duration,
     cpu: RayonCpuExecutor,

@@ -53,7 +53,7 @@ fence；模型已经返回规范围栏时只移除这层围栏再建立同等的
 ## 3. 敏感信息与权威性
 
 任务记录不写 API key、Authorization 或其他由
-[Chat Completions 规格](../runtime/chat-completions.md#6-敏感信息闭集唯一权威)定义的
+[OpenAI-compatible HTTP 规格](../runtime/openai-compatible.md#6-敏感信息闭集唯一权威)定义的
 敏感值。User 与 Assistant 中出现这些值时，只替换对应正文，不改写其余内容。
 
 任务记录是旁路证据，不是权威业务状态。Assistant 缺失只表示没有这份证据，不授权重新

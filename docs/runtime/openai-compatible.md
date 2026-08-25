@@ -1,10 +1,10 @@
-# OpenAI-compatible Chat Completions 运行根现行规格
+# OpenAI-compatible 模型 HTTP 运行根现行规格
 
 ## 1. 职责
 
-`OpenAiChatCompletionExecutor` 按所选 Client 执行非流式请求，拥有共享 HTTP 连接池、
-Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求超时和实际 HTTP 协议。
-MV、MZ 与 Generic Translate 共享同一 Client 约束。
+`OpenAiCompatibleExecutor` 按所选 Client 执行非流式 Chat Completions 或 Responses
+请求，拥有共享 HTTP 连接池、Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求
+超时和实际 HTTP 协议。MV、MZ 与 Generic Translate 共享同一 Client 约束。
 
 运行根专注做好一件事：执行请求，并把结构化传输事实交还调用方。TaskBlock、引擎
 value 形状、逐 ID 验收、数据库提交状态和任务记录各有负责的翻译域；独立 Lua 走
@@ -18,7 +18,16 @@ ATT 不叠加第二层用户队列、总容量或本地准入截止时间；等�
 
 ## 2. 请求
 
-基础正文是：
+Client 的 `protocol` 取 `chat_completions` 或 `responses`；省略时默认
+`chat_completions`，Responses 必须显式选择。协议只由该字段决定，不根据 URL、模型名、
+HTTP 失败或响应正文猜测，也不在失败后尝试另一个协议。
+
+`url` 接受服务基础地址或已经包含协议路径的完整端点。ATT 保留配置中的 scheme、host、port、
+路径前缀和 query，移除末尾斜杠；如果路径以 `/chat/completions` 或 `/responses` 结尾，先移除
+该已知后缀，再按所选协议追加 `/chat/completions` 或 `/responses`。其他路径直接作为基础路径
+追加协议后缀。ATT 不自行插入 `/v1` 或其他供应商版本路径。
+
+Chat Completions 基础正文是：
 
 ```json
 {
@@ -28,9 +37,22 @@ ATT 不叠加第二层用户队列、总容量或本地准入截止时间；等�
 }
 ```
 
-Client 的严格 JSON `parameters` 随后并入正文；`model`、`messages`、`stream` 由
-ATT 保留，parameters 中不得出现这三个键。供应商私有字段原样发给供应商，ATT 自己
-不解释。API key 只以 Bearer Header 的形式发送。
+Responses 基础正文是：
+
+```json
+{
+  "model": "client-model",
+  "input": [],
+  "stream": false,
+  "background": false
+}
+```
+
+调用方建立的 system 与 user message 按原顺序进入 Chat Completions 的 `messages` 或
+Responses 的 `input`，role 与字符串 content 保持不变。Client 的严格 JSON `parameters`
+随后并入正文；`model`、`stream` 及所选协议的 `messages` 或 `input` 由 ATT 保留，Responses
+的 `background` 固定为 `false`，这些字段都不得由 parameters 覆盖。ATT 不执行后台任务轮询。
+供应商私有字段原样发给供应商，ATT 自己不解释。API key 只以 Bearer Header 的形式发送。
 
 `connect_timeout_ms` 管建立连接，`read_timeout_ms` 管连续读取，
 `request_timeout_ms` 管完整 HTTP 请求；本地许可和限速等待属于调度，不在它们的
@@ -38,16 +60,30 @@ ATT 保留，parameters 中不得出现这三个键。供应商私有字段原�
 
 ## 3. 成功信封
 
-HTTP 200 后要求：
+HTTP 200 后首先要求正文是一个完整 JSON object，再按所选协议验收。
 
-- 正文是一个完整 JSON 值；
+Chat Completions 要求：
+
 - `choices` 中恰有一个数值 `index == 0`；
 - 该 choice 的 `message.content` 与 `finish_reason` 是字符串。
 
-其余 choice 和未消费的供应商扩展字段原样忽略。`x-request-id`、正文 `id` 与
-`usage` 按宽松可选方式读取：缺失或类型不符时为 `None`，三者互不补位。拿到
-`message.content` 后，对应引擎继续执行完整 ID、value 形状、ATT token、语言和
-逐 ID 验收。
+`finish_reason` 的 `stop`、`length`、`content_filter` 分别映射到统一的 Stop、Length、
+ContentFilter，其他字符串保留为 Other。
+
+Responses 要求：
+
+- `status` 是 `completed` 或 `incomplete`；
+- `output` 是数组；ATT 按顺序查找其中 `type = "message"`、`role = "assistant"` 的消息，
+  再按顺序连接全部 `type = "output_text"` 的字符串 `text`；没有 output text、但存在
+  `type = "refusal"` 时，连接其字符串 `refusal` 并映射到 ContentFilter；
+- `completed` 映射到 Stop；`incomplete` 必须提供字符串
+  `incomplete_details.reason`，其中 `max_output_tokens` 与 `content_filter` 分别映射到
+  Length 与 ContentFilter，其他字符串保留为 Other。`incomplete` 即使尚未产生 output text
+  也保留为空正文的统一响应，交给翻译响应验收处理；`completed` 必须含 output text 或 refusal。
+
+Chat Completions 的其他 choice、Responses 的 reasoning 等其他 output item，以及两个协议
+未消费的 `id`、`usage` 和供应商扩展字段都忽略。拿到统一 Assistant 正文后，对应引擎继续
+执行完整 ID、value 形状、ATT token、语言和逐 ID 验收。
 
 ## 4. 失败与重试
 

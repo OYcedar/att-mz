@@ -6,7 +6,7 @@
 | --- | --- |
 | 命令语法、保存选择、取消、输出或退出码 | [CLI](cli.md) |
 | 固定配置、语言、Profile、Client 或参数 | [配置](configuration.md) |
-| HTTP、连接、超时、代理、限速、重试或敏感信息 | [Chat Completions](chat-completions.md) |
+| HTTP、模型请求协议、连接、超时、代理、限速、重试或敏感信息 | [OpenAI-compatible HTTP](openai-compatible.md) |
 | 项目数据库、Unit 状态、事务、锁、schema 或提交结果未知 | [SQLite](sqlite.md) |
 | RunId、结构化诊断、任务事件、日志降级或呈现失败 | [项目日志](project-log.md) |
 | candidate、stage、backup、journal、目录交换或发布终态 | [目录发布](directory-publishing.md) |

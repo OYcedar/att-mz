@@ -116,7 +116,8 @@ complete_continuation_whitespace = true
 
 ```toml
 [llm.clients.primary]
-url = "https://api.example.com/v1/chat/completions"
+protocol = "chat_completions"
+url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
 max_concurrent_requests = 16
@@ -132,10 +133,15 @@ parameters = '''
 '''
 ```
 
+`protocol` 可省略并默认 `chat_completions`；使用 Responses 时显式设为 `responses`。ATT
+只按该字段选择请求和响应协议，不从 URL 或模型名猜测。`url` 可以是包含供应商路径前缀的
+基础地址，也可以是已经以 `/chat/completions` 或 `/responses` 结尾的完整端点；ATT 会保留
+路径前缀和 query，并把已知后缀规范化为所选协议的路径。它不自行插入 `/v1` 等供应商版本路径。
+
 `rate_limit` 整表可省略；一旦给出，两个值都必须为正。`proxy` 取 `false` 或一个
-不含凭据的 URL。`parameters` 是严格 JSON object，顶层留给 ATT 的 `model`、
-`messages`、`stream` 三个键不出现在这里。`api_key` 按字面读取，ATT 不展开环境
-变量。
+不含凭据的 URL。`parameters` 是严格 JSON object，顶层留给 ATT 的 `model`、`stream`
+及所选协议的 `messages` 或 `input` 不出现在这里；Responses 的 `background` 也由 ATT
+固定为 `false`，不接受后台任务。`api_key` 按字面读取，ATT 不展开环境变量。
 
 发行模板不启用 `rate_limit`。只有模型服务确实规定 RPM 时才增加：
 
@@ -157,4 +163,4 @@ worker、TaskBlock 数量、SQLite 策略和文件总量由执行代码决定，
 | CLI 的游戏、JSONL、Rules、术语、Placeholder、WriteBack 排版规则与 Lua 路径 | 进程当前工作目录 |
 
 配置出错时，诊断会给出路径、字段、一基行列和具体原因；敏感值按
-[Chat Completions 规格](chat-completions.md#6-敏感信息闭集唯一权威)处理。
+[OpenAI-compatible HTTP 规格](openai-compatible.md#6-敏感信息闭集唯一权威)处理。

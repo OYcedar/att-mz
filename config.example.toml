@@ -18,8 +18,10 @@ source_echo = false
 
 # primary 是这个模型服务配置的 ID，翻译方案通过该 ID 使用它。
 [llm.clients.primary]
-# OpenAI-compatible Chat Completions 接口地址。
-url = "https://api.example.com/v1/chat/completions"
+# 请求协议；省略时默认 chat_completions，使用 Responses 时显式改为 responses。
+protocol = "chat_completions"
+# 模型服务基础地址。ATT 会按 protocol 补全 /chat/completions 或 /responses；完整端点也可使用。
+url = "https://api.example.com/v1"
 # API key 会按原样读取，不会展开环境变量或 ${...}。
 api_key = "replace-with-api-key"
 # 发给模型服务的模型 ID。
@@ -40,7 +42,8 @@ additional_pem_files = []
 retry_delays_ms = []
 # 接受服务端 Retry-After 指定等待时间的最大值。
 max_retry_after_ms = 1000
-# 合并到请求正文中的额外 JSON object，不能包含 model、messages 或 stream。
+# 合并到请求正文中的额外 JSON object，不能覆盖所选协议的 model、messages/input、stream，
+# Responses 也不能覆盖固定为 false 的 background。
 # 供应商私有字段只在该服务明确要求时添加。
 parameters = '''
 {}

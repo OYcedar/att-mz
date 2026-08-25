@@ -1665,7 +1665,7 @@ pub(crate) enum RpgMakerLanguageModuleKind {
     English,
 }
 
-/// Chat Completions 返回的最终结束原因。
+/// 模型 HTTP 协议返回的最终结束原因。
 ///
 /// 已知协议值使用封闭变体；供应商扩展值只作为清理后的事实保存，不能充当诊断 code。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
