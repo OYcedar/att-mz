@@ -805,21 +805,43 @@ pub(crate) struct TranslationPlanPreparationCounts {
     retained: usize,
     invalidated: usize,
     not_applicable: usize,
-    rejected: usize,
+    rejected_outside_tasks: usize,
+    existing_rejected: usize,
+    rejected_after_preparation: usize,
+    resolved_rejected: usize,
 }
 
 impl TranslationPlanPreparationCounts {
-    pub(crate) const fn new(
+    #[cfg(test)]
+    pub(crate) const fn new(retained: usize, invalidated: usize, not_applicable: usize) -> Self {
+        Self {
+            retained,
+            invalidated,
+            not_applicable,
+            rejected_outside_tasks: 0,
+            existing_rejected: 0,
+            rejected_after_preparation: 0,
+            resolved_rejected: 0,
+        }
+    }
+
+    pub(crate) const fn with_rejected_state(
         retained: usize,
         invalidated: usize,
         not_applicable: usize,
-        rejected: usize,
+        rejected_outside_tasks: usize,
+        existing_rejected: usize,
+        rejected_after_preparation: usize,
+        resolved_rejected: usize,
     ) -> Self {
         Self {
             retained,
             invalidated,
             not_applicable,
-            rejected,
+            rejected_outside_tasks,
+            existing_rejected,
+            rejected_after_preparation,
+            resolved_rejected,
         }
     }
 }
@@ -837,7 +859,10 @@ pub(crate) struct TranslationPlanPreparation {
     retained: usize,
     invalidated: usize,
     not_applicable: usize,
-    rejected: usize,
+    rejected_outside_tasks: usize,
+    existing_rejected: usize,
+    rejected_after_preparation: usize,
+    resolved_rejected: usize,
     snapshot_baseline: TranslationSnapshotBaseline,
 }
 
@@ -857,7 +882,7 @@ impl TranslationPlanPreparation {
             reuses,
             terminology_json,
             placeholder_rules_json,
-            TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable, 0),
+            TranslationPlanPreparationCounts::new(retained, invalidated, not_applicable),
             TranslationSnapshotBaseline::new(
                 SourceSnapshotFingerprint::from_bytes([0; 32]),
                 Vec::new(),
@@ -883,7 +908,10 @@ impl TranslationPlanPreparation {
             retained: counts.retained,
             invalidated: counts.invalidated,
             not_applicable: counts.not_applicable,
-            rejected: counts.rejected,
+            rejected_outside_tasks: counts.rejected_outside_tasks,
+            existing_rejected: counts.existing_rejected,
+            rejected_after_preparation: counts.rejected_after_preparation,
+            resolved_rejected: counts.resolved_rejected,
             snapshot_baseline,
         }
     }
@@ -910,8 +938,20 @@ impl TranslationPlanPreparation {
         self.not_applicable
     }
 
-    pub(crate) const fn rejected(&self) -> usize {
-        self.rejected
+    pub(crate) const fn rejected_outside_tasks(&self) -> usize {
+        self.rejected_outside_tasks
+    }
+
+    pub(crate) const fn existing_rejected(&self) -> usize {
+        self.existing_rejected
+    }
+
+    pub(crate) const fn rejected_after_preparation(&self) -> usize {
+        self.rejected_after_preparation
+    }
+
+    pub(crate) const fn resolved_rejected(&self) -> usize {
+        self.resolved_rejected
     }
 
     pub(crate) fn reused(&self) -> usize {
@@ -1411,6 +1451,7 @@ pub(crate) struct TranslationPropagationTarget {
     identity: TranslationUnitIdentity,
     state_context: TranslationStateContext,
     expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    was_current_rejected: bool,
 }
 
 impl TranslationPropagationTarget {
@@ -1423,14 +1464,16 @@ impl TranslationPropagationTarget {
             identity,
             state_context,
             expected_previous: None,
+            was_current_rejected: false,
         }
     }
 
-    pub(crate) fn with_previous(
+    pub(crate) fn with_previous_and_rejected_state(
         identity: TranslationUnitIdentity,
         state_context: TranslationStateContext,
         expected_translation: Option<TextUnitContent>,
         expected_translation_state: Option<Sha256Fingerprint>,
+        was_current_rejected: bool,
     ) -> Self {
         assert_eq!(
             expected_translation.is_some(),
@@ -1441,7 +1484,12 @@ impl TranslationPropagationTarget {
             identity,
             state_context,
             expected_previous: expected_translation.zip(expected_translation_state),
+            was_current_rejected,
         }
+    }
+
+    pub(crate) const fn was_current_rejected(&self) -> bool {
+        self.was_current_rejected
     }
 
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
@@ -1752,6 +1800,8 @@ pub(crate) struct ExpectedTranslationOutput {
     propagation_state_contexts: Vec<TranslationStateContext>,
     expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
     propagation_expected_previous: Vec<Option<(TextUnitContent, Sha256Fingerprint)>>,
+    was_current_rejected: bool,
+    propagation_was_current_rejected: Vec<bool>,
 }
 
 impl ExpectedTranslationOutput {
@@ -1802,6 +1852,7 @@ impl ExpectedTranslationOutput {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn try_new_with_previous_and_cancellation<E>(
         id: TaskId,
         identity: TranslationUnitIdentity,
@@ -1810,12 +1861,44 @@ impl ExpectedTranslationOutput {
         state_context: TranslationStateContext,
         propagation_state_contexts: Vec<TranslationStateContext>,
         expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+        propagation_expected_previous: Vec<Option<(TextUnitContent, Sha256Fingerprint)>>,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, ExpectedTranslationOutputContractError>, E> {
+        Self::try_new_with_rejected_state_and_cancellation(
+            id,
+            identity,
+            propagation_targets,
+            validation,
+            state_context,
+            propagation_state_contexts,
+            expected_previous,
+            propagation_expected_previous,
+            false,
+            Vec::new(),
+            ensure_running,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_rejected_state_and_cancellation<E>(
+        id: TaskId,
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
+        validation: ExpectedTranslationValidation,
+        state_context: TranslationStateContext,
+        propagation_state_contexts: Vec<TranslationStateContext>,
+        expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
         mut propagation_expected_previous: Vec<Option<(TextUnitContent, Sha256Fingerprint)>>,
+        was_current_rejected: bool,
+        mut propagation_was_current_rejected: Vec<bool>,
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<Self, ExpectedTranslationOutputContractError>, E> {
         ensure_running()?;
         if propagation_expected_previous.is_empty() {
             propagation_expected_previous.resize(propagation_targets.len(), None);
+        }
+        if propagation_was_current_rejected.is_empty() {
+            propagation_was_current_rejected.resize(propagation_targets.len(), false);
         }
         if propagation_targets.len() != propagation_state_contexts.len() {
             return Ok(Err(
@@ -1838,6 +1921,18 @@ impl ExpectedTranslationOutput {
                     )),
                     target_count: propagation_targets.len(),
                     context_count: propagation_expected_previous.len(),
+                },
+            ));
+        }
+        if propagation_targets.len() != propagation_was_current_rejected.len() {
+            return Ok(Err(
+                ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
+                    unit_id: id,
+                    target: Box::new(ExpectedTranslationOutputContractTarget::from_identity(
+                        &identity,
+                    )),
+                    target_count: propagation_targets.len(),
+                    context_count: propagation_was_current_rejected.len(),
                 },
             ));
         }
@@ -1874,6 +1969,8 @@ impl ExpectedTranslationOutput {
             propagation_state_contexts,
             expected_previous,
             propagation_expected_previous,
+            was_current_rejected,
+            propagation_was_current_rejected,
         }))
     }
 
@@ -1911,6 +2008,14 @@ impl ExpectedTranslationOutput {
         &self,
     ) -> &[Option<(TextUnitContent, Sha256Fingerprint)>] {
         &self.propagation_expected_previous
+    }
+
+    pub(crate) const fn was_current_rejected(&self) -> bool {
+        self.was_current_rejected
+    }
+
+    pub(crate) fn propagation_was_current_rejected(&self) -> &[bool] {
+        &self.propagation_was_current_rejected
     }
 
     pub(crate) const fn line_shape(&self) -> ExpectedLineShape {
@@ -2194,6 +2299,7 @@ pub(crate) struct TranslationPatch {
     translation: TextUnitContent,
     translation_state: Sha256Fingerprint,
     expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    was_current_rejected: bool,
 }
 
 impl TranslationPatch {
@@ -2210,15 +2316,17 @@ impl TranslationPatch {
             translation,
             translation_state,
             expected_previous: None,
+            was_current_rejected: false,
         }
     }
 
-    pub(crate) fn with_previous(
+    pub(crate) fn with_previous_and_rejected_state(
         identity: TranslationUnitIdentity,
         propagation_targets: Vec<TranslationPropagationTarget>,
         translation: TextUnitContent,
         translation_state: Sha256Fingerprint,
         expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+        was_current_rejected: bool,
     ) -> Self {
         Self {
             identity,
@@ -2226,7 +2334,12 @@ impl TranslationPatch {
             translation,
             translation_state,
             expected_previous,
+            was_current_rejected,
         }
+    }
+
+    pub(crate) const fn was_current_rejected(&self) -> bool {
+        self.was_current_rejected
     }
 
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
@@ -2291,19 +2404,35 @@ pub(crate) struct RejectedTranslationTarget {
     identity: TranslationUnitIdentity,
     planning_state: Sha256Fingerprint,
     expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    was_current_rejected: bool,
 }
 
 impl RejectedTranslationTarget {
+    #[cfg(test)]
     pub(crate) fn new(
         identity: TranslationUnitIdentity,
         planning_state: Sha256Fingerprint,
         expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
     ) -> Self {
+        Self::with_rejected_state(identity, planning_state, expected_previous, false)
+    }
+
+    pub(crate) fn with_rejected_state(
+        identity: TranslationUnitIdentity,
+        planning_state: Sha256Fingerprint,
+        expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+        was_current_rejected: bool,
+    ) -> Self {
         Self {
             identity,
             planning_state,
             expected_previous,
+            was_current_rejected,
         }
+    }
+
+    pub(crate) const fn was_current_rejected(&self) -> bool {
+        self.was_current_rejected
     }
 
     pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
@@ -2647,6 +2776,37 @@ impl TranslationTaskOutcome {
             .count()
     }
 
+    pub(crate) fn rejected_location_count(&self) -> usize {
+        self.unresolved()
+            .iter()
+            .filter_map(UnresolvedTranslationUnit::rejected_candidate)
+            .map(|candidate| candidate.targets().len())
+            .sum()
+    }
+
+    pub(crate) fn resolved_rejected_location_count(&self) -> usize {
+        self.accepted()
+            .iter()
+            .map(|decision| {
+                usize::from(decision.patch().was_current_rejected())
+                    + decision
+                        .propagation_targets()
+                        .iter()
+                        .filter(|target| target.was_current_rejected())
+                        .count()
+            })
+            .sum()
+    }
+
+    pub(crate) fn newly_rejected_location_count(&self) -> usize {
+        self.unresolved()
+            .iter()
+            .filter_map(UnresolvedTranslationUnit::rejected_candidate)
+            .flat_map(RejectedTranslationCandidate::targets)
+            .filter(|target| !target.was_current_rejected())
+            .count()
+    }
+
     pub(crate) fn accepted_location_count(&self) -> usize {
         self.accepted()
             .iter()
@@ -2958,6 +3118,7 @@ pub(crate) struct RpgMakerTranslationRunReport {
     written_locations: usize,
     unresolved_decisions: usize,
     unresolved_locations: usize,
+    rejected_locations: usize,
     protocol_diagnostics: usize,
     recoverable_request_exhaustions: usize,
     request_admission_stopped: bool,
@@ -2968,6 +3129,7 @@ pub(crate) struct RpgMakerTranslationRunReport {
 }
 
 impl RpgMakerTranslationRunReport {
+    #[cfg(test)]
     pub(crate) const fn with_reconciliation(
         total_tasks: usize,
         planned_decisions: usize,
@@ -2986,6 +3148,7 @@ impl RpgMakerTranslationRunReport {
             written_locations: 0,
             unresolved_decisions: planned_decisions,
             unresolved_locations: planned_locations,
+            rejected_locations: 0,
             protocol_diagnostics: 0,
             recoverable_request_exhaustions: 0,
             request_admission_stopped: false,
@@ -2994,6 +3157,55 @@ impl RpgMakerTranslationRunReport {
             not_applicable,
             reused,
         }
+    }
+
+    pub(crate) fn from_plan(
+        total_tasks: usize,
+        planned_decisions: usize,
+        planned_locations: usize,
+        rejected_locations: usize,
+        preparation: &TranslationPlanPreparation,
+    ) -> Self {
+        Self {
+            total_tasks,
+            complete_tasks: 0,
+            partial_tasks: 0,
+            unavailable_tasks: 0,
+            accepted_decisions: 0,
+            written_locations: 0,
+            unresolved_decisions: planned_decisions,
+            unresolved_locations: planned_locations,
+            rejected_locations,
+            protocol_diagnostics: 0,
+            recoverable_request_exhaustions: 0,
+            request_admission_stopped: false,
+            retained: preparation.retained(),
+            invalidated: preparation.invalidated(),
+            not_applicable: preparation.not_applicable(),
+            reused: preparation.reused(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_initial_rejected_for_test(mut self, rejected_locations: usize) -> Self {
+        self.rejected_locations = rejected_locations;
+        self
+    }
+
+    pub(crate) fn record_preparation_applied(
+        &mut self,
+        rejected_locations: usize,
+        resolved_rejected_locations: usize,
+    ) {
+        self.unresolved_decisions = self
+            .unresolved_decisions
+            .checked_sub(resolved_rejected_locations)
+            .expect("准备阶段修复的 Rejected 不得超过剩余决策");
+        self.unresolved_locations = self
+            .unresolved_locations
+            .checked_sub(resolved_rejected_locations)
+            .expect("准备阶段修复的 Rejected 不得超过剩余位置");
+        self.rejected_locations = rejected_locations;
     }
 
     pub(crate) fn record(&mut self, outcome: &TranslationTaskOutcome) {
@@ -3014,6 +3226,11 @@ impl RpgMakerTranslationRunReport {
         }
         self.accepted_decisions += outcome.accepted().len();
         self.written_locations += outcome.accepted_location_count();
+        self.rejected_locations = self
+            .rejected_locations
+            .checked_sub(outcome.resolved_rejected_location_count())
+            .and_then(|value| value.checked_add(outcome.newly_rejected_location_count()))
+            .expect("RPG Maker Task 的 Rejected 终态计数必须保持有效");
         self.unresolved_decisions = self
             .unresolved_decisions
             .checked_sub(outcome.accepted().len())
@@ -3063,6 +3280,10 @@ impl RpgMakerTranslationRunReport {
 
     pub(crate) const fn unresolved_locations(&self) -> usize {
         self.unresolved_locations
+    }
+
+    pub(crate) const fn rejected_locations(&self) -> usize {
+        self.rejected_locations
     }
 
     pub(crate) const fn protocol_diagnostics(&self) -> usize {
@@ -3232,6 +3453,9 @@ pub(crate) trait RpgMakerTranslation: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpgMakerTranslationLogEvent {
     PlanningCompleted {
+        report: RpgMakerTranslationRunReport,
+    },
+    PreparationApplied {
         report: RpgMakerTranslationRunReport,
     },
     TaskStarted {
@@ -4125,26 +4349,31 @@ where
                 return Ok(OperationCompletion::Cancelled);
             }
             let (_semantics, preparation, tasks) = plan.into_parts();
-            let skipped_rejected = preparation.rejected();
+            let rejected_outside_tasks = preparation.rejected_outside_tasks();
+            let existing_rejected = preparation.existing_rejected();
+            let rejected_after_preparation = preparation.rejected_after_preparation();
+            let resolved_rejected = preparation.resolved_rejected();
             let planned_decisions = tasks
                 .iter()
                 .map(|task| task.expected_outputs().len())
                 .sum::<usize>()
-                .saturating_add(skipped_rejected);
+                .checked_add(rejected_outside_tasks)
+                .and_then(|value| value.checked_add(resolved_rejected))
+                .expect("RPG Maker 计划决策数不得溢出");
             let planned_locations = tasks
                 .iter()
                 .flat_map(RpgMakerExecutableTask::expected_outputs)
                 .map(|output| 1 + output.propagation_targets().len())
                 .sum::<usize>()
-                .saturating_add(skipped_rejected);
-            let report = RpgMakerTranslationRunReport::with_reconciliation(
+                .checked_add(rejected_outside_tasks)
+                .and_then(|value| value.checked_add(resolved_rejected))
+                .expect("RPG Maker 计划位置数不得溢出");
+            let mut report = RpgMakerTranslationRunReport::from_plan(
                 tasks.len(),
                 planned_decisions,
                 planned_locations,
-                preparation.retained(),
-                preparation.invalidated(),
-                preparation.not_applicable(),
-                preparation.reused(),
+                existing_rejected,
+                &preparation,
             );
             self.event_log
                 .emit(RpgMakerTranslationLogEvent::PlanningCompleted {
@@ -4155,6 +4384,11 @@ where
                 .apply_preparation(project, preparation)
                 .await
                 .map_err(RpgMakerTranslationServiceError::ApplyPreparation)?;
+            report.record_preparation_applied(rejected_after_preparation, resolved_rejected);
+            self.event_log
+                .emit(RpgMakerTranslationLogEvent::PreparationApplied {
+                    report: report.clone(),
+                });
 
             if self.cancellation.is_requested() {
                 return Ok(OperationCompletion::Cancelled);
@@ -4980,7 +5214,8 @@ mod tests {
                         }
                     }
                 }
-                RpgMakerTranslationLogEvent::PlanningCompleted { .. } => {}
+                RpgMakerTranslationLogEvent::PlanningCompleted { .. }
+                | RpgMakerTranslationLogEvent::PreparationApplied { .. } => {}
             }
             self.records
                 .lock()
@@ -6445,6 +6680,80 @@ mod tests {
         assert_send(harness.service.run(&project, &profile, input()));
     }
 
+    #[test]
+    fn report_tracks_rejected_locations_across_first_rejection_repeat_and_repair() {
+        let rejected_outcome = |was_current_rejected| {
+            let identity = translation_identity();
+            let target = RejectedTranslationTarget::with_rejected_state(
+                identity.clone(),
+                test_state_context(9).rejection_planning_state(identity.source_content()),
+                None,
+                was_current_rejected,
+            );
+            TranslationTaskOutcome::Unavailable {
+                context: TranslationTaskOutcomeContext::new(
+                    RpgMakerTranslationTaskIndex::new(0),
+                    NonZeroUsize::MIN,
+                    Vec::new(),
+                ),
+                reason: TranslationTaskUnavailableReason::AllOutputsRejected,
+                unresolved: test_non_empty(vec![
+                    UnresolvedTranslationUnit::with_rejected_candidate(
+                        task_id(0),
+                        rpg_maker_diagnostic_unit(&identity),
+                        TranslationUnitRejectionReason::InvalidShape {
+                            problem: TranslationAssistantValueError::NotStringArray,
+                        },
+                        RejectedTranslationCandidate::new(
+                            "true".to_owned(),
+                            None,
+                            ProvenInvariantViolation::InvalidCandidateShape,
+                            vec![target],
+                        ),
+                    ),
+                ]),
+            }
+        };
+
+        let mut first = RpgMakerTranslationRunReport::with_reconciliation(1, 1, 1, 0, 0, 0, 0);
+        first.record(&rejected_outcome(false));
+        assert_eq!(first.rejected_locations(), 1);
+        assert_eq!(first.unresolved_locations(), 1);
+
+        let mut repeated = RpgMakerTranslationRunReport::with_reconciliation(1, 1, 1, 0, 0, 0, 0)
+            .with_initial_rejected_for_test(1);
+        repeated.record(&rejected_outcome(true));
+        assert_eq!(repeated.rejected_locations(), 1);
+        assert_eq!(repeated.unresolved_locations(), 1);
+
+        let identity = translation_identity();
+        let translation = TextUnitContent::Value("译文".to_owned());
+        let repaired = TranslationTaskOutcome::Complete {
+            context: TranslationTaskOutcomeContext::new(
+                RpgMakerTranslationTaskIndex::new(0),
+                NonZeroUsize::MIN,
+                Vec::new(),
+            ),
+            accepted: test_non_empty(vec![AcceptedTranslationDecision::new(
+                task_id(0),
+                TranslationPatch::with_previous_and_rejected_state(
+                    identity,
+                    Vec::new(),
+                    translation,
+                    test_state_context(10).finish(&TextUnitContent::Value("译文".to_owned())),
+                    None,
+                    true,
+                ),
+            )]),
+        };
+        let mut repaired_report =
+            RpgMakerTranslationRunReport::with_reconciliation(1, 1, 1, 0, 0, 0, 0)
+                .with_initial_rejected_for_test(1);
+        repaired_report.record(&repaired);
+        assert_eq!(repaired_report.rejected_locations(), 0);
+        assert_eq!(repaired_report.unresolved_locations(), 0);
+    }
+
     fn profile(max_concurrent_requests: usize) -> FakeProfile {
         FakeProfile {
             max_concurrent_requests: NonZeroUsize::new(max_concurrent_requests)
@@ -6517,15 +6826,26 @@ mod tests {
                 .iter()
                 .cloned()
                 .zip(output.propagation_state_contexts().iter().copied())
-                .map(|(identity, state)| TranslationPropagationTarget::new(identity, state))
+                .zip(output.propagation_was_current_rejected().iter().copied())
+                .map(|((identity, state), was_current_rejected)| {
+                    TranslationPropagationTarget::with_previous_and_rejected_state(
+                        identity,
+                        state,
+                        None,
+                        None,
+                        was_current_rejected,
+                    )
+                })
                 .collect();
             AcceptedTranslationDecision::new(
                 output.id(),
-                TranslationPatch::new(
+                TranslationPatch::with_previous_and_rejected_state(
                     output.identity().clone(),
                     propagation_targets,
                     translation.clone(),
                     output.state_context().finish(&translation),
+                    None,
+                    output.was_current_rejected(),
                 ),
             )
         };

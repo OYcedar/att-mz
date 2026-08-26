@@ -128,10 +128,12 @@ Complete 分别显示 `无需处理` 与 `完整`。
 
 `translation.finished` 固定保存 planned、started、complete、partial、unavailable、failed、
 cancelled 与 not_started Task 计数，并保存 Generic 专用的 cleared/reused/accepted/written/
-conflicted units、response problems、planned_units、remaining_units、recoverable request
+conflicted units、response problems、planned_units、remaining_units、运行结束时仍为 Rejected 的
+rejected_units、recoverable request
 exhaustions 与 request admission stopped。Task 计数始终满足
-`planned = started + not_started`；remaining_units 等于计划交给模型的 Unit 减去实际写入
-的 Unit，并且必须满足 `planned_units = written_units + remaining_units`；CAS 冲突不算写入。
+`planned = started + not_started`；planned_units 是模型责任 Unit 与未进入模型 Task 的当前
+Rejected Unit 的并集，只有模型结果或受信复用确认修复的位置才从 remaining_units 扣除。
+rejected_units 始终是 remaining_units 的子集；CAS 冲突不算写入或修复。
 Task 只在第一次真实 HTTP attempt 开始时计入 started，准入前失败或停发仍属于 not_started。
 Failed 与 Cancelled 在已经形成计划和引擎汇总时，也把同一份
 计数和汇总写入 JSONL，并在 stderr 打印一次短汇总；规划前失败或提前取消不伪造引擎

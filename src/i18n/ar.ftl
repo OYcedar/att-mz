@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] غير مكتمل
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = الترجمة: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ كُتب { $written } موضعًا وتبقى { $remaining }
+result-translate-summary = الترجمة: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ كُتب { $written } موضعًا وتبقى { $remaining }، منها { $rejected } مرفوضة
 result-translate-convergence = تقارب الحالة: أُبقي { $retained }، أُبطل { $invalidated }، غير منطبق { $not_applicable }، أُعيد استخدام { $reused }
 result-write-back-completed = اكتملت الكتابة: { $project }
 result-project-lua-completed = اكتمل تنفيذ Lua للمشروع: { $project }
@@ -106,7 +106,7 @@ result-output-directory = مجلد الإخراج: { $path }
 result-write-back-summary = الكتابة: { $translated } وحدة مترجمة و{ $original } وحدة مصدر
 result-generic-extract-unchanged = لم تتغير مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة
 result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } ملفًا و{ $groups } مجموعة و{ $units } وحدة؛ حُفظت { $preserved } ترجمة ومُسحت { $cleared }
-result-generic-translate-summary = ترجمة Generic: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ وحدات مخططة { $planned_units }، ومتبقية { $remaining_units }، ومُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
+result-generic-translate-summary = ترجمة Generic: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ وحدات مخططة { $planned_units }، ومتبقية { $remaining_units }، منها { $rejected_units } مرفوضة، ومُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
 result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
 result-run-log = سجل التشغيل: { $path }
 translate-incomplete-object = تشغيل Translate للمشروع { $project }
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = مهام جزئية: { $partial }، وغ
     $admission ->
         [stopped] متوقف
        *[open] مستمر
-    }؛ تبقى { $remaining_decisions } قرارات و{ $remaining_locations } مواضع
+    }؛ تبقى { $remaining_decisions } قرارات و{ $remaining_locations } مواضع، منها { $rejected_locations } مرفوضة
 translate-incomplete-generic-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ولم تبدأ: { $not_started }، وطلبات مستنفدة: { $exhausted }؛ قبول الطلبات {
     $admission ->
         [stopped] متوقف
        *[open] مستمر
-    }؛ ووحدات متبقية: { $remaining_units }، وتعارضات كتابة: { $conflicted }، ومشكلات استجابة: { $problems }
+    }؛ ووحدات متبقية: { $remaining_units }، منها { $rejected_units } مرفوضة، وتعارضات كتابة: { $conflicted }، ومشكلات استجابة: { $problems }
 translate-incomplete-help = راجع تشخيصات المهام في سجل هذا التشغيل، وأصلح المشكلات القابلة للتكرار ثم شغّل Translate مجددًا؛ استخدم Manual للباقي القليل
+translate-incomplete-rejected-help = راجع تشخيصات المهام؛ أعد محاولة المحتوى المرفوض باستخدام --retry-rejected، أو صدّره عبر manual export --selection rejected لمعالجته من خلال Manual
 result-cancelled = أُلغي الأمر بعد إنهاء آمن.
 result-plan-saved = حُفظت خطة التشغيل الناجحة.
 log-run-started = بدأ الأمر { $command }.

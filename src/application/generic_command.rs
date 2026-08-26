@@ -347,6 +347,7 @@ pub(crate) struct GenericTranslationSummary {
     pub(crate) unavailable_tasks: usize,
     pub(crate) planned_units: usize,
     pub(crate) remaining_units: usize,
+    pub(crate) rejected_units: usize,
     pub(crate) cleared_units: usize,
     pub(crate) reused_units: usize,
     pub(crate) accepted_units: usize,
@@ -364,6 +365,7 @@ impl GenericTranslationSummary {
             || self.unavailable_tasks > 0
             || self.not_started_tasks > 0
             || self.remaining_units > 0
+            || self.rejected_units > 0
             || self.conflicted_units > 0
             || self.response_problems > 0
     }
@@ -1702,7 +1704,8 @@ impl ProductionGenericCommandRunner {
                 .map_err(generic_preparation_failure)?;
 
             let PreparedGenericTranslation { plan, facts } = prepared;
-            let (invalidations, reused, tasks, skipped_rejected) = plan.into_parts();
+            let (invalidations, reused, tasks, planned_units, initial_rejected_units) =
+                plan.into_parts();
             let transformation_cancellation = operation_cancellation.clone();
             let (
                 terminology_json,
@@ -1744,15 +1747,11 @@ impl ProductionGenericCommandRunner {
                 .await
                 .map_err(generic_cpu_execution_failure)?
                 .map_err(generic_preparation_failure)?;
-            let planned_units = tasks
-                .iter()
-                .map(PlannedTask::unit_count)
-                .sum::<usize>()
-                .saturating_add(skipped_rejected);
             let mut summary = GenericTranslationSummary {
                 total_tasks: tasks.len(),
                 planned_units,
                 remaining_units: planned_units,
+                rejected_units: initial_rejected_units,
                 ..GenericTranslationSummary::default()
             };
             set_generic_translate_summary(&operation_translate_project_log, summary);
@@ -1811,6 +1810,10 @@ impl ProductionGenericCommandRunner {
                 .await?;
                 mark_generic_translate_run_plan_saved(&operation_translate_project_log);
                 summary.cleared_units = resource_outcome.committed;
+                summary.rejected_units = summary
+                    .rejected_units
+                    .checked_add(resource_outcome.committed)
+                    .expect("Generic Rejected Unit 数不得溢出");
                 summary.conflicted_units += resource_outcome.conflicts.len();
                 set_generic_translate_summary(&operation_translate_project_log, summary);
             }
@@ -3920,6 +3923,49 @@ enum GenericTaskTerminal {
     Cancelled,
 }
 
+/// 一次已验收并完成提交尝试的 Generic Task 唯一终态。
+///
+/// Review 诊断可以随 Complete 一起保留；只有响应问题或提交冲突使终态成为 Partial。
+struct GenericCommittedTaskFinalResult {
+    terminal: GenericTaskTerminal,
+    accepted_output_ids: Vec<usize>,
+    written_units: usize,
+    diagnostics: Vec<DiagnosticReport>,
+}
+
+impl GenericCommittedTaskFinalResult {
+    fn new(
+        complete: bool,
+        accepted_output_ids: Vec<usize>,
+        written_units: usize,
+        diagnostics: Vec<DiagnosticReport>,
+    ) -> Self {
+        Self {
+            terminal: if complete {
+                GenericTaskTerminal::Complete
+            } else {
+                GenericTaskTerminal::Partial
+            },
+            accepted_output_ids,
+            written_units,
+            diagnostics,
+        }
+    }
+
+    const fn is_complete(&self) -> bool {
+        matches!(self.terminal, GenericTaskTerminal::Complete)
+    }
+
+    fn task_record_state(&self) -> GenericTaskRecordState {
+        GenericTaskRecordState::committed(
+            self.is_complete(),
+            self.accepted_output_ids.clone(),
+            self.written_units,
+            self.diagnostics.clone(),
+        )
+    }
+}
+
 #[derive(Default)]
 struct GenericTaskLogState {
     planned: u64,
@@ -4144,6 +4190,8 @@ struct GenericTaskSummary {
     unavailable_tasks: usize,
     accepted_units: usize,
     written_units: usize,
+    resolved_rejected_units: usize,
+    newly_rejected_units: usize,
     conflicted_units: usize,
     response_problems: usize,
     recoverable_request_exhaustions: usize,
@@ -4516,6 +4564,8 @@ async fn execute_generic_tasks(
                     Ok(CommitTranslationResultsOutcome {
                         committed: 0,
                         rejected: 0,
+                        resolved_rejected: 0,
+                        newly_rejected: 0,
                         conflicts: Vec::new(),
                     })
                 } else {
@@ -4566,16 +4616,12 @@ async fn execute_generic_tasks(
                 if commit.committed > 0 || commit.rejected > 0 {
                     mark_generic_translate_run_plan_saved(&translate_project_log);
                 }
-                let complete = response_complete && commit.conflicts.is_empty();
                 summary.accepted_units += accepted_units;
                 summary.response_problems += response_problems;
                 summary.written_units += commit.committed;
+                summary.resolved_rejected_units += commit.resolved_rejected;
+                summary.newly_rejected_units += commit.newly_rejected;
                 summary.conflicted_units += commit.conflicts.len();
-                if complete {
-                    summary.complete_tasks += 1;
-                } else {
-                    summary.partial_tasks += 1;
-                }
                 update_generic_translate_summary(&translate_project_log, |stored| {
                     stored.accepted_units += accepted_units;
                     stored.response_problems += response_problems;
@@ -4584,12 +4630,12 @@ async fn execute_generic_tasks(
                         .remaining_units
                         .checked_sub(commit.committed)
                         .expect("Generic 已写入模型 Unit 不得超过计划 Unit");
+                    stored.rejected_units = stored
+                        .rejected_units
+                        .checked_sub(commit.resolved_rejected)
+                        .and_then(|value| value.checked_add(commit.newly_rejected))
+                        .expect("Generic Task 的 Rejected 终态计数必须保持有效");
                     stored.conflicted_units += commit.conflicts.len();
-                    if complete {
-                        stored.complete_tasks += 1;
-                    } else {
-                        stored.partial_tasks += 1;
-                    }
                 });
                 if !commit.conflicts.is_empty() {
                     diagnostics.push(generic_task_response_diagnostic(
@@ -4600,24 +4646,32 @@ async fn execute_generic_tasks(
                         },
                     ));
                 }
-                let task_record_diagnostics = diagnostics.clone();
+                let final_result = GenericCommittedTaskFinalResult::new(
+                    response_complete && commit.conflicts.is_empty(),
+                    accepted_output_ids,
+                    commit.committed,
+                    diagnostics,
+                );
+                if final_result.is_complete() {
+                    summary.complete_tasks += 1;
+                } else {
+                    summary.partial_tasks += 1;
+                }
+                update_generic_translate_summary(&translate_project_log, |stored| {
+                    if final_result.is_complete() {
+                        stored.complete_tasks += 1;
+                    } else {
+                        stored.partial_tasks += 1;
+                    }
+                });
                 project_log.finished(
                     task_index,
                     attempt_count,
-                    if complete {
-                        GenericTaskTerminal::Complete
-                    } else {
-                        GenericTaskTerminal::Partial
-                    },
-                    diagnostics,
+                    final_result.terminal,
+                    final_result.diagnostics.clone(),
                 );
                 if let Some(record) = record {
-                    task_records.submit(record.finish(GenericTaskRecordState::committed(
-                        response_complete,
-                        accepted_output_ids,
-                        commit.committed,
-                        task_record_diagnostics,
-                    )));
+                    task_records.submit(record.finish(final_result.task_record_state()));
                 }
             }
             GenericPreparedTaskOutcome::Unavailable {
@@ -5480,6 +5534,14 @@ fn add_commit_outcome(
     outcome: &CommitTranslationsOutcome,
 ) {
     summary.written_units += outcome.committed;
+    summary.remaining_units = summary
+        .remaining_units
+        .checked_sub(outcome.resolved_rejected)
+        .expect("复用修复的 Generic Rejected Unit 不得超过剩余 Unit");
+    summary.rejected_units = summary
+        .rejected_units
+        .checked_sub(outcome.resolved_rejected)
+        .expect("复用修复的 Generic Rejected Unit 不得超过当前 Rejected");
     summary.conflicted_units += outcome.conflicts.len();
 }
 
@@ -5508,6 +5570,11 @@ fn merge_task_summary(summary: &mut GenericTranslationSummary, tasks: GenericTas
     summary.unavailable_tasks += tasks.unavailable_tasks;
     summary.accepted_units += tasks.accepted_units;
     summary.written_units += tasks.written_units;
+    summary.rejected_units = summary
+        .rejected_units
+        .checked_sub(tasks.resolved_rejected_units)
+        .and_then(|value| value.checked_add(tasks.newly_rejected_units))
+        .expect("Generic Task 的 Rejected 终态计数必须保持有效");
     summary.conflicted_units += tasks.conflicted_units;
     summary.response_problems += tasks.response_problems;
     summary.remaining_units = summary
@@ -6014,6 +6081,7 @@ fn project_log_generic_translation_summary(
     ProjectLogGenericTranslationSummary {
         planned_units: generic_count(summary.planned_units),
         remaining_units: generic_count(summary.remaining_units),
+        rejected_units: generic_count(summary.rejected_units),
         cleared_units: generic_count(summary.cleared_units),
         reused_units: generic_count(summary.reused_units),
         accepted_units: generic_count(summary.accepted_units),
@@ -9201,6 +9269,7 @@ mod tests {
             started_tasks: 0,
             planned_units: 1,
             remaining_units: 1,
+            rejected_units: 1,
             ..GenericTranslationSummary::default()
         };
 
@@ -9292,6 +9361,7 @@ mod tests {
                         translation: "已有上下文 {hero}".to_owned(),
                         state_fingerprint: current_state,
                         expected_translation: None,
+                        was_current_rejected: false,
                     },
                     crate::generic::TranslationWrite {
                         group_id: invalid_current_group.id().to_owned(),
@@ -9301,6 +9371,7 @@ mod tests {
                         translation: "损坏的已有译文".to_owned(),
                         state_fingerprint: invalid_current_state,
                         expected_translation: None,
+                        was_current_rejected: false,
                     },
                 ],
             )
@@ -9611,6 +9682,7 @@ mod tests {
                     translation: "自动译文".to_owned(),
                     state_fingerprint: automatic_state,
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .expect("应该可保存测试译文");
@@ -10192,5 +10264,23 @@ mod tests {
         .expect("源语言残留只进入 Review，不应丢弃合法候选");
         assert_eq!(residual.value(), "こんにちは {name}");
         assert_eq!(residual.reviews(), &[ReviewFinding::SourceResidual]);
+    }
+
+    #[test]
+    fn review_only_committed_task_has_one_complete_terminal_for_all_consumers() {
+        let review = generic_task_response_diagnostic(
+            0,
+            1,
+            GenericTaskResponseProblem::ResponseReview {
+                finding: GenericResponseReviewFinding::NonStopFinish,
+            },
+        );
+        let result = GenericCommittedTaskFinalResult::new(true, vec![0], 1, vec![review]);
+
+        assert!(result.is_complete());
+        assert!(matches!(result.terminal, GenericTaskTerminal::Complete));
+        assert_eq!(result.diagnostics.len(), 1, "Review 诊断仍应保留");
+        let record = result.task_record_state();
+        assert_eq!(record.code_for_test(), "complete");
     }
 }

@@ -494,6 +494,7 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
                 "summary": {
                     "planned_units": 1,
                     "remaining_units": 1,
+                    "rejected_units": 0,
                     "cleared_units": 0,
                     "reused_units": 0,
                     "accepted_units": 0,
@@ -1218,6 +1219,7 @@ fn generic_cancellation_finishes_started_tasks_and_counts_unstarted_tasks() {
             "summary": {
                 "planned_units": 4,
                 "remaining_units": 4,
+                "rejected_units": 0,
                 "cleared_units": 0,
                 "reused_units": 0,
                 "accepted_units": 0,

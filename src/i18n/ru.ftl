@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] не полностью
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Перевод: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; записано { $written } позиций, осталось { $remaining }
+result-translate-summary = Перевод: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; записано { $written } позиций, осталось { $remaining }, из них отклонено { $rejected }
 result-translate-convergence = Сведение состояния: сохранено { $retained }, аннулировано { $invalidated }, неприменимо { $not_applicable }, переиспользовано { $reused }
 result-write-back-completed = Запись завершена: { $project }
 result-project-lua-completed = Выполнение Lua проекта завершено: { $project }
@@ -106,7 +106,7 @@ result-output-directory = Каталог вывода: { $path }
 result-write-back-summary = Запись: { $translated } переведённых единиц, { $original } исходных
 result-generic-extract-unchanged = Входные данные Generic не изменились: файлов — { $files }, групп — { $groups }, единиц — { $units }
 result-generic-extract-updated = Входные данные Generic обновлены: файлов — { $files }, групп — { $groups }, единиц — { $units }; переводов сохранено — { $preserved }, очищено — { $cleared }
-result-generic-translate-summary = Перевод Generic: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; запланировано Unit: { $planned_units }, осталось Unit: { $remaining_units }, очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
+result-generic-translate-summary = Перевод Generic: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; запланировано Unit: { $planned_units }, осталось Unit: { $remaining_units }, из них отклонено { $rejected_units }, очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
 result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
 result-run-log = Журнал запуска: { $path }
 translate-incomplete-object = Запуск Translate для проекта { $project }
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = Частичных задач: { $partia
     $admission ->
         [stopped] остановлен
        *[open] продолжен
-    }; осталось решений: { $remaining_decisions }, мест: { $remaining_locations }
+    }; осталось решений: { $remaining_decisions }, мест: { $remaining_locations }, из них отклонено: { $rejected_locations }
 translate-incomplete-generic-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, не начато: { $not_started }, исчерпанных запросов: { $exhausted }; приём запросов {
     $admission ->
         [stopped] остановлен
        *[open] продолжен
-    }; осталось Unit: { $remaining_units }, конфликтов записи: { $conflicted }, проблем ответа: { $problems }
+    }; осталось Unit: { $remaining_units }, из них отклонено: { $rejected_units }, конфликтов записи: { $conflicted }, проблем ответа: { $problems }
 translate-incomplete-help = Изучите диагностику задач в журнале этого запуска, исправьте повторяемые проблемы и снова запустите Translate; для небольшого остатка используйте Manual
+translate-incomplete-rejected-help = Изучите диагностику задач; повторите отклонённый перевод с --retry-rejected или экспортируйте его командой manual export --selection rejected для обработки через Manual
 result-cancelled = Команда отменена после безопасного завершения.
 result-plan-saved = Успешный план запуска сохранён.
 log-run-started = Команда { $command } запущена.

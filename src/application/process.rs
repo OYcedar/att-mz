@@ -1178,6 +1178,7 @@ fn render_translation_terminal_summary(
                     cancelled: tasks.cancelled,
                     written: engine.written_locations,
                     remaining: engine.remaining_locations,
+                    rejected: engine.rejected_locations,
                 })
             )?;
             writeln!(
@@ -1196,6 +1197,7 @@ fn render_translation_terminal_summary(
                     not_started: tasks.not_started,
                     remaining_decisions: engine.remaining_decisions,
                     remaining_locations: engine.remaining_locations,
+                    rejected_locations: engine.rejected_locations,
                 })
             )
         }
@@ -1214,6 +1216,7 @@ fn render_translation_terminal_summary(
                     cancelled: tasks.cancelled,
                     planned_units: engine.planned_units,
                     remaining_units: engine.remaining_units,
+                    rejected_units: engine.rejected_units,
                     cleared: engine.cleared_units,
                     reused: engine.reused_units,
                     accepted: engine.accepted_units,
@@ -1238,6 +1241,7 @@ fn render_translation_terminal_summary(
                     },
                     not_started: tasks.not_started,
                     remaining_units: engine.remaining_units,
+                    rejected_units: engine.rejected_units,
                 })
             )
         }
@@ -1718,6 +1722,7 @@ fn render_generic_output(
                     cancelled: 0,
                     planned_units: count(summary.planned_units),
                     remaining_units: count(summary.remaining_units),
+                    rejected_units: count(summary.rejected_units),
                     cleared: count(summary.cleared_units),
                     reused: count(summary.reused_units),
                     accepted: count(summary.accepted_units),
@@ -1726,7 +1731,7 @@ fn render_generic_output(
                     problems: count(summary.response_problems),
                 })
             )?;
-            if summary.total_tasks == 0 {
+            if summary.total_tasks == 0 && !summary.is_incomplete() {
                 writeln!(
                     stdout,
                     "{}",
@@ -1809,9 +1814,14 @@ fn render_generic_success_warnings(
         },
         not_started: count(summary.not_started_tasks),
         remaining_units: count(summary.remaining_units),
+        rejected_units: count(summary.rejected_units),
     });
     let impact = render_state_effect_impact(StateEffect::ProgressPreserved, localizer);
-    let help = localizer.format(UiMessage::TranslateIncompleteHelp);
+    let help = localizer.format(if summary.rejected_units > 0 {
+        UiMessage::TranslateIncompleteRejectedHelp
+    } else {
+        UiMessage::TranslateIncompleteHelp
+    });
     writeln!(
         stderr,
         "{}",
@@ -2478,6 +2488,15 @@ mod tests {
                 },
                 "状态：未完整",
             ),
+            (
+                GenericTranslationSummary {
+                    planned_units: 1,
+                    remaining_units: 1,
+                    rejected_units: 1,
+                    ..GenericTranslationSummary::default()
+                },
+                "状态：未完整",
+            ),
         ] {
             let mut stdout = Vec::new();
             render_generic_output(&output(summary), &localizer, &mut stdout)
@@ -2521,6 +2540,27 @@ mod tests {
         ] {
             assert!(stderr.contains(expected), "缺少 {expected:?}：{stderr}");
         }
+
+        let rejected = output(GenericTranslationSummary {
+            planned_units: 157,
+            remaining_units: 157,
+            rejected_units: 157,
+            ..GenericTranslationSummary::default()
+        });
+        let mut stdout = Vec::new();
+        render_generic_output(&rejected, &localizer, &mut stdout).unwrap();
+        let stdout = String::from_utf8(stdout)
+            .unwrap()
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(stdout.contains("Rejected Unit 157"));
+        assert!(!stdout.contains("全部翻译单元均为最新状态"));
+        let mut stderr = Vec::new();
+        render_generic_success_warnings(&rejected, &localizer, &mut stderr).unwrap();
+        let stderr = String::from_utf8(stderr)
+            .unwrap()
+            .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(stderr.contains("--retry-rejected"));
+        assert!(stderr.contains("manual export --selection rejected"));
     }
 
     #[test]
@@ -2535,6 +2575,7 @@ mod tests {
             written_locations: 3,
             remaining_decisions: 6,
             remaining_locations: 8,
+            rejected_locations: 2,
             protocol_diagnostics: 1,
             recoverable_request_exhaustions: 1,
             request_admission_stopped: true,
@@ -2546,6 +2587,7 @@ mod tests {
         let generic = TranslationEngineSummary::Generic(LoggedGenericTranslationSummary {
             planned_units: 10,
             remaining_units: 7,
+            rejected_units: 2,
             cleared_units: 0,
             reused_units: 0,
             accepted_units: 3,
@@ -2655,6 +2697,7 @@ mod tests {
                     written_locations: 0,
                     remaining_decisions: 1,
                     remaining_locations: 2,
+                    rejected_locations: 1,
                     protocol_diagnostics: 0,
                     recoverable_request_exhaustions: 0,
                     request_admission_stopped: false,
@@ -2688,9 +2731,14 @@ mod tests {
             .replace(['\u{2068}', '\u{2069}'], "");
         assert!(stdout.contains("状态：未完整"), "实际 stdout：{stdout}");
         assert!(!stdout.contains("状态：无需处理"), "实际 stdout：{stdout}");
+        assert!(stdout.contains("Rejected 1 处"), "实际 stdout：{stdout}");
+        assert!(!stdout.contains("全部翻译单元均为最新状态"));
         assert!(stderr.contains("警告："), "实际 stderr：{stderr}");
         assert!(stderr.contains("剩余决策 1"), "实际 stderr：{stderr}");
         assert!(stderr.contains("剩余位置 2"), "实际 stderr：{stderr}");
+        assert!(stderr.contains("Rejected 1 处"), "实际 stderr：{stderr}");
+        assert!(stderr.contains("--retry-rejected"));
+        assert!(stderr.contains("manual export --selection rejected"));
     }
 
     #[test]

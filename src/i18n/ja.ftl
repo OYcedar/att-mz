@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] 未完了
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。{ $written } 箇所を書き込み、残り { $remaining } 箇所
+result-translate-summary = 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。{ $written } 箇所を書き込み、残り { $remaining } 箇所（Rejected { $rejected } 箇所）
 result-translate-convergence = 状態収束: 保持 { $retained }、無効化 { $invalidated }、非該当 { $not_applicable }、再利用 { $reused }
 result-write-back-completed = 書き戻し完了: { $project }
 result-project-lua-completed = プロジェクト Lua 実行完了: { $project }
@@ -106,7 +106,7 @@ result-output-directory = 出力ディレクトリ: { $path }
 result-write-back-summary = 書き戻し: 訳文 { $translated } 単位、原文 { $original } 単位
 result-generic-extract-unchanged = Generic 入力に変更なし: { $files } ファイル、{ $groups } グループ、{ $units } 単位
 result-generic-extract-updated = Generic 入力を更新: { $files } ファイル、{ $groups } グループ、{ $units } 単位。訳文 { $preserved } 件を保持し、{ $cleared } 件を消去
-result-generic-translate-summary = Generic 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。計画 Unit { $planned_units }、残り Unit { $remaining_units }、クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
+result-generic-translate-summary = Generic 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。計画 Unit { $planned_units }、残り Unit { $remaining_units }（Rejected { $rejected_units }）、クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
 result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
 result-run-log = 実行記録：{ $path }
 translate-incomplete-object = プロジェクト { $project } の今回の Translate
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = 部分タスク { $partial }、利用不
     $admission ->
         [stopped] 停止
        *[open] 継続
-    }。残りの判断 { $remaining_decisions }、残りの場所 { $remaining_locations }
+    }。残りの判断 { $remaining_decisions }、残りの場所 { $remaining_locations }（Rejected { $rejected_locations }）
 translate-incomplete-generic-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、未開始タスク { $not_started }、要求枯渇 { $exhausted }。要求受付は{
     $admission ->
         [stopped] 停止
        *[open] 継続
-    }。残り Unit { $remaining_units }、書き込み競合 { $conflicted }、応答問題 { $problems }
+    }。残り Unit { $remaining_units }（Rejected { $rejected_units }）、書き込み競合 { $conflicted }、応答問題 { $problems }
 translate-incomplete-help = 今回の実行記録にあるタスク診断を確認し、再現する問題を修正して Translate を再実行してください。少量の残りには Manual を使用できます
+translate-incomplete-rejected-help = タスク診断を確認してください。Rejected は --retry-rejected で再翻訳するか、manual export --selection rejected で出力して Manual で処理できます
 result-cancelled = 安全な終了処理後にコマンドをキャンセルしました。
 result-plan-saved = 成功した実行プランを保存しました。
 log-run-started = コマンド { $command } を開始しました。

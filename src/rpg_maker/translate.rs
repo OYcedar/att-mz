@@ -41,6 +41,7 @@ pub struct TranslationSummary {
     pub written_locations: usize,
     pub remaining_decisions: usize,
     pub remaining_locations: usize,
+    pub rejected_locations: usize,
     pub protocol_diagnostics: usize,
     pub recoverable_request_exhaustions: usize,
     pub request_admission_stopped: bool,
@@ -60,6 +61,7 @@ impl TranslationSummary {
             || self.not_started_tasks > 0
             || self.remaining_decisions > 0
             || self.remaining_locations > 0
+            || self.rejected_locations > 0
     }
 }
 

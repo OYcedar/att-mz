@@ -4399,6 +4399,7 @@ impl ProductionBusinessLog {
             written_locations: usize_to_u64(summary.written_locations, "已写入位置数"),
             remaining_decisions: usize_to_u64(summary.remaining_decisions, "剩余决策数"),
             remaining_locations: usize_to_u64(summary.remaining_locations, "剩余位置数"),
+            rejected_locations: usize_to_u64(summary.rejected_locations, "Rejected 位置数"),
             protocol_diagnostics: usize_to_u64(summary.protocol_diagnostics, "协议诊断数"),
             recoverable_request_exhaustions: usize_to_u64(
                 summary.recoverable_request_exhaustions,
@@ -4418,6 +4419,7 @@ impl ProductionBusinessLog {
             written_locations: usize_to_u64(summary.written_locations(), "已写入位置数"),
             remaining_decisions: usize_to_u64(summary.unresolved_decisions(), "剩余决策数"),
             remaining_locations: usize_to_u64(summary.unresolved_locations(), "剩余位置数"),
+            rejected_locations: usize_to_u64(summary.rejected_locations(), "Rejected 位置数"),
             protocol_diagnostics: usize_to_u64(summary.protocol_diagnostics(), "协议诊断数"),
             recoverable_request_exhaustions: usize_to_u64(
                 summary.recoverable_request_exhaustions(),
@@ -4670,6 +4672,12 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                 if let Some(progress) = &self.translation_progress {
                     progress.complete_phase(TranslateProgressPhase::Planning);
                 }
+            }
+            RpgMakerTranslationLogEvent::PreparationApplied { report } => {
+                *self
+                    .translation_summary
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
             }
             RpgMakerTranslationLogEvent::TaskStarted {
                 task_index,
@@ -7158,6 +7166,10 @@ impl CommandResultRenderer {
                             output.summary.remaining_locations,
                             "剩余位置数",
                         ),
+                        rejected: usize_to_u64(
+                            output.summary.rejected_locations,
+                            "Rejected 位置数",
+                        ),
                     })
                 )?;
                 writeln!(
@@ -7173,7 +7185,7 @@ impl CommandResultRenderer {
                         reused: usize_to_u64(output.summary.reused, "复用决策数"),
                     })
                 )?;
-                if output.summary.total_tasks == 0 {
+                if output.summary.total_tasks == 0 && !output.summary.is_incomplete() {
                     writeln!(
                         stdout,
                         "{}",
@@ -7347,9 +7359,14 @@ fn render_rpg_maker_incomplete_warning(
         not_started: usize_to_u64(output.summary.not_started_tasks, "未开始任务数"),
         remaining_decisions: usize_to_u64(output.summary.remaining_decisions, "剩余决策数"),
         remaining_locations: usize_to_u64(output.summary.remaining_locations, "剩余位置数"),
+        rejected_locations: usize_to_u64(output.summary.rejected_locations, "Rejected 位置数"),
     });
     let impact = render_state_effect_impact(StateEffect::ProgressPreserved, localizer);
-    let help = localizer.format(UiMessage::TranslateIncompleteHelp);
+    let help = localizer.format(if output.summary.rejected_locations > 0 {
+        UiMessage::TranslateIncompleteRejectedHelp
+    } else {
+        UiMessage::TranslateIncompleteHelp
+    });
     writeln!(
         stderr,
         "{}",

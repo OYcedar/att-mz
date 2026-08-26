@@ -117,7 +117,8 @@ Partial、Unavailable、协议问题、可恢复请求耗尽、剩余决策和�
 本次项目日志与任务记录。NoWork 和 Complete 分别显示 `无需处理` 与 `完整`。
 
 `translation.finished` 固定保存完整 Task 计数，并保存 RPG Maker 专用的 accepted decisions、
-written/remaining locations、remaining decisions、protocol diagnostics、recoverable request
+written/remaining locations、remaining decisions、运行结束时仍为 Rejected 的
+rejected_locations、protocol diagnostics、recoverable request
 exhaustions、request admission stopped 和 reconciliation 计数。Task 计数始终满足
 `planned = started + not_started`；remaining decisions 与 remaining locations 按实际提交
 递减，不把已准入、冲突或停发后的工作伪装成已完成。started 只在第一次真实 HTTP
@@ -126,6 +127,10 @@ attempt 开始时计数；准入前失败、取消或停发仍计入 not_started
 提前取消不伪造引擎工作量。停止路径不补写 100%。Placeholder 等规划错误在任何模型请求前形成可读
 `diagnostic.run_plan`，保存类似 `Map023.json:event17:page1:dialogue42` 的位置、规则文件、
 自然规则号、原因和修改方法；结果为 Failed，数据库保持不变。
+
+rejected_locations 必须是 remaining_locations 的子集。准备阶段的失效转入、Rejected 复用，
+以及每个已提交 Task 的首次拒绝、再次拒绝和修复都更新同一终态计数；提交失败或冲突不伪造
+状态变化。NoWork 与 Complete 要求 remaining 和 Rejected 同时为零。
 
 Partial 会保留合法 ID 和已确认前序进度；再次运行会重新判断剩余 ID 而不改变稳定装箱。
 是否继续同一 Translate、修正系统性资源问题，还是用 Manual 完成少量局部补译，要按

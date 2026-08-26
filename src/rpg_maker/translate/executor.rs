@@ -31,7 +31,7 @@ use crate::execution::llm_request::{
     LlmRequestAttemptEvidence, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
     execute_llm_request_with_retry_observed,
 };
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::fingerprint::Sha256FramedHasher;
 use crate::language::{
     LanguageId, LanguageModule, LanguageModuleError, LanguageModuleKind,
     LanguageOperationCancelled, LanguagePair, LanguageText, LanguageTextSegment,
@@ -68,8 +68,7 @@ use super::pipeline::{
     RejectedTranslationTarget, RpgMakerExecutableTask, RpgMakerTranslationExecutionProfile,
     RpgMakerTranslationTaskExecutor, RpgMakerTranslationTaskIndex, TranslationPatch,
     TranslationProtocolDiagnostic, TranslationTaskOutcome, TranslationTaskOutcomeContext,
-    TranslationTaskUnavailableReason, TranslationUnitIdentity, TranslationUnitRejectionReason,
-    UnresolvedTranslationUnit,
+    TranslationTaskUnavailableReason, TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 use super::placeholder::PlaceholderProtectionError;
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
@@ -1504,9 +1503,7 @@ fn process_response(
                 Ok(false) => {
                     unresolved.push(unresolved_propagation_target_with_rejected_candidate(
                         expected,
-                        identity,
-                        expected.propagation_state_contexts()[index],
-                        expected.propagation_expected_previous()[index].clone(),
+                        index,
                         candidate_json.clone(),
                         Some(candidate_translation.clone()),
                         TranslationUnitRejectionReason::PlaceholderMismatch {
@@ -1591,13 +1588,14 @@ fn process_response(
             let state_context = expected.propagation_state_contexts()[index];
             let expected_previous = expected.propagation_expected_previous()[index].clone();
             propagation_targets.push(
-                super::pipeline::TranslationPropagationTarget::with_previous(
+                super::pipeline::TranslationPropagationTarget::with_previous_and_rejected_state(
                     identity.clone(),
                     state_context,
                     expected_previous
                         .as_ref()
                         .map(|(translation, _)| translation.clone()),
                     expected_previous.map(|(_, state)| state),
+                    expected.propagation_was_current_rejected()[index],
                 ),
             );
         }
@@ -1609,7 +1607,7 @@ fn process_response(
         }
         accepted.push(AcceptedTranslationDecision::new(
             expected.id(),
-            TranslationPatch::with_previous(
+            TranslationPatch::with_previous_and_rejected_state(
                 expected.identity().clone(),
                 propagation_targets,
                 translation,
@@ -1617,6 +1615,7 @@ fn process_response(
                 expected
                     .expected_previous()
                     .map(|(translation, state)| (translation.clone(), state)),
+                expected.was_current_rejected(),
             ),
         ));
     }
@@ -2143,7 +2142,7 @@ fn unresolved_unit_with_rejected_candidate(
     let violation = proven_violation(&reason, translation.as_deref())
         .expect("唯一绑定候选的内容拒绝必须属于硬不变量闭集");
     let mut targets = Vec::with_capacity(1 + expected.propagation_targets().len());
-    targets.push(RejectedTranslationTarget::new(
+    targets.push(RejectedTranslationTarget::with_rejected_state(
         expected.identity().clone(),
         expected
             .state_context()
@@ -2151,17 +2150,20 @@ fn unresolved_unit_with_rejected_candidate(
         expected
             .expected_previous()
             .map(|(translation, state)| (translation.clone(), state)),
+        expected.was_current_rejected(),
     ));
-    for ((identity, state_context), expected_previous) in expected
+    for (((identity, state_context), expected_previous), was_current_rejected) in expected
         .propagation_targets()
         .iter()
         .zip(expected.propagation_state_contexts().iter().copied())
         .zip(expected.propagation_expected_previous())
+        .zip(expected.propagation_was_current_rejected())
     {
-        targets.push(RejectedTranslationTarget::new(
+        targets.push(RejectedTranslationTarget::with_rejected_state(
             identity.clone(),
             state_context.rejection_planning_state(identity.source_content()),
             expected_previous.clone(),
+            *was_current_rejected,
         ));
     }
     UnresolvedTranslationUnit::with_rejected_candidate(
@@ -2174,13 +2176,15 @@ fn unresolved_unit_with_rejected_candidate(
 
 fn unresolved_propagation_target_with_rejected_candidate(
     expected: &ExpectedTranslationOutput,
-    identity: &TranslationUnitIdentity,
-    state_context: super::pipeline::TranslationStateContext,
-    expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    target_index: usize,
     candidate_json: String,
     translation: Option<Vec<String>>,
     reason: TranslationUnitRejectionReason,
 ) -> UnresolvedTranslationUnit {
+    let identity = &expected.propagation_targets()[target_index];
+    let state_context = expected.propagation_state_contexts()[target_index];
+    let expected_previous = expected.propagation_expected_previous()[target_index].clone();
+    let was_current_rejected = expected.propagation_was_current_rejected()[target_index];
     let violation = proven_violation(&reason, translation.as_deref())
         .expect("传播目标的候选内容拒绝必须属于硬不变量闭集");
     UnresolvedTranslationUnit::with_rejected_candidate(
@@ -2191,10 +2195,11 @@ fn unresolved_propagation_target_with_rejected_candidate(
             candidate_json,
             translation,
             violation,
-            vec![RejectedTranslationTarget::new(
+            vec![RejectedTranslationTarget::with_rejected_state(
                 identity.clone(),
                 state_context.rejection_planning_state(identity.source_content()),
                 expected_previous,
+                was_current_rejected,
             )],
         ),
     )

@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] 미완료
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; { $written }개 위치 기록, { $remaining }개 남음
+result-translate-summary = 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; { $written }개 위치 기록, { $remaining }개 남음(Rejected { $rejected }개)
 result-translate-convergence = 상태 수렴: 유지 { $retained }, 무효화 { $invalidated }, 해당 없음 { $not_applicable }, 재사용 { $reused }
 result-write-back-completed = 쓰기 완료: { $project }
 result-project-lua-completed = 프로젝트 Lua 실행 완료: { $project }
@@ -106,7 +106,7 @@ result-output-directory = 출력 디렉터리: { $path }
 result-write-back-summary = 쓰기: 번역 { $translated }단위, 원문 { $original }단위
 result-generic-extract-unchanged = Generic 입력 변경 없음: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개
 result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, 그룹 { $groups }개, 단위 { $units }개; 번역 { $preserved }개 유지, { $cleared }개 삭제
-result-generic-translate-summary = Generic 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; 계획 Unit { $planned_units }개, 남은 Unit { $remaining_units }개, 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
+result-generic-translate-summary = Generic 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; 계획 Unit { $planned_units }개, 남은 Unit { $remaining_units }개(Rejected { $rejected_units }개), 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
 result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
 result-run-log = 실행 기록: { $path }
 translate-incomplete-object = 프로젝트 { $project }의 이번 Translate
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = 부분 작업 { $partial }개, 사용 �
     $admission ->
         [stopped] 중지
        *[open] 유지
-    }, 남은 결정 { $remaining_decisions }개, 남은 위치 { $remaining_locations }개
+    }, 남은 결정 { $remaining_decisions }개, 남은 위치 { $remaining_locations }개(Rejected { $rejected_locations }개)
 translate-incomplete-generic-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 미시작 작업 { $not_started }개, 요청 소진 { $exhausted }개, 요청 접수 {
     $admission ->
         [stopped] 중지
        *[open] 유지
-    }, 남은 Unit { $remaining_units }개, 쓰기 충돌 { $conflicted }개, 응답 문제 { $problems }개
+    }, 남은 Unit { $remaining_units }개(Rejected { $rejected_units }개), 쓰기 충돌 { $conflicted }개, 응답 문제 { $problems }개
 translate-incomplete-help = 이번 실행 기록의 작업 진단을 확인하고 반복 가능한 문제를 수정한 뒤 Translate를 다시 실행하십시오. 남은 항목이 적으면 Manual을 사용할 수 있습니다
+translate-incomplete-rejected-help = 작업 진단을 확인하십시오. Rejected 항목은 --retry-rejected로 다시 번역하거나 manual export --selection rejected로 내보낸 뒤 Manual로 처리할 수 있습니다
 result-cancelled = 안전한 마무리 후 명령을 취소했습니다.
 result-plan-saved = 성공한 실행 계획을 저장했습니다.
 log-run-started = 명령 { $command }이 시작되었습니다.

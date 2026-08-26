@@ -104,17 +104,21 @@ started = complete + partial + unavailable + failed + cancelled
 planned = started + not_started
 ```
 
-Generic 汇总保存 cleared、reused、accepted、written、conflicted Unit 与响应问题数；RPG
-Maker 汇总保存接受、写入、剩余、协议和协调结果。Generic 另保存 planned_units 与
-remaining_units；RPG Maker 分别保存 remaining_decisions 与 remaining_locations。两者都
+Generic 汇总保存 cleared、reused、accepted、written、conflicted Unit、响应问题数与运行结束时
+仍为 Rejected 的 `rejected_units`；RPG Maker 汇总保存接受、写入、剩余、协议、协调结果与
+`rejected_locations`。Generic 另保存 planned_units 与 remaining_units；RPG Maker 分别保存
+remaining_decisions 与 remaining_locations。两者都
 保存 recoverable_request_exhaustions 和 request_admission_stopped。不同引擎不共用含义
 不同的字段。
 
-Generic 的 `planned_units - remaining_units` 是模型计划中已经成功写入的 Unit；
-`written_units` 还可以包含既有译文复用写入，因此不能用 `written_units` 反推模型剩余量。
-模型写入不得多于 accepted Unit，总写入减去模型写入不得多于本次复用目标。RPG Maker 的
+Generic 的 planned_units 是本轮模型责任位置与尚未进入模型 Task 的当前 Rejected 位置的并集；
+`planned_units - remaining_units` 是其中已经由模型结果或受信复用修复的 Unit。
+`written_units` 还可以包含不属于这个集合的既有译文复用写入，因此不能用 `written_units`
+反推剩余量。已解决 Unit 不得多于 accepted 与 reused 之和，总写入减去已解决 Unit 不得多于
+本次复用目标。RPG Maker 的
 accepted decisions 不能多于 written locations，remaining decisions 不能多于
-remaining locations。NoWork 和 Complete 的剩余必须为零。
+remaining locations。Rejected 必须是 remaining 的子集；NoWork 和 Complete 的剩余与
+Rejected 都必须为零。
 
 只要 Translate 已经形成计划事实，Complete、Incomplete、Failed 和 Cancelled 都保存当时
 的 Task 计数和引擎汇总。Failed 或 Cancelled 不得把已经开始、未开始、已写入和剩余工作

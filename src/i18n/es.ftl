@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] incompleta
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Traducción: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $written } ubicaciones escritas, { $remaining } restantes
+result-translate-summary = Traducción: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $written } ubicaciones escritas, { $remaining } restantes, incluidas { $rejected } rechazadas
 result-translate-convergence = Convergencia: { $retained } conservadas, { $invalidated } invalidadas, { $not_applicable } no aplicables, { $reused } reutilizadas
 result-write-back-completed = Escritura completa: { $project }
 result-project-lua-completed = Ejecución Lua del proyecto completada: { $project }
@@ -106,7 +106,7 @@ result-output-directory = Directorio de salida: { $path }
 result-write-back-summary = Escritura: { $translated } unidades traducidas, { $original } unidades de origen
 result-generic-extract-unchanged = Entrada Generic sin cambios: { $files } archivos, { $groups } grupos, { $units } unidades
 result-generic-extract-updated = Entrada Generic actualizada: { $files } archivos, { $groups } grupos, { $units } unidades; { $preserved } traducciones conservadas y { $cleared } borradas
-result-generic-translate-summary = Traducción Generic: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $planned_units } unidades planificadas, { $remaining_units } restantes, { $cleared } borradas, { $reused } reutilizadas, { $accepted } aceptadas, { $written } escritas, { $conflicted } conflictos, { $problems } problemas de respuesta
+result-generic-translate-summary = Traducción Generic: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $planned_units } unidades planificadas, { $remaining_units } restantes, incluidas { $rejected_units } rechazadas, { $cleared } borradas, { $reused } reutilizadas, { $accepted } aceptadas, { $written } escritas, { $conflicted } conflictos, { $problems } problemas de respuesta
 result-generic-write-back-summary = Escritura Generic: { $translated } unidades traducidas, { $original } unidades de origen conservadas
 result-run-log = Registro de ejecución: { $path }
 translate-incomplete-object = Ejecución Translate del proyecto { $project }
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = { $partial } tareas parciales, { $unavai
     $admission ->
         [stopped] se detuvo
        *[open] siguió abierta
-    }; quedan { $remaining_decisions } decisiones y { $remaining_locations } ubicaciones
+    }; quedan { $remaining_decisions } decisiones y { $remaining_locations } ubicaciones, incluidas { $rejected_locations } rechazadas
 translate-incomplete-generic-reason = { $partial } tareas parciales, { $unavailable } no disponibles, { $not_started } sin iniciar, { $exhausted } solicitudes agotadas; la admisión de solicitudes {
     $admission ->
         [stopped] se detuvo
        *[open] siguió abierta
-    }; { $remaining_units } unidades restantes, { $conflicted } conflictos de escritura y { $problems } problemas de respuesta
+    }; { $remaining_units } unidades restantes, incluidas { $rejected_units } rechazadas, { $conflicted } conflictos de escritura y { $problems } problemas de respuesta
 translate-incomplete-help = Consulte los diagnósticos de tareas de este registro, corrija los problemas reproducibles y vuelva a ejecutar Translate; use Manual para un resto pequeño
+translate-incomplete-rejected-help = Consulte los diagnósticos de tareas; vuelva a intentar el contenido rechazado con --retry-rejected, o expórtelo con manual export --selection rejected para tratarlo mediante Manual
 result-cancelled = El comando se canceló tras finalizar de forma segura.
 result-plan-saved = Se guardó el plan de ejecución correcto.
 log-run-started = El comando { $command } comenzó.

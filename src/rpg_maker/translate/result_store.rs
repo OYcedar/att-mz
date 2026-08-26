@@ -1173,12 +1173,7 @@ fn commit_work(
     outcome: Arc<TranslationTaskOutcome>,
 ) -> Result<CommitPlanWork, ResultStoragePlanError> {
     let decisions = outcome.accepted();
-    let rejected_count = outcome
-        .unresolved()
-        .iter()
-        .filter_map(|unit| unit.rejected_candidate())
-        .map(|candidate| candidate.targets().len())
-        .sum::<usize>();
+    let rejected_count = outcome.rejected_location_count();
     if decisions.is_empty() && rejected_count == 0 {
         return Err(ResultStoragePlanError::EmptyTaskResult);
     }

@@ -471,11 +471,16 @@ impl PlanningUnit {
             && (!self.current_rejected || self.retry_rejected)
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_skipped_rejected(&self) -> bool {
         self.needs_translation
             && self.current_translation.is_none()
             && self.current_rejected
             && !self.retry_rejected
+    }
+
+    pub(crate) const fn is_current_rejected(&self) -> bool {
+        self.current_rejected
     }
 
     pub(crate) fn current_translation(&self) -> Option<&str> {
@@ -597,6 +602,7 @@ pub(crate) struct PlannedReuse {
     expected_group_context: Sha256Fingerprint,
     expected_state_fingerprint: Sha256Fingerprint,
     expected_previous: Option<GenericStoredTranslation>,
+    was_current_rejected: bool,
 }
 
 /// 一个目标 Unit 已经完整验收的复用结果。
@@ -651,6 +657,7 @@ impl PlannedReuse {
             translation: self.translation,
             state_fingerprint: self.expected_state_fingerprint,
             expected_translation: self.expected_previous,
+            was_current_rejected: self.was_current_rejected,
         }
     }
 }
@@ -700,6 +707,7 @@ struct PlannedDestination {
     expected_previous: Option<GenericStoredTranslation>,
     source_language: String,
     target_language: String,
+    was_current_rejected: bool,
 }
 
 /// 一个不能跨 JSONL 文件的模型任务。
@@ -746,7 +754,8 @@ pub(crate) struct TranslationPlan {
     invalidations: Vec<PlannedInvalidation>,
     reused: Vec<PlannedReuse>,
     tasks: Vec<PlannedTask>,
-    skipped_rejected: usize,
+    planned_units: usize,
+    initial_rejected_units: usize,
 }
 
 impl TranslationPlan {
@@ -772,12 +781,14 @@ impl TranslationPlan {
         Vec<PlannedReuse>,
         Vec<PlannedTask>,
         usize,
+        usize,
     ) {
         (
             self.invalidations,
             self.reused,
             self.tasks,
-            self.skipped_rejected,
+            self.planned_units,
+            self.initial_rejected_units,
         )
     }
 }
@@ -1254,6 +1265,7 @@ where
                                 )
                             })
                             .transpose()?,
+                        was_current_rejected: fact.input.is_current_rejected(),
                     });
                 }
                 let previous = representative_destinations.insert_with_cancellation(
@@ -1308,6 +1320,7 @@ where
                             )
                         })
                         .transpose()?,
+                    was_current_rejected: fact.input.is_current_rejected(),
                 };
                 let validated = reuse_validator(&fact.key, &translation)?;
                 ensure_planning_not_cancelled(&is_cancelled)?;
@@ -1324,6 +1337,7 @@ where
                             expected_group_context: destination.expected_group_context,
                             expected_state_fingerprint: destination.expected_state_fingerprint,
                             expected_previous: destination.expected_previous,
+                            was_current_rejected: destination.was_current_rejected,
                         });
                         let previous = known_targets.insert_with_cancellation(
                             clone_planning_key_with_cancellation(&fact.key, &is_cancelled)?,
@@ -1395,6 +1409,7 @@ where
                         clone_planning_stored_translation_with_cancellation(previous, &is_cancelled)
                     })
                     .transpose()?,
+                was_current_rejected: fact.input.is_current_rejected(),
             });
         }
         let previous = representative_destinations.insert_with_cancellation(
@@ -1481,14 +1496,36 @@ where
     ensure_planning_not_cancelled(&is_cancelled)?;
     debug_assert!(representative_destinations.is_empty());
 
+    let rejected_units_after_preparation = facts
+        .iter()
+        .filter(|fact| fact.input.is_current_rejected())
+        .count();
+    let rejected_units_in_tasks = tasks
+        .iter()
+        .flat_map(|task| task.outputs.values())
+        .flatten()
+        .filter(|destination| destination.was_current_rejected)
+        .count();
+    let planned_units = tasks
+        .iter()
+        .map(PlannedTask::unit_count)
+        .sum::<usize>()
+        .checked_add(
+            rejected_units_after_preparation
+                .checked_sub(rejected_units_in_tasks)
+                .expect("Task 中的 Rejected Unit 必须来自本次规划事实"),
+        )
+        .expect("Generic 计划 Unit 数不得溢出");
+    let initial_rejected_units = rejected_units_after_preparation
+        .checked_sub(invalidations.len())
+        .expect("新失效 Unit 必须由非 Rejected 状态转入 Rejected");
+
     Ok(TranslationPlan {
         invalidations,
         reused,
         tasks,
-        skipped_rejected: facts
-            .iter()
-            .filter(|fact| fact.input.is_skipped_rejected())
-            .count(),
+        planned_units,
+        initial_rejected_units,
     })
 }
 
@@ -1713,6 +1750,7 @@ pub(crate) struct AcceptedTranslation {
     expected_group_context: Sha256Fingerprint,
     expected_state_fingerprint: Sha256Fingerprint,
     expected_previous: Option<GenericStoredTranslation>,
+    was_current_rejected: bool,
 }
 
 /// 一个已绑定到当前规划事实、只因硬不变量而未能入库的候选。
@@ -1731,6 +1769,7 @@ pub(crate) struct RejectedTranslation {
     source_language: String,
     target_language: String,
     expected_previous: Option<GenericStoredTranslation>,
+    was_current_rejected: bool,
 }
 
 impl RejectedTranslation {
@@ -1773,6 +1812,7 @@ impl RejectedTranslation {
             violation: self.violation,
             planning_state: self.planning_state,
             expected_translation: self.expected_previous,
+            was_current_rejected: self.was_current_rejected,
         }
     }
 }
@@ -1787,6 +1827,7 @@ impl AcceptedTranslation {
             translation: self.translation,
             state_fingerprint: self.expected_state_fingerprint,
             expected_translation: self.expected_previous,
+            was_current_rejected: self.was_current_rejected,
         }
     }
 }
@@ -2111,6 +2152,7 @@ where
                 expected_group_context: destination.expected_group_context,
                 expected_state_fingerprint: destination.expected_state_fingerprint,
                 expected_previous: destination.expected_previous,
+                was_current_rejected: destination.was_current_rejected,
             });
             output_accepted = true;
         }
@@ -2175,6 +2217,7 @@ fn rejected_generic_destination(
         source_language: destination.source_language,
         target_language: destination.target_language,
         expected_previous: destination.expected_previous,
+        was_current_rejected: destination.was_current_rejected,
     }
 }
 
@@ -3022,6 +3065,36 @@ mod tests {
     }
 
     #[test]
+    fn retry_rejected_resolved_by_reuse_remains_in_planned_and_rejected_baselines() {
+        let mut snapshot = stored_snapshot();
+        snapshot.files[0].groups[0].units[0].translation = Some(GenericStoredTranslation {
+            translation: "相同".to_owned(),
+            origin: TranslationOrigin::Manual,
+            state_fingerprint: fingerprint(9),
+        });
+        let mut planning_units = planning(&snapshot);
+        let rejected = planning_units
+            .iter_mut()
+            .find(|unit| unit.key().group_id() == "g3")
+            .expect("测试快照应含跨文件同文目标");
+        rejected.current_rejected = true;
+        rejected.retry_rejected = true;
+
+        let plan = plan_translation(&snapshot, &planning_units, |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .unwrap();
+
+        assert!(
+            plan.reused()
+                .iter()
+                .any(|reuse| reuse.key().group_id() == "g3" && reuse.was_current_rejected)
+        );
+        assert_eq!(plan.initial_rejected_units, 1);
+        assert_eq!(plan.planned_units, 2, "独立模型 Unit 与复用修复各计一次");
+    }
+
+    #[test]
     fn current_reuse_validator_can_propagate_cancellation() {
         let mut snapshot = stored_snapshot();
         snapshot.files[0].groups[0].units[0].translation = Some(GenericStoredTranslation {
@@ -3318,7 +3391,8 @@ mod tests {
         })
         .unwrap();
         assert!(plan.tasks().is_empty());
-        assert_eq!(plan.skipped_rejected, 1);
+        assert_eq!(plan.planned_units, 1);
+        assert_eq!(plan.initial_rejected_units, 1);
 
         let retried = make_planning(true);
         assert!(retried.needs_candidate());
@@ -3333,7 +3407,8 @@ mod tests {
                 .sum::<usize>(),
             1
         );
-        assert_eq!(plan.skipped_rejected, 0);
+        assert_eq!(plan.planned_units, 1);
+        assert_eq!(plan.initial_rejected_units, 1);
     }
 
     #[test]

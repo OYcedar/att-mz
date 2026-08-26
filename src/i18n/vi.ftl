@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] chưa đầy đủ
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Dịch: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; đã ghi { $written } vị trí, còn { $remaining }
+result-translate-summary = Dịch: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; đã ghi { $written } vị trí, còn { $remaining }, gồm { $rejected } Rejected
 result-translate-convergence = Hội tụ trạng thái: giữ { $retained }, vô hiệu { $invalidated }, không áp dụng { $not_applicable }, tái dùng { $reused }
 result-write-back-completed = Ghi lại hoàn tất: { $project }
 result-project-lua-completed = Thực thi Lua dự án hoàn tất: { $project }
@@ -106,7 +106,7 @@ result-output-directory = Thư mục đầu ra: { $path }
 result-write-back-summary = Ghi lại: { $translated } đơn vị dịch, { $original } đơn vị nguồn
 result-generic-extract-unchanged = Đầu vào Generic không đổi: { $files } tệp, { $groups } nhóm, { $units } đơn vị
 result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files } tệp, { $groups } nhóm, { $units } đơn vị; giữ { $preserved } bản dịch và xóa { $cleared }
-result-generic-translate-summary = Dịch Generic: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; { $planned_units } Unit đã lên kế hoạch, còn { $remaining_units } Unit, xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
+result-generic-translate-summary = Dịch Generic: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; { $planned_units } Unit đã lên kế hoạch, còn { $remaining_units } Unit, gồm { $rejected_units } Rejected, xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
 result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
 result-run-log = Nhật ký lần chạy: { $path }
 translate-incomplete-object = Lần chạy Translate của dự án { $project }
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = { $partial } tác vụ một phần, { $
     $admission ->
         [stopped] đã dừng
        *[open] vẫn mở
-    }; còn { $remaining_decisions } quyết định và { $remaining_locations } vị trí
+    }; còn { $remaining_decisions } quyết định và { $remaining_locations } vị trí, gồm { $rejected_locations } Rejected
 translate-incomplete-generic-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $not_started } chưa bắt đầu, { $exhausted } yêu cầu đã cạn; nhận yêu cầu {
     $admission ->
         [stopped] đã dừng
        *[open] vẫn mở
-    }; còn { $remaining_units } Unit, { $conflicted } xung đột ghi và { $problems } lỗi phản hồi
+    }; còn { $remaining_units } Unit, gồm { $rejected_units } Rejected, { $conflicted } xung đột ghi và { $problems } lỗi phản hồi
 translate-incomplete-help = Xem chẩn đoán tác vụ trong nhật ký lần chạy này, sửa lỗi có thể lặp lại rồi chạy Translate lần nữa; dùng Manual nếu chỉ còn ít nội dung
+translate-incomplete-rejected-help = Xem chẩn đoán tác vụ; dịch lại nội dung Rejected bằng --retry-rejected, hoặc xuất bằng manual export --selection rejected rồi xử lý qua Manual
 result-cancelled = Lệnh đã bị hủy sau khi hoàn tất an toàn.
 result-plan-saved = Kế hoạch chạy thành công đã được lưu.
 log-run-started = Lệnh { $command } đã bắt đầu.

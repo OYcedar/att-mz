@@ -28,11 +28,13 @@ pub(crate) struct TranslationDeduplicationCandidate {
     translation_state: Option<Sha256Fingerprint>,
     state_context: TranslationStateContext,
     invalidated: bool,
+    rejected_at_task_baseline: bool,
 }
 
 impl TranslationDeduplicationCandidate {
     // 每项参数都是去重判断直接使用的候选事实；额外参数对象只会复制本结构。
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn new(
         identity: TranslationUnitIdentity,
         protected_text: impl Into<String>,
@@ -43,6 +45,31 @@ impl TranslationDeduplicationCandidate {
         state_context: TranslationStateContext,
         invalidated: bool,
     ) -> Self {
+        Self::with_rejected_state(
+            identity,
+            protected_text,
+            applied_placeholders,
+            candidate_contract,
+            translation,
+            translation_state,
+            state_context,
+            invalidated,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_rejected_state(
+        identity: TranslationUnitIdentity,
+        protected_text: impl Into<String>,
+        applied_placeholders: Vec<AppliedPlaceholder>,
+        candidate_contract: Sha256Fingerprint,
+        translation: Option<TextUnitContent>,
+        translation_state: Option<Sha256Fingerprint>,
+        state_context: TranslationStateContext,
+        invalidated: bool,
+        rejected_at_task_baseline: bool,
+    ) -> Self {
         Self {
             identity,
             protected_text: protected_text.into(),
@@ -52,6 +79,7 @@ impl TranslationDeduplicationCandidate {
             translation_state,
             state_context,
             invalidated,
+            rejected_at_task_baseline,
         }
     }
 }
@@ -325,11 +353,12 @@ fn plan_active_members(
         .copied()
         .filter(|&index| index != leader_index)
         .map(|index| {
-            TranslationPropagationTarget::with_previous(
+            TranslationPropagationTarget::with_previous_and_rejected_state(
                 candidates[index].identity.clone(),
                 candidates[index].state_context,
                 candidates[index].translation.clone(),
                 candidates[index].translation_state,
+                candidates[index].rejected_at_task_baseline,
             )
         })
         .collect();

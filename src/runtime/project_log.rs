@@ -818,6 +818,7 @@ impl<'de> Deserialize<'de> for TranslationTaskCounters {
 pub(crate) struct GenericTranslationSummary {
     pub(crate) planned_units: u64,
     pub(crate) remaining_units: u64,
+    pub(crate) rejected_units: u64,
     pub(crate) cleared_units: u64,
     pub(crate) reused_units: u64,
     pub(crate) accepted_units: u64,
@@ -835,6 +836,7 @@ pub(crate) struct RpgMakerTranslationSummary {
     pub(crate) written_locations: u64,
     pub(crate) remaining_decisions: u64,
     pub(crate) remaining_locations: u64,
+    pub(crate) rejected_locations: u64,
     pub(crate) protocol_diagnostics: u64,
     pub(crate) recoverable_request_exhaustions: u64,
     pub(crate) request_admission_stopped: bool,
@@ -860,30 +862,40 @@ impl TranslationEngineSummary {
     fn is_consistent(self) -> bool {
         match self {
             Self::Generic(summary) => {
-                let Some(model_writes) = summary.planned_units.checked_sub(summary.remaining_units)
+                let Some(resolved_units) =
+                    summary.planned_units.checked_sub(summary.remaining_units)
                 else {
                     return false;
                 };
-                let Some(maximum_writes) = model_writes.checked_add(summary.reused_units) else {
+                let Some(maximum_writes) = resolved_units.checked_add(summary.reused_units) else {
                     return false;
                 };
-                model_writes <= summary.accepted_units
+                let Some(maximum_resolved) =
+                    summary.accepted_units.checked_add(summary.reused_units)
+                else {
+                    return false;
+                };
+                resolved_units <= maximum_resolved
                     && summary.accepted_units <= summary.planned_units
-                    && model_writes <= summary.written_units
+                    && resolved_units <= summary.written_units
                     && summary.written_units <= maximum_writes
+                    && summary.rejected_units <= summary.remaining_units
             }
             Self::RpgMaker(summary) => {
                 summary.accepted_decisions <= summary.written_locations
                     && summary.remaining_decisions <= summary.remaining_locations
+                    && summary.rejected_locations <= summary.remaining_locations
             }
         }
     }
 
     const fn has_no_remaining_work(self) -> bool {
         match self {
-            Self::Generic(summary) => summary.remaining_units == 0,
+            Self::Generic(summary) => summary.remaining_units == 0 && summary.rejected_units == 0,
             Self::RpgMaker(summary) => {
-                summary.remaining_decisions == 0 && summary.remaining_locations == 0
+                summary.remaining_decisions == 0
+                    && summary.remaining_locations == 0
+                    && summary.rejected_locations == 0
             }
         }
     }
@@ -4726,6 +4738,7 @@ mod tests {
                 cleared_units: 0,
                 planned_units: 1,
                 remaining_units: 1,
+                rejected_units: 0,
                 reused_units: 0,
                 accepted_units: 1,
                 written_units: 1,
@@ -4746,6 +4759,7 @@ mod tests {
                 cleared_units: 0,
                 planned_units: 1,
                 remaining_units: 0,
+                rejected_units: 0,
                 reused_units: 0,
                 accepted_units: 1,
                 written_units: 1,
@@ -4787,6 +4801,7 @@ mod tests {
             cleared_units: 0,
             planned_units: 0,
             remaining_units: 0,
+            rejected_units: 0,
             reused_units: 1,
             accepted_units: 0,
             written_units: 1,
@@ -4800,6 +4815,42 @@ mod tests {
             summary.is_consistent(),
             "既有译文复用不属于模型计划 Unit，正常复用写入不得被日志契约拒绝"
         );
+    }
+
+    #[test]
+    fn rejected_summary_must_remain_within_remaining_work() {
+        let generic = TranslationEngineSummary::Generic(GenericTranslationSummary {
+            cleared_units: 0,
+            planned_units: 1,
+            remaining_units: 0,
+            rejected_units: 1,
+            reused_units: 0,
+            accepted_units: 1,
+            written_units: 1,
+            conflicted_units: 0,
+            response_problems: 0,
+            recoverable_request_exhaustions: 0,
+            request_admission_stopped: false,
+        });
+        let rpg = TranslationEngineSummary::RpgMaker(RpgMakerTranslationSummary {
+            accepted_decisions: 0,
+            written_locations: 0,
+            remaining_decisions: 0,
+            remaining_locations: 0,
+            rejected_locations: 1,
+            protocol_diagnostics: 0,
+            recoverable_request_exhaustions: 0,
+            request_admission_stopped: false,
+            retained: 0,
+            invalidated: 0,
+            not_applicable: 0,
+            reused: 0,
+        });
+
+        assert!(!generic.is_consistent());
+        assert!(!generic.has_no_remaining_work());
+        assert!(!rpg.is_consistent());
+        assert!(!rpg.has_no_remaining_work());
     }
 
     #[test]

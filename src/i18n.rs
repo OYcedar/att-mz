@@ -654,6 +654,7 @@ pub(crate) enum UiMessage<'a> {
         cancelled: u64,
         written: u64,
         remaining: u64,
+        rejected: u64,
     },
     ResultTranslateConvergence {
         retained: u64,
@@ -672,6 +673,7 @@ pub(crate) enum UiMessage<'a> {
         cancelled: u64,
         planned_units: u64,
         remaining_units: u64,
+        rejected_units: u64,
         cleared: u64,
         reused: u64,
         accepted: u64,
@@ -711,6 +713,7 @@ pub(crate) enum UiMessage<'a> {
         not_started: u64,
         remaining_decisions: u64,
         remaining_locations: u64,
+        rejected_locations: u64,
     },
     TranslateIncompleteGenericReason {
         partial: u64,
@@ -721,8 +724,10 @@ pub(crate) enum UiMessage<'a> {
         admission: &'a str,
         not_started: u64,
         remaining_units: u64,
+        rejected_units: u64,
     },
     TranslateIncompleteHelp,
+    TranslateIncompleteRejectedHelp,
     ResultCancelled,
     ResultPlanSaved,
     LogRunStarted {
@@ -962,6 +967,7 @@ impl UiMessage<'_> {
             }
             Self::TranslateIncompleteGenericReason { .. } => "translate-incomplete-generic-reason",
             Self::TranslateIncompleteHelp => "translate-incomplete-help",
+            Self::TranslateIncompleteRejectedHelp => "translate-incomplete-rejected-help",
             Self::ResultCancelled => "result-cancelled",
             Self::ResultPlanSaved => "result-plan-saved",
             Self::LogRunStarted { .. } => "log-run-started",
@@ -1077,6 +1083,7 @@ impl UiMessage<'_> {
                 cancelled,
                 written,
                 remaining,
+                rejected,
             } => {
                 set_number(&mut arguments, "total", total);
                 set_number(&mut arguments, "started", started);
@@ -1088,6 +1095,7 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "cancelled", cancelled);
                 set_number(&mut arguments, "written", written);
                 set_number(&mut arguments, "remaining", remaining);
+                set_number(&mut arguments, "rejected", rejected);
             }
             Self::ResultTranslateConvergence {
                 retained,
@@ -1111,6 +1119,7 @@ impl UiMessage<'_> {
                 cancelled,
                 planned_units,
                 remaining_units,
+                rejected_units,
                 cleared,
                 reused,
                 accepted,
@@ -1128,6 +1137,7 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "cancelled", cancelled);
                 set_number(&mut arguments, "planned_units", planned_units);
                 set_number(&mut arguments, "remaining_units", remaining_units);
+                set_number(&mut arguments, "rejected_units", rejected_units);
                 set_number(&mut arguments, "cleared", cleared);
                 set_number(&mut arguments, "reused", reused);
                 set_number(&mut arguments, "accepted", accepted);
@@ -1336,6 +1346,7 @@ impl UiMessage<'_> {
                 not_started,
                 remaining_decisions,
                 remaining_locations,
+                rejected_locations,
             } => {
                 set_number(&mut arguments, "partial", partial);
                 set_number(&mut arguments, "unavailable", unavailable);
@@ -1345,6 +1356,7 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "not_started", not_started);
                 set_number(&mut arguments, "remaining_decisions", remaining_decisions);
                 set_number(&mut arguments, "remaining_locations", remaining_locations);
+                set_number(&mut arguments, "rejected_locations", rejected_locations);
             }
             Self::TranslateIncompleteGenericReason {
                 partial,
@@ -1355,6 +1367,7 @@ impl UiMessage<'_> {
                 admission,
                 not_started,
                 remaining_units,
+                rejected_units,
             } => {
                 set_number(&mut arguments, "partial", partial);
                 set_number(&mut arguments, "unavailable", unavailable);
@@ -1364,6 +1377,7 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "admission", admission);
                 set_number(&mut arguments, "not_started", not_started);
                 set_number(&mut arguments, "remaining_units", remaining_units);
+                set_number(&mut arguments, "rejected_units", rejected_units);
             }
             Self::AppAbout
             | Self::CliUiLanguageHelp
@@ -1445,6 +1459,7 @@ impl UiMessage<'_> {
             | Self::ResultCancelled
             | Self::ResultPlanSaved
             | Self::TranslateIncompleteHelp
+            | Self::TranslateIncompleteRejectedHelp
             | Self::TaskRecordTitle
             | Self::TaskRecordFinalResultHeading => {}
         }
@@ -2064,6 +2079,7 @@ mod tests {
                 cancelled: 0,
                 written: 2,
                 remaining: 0,
+                rejected: 0,
             },
             UiMessage::ResultTranslateConvergence {
                 retained: 1,
@@ -2082,6 +2098,7 @@ mod tests {
                 cancelled: 0,
                 planned_units: 11,
                 remaining_units: 12,
+                rejected_units: 2,
                 cleared: 5,
                 reused: 6,
                 accepted: 7,
@@ -2102,6 +2119,7 @@ mod tests {
                 not_started: 0,
                 remaining_decisions: 5,
                 remaining_locations: 6,
+                rejected_locations: 2,
             },
             UiMessage::TranslateIncompleteGenericReason {
                 partial: 1,
@@ -2112,8 +2130,10 @@ mod tests {
                 admission: "stopped",
                 not_started: 6,
                 remaining_units: 7,
+                rejected_units: 2,
             },
             UiMessage::TranslateIncompleteHelp,
+            UiMessage::TranslateIncompleteRejectedHelp,
             UiMessage::ResultWriteBackCompleted { project: "demo" },
             UiMessage::ResultProjectLuaCompleted { project: "demo" },
             UiMessage::ResultOutputDirectory { path: "output" },

@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] incomplete
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = Translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; wrote { $written } locations, { $remaining } remaining
+result-translate-summary = Translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; wrote { $written } locations, { $remaining } remaining, including { $rejected } rejected
 result-translate-convergence = State convergence: { $retained } retained, { $invalidated } invalidated, { $not_applicable } not applicable, { $reused } reused
 result-write-back-completed = Write-back complete: { $project }
 result-project-lua-completed = Project Lua execution complete: { $project }
@@ -106,7 +106,7 @@ result-output-directory = Output directory: { $path }
 result-write-back-summary = Write-back: { $translated } translated units, { $original } source units
 result-generic-extract-unchanged = Generic input unchanged: { $files } files, { $groups } groups, { $units } units
 result-generic-extract-updated = Generic input updated: { $files } files, { $groups } groups, { $units } units; preserved { $preserved } translations and cleared { $cleared }
-result-generic-translate-summary = Generic translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; { $planned_units } planned units, { $remaining_units } remaining units, cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
+result-generic-translate-summary = Generic translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; { $planned_units } planned units, { $remaining_units } remaining units, including { $rejected_units } rejected, cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
 result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
 result-run-log = Run log: { $path }
 translate-incomplete-object = Translate run for project { $project }
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = { $partial } partial tasks, { $unavailab
     $admission ->
         [stopped] stopped
        *[open] remained open
-    }; { $remaining_decisions } decisions and { $remaining_locations } locations remain
+    }; { $remaining_decisions } decisions and { $remaining_locations } locations remain, including { $rejected_locations } rejected
 translate-incomplete-generic-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $not_started } not started, { $exhausted } exhausted requests; request admission {
     $admission ->
         [stopped] stopped
        *[open] remained open
-    }; { $remaining_units } remaining units, { $conflicted } write conflicts, and { $problems } response problems
+    }; { $remaining_units } remaining units, including { $rejected_units } rejected, { $conflicted } write conflicts, and { $problems } response problems
 translate-incomplete-help = Read the task diagnostics in this run log, fix repeatable problems, and run Translate again; use Manual for a small remainder
+translate-incomplete-rejected-help = Read the task diagnostics in this run log; retry rejected content with --retry-rejected, or export it with manual export --selection rejected and handle it through Manual
 result-cancelled = The command was cancelled after safe finalization.
 result-plan-saved = The successful run plan was saved.
 log-run-started = Command { $command } started.

@@ -1059,6 +1059,7 @@ mod tests {
                     translation: "译文\n第二行".to_owned(),
                     state_fingerprint: Sha256Fingerprint::from_bytes([9; 32]),
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .unwrap();

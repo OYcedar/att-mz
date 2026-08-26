@@ -98,7 +98,7 @@ result-translate-status-value = { $status ->
     [incomplete] 未完整
    *[other] __ATT_FALLBACK__
 }
-result-translate-summary = 翻譯：計畫 { $total } 個工作，已開始 { $started }，未開始 { $not_started }；完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }，失敗 { $failed }，取消 { $cancelled }；寫入 { $written } 處，剩餘 { $remaining } 處
+result-translate-summary = 翻譯：計畫 { $total } 個工作，已開始 { $started }，未開始 { $not_started }；完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }，失敗 { $failed }，取消 { $cancelled }；寫入 { $written } 處，剩餘 { $remaining } 處，其中 Rejected { $rejected } 處
 result-translate-convergence = 狀態收斂：保留 { $retained }，失效 { $invalidated }，不適用 { $not_applicable }，重用 { $reused }
 result-write-back-completed = 寫回完成：{ $project }
 result-project-lua-completed = 專案 Lua 執行完成：{ $project }
@@ -106,7 +106,7 @@ result-output-directory = 輸出目錄：{ $path }
 result-write-back-summary = 寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元
 result-generic-extract-unchanged = Generic 輸入未變更：{ $files } 個檔案，{ $groups } 個群組，{ $units } 個單元
 result-generic-extract-updated = Generic 輸入已更新：{ $files } 個檔案，{ $groups } 個群組，{ $units } 個單元；保留 { $preserved } 條譯文，清除 { $cleared } 條
-result-generic-translate-summary = Generic 翻譯：計畫 { $total } 個工作，已開始 { $started }，未開始 { $not_started }；完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }，失敗 { $failed }，取消 { $cancelled }；計畫 Unit { $planned_units }，剩餘 Unit { $remaining_units }，清除 { $cleared }，重用 { $reused }，接受 { $accepted }，寫入 { $written }，衝突 { $conflicted }，回應問題 { $problems }
+result-generic-translate-summary = Generic 翻譯：計畫 { $total } 個工作，已開始 { $started }，未開始 { $not_started }；完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }，失敗 { $failed }，取消 { $cancelled }；計畫 Unit { $planned_units }，剩餘 Unit { $remaining_units }，其中 Rejected Unit { $rejected_units }，清除 { $cleared }，重用 { $reused }，接受 { $accepted }，寫入 { $written }，衝突 { $conflicted }，回應問題 { $problems }
 result-generic-write-back-summary = Generic 寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元
 result-run-log = 執行記錄：{ $path }
 translate-incomplete-object = 專案 { $project } 的本次 Translate
@@ -114,13 +114,14 @@ translate-incomplete-rpg-maker-reason = 部分任務 { $partial }，不可用任
     $admission ->
         [stopped] 已停止
        *[open] 未停止
-    }；剩餘決策 { $remaining_decisions }，剩餘位置 { $remaining_locations }
+    }；剩餘決策 { $remaining_decisions }，剩餘位置 { $remaining_locations }，其中 Rejected { $rejected_locations } 處
 translate-incomplete-generic-reason = 部分任務 { $partial }，不可用任務 { $unavailable }，未開始任務 { $not_started }，請求耗盡 { $exhausted }；請求准入{
     $admission ->
         [stopped] 已停止
        *[open] 未停止
-    }；剩餘 Unit { $remaining_units }，寫入衝突 { $conflicted }，回應問題 { $problems }
+    }；剩餘 Unit { $remaining_units }，其中 Rejected Unit { $rejected_units }，寫入衝突 { $conflicted }，回應問題 { $problems }
 translate-incomplete-help = 查看本次執行記錄中的具體任務診斷，修正可重現的問題後再次執行 Translate；少量剩餘內容可使用 Manual
+translate-incomplete-rejected-help = 查看本次執行記錄中的具體任務診斷；Rejected 內容可用 --retry-rejected 再次翻譯，或用 manual export --selection rejected 匯出後透過 Manual 處理
 result-cancelled = 命令已在安全收尾後取消。
 result-plan-saved = 已儲存本次成功執行方案。
 log-run-started = 命令 { $command } 已開始。

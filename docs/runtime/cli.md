@@ -206,7 +206,10 @@ Partial、Unavailable、Review、取消后已经生效的状态和任务记录�
 
 Translate 的正常终态明确显示 `无需处理`、`完整` 或 `未完整`。Partial 或 Unavailable
 属于结果明确的未完整状态，继续退出 `0`；stderr 同时用一条汇总警告说明任务、协议、请求
-耗尽、冲突和剩余数量，逐任务详情保留在同次项目日志与任务记录中。
+耗尽、冲突、剩余数量和其中仍为 Rejected 的数量，逐任务详情保留在同次项目日志与任务记录中。
+只有剩余与 Rejected 都为零的零 Task 运行才显示“全部最新”。存在 Rejected 时，处理办法明确
+提示 Translate 的 `--retry-rejected`，或 `manual export --selection rejected` 后通过 Manual
+处理。
 
 Translate 失败或取消时，如果此前已经形成计划和引擎汇总，stderr 在错误或取消文案附近
 打印一次同源短汇总：planned、started、not_started、失败或取消 Task、剩余工作，以及请求

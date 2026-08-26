@@ -163,6 +163,7 @@ where
                 written_locations: report.written_locations(),
                 remaining_decisions: report.unresolved_decisions(),
                 remaining_locations: report.unresolved_locations(),
+                rejected_locations: report.rejected_locations(),
                 protocol_diagnostics: report.protocol_diagnostics(),
                 recoverable_request_exhaustions: report.recoverable_request_exhaustions(),
                 request_admission_stopped: report.request_admission_stopped(),

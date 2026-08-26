@@ -460,40 +460,58 @@ where
                         invalidations.extend(deduplication_invalidations);
                         apply_deduplication_outcomes(&mut scopes, positions, outcomes);
 
-                        let retained = scopes
+                        let mut retained = 0_usize;
+                        let mut invalidated = 0_usize;
+                        let mut not_applicable = 0_usize;
+                        let mut existing_rejected = 0_usize;
+                        let mut rejected_after_preparation = 0_usize;
+                        let mut rejected_outside_tasks = 0_usize;
+                        let mut resolved_rejected = 0_usize;
+                        for unit in scopes
                             .iter()
                             .flat_map(|scope| &scope.groups)
                             .flat_map(|group| &group.units)
-                            .filter(|unit| unit.current)
-                            .count();
-                        let not_applicable = scopes
-                            .iter()
-                            .flat_map(|scope| &scope.groups)
-                            .flat_map(|group| &group.units)
-                            .filter(|unit| unit.not_applicable)
-                            .count();
-                        let invalidated = scopes
-                            .iter()
-                            .flat_map(|scope| &scope.groups)
-                            .flat_map(|group| &group.units)
-                            .filter(|unit| unit.invalidated && !unit.not_applicable)
-                            .count();
-                        let rejected = scopes
-                            .iter()
-                            .flat_map(|scope| &scope.groups)
-                            .flat_map(|group| &group.units)
-                            .filter(|unit| unit.skipped_rejected)
-                            .count();
+                        {
+                            retained += usize::from(unit.current);
+                            invalidated += usize::from(unit.invalidated && !unit.not_applicable);
+                            not_applicable += usize::from(unit.not_applicable);
+                            existing_rejected += usize::from(unit.current_rejected);
+
+                            let reused = matches!(
+                                &unit.responsibility,
+                                PreparedUnitResponsibility::Virtual {
+                                    reason: TranslationVirtualReason::Reused { .. }
+                                }
+                            );
+                            resolved_rejected += usize::from(unit.current_rejected && reused);
+                            let rejected_at_task_baseline =
+                                unit.current_rejected || unit.invalidation_violation.is_some();
+                            rejected_after_preparation +=
+                                usize::from(rejected_at_task_baseline && !reused);
+                            let belongs_to_task = matches!(
+                                &unit.responsibility,
+                                PreparedUnitResponsibility::Active { .. }
+                                    | PreparedUnitResponsibility::Virtual {
+                                        reason: TranslationVirtualReason::Duplicate { .. }
+                                    }
+                            );
+                            rejected_outside_tasks += usize::from(
+                                rejected_at_task_baseline && !reused && !belongs_to_task,
+                            );
+                        }
 
                         Ok::<_, GlobalPreparationFailure>((
                             scopes,
                             invalidations,
                             reuses,
-                            TranslationPlanPreparationCounts::new(
+                            TranslationPlanPreparationCounts::with_rejected_state(
                                 retained,
                                 invalidated,
                                 not_applicable,
-                                rejected,
+                                rejected_outside_tasks,
+                                existing_rejected,
+                                rejected_after_preparation,
+                                resolved_rejected,
                             ),
                             complete_plan,
                         ))
@@ -889,7 +907,7 @@ struct PreprocessedUnit {
     state_context: TranslationStateContext,
     current: bool,
     not_applicable: bool,
-    skipped_rejected: bool,
+    current_rejected: bool,
     responsibility: PreparedUnitResponsibility,
 }
 
@@ -1051,7 +1069,7 @@ fn preprocess_scope(
                 state_context,
                 current,
                 not_applicable,
-                skipped_rejected: skipped_rejected || skip_new_rejected,
+                current_rejected,
                 responsibility,
             });
         }
@@ -1346,7 +1364,7 @@ fn collect_deduplication_inputs(
                     if unit.invalidation_violation.is_some() {
                         invalidations.push(unit_invalidation(unit));
                     }
-                    candidates.push(TranslationDeduplicationCandidate::new(
+                    candidates.push(TranslationDeduplicationCandidate::with_rejected_state(
                         unit.identity.clone(),
                         unit.protected_text.clone(),
                         unit.placeholders.clone(),
@@ -1361,6 +1379,7 @@ fn collect_deduplication_inputs(
                             .flatten(),
                         unit.state_context,
                         unit.invalidated && unit.invalidation_violation.is_none(),
+                        unit.current_rejected || unit.invalidation_violation.is_some(),
                     ));
                     positions.push((scope_index, group_index, unit_index));
                 } else if unit.invalidation_violation.is_some() {
@@ -1535,6 +1554,8 @@ fn materialize_task_block(
                 } else {
                     unit.translation.clone().zip(unit.translation_state)
                 },
+                was_current_rejected: unit.current_rejected
+                    || unit.invalidation_violation.is_some(),
             });
         }
         rendered_groups.push(RenderedGroup {
@@ -1564,6 +1585,8 @@ fn materialize_task_block(
                 Vec::with_capacity(expected.propagation_targets.len());
             let mut propagation_expected_previous =
                 Vec::with_capacity(expected.propagation_targets.len());
+            let mut propagation_was_current_rejected =
+                Vec::with_capacity(expected.propagation_targets.len());
             for target in expected.propagation_targets {
                 ensure_planner_cpu_running(cancellation)
                     .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?;
@@ -1574,9 +1597,10 @@ fn materialize_task_block(
                         .expected_previous()
                         .map(|(translation, state)| (translation.clone(), state)),
                 );
+                propagation_was_current_rejected.push(target.was_current_rejected());
             }
             expected_outputs.push(
-                ExpectedTranslationOutput::try_new_with_previous_and_cancellation(
+                ExpectedTranslationOutput::try_new_with_rejected_state_and_cancellation(
                     expected.id,
                     expected.identity,
                     propagation_targets,
@@ -1590,6 +1614,8 @@ fn materialize_task_block(
                     propagation_state_contexts,
                     expected.expected_previous,
                     propagation_expected_previous,
+                    expected.was_current_rejected,
+                    propagation_was_current_rejected,
                     || ensure_planner_cpu_running(cancellation),
                 )
                 .map_err(|()| ScopeTaskPlanningFailure::Cancelled)?
@@ -1674,6 +1700,7 @@ struct ExpectedBase {
     language_analysis: LanguageAnalysis,
     state_context: TranslationStateContext,
     expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    was_current_rejected: bool,
 }
 
 pub(crate) fn expected_line_shape(identity: &TranslationUnitIdentity) -> ExpectedLineShape {
@@ -4165,6 +4192,13 @@ pattern = '保護対象'
 
         assert_eq!(preparation.invalidated(), 2);
         assert_eq!(preparation.invalidations().len(), 2);
+        assert_eq!(preparation.existing_rejected(), 0);
+        assert_eq!(preparation.rejected_after_preparation(), 2);
+        assert_eq!(
+            preparation.rejected_outside_tasks(),
+            0,
+            "两个 Rejected 都属于模型 Task"
+        );
         assert_eq!(tasks.len(), 1);
         let [expected] = tasks[0].expected_outputs() else {
             panic!("同一去重族应只要求一个模型结果")
@@ -4173,12 +4207,14 @@ pattern = '保護対象'
             expected.expected_previous().is_none(),
             "代表单元的旧译文会在请求前转入 Rejected，提交必须以空 Current 为基线"
         );
+        assert!(expected.was_current_rejected());
         assert_eq!(expected.propagation_targets().len(), 1);
         assert_eq!(
             expected.propagation_expected_previous(),
             &[None],
             "传播目标也必须使用各自 Preparation 完成后的空 Current 基线"
         );
+        assert_eq!(expected.propagation_was_current_rejected(), &[true]);
     }
 
     #[tokio::test]

@@ -22,6 +22,11 @@ pub(crate) struct GenericTaskRecordState {
 }
 
 impl GenericTaskRecordState {
+    #[cfg(test)]
+    pub(crate) const fn code_for_test(&self) -> &'static str {
+        self.code
+    }
+
     pub(crate) fn committed(
         complete: bool,
         accepted_ids: Vec<usize>,
@@ -29,11 +34,7 @@ impl GenericTaskRecordState {
         diagnostics: Vec<DiagnosticReport>,
     ) -> Self {
         Self {
-            code: if complete && diagnostics.is_empty() {
-                "complete"
-            } else {
-                "partial"
-            },
+            code: if complete { "complete" } else { "partial" },
             accepted_ids,
             written,
             diagnostics,
@@ -230,6 +231,9 @@ mod tests {
     use secrecy::SecretString;
 
     use super::*;
+    use crate::diagnostic::{
+        Diagnostic, RuntimeComponent, RuntimeIssue, RuntimeOperation, StateEffect,
+    };
 
     #[test]
     fn record_keeps_only_user_assistant_and_final_result() {
@@ -278,5 +282,20 @@ mod tests {
         );
 
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn caller_classified_complete_keeps_nonblocking_diagnostics() {
+        let review = DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::runtime(RuntimeIssue::Cancelled {
+                component: RuntimeComponent::Process,
+                operation: RuntimeOperation::ExecuteTask,
+            }),
+        );
+        let state = GenericTaskRecordState::committed(true, vec![0], 1, vec![review]);
+
+        assert_eq!(state.code_for_test(), "complete");
+        assert_eq!(state.diagnostics.len(), 1, "Review 仍应保留为旁路诊断");
     }
 }

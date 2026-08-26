@@ -593,6 +593,8 @@ pub(crate) struct TranslationWrite {
     pub(crate) translation: String,
     pub(crate) state_fingerprint: Sha256Fingerprint,
     pub(crate) expected_translation: Option<GenericStoredTranslation>,
+    /// 提交基线中该 Unit 是否是当前 Rejected。
+    pub(crate) was_current_rejected: bool,
 }
 
 /// 一个已绑定到当前 Generic Unit、准备原子替换的硬拒绝候选。
@@ -611,6 +613,8 @@ pub(crate) struct RejectedTranslationWrite {
     pub(crate) violation: ProvenInvariantViolation,
     pub(crate) planning_state: Sha256Fingerprint,
     pub(crate) expected_translation: Option<GenericStoredTranslation>,
+    /// 提交基线中该 Unit 是否已经是当前 Rejected。
+    pub(crate) was_current_rejected: bool,
 }
 
 /// 一条已经证明违反当前强不变量、准备以 CAS 转入 Rejected 的旧译文。
@@ -647,6 +651,7 @@ pub(crate) enum ExtractOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitTranslationsOutcome {
     pub(crate) committed: usize,
+    pub(crate) resolved_rejected: usize,
     pub(crate) conflicts: Vec<(String, String)>,
 }
 
@@ -655,6 +660,8 @@ pub(crate) struct CommitTranslationsOutcome {
 pub(crate) struct CommitTranslationResultsOutcome {
     pub(crate) committed: usize,
     pub(crate) rejected: usize,
+    pub(crate) resolved_rejected: usize,
+    pub(crate) newly_rejected: usize,
     pub(crate) conflicts: Vec<(String, String)>,
 }
 
@@ -662,6 +669,7 @@ impl CommitTranslationResultsOutcome {
     fn translations_only(self) -> CommitTranslationsOutcome {
         CommitTranslationsOutcome {
             committed: self.committed,
+            resolved_rejected: self.resolved_rejected,
             conflicts: self.conflicts,
         }
     }
@@ -1288,11 +1296,13 @@ impl GenericProjectStore {
                     }
                 }
                 let mut committed = 0;
+                let mut resolved_rejected = 0;
                 let mut conflicts = Vec::new();
                 for (write, applied) in writes.iter().zip(applied) {
                     self.ensure_not_cancelled()?;
                     if applied {
                         committed += 1;
+                        resolved_rejected += usize::from(write.was_current_rejected);
                         transaction
                             .execute(
                                 "DELETE FROM generic_rejected_translation
@@ -1311,6 +1321,7 @@ impl GenericProjectStore {
                     }
                 }
                 let mut rejected = 0_usize;
+                let mut newly_rejected = 0_usize;
                 for rejection in rejections {
                     self.ensure_not_cancelled()?;
                     let (expected_translation, expected_state) = rejection
@@ -1410,6 +1421,7 @@ impl GenericProjectStore {
                             source,
                         })?;
                     rejected += 1;
+                    newly_rejected += usize::from(!rejection.was_current_rejected);
                 }
                 if (committed > 0 || rejected > 0)
                     && let Some(profile_id) = profile_id
@@ -1429,6 +1441,8 @@ impl GenericProjectStore {
                 Ok(CommitTranslationResultsOutcome {
                     committed,
                     rejected,
+                    resolved_rejected,
+                    newly_rejected,
                     conflicts,
                 })
             },
@@ -1806,6 +1820,7 @@ impl GenericProjectStore {
                 }
                 Ok(CommitTranslationsOutcome {
                     committed,
+                    resolved_rejected: 0,
                     conflicts,
                 })
             },
@@ -6388,6 +6403,7 @@ mod tests {
                 translation: format!("译{}", unit.source_text()),
                 state_fingerprint: Sha256Fingerprint::from_bytes([7; 32]),
                 expected_translation: None,
+                was_current_rejected: false,
             })
             .collect::<Vec<_>>();
         store
@@ -6638,6 +6654,7 @@ mod tests {
             translation: "译文".to_owned(),
             state_fingerprint: Sha256Fingerprint::from_bytes([42; 32]),
             expected_translation: None,
+            was_current_rejected: false,
         };
 
         let outcome = store
@@ -6704,6 +6721,7 @@ mod tests {
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: state,
             expected_translation: None,
+            was_current_rejected: false,
         };
 
         let outcome = store
@@ -6715,6 +6733,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.rejected, 1);
+        assert_eq!(outcome.newly_rejected, 1);
+        assert_eq!(outcome.resolved_rejected, 0);
         let snapshot = store.load_snapshot().unwrap();
         let stored = snapshot.files()[0].groups()[0].units()[0]
             .rejected()
@@ -6736,6 +6756,8 @@ mod tests {
             .unwrap();
         assert_eq!(no_result.committed, 0);
         assert_eq!(no_result.rejected, 0);
+        assert_eq!(no_result.newly_rejected, 0);
+        assert_eq!(no_result.resolved_rejected, 0);
         let unchanged = store.load_snapshot().unwrap();
         assert_eq!(
             unchanged.files()[0].groups()[0].units()[0]
@@ -6745,6 +6767,21 @@ mod tests {
             rejected.candidate_json
         );
 
+        let repeated = store
+            .commit_translation_results_for_profile(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                &[RejectedTranslationWrite {
+                    was_current_rejected: true,
+                    ..rejected.clone()
+                }],
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(repeated.rejected, 1);
+        assert_eq!(repeated.newly_rejected, 0);
+        assert_eq!(repeated.resolved_rejected, 0);
+
         let write = TranslationWrite {
             group_id: rejected.group_id,
             unit_id: rejected.unit_id,
@@ -6753,6 +6790,7 @@ mod tests {
             translation: "译文".to_owned(),
             state_fingerprint: state,
             expected_translation: None,
+            was_current_rejected: true,
         };
         let outcome = store
             .commit_translation_results_for_profile(
@@ -6763,6 +6801,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.committed, 1);
+        assert_eq!(outcome.resolved_rejected, 1);
+        assert_eq!(outcome.newly_rejected, 0);
         let snapshot = store.load_snapshot().unwrap();
         let unit = &snapshot.files()[0].groups()[0].units()[0];
         assert_eq!(unit.translation().unwrap().translation(), "译文");
@@ -6803,6 +6843,7 @@ mod tests {
                     translation: "旧语境译文".to_owned(),
                     state_fingerprint: old_state,
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .unwrap();
@@ -6841,6 +6882,7 @@ mod tests {
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: current_state,
             expected_translation: Some(previous.clone()),
+            was_current_rejected: false,
         };
 
         let saved = store
@@ -6866,6 +6908,7 @@ mod tests {
             translation: "新语境译文".to_owned(),
             state_fingerprint: current_state,
             expected_translation: Some(previous),
+            was_current_rejected: false,
         };
         assert_eq!(
             store
@@ -6955,6 +6998,7 @@ mod tests {
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: Sha256Fingerprint::from_bytes([41; 32]),
             expected_translation: None,
+            was_current_rejected: false,
         };
         let current_outcome = store
             .commit_translation_results_for_profile(
@@ -7003,6 +7047,7 @@ mod tests {
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: Sha256Fingerprint::from_bytes([42; 32]),
             expected_translation: None,
+            was_current_rejected: false,
         };
 
         let outcome = store
@@ -7055,6 +7100,7 @@ mod tests {
                 translation: format!("译文-{}", unit.id()),
                 state_fingerprint: state,
                 expected_translation: None,
+                was_current_rejected: false,
             })
             .collect::<Vec<_>>();
         writes[1].expected_source_text = "错误原文".to_owned();
@@ -7090,6 +7136,7 @@ mod tests {
             translation: "人工并发修改后的新正文".to_owned(),
             state_fingerprint: Sha256Fingerprint::from_bytes([43; 32]),
             expected_translation: Some(previous),
+            was_current_rejected: false,
         };
         let outcome = store
             .commit_translations(
@@ -7176,6 +7223,7 @@ mod tests {
                         translation: "译文".to_owned(),
                         state_fingerprint: current_state,
                         expected_translation: None,
+                        was_current_rejected: false,
                     }],
                 )
                 .expect("测试译文应该可提交");
@@ -7277,6 +7325,7 @@ mod tests {
                     translation: "译文".to_owned(),
                     state_fingerprint: untagged,
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .expect("未标记状态的测试译文应该可提交");
@@ -7382,6 +7431,7 @@ mod tests {
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: untagged,
             expected_translation: None,
+            was_current_rejected: false,
         };
         assert_eq!(
             store
@@ -7478,6 +7528,7 @@ mod tests {
                     translation: "译文一".to_owned(),
                     state_fingerprint: untagged,
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .expect("未标记状态的测试译文应该可提交");
@@ -7522,6 +7573,7 @@ mod tests {
                         changed_group.context_fingerprint(),
                     ),
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .expect("CAS 冲突应作为可观察提交结果返回");
@@ -7585,6 +7637,7 @@ mod tests {
                     translation: "译文".to_owned(),
                     state_fingerprint: Sha256Fingerprint::from_bytes([31; 32]),
                     expected_translation: None,
+                    was_current_rejected: false,
                 }],
             )
             .expect("测试译文应该可提交");
@@ -8095,6 +8148,7 @@ mod tests {
                 translation: format!("译文-{}", unit.id()),
                 state_fingerprint: Sha256Fingerprint::from_bytes([8; 32]),
                 expected_translation: None,
+                was_current_rejected: false,
             })
             .collect::<Vec<_>>();
         store
