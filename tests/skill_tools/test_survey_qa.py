@@ -45,6 +45,7 @@ def write_jsonl(path: Path, values: Sequence[object]) -> None:
     path.write_text(
         "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in values),
         encoding="utf-8",
+        newline="\n",
     )
 
 

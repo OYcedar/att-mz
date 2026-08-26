@@ -159,8 +159,17 @@ att <mv或mz或generic> translation export --name <项目名> <工作目录>\tra
 python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations.jsonl --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa
 ```
 
-Generic 项目另传 `--generic-manifest <工作目录>\plan\generic\manifest.json`。首次静态 QA 不传实际
-`write_back` 和 NW.js 报告，因此没有静态问题时也只能是 `unverified`；它们只在最终合并 QA 时传入。
+上面的 Survey 模式用于 MV/MZ，以及由该 Survey 计划产生的 Generic；后一种另传
+`--generic-manifest <工作目录>\plan\generic\manifest.json`。没有 RPG Maker Survey 的独立 Generic
+项目不建立或猜测 manifest，改用当前 JSONL 输入根：
+
+```powershell
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations.jsonl --generic-input <Generic当前JSONL根> --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa
+```
+
+`--survey + --coverage` 与 `--generic-input` 是互斥证据；`--generic-manifest` 和
+`--runtime-report` 只用于 Survey 模式。首次静态 QA 不传实际 `write_back`，因此没有静态问题时
+也只能是 `unverified`；实际输出只在最终 QA 时传入。
 `qa_status` 只取 `clean`、`needs_review`、
 `unverified`；发现多少 Review 都不会拒绝已有结构合法译文。
 
@@ -186,6 +195,8 @@ apply 成功后重新导出当前译文并再做一次静态 QA；确认本轮�
 att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations-after-manual.jsonl
 python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations-after-manual.jsonl --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa-after-manual
 ```
+
+独立 Generic 在这一轮继续使用同一个 `--generic-input`，不得改回 Survey 参数或补造 manifest。
 
 ## WriteBack、最终运行观察和 QA
 
@@ -246,9 +257,18 @@ RPG Maker 的现有 Survey/coverage 也没有完整 WriteBack recipe，工具能
 不能证明每个自然 ID 的精确写回位置，因此保留
 `rpg_write_back_unit_mapping_unverified`；按验收指南检查真实差异和场景，不能把该项改写成已验证。
 
-Generic 项目另传 `--generic-manifest` 和实际 Generic `write_back`。当前没有通用的外部反向转换或游戏
-消费者报告格式，因此 Generic 最终 QA 保持 `unverified`，直到任务按已确认的外部消费过程另行取得并
-记录实际结果；不要为让工具显示 clean 手造报告。
+Survey 计划产生的 Generic 另传 `--generic-manifest` 和实际 Generic `write_back`。当前没有通用的
+外部反向转换或游戏消费者报告格式，因此 Generic 最终 QA 保持 `unverified`，直到任务按已确认的
+外部消费过程另行取得并记录实际结果；不要为让工具显示 clean 手造报告。
+
+独立 Generic 的最终 QA 使用当前输入和实际输出，不传 Survey 专用参数：
+
+```powershell
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations-after-manual.jsonl --generic-input <Generic当前JSONL根> --write-back <ATT项目目录>\write_back --terminology <任务根>\artifacts\rules\terminology.toml --output <任务根>\artifacts\qa\final
+```
+
+该模式会核对 JSONL 文件集合、完整自然 ID 顺序、Group/Unit 身份、Current 译文和保留原文；
+外部来源映射、反向转换与实际消费者仍分别保持 `unverified`，必须沿任务已经确认的外部流程验收。
 
 运行报告、用户实机检查或返修后新出现的可观察事实可以触发下一轮 Manual、WriteBack 和受影响场景复查；
 不得为了避免第二轮而在译前穷举无法确认的内容，也不得因同一静态问题重复返工。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从 ATT Translation export 和调查事实生成非阻断译后 QA。"""
+"""从 ATT Translation export 与 Survey 或 Generic 输入事实生成非阻断译后 QA。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import tomllib
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -57,16 +58,26 @@ _RUNTIME_SMOKE_SCENARIOS = ("title", "new_game", "dialogue", "menu", "quest_log"
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = ToolArgumentParser(description="扫描 ATT 当前译文、调查事实及可选运行证据，生成非阻断 QA。")
+    parser = ToolArgumentParser(description="扫描 ATT 当前译文、来源事实及可选输出证据，生成非阻断 QA。")
     subparsers = parser.add_subparsers(dest="command", required=True)
     scan = subparsers.add_parser("scan", help="扫描当前 Translation export")
     scan.add_argument("--translations", type=Path, required=True, help="ATT translation export JSONL")
-    scan.add_argument("--survey", type=Path, required=True, help="同一来源快照的 survey 作业目录")
-    scan.add_argument("--coverage", type=Path, required=True, help="同一次 finalize 生成的 coverage.json")
-    scan.add_argument("--generic-manifest", type=Path, help="finalize 生成的可选 Generic 精确映射")
+    evidence = scan.add_mutually_exclusive_group(required=True)
+    evidence.add_argument("--survey", type=Path, help="同一来源快照的 survey 作业目录")
+    evidence.add_argument("--generic-input", type=Path, help="独立 Generic 项目的当前 JSONL 输入根")
+    scan.add_argument("--coverage", type=Path, help="同一次 finalize 生成的 coverage.json")
+    scan.add_argument(
+        "--generic-manifest",
+        type=Path,
+        help="Survey finalize 生成的可选 Generic 精确映射",
+    )
     scan.add_argument("--terminology", type=Path, help="本次 Translate 使用的 terminology.toml")
     scan.add_argument("--write-back", type=Path, help="可选 ATT 当前项目的实际 write_back 目录")
-    scan.add_argument("--runtime-report", type=Path, help="可选 NW.js smoke/observe report.json")
+    scan.add_argument(
+        "--runtime-report",
+        type=Path,
+        help="Survey 模式可选的 NW.js smoke/observe report.json",
+    )
     scan.add_argument("--output", type=Path, required=True, help="QA 作业目录")
     scan.add_argument("--replace", action="store_true")
     manual = subparsers.add_parser("manual", help="只输出供 att manual export --ids 使用的自然 ID JSONL")
@@ -151,6 +162,205 @@ def _read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
     return read_translation_export(path)
 
 
+@dataclass(frozen=True)
+class _GenericTreeUnit:
+    manual_id: str
+    relative_path: str
+    group_id: str
+    kind: str
+    unit_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _GenericTree:
+    root: Path
+    files: tuple[str, ...]
+    units: tuple[_GenericTreeUnit, ...]
+    fact: dict[str, JsonValue]
+
+
+def _generic_jsonl_lines(path: Path, description: str) -> tuple[list[str], bytes]:
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(str(path), f"{description}不是有效 UTF-8：{error}", "修正 JSONL 后重新运行 QA")
+    normalized = text.replace("\r\n", "\n")
+    if "\r" in normalized:
+        fail(str(path), f"{description}包含非 CRLF 的 CR", "只使用 LF 或 CRLF 物理行")
+    if not normalized:
+        return [], raw
+    lines = normalized.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines, raw
+
+
+def _read_generic_tree(root_path: Path, description: str, *, only_jsonl: bool) -> _GenericTree:
+    root = require_directory(root_path, description)
+    all_files = sorted(
+        safe_walk_files(root),
+        key=lambda path: path.relative_to(root).as_posix().encode("utf-8"),
+    )
+    for path in all_files:
+        try:
+            link_count = path.stat().st_nlink
+        except OSError as error:
+            fail(str(path), f"无法读取文件身份：{error}", "修正文件系统错误后重新运行 QA")
+        if link_count != 1:
+            fail(str(path), f"文件有 {link_count} 个硬链接", "使用没有硬链接的当前 Generic 输入或输出")
+    non_jsonl = [path for path in all_files if path.suffix != ".jsonl"]
+    if only_jsonl and non_jsonl:
+        fail(
+            str(root),
+            f"{description}包含非 JSONL 文件 {non_jsonl[0].relative_to(root).as_posix()}",
+            "传入 ATT 当前 Generic 项目的实际 write_back 目录",
+        )
+    jsonl_files = [path for path in all_files if path.suffix == ".jsonl"]
+    digest = hashlib.sha256()
+    relative_files: list[str] = []
+    units: list[_GenericTreeUnit] = []
+    group_ids: set[str] = set()
+    group_count = 0
+    for path in jsonl_files:
+        relative = path.relative_to(root).as_posix()
+        relative_files.append(relative)
+        lines, raw = _generic_jsonl_lines(path, description)
+        if only_jsonl and (b"\r" in raw or (raw and not raw.endswith(b"\n"))):
+            fail(
+                str(path),
+                "Generic write_back 没有使用 LF，或非空文件末尾缺少 LF",
+                "重新执行 Generic WriteBack",
+            )
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(raw).digest())
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                fail(str(path), f"第 {line_number} 行为空", "删除空白物理行后重新运行 QA")
+            raw_group = parse_json_text(line, f"{path} 第 {line_number} 行")
+            if not isinstance(raw_group, dict):
+                fail(str(path), f"第 {line_number} 行不是 Group object", "修正 Generic JSONL")
+            group = dict(raw_group)
+            validate_object_keys(group, f"{path} 第 {line_number} 行", {"id", "kind", "units"})
+            if set(group) != {"id", "kind", "units"}:
+                fail(str(path), f"第 {line_number} 行缺少 Group 字段", "补齐 id、kind 和 units")
+            group_id = group.get("id")
+            kind = group.get("kind")
+            raw_units = group.get("units")
+            if (
+                not isinstance(group_id, str)
+                or group_id == ""
+                or group_id in group_ids
+                or not isinstance(kind, str)
+                or kind == ""
+                or not isinstance(raw_units, list)
+                or not raw_units
+            ):
+                fail(
+                    str(path),
+                    f"第 {line_number} 行 Group 身份重复、为空或 units 无效",
+                    "按 Generic JSONL 规格修正输入",
+                )
+            group_ids.add(group_id)
+            group_count += 1
+            unit_ids: set[str] = set()
+            for unit_number, raw_unit in enumerate(raw_units, start=1):
+                if not isinstance(raw_unit, dict):
+                    fail(
+                        str(path),
+                        f"第 {line_number} 行第 {unit_number} 项不是 Unit object",
+                        "修正 Generic JSONL",
+                    )
+                unit = dict(raw_unit)
+                validate_object_keys(
+                    unit,
+                    f"{path} 第 {line_number} 行第 {unit_number} 项",
+                    {"id", "text"},
+                )
+                if set(unit) != {"id", "text"}:
+                    fail(
+                        str(path),
+                        f"第 {line_number} 行第 {unit_number} 项缺少 Unit 字段",
+                        "补齐 id 和 text",
+                    )
+                unit_id = unit.get("id")
+                text = unit.get("text")
+                if (
+                    not isinstance(unit_id, str)
+                    or unit_id == ""
+                    or unit_id in unit_ids
+                    or not isinstance(text, str)
+                    or "\r" in text
+                    or "\0" in text
+                ):
+                    fail(
+                        str(path),
+                        f"第 {line_number} 行第 {unit_number} 项身份重复、为空或 text 无效",
+                        "按 Generic JSONL 规格修正输入",
+                    )
+                unit_ids.add(unit_id)
+                units.append(
+                    _GenericTreeUnit(
+                        manual_id=f"{relative}:line{line_number}:unit{unit_number}:text",
+                        relative_path=relative,
+                        group_id=group_id,
+                        kind=kind,
+                        unit_id=unit_id,
+                        text=text,
+                    )
+                )
+    return _GenericTree(
+        root=root,
+        files=tuple(relative_files),
+        units=tuple(units),
+        fact={
+            "path": str(root),
+            "files": len(relative_files),
+            "groups": group_count,
+            "units": len(units),
+            "sha256": digest.hexdigest(),
+        },
+    )
+
+
+def _standalone_generic_recipes(tree: _GenericTree) -> dict[str, dict[str, JsonValue]]:
+    return {
+        unit.manual_id: {
+            "input_file": f"generic/input/{unit.relative_path}",
+            "group_id": unit.group_id,
+            "kind": unit.kind,
+            "unit_id": unit.unit_id,
+            "source": unit.text,
+        }
+        for unit in tree.units
+    }
+
+
+def _bind_generic_export_to_input(rows: Sequence[Mapping[str, JsonValue]], tree: _GenericTree) -> None:
+    actual_ids = [cast(str, row["manual_id"]) for row in rows]
+    expected_ids = [unit.manual_id for unit in tree.units]
+    if actual_ids != expected_ids:
+        fail(
+            "Translation export",
+            "Generic 导出的自然 ID 集合或顺序与当前 JSONL 输入不一致",
+            "对该输入重新执行 Extract，再导出完整 translation export",
+        )
+    for row, unit in zip(rows, tree.units, strict=True):
+        if (
+            row.get("source") != unit.text.split("\n")
+            or row.get("type") != "free"
+            or row.get("owner") is not None
+            or row.get("rule_number") is not None
+        ):
+            fail(
+                "Translation export",
+                f"{unit.manual_id} 与当前 JSONL 输入的原文或 Generic 类型不一致",
+                "对该输入重新执行 Extract，再导出完整 translation export",
+            )
+
+
 def _generic_manifest(path: Path | None) -> dict[str, dict[str, JsonValue]] | None:
     if path is None:
         return None
@@ -182,6 +392,24 @@ def _generic_manifest(path: Path | None) -> dict[str, dict[str, JsonValue]] | No
         output[manual_id] = typed
         seen_candidates.add(candidate_id)
     return output
+
+
+def _generic_recipe_relative_path(recipe: Mapping[str, JsonValue], description: str) -> str:
+    input_file = recipe.get("input_file")
+    if not isinstance(input_file, str):
+        fail(description, "Generic recipe 缺少 input_file", "重新运行 rpg_maker_survey.py finalize")
+    parts = PurePosixPath(input_file).parts
+    if (
+        len(parts) < 3
+        or parts[:2] != ("generic", "input")
+        or ".." in parts
+        or PurePosixPath(input_file).as_posix() != input_file
+    ):
+        fail(description, "Generic recipe input_file 不在 generic/input 下", "重新运行 finalize")
+    relative = PurePosixPath(*parts[2:]).as_posix()
+    if not relative.endswith(".jsonl"):
+        fail(description, "Generic recipe input_file 不是 JSONL", "重新运行 finalize")
+    return relative
 
 
 def _coverage_projection(
@@ -821,7 +1049,10 @@ def _survey_findings(
 
 def _directory_fact(root: Path) -> dict[str, JsonValue]:
     digest = hashlib.sha256()
-    files = list(safe_walk_files(root))
+    files = sorted(
+        safe_walk_files(root),
+        key=lambda path: path.relative_to(root).as_posix().encode("utf-8"),
+    )
     for path in files:
         relative = path.relative_to(root).as_posix()
         raw = path.read_bytes()
@@ -839,6 +1070,14 @@ def _semantic_characters(value: str) -> str:
     )
 
 
+def _write_back_stable_characters(value: str) -> str:
+    return "".join(
+        character
+        for character in _CONTROL_SHAPE.sub("", value)
+        if unicodedata.category(character).startswith(("L", "M", "N", "S"))
+    )
+
+
 def _write_back_residual(source: str, expected_text: str, output_text: str) -> tuple[list[str], list[str]]:
     source_tokens = _text_tokens(source)
     actual = source_tokens.intersection(_text_tokens(output_text))
@@ -850,112 +1089,71 @@ def _generic_write_back_findings(
     root: Path,
     rows: Sequence[Mapping[str, JsonValue]],
     manifest: Mapping[str, Mapping[str, JsonValue]],
-) -> list[dict[str, JsonValue]]:
-    files = list(safe_walk_files(root))
-    actual_files = {path.relative_to(root).as_posix(): path for path in files}
-    if any(not relative.endswith(".jsonl") for relative in actual_files):
-        fail(
-            str(root), "Generic write_back 包含非 JSONL 文件", "传入 ATT 当前 Generic 项目的 write_back 目录"
-        )
-
-    expected_files: set[str] = set()
-    for recipe in manifest.values():
-        input_file = recipe.get("input_file")
-        if not isinstance(input_file, str):
-            fail("Generic manifest", "recipe 缺少 input_file", "重新运行 rpg_maker_survey.py finalize")
-        parts = PurePosixPath(input_file).parts
-        if len(parts) < 3 or parts[:2] != ("generic", "input"):
-            fail("Generic manifest", "recipe input_file 不在 generic/input 下", "重新运行 finalize")
-        expected_files.add(PurePosixPath(*parts[2:]).as_posix())
-    if set(actual_files) != expected_files:
+    *,
+    expected_files: set[str] | None,
+    strict_export_text: bool,
+) -> tuple[list[dict[str, JsonValue]], bool, dict[str, JsonValue]]:
+    tree = _read_generic_tree(root, "Generic write_back 目录", only_jsonl=True)
+    required_files = (
+        expected_files
+        if expected_files is not None
+        else {_generic_recipe_relative_path(recipe, "Generic manifest") for recipe in manifest.values()}
+    )
+    if set(tree.files) != required_files:
         fail(
             str(root),
-            "Generic write_back 文件集合与 manifest 不一致",
-            "传入该 manifest 对应 ATT 项目的最新 write_back 目录",
+            "Generic write_back 文件集合与当前输入不一致",
+            "重新执行该 Generic 项目的 WriteBack，并传入实际输出目录",
         )
-
-    actual_units: dict[str, tuple[str, str, str, str]] = {}
-    group_ids: set[str] = set()
-    for relative in sorted(actual_files, key=lambda value: value.encode("utf-8")):
-        path = actual_files[relative]
-        for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
-            if not line.strip():
-                fail(str(path), f"第 {line_number} 行为空", "重新执行 Generic WriteBack")
-            raw_group = parse_json_text(line, f"{path} 第 {line_number} 行")
-            if not isinstance(raw_group, dict):
-                fail(str(path), f"第 {line_number} 行不是 Group object", "重新执行 Generic WriteBack")
-            group = dict(raw_group)
-            validate_object_keys(group, f"{path} 第 {line_number} 行", {"id", "kind", "units"})
-            group_id = group.get("id")
-            kind = group.get("kind")
-            units = group.get("units")
-            if (
-                not isinstance(group_id, str)
-                or not group_id
-                or group_id in group_ids
-                or not isinstance(kind, str)
-                or not kind
-                or not isinstance(units, list)
-                or not units
-            ):
-                fail(str(path), f"第 {line_number} 行 Group 身份或 units 无效", "重新执行 Generic WriteBack")
-            group_ids.add(group_id)
-            unit_ids: set[str] = set()
-            for unit_number, raw_unit in enumerate(units, start=1):
-                if not isinstance(raw_unit, dict):
-                    fail(
-                        str(path),
-                        f"第 {line_number} 行第 {unit_number} 项不是 Unit object",
-                        "重新执行 WriteBack",
-                    )
-                unit = dict(raw_unit)
-                validate_object_keys(
-                    unit,
-                    f"{path} 第 {line_number} 行第 {unit_number} 项",
-                    {"id", "text"},
-                )
-                unit_id = unit.get("id")
-                text = unit.get("text")
-                if (
-                    not isinstance(unit_id, str)
-                    or not unit_id
-                    or unit_id in unit_ids
-                    or not isinstance(text, str)
-                    or "\r" in text
-                    or "\0" in text
-                ):
-                    fail(
-                        str(path), f"第 {line_number} 行第 {unit_number} 项无效", "重新执行 Generic WriteBack"
-                    )
-                unit_ids.add(unit_id)
-                manual_id = f"{relative}:line{line_number}:unit{unit_number}:text"
-                actual_units[manual_id] = (group_id, kind, unit_id, text)
-
+    actual_units = {unit.manual_id: unit for unit in tree.units}
     if set(actual_units) != set(manifest):
         fail(
             str(root),
-            "Generic write_back Unit 集合与 manifest 不一致",
-            "传入该 manifest 对应 ATT 项目的最新 write_back 目录",
+            "Generic write_back Unit 集合与当前输入不一致",
+            "重新执行该 Generic 项目的 WriteBack",
         )
     exported = {cast(str, row["manual_id"]): row for row in rows}
     findings: list[dict[str, JsonValue]] = []
+    transformed_current = False
     for manual_id, recipe in manifest.items():
-        group_id, kind, unit_id, output_text = actual_units[manual_id]
+        actual = actual_units[manual_id]
+        output_text = actual.text
         if (
-            group_id != recipe.get("group_id")
-            or kind != recipe.get("kind")
-            or unit_id != recipe.get("unit_id")
+            actual.relative_path != _generic_recipe_relative_path(recipe, "Generic recipe")
+            or actual.group_id != recipe.get("group_id")
+            or actual.kind != recipe.get("kind")
+            or actual.unit_id != recipe.get("unit_id")
         ):
             fail(
-                str(root), f"{manual_id} 的 Group、Unit 身份或 kind 与 manifest 不一致", "重新执行 WriteBack"
+                str(root),
+                f"{manual_id} 的 Group、Unit 身份或 kind 与当前输入不一致",
+                "重新执行 WriteBack",
             )
         row = exported[manual_id]
         source = "\n".join(cast(list[str], row["source"]))
         if row.get("state") == "current":
             expected_text = "\n".join(cast(list[str], row["translation"]))
+            if strict_export_text and output_text != expected_text:
+                same_semantic_text = _write_back_stable_characters(
+                    output_text
+                ) == _write_back_stable_characters(expected_text)
+                same_controls = _CONTROL_SHAPE.findall(output_text) == _CONTROL_SHAPE.findall(expected_text)
+                if not same_semantic_text or not same_controls:
+                    fail(
+                        str(root),
+                        f"{manual_id} 的 WriteBack 正文不对应 Current 译文",
+                        "用当前 translation export 重新执行 Generic WriteBack",
+                    )
+                transformed_current = True
         else:
             expected_text = source
             if output_text != source:
+                if strict_export_text:
+                    fail(
+                        str(root),
+                        f"{manual_id} 的未接受正文没有保留当前原文",
+                        "用当前 translation export 重新执行 Generic WriteBack",
+                    )
                 findings.append(
                     _finding(
                         "write_back_unaccepted_text_changed",
@@ -992,7 +1190,21 @@ def _generic_write_back_findings(
                     },
                 )
             )
-    return findings
+    if _read_generic_tree(root, "Generic write_back 目录", only_jsonl=True) != tree:
+        fail(
+            str(root),
+            "Generic write_back 在 QA 期间发生变化",
+            "等待 WriteBack 输出稳定后重新执行完整 QA",
+        )
+    return (
+        findings,
+        transformed_current,
+        {
+            "path": tree.fact["path"],
+            "files": tree.fact["files"],
+            "sha256": tree.fact["sha256"],
+        },
+    )
 
 
 def _rpg_output_relative(manual_id: str, engine: str) -> str | None:
@@ -1094,7 +1306,9 @@ def _write_back_findings(
     manifest: Mapping[str, Mapping[str, JsonValue]] | None,
     *,
     generic_project: bool,
-    engine: str,
+    engine: str | None,
+    generic_expected_files: set[str] | None = None,
+    strict_generic_text: bool = False,
 ) -> tuple[list[dict[str, JsonValue]], list[str], Path | None, dict[str, JsonValue] | None]:
     if path is None:
         return [], ["write_back_output_missing"], None, None
@@ -1102,8 +1316,17 @@ def _write_back_findings(
     if generic_project:
         if manifest is None:
             return [], ["generic_manifest_missing"], root, _directory_fact(root)
-        findings = _generic_write_back_findings(root, rows, manifest)
-        return findings, [], root, _directory_fact(root)
+        findings, transformed_current, write_back_fact = _generic_write_back_findings(
+            root,
+            rows,
+            manifest,
+            expected_files=generic_expected_files,
+            strict_export_text=strict_generic_text,
+        )
+        unverified = ["generic_write_back_text_transform_unverified"] if transformed_current else []
+        return findings, unverified, root, write_back_fact
+    if engine not in {"mv", "mz"}:
+        fail("Survey", "RPG Maker QA 缺少有效引擎", "重新运行 survey scan/finalize")
     findings, unverified = _rpg_write_back_findings(root, rows, engine)
     return findings, unverified, root, _directory_fact(root)
 
@@ -1654,96 +1877,204 @@ def _runtime_findings(
 def _scan(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     translations_path = require_file(args.translations, "ATT Translation export JSONL")
-    survey_root = require_directory(args.survey, "survey 作业目录")
-    coverage_path = require_file(args.coverage, "finalize coverage.json")
-    rules_manifest_path = require_file(
-        coverage_path.with_name("rules-manifest.json"),
-        "同一次 finalize 生成的 rules-manifest.json",
-    )
+    translation_export_fact = _file_fact(translations_path, "ATT Translation export JSONL")
+    survey_path = cast(Path | None, args.survey)
+    generic_input_path = cast(Path | None, args.generic_input)
+    coverage_argument = cast(Path | None, args.coverage)
     generic_manifest_path = cast(Path | None, args.generic_manifest)
     terminology_path = cast(Path | None, args.terminology)
     write_back_path = cast(Path | None, args.write_back)
     runtime_path = cast(Path | None, args.runtime_report)
-    inputs = [translations_path, survey_root, coverage_path, rules_manifest_path]
+    standalone_generic = generic_input_path is not None
+    if standalone_generic:
+        if coverage_argument is not None:
+            fail("--coverage", "standalone Generic 模式不接受 coverage", "删除 --coverage")
+        if generic_manifest_path is not None:
+            fail(
+                "--generic-manifest",
+                "standalone Generic 模式不接受 Survey 生成的 manifest",
+                "删除 --generic-manifest，直接使用 --generic-input",
+            )
+        if runtime_path is not None:
+            fail(
+                "--runtime-report",
+                "standalone Generic 模式不接受 RPG Maker Survey 运行报告",
+                "删除 --runtime-report，并在任务中另行验证实际 Generic 消费者",
+            )
+    elif coverage_argument is None:
+        fail("--coverage", "Survey 模式缺少 coverage", "同时提供 --survey 与 --coverage")
+
+    inputs = [translations_path]
+    survey_root = require_directory(survey_path, "survey 作业目录") if survey_path is not None else None
+    generic_input_root = (
+        require_directory(generic_input_path, "Generic JSONL 输入根")
+        if generic_input_path is not None
+        else None
+    )
+    coverage_path = (
+        require_file(coverage_argument, "finalize coverage.json") if coverage_argument is not None else None
+    )
+    rules_manifest_path = (
+        require_file(
+            coverage_path.with_name("rules-manifest.json"),
+            "同一次 finalize 生成的 rules-manifest.json",
+        )
+        if coverage_path is not None
+        else None
+    )
+    inputs.extend(
+        path
+        for path in (survey_root, generic_input_root, coverage_path, rules_manifest_path)
+        if path is not None
+    )
     inputs.extend(
         path
         for path in (generic_manifest_path, terminology_path, write_back_path, runtime_path)
         if path is not None
     )
     protect_outputs([args.output], inputs=inputs, replace=args.replace)
-    survey, locations, groups, baseline = load_survey(survey_root)
-    if write_back_path is not None or runtime_path is not None:
-        verify_source_baseline(survey, baseline)
     rows = _read_translation_export(translations_path)
-    rules_manifest = read_rules_manifest(rules_manifest_path)
-    coverage_projection, generic_candidates, coverage_complete = _coverage_projection(
-        coverage_path,
-        survey,
-        locations,
-        groups,
-        rules_manifest,
-    )
-    generic_manifest = _generic_manifest(generic_manifest_path)
-    owner_values: set[str | None] = set()
-    for row in rows:
-        owner = row.get("owner")
-        owner_values.add(owner if isinstance(owner, str) else None)
-    if None in owner_values and len(owner_values) > 1:
-        fail(str(translations_path), "RPG Maker 与 Generic 导出不能混在一个文件", "分别执行译后 QA")
-    generic_project = generic_manifest is not None or owner_values == {None}
-    if generic_project and any(row.get("owner") is not None for row in rows):
+
+    survey: dict[str, JsonValue] | None
+    locations: list[dict[str, JsonValue]]
+    baseline: dict[str, JsonValue] | None
+    generic_tree: _GenericTree | None
+    generic_expected_files: set[str] | None
+    if standalone_generic:
+        assert generic_input_root is not None
+        survey = None
+        locations = []
+        baseline = None
+        generic_tree = _read_generic_tree(generic_input_root, "Generic JSONL 输入根", only_jsonl=False)
+        generic_recipes = _standalone_generic_recipes(generic_tree)
+        generic_expected_files = set(generic_tree.files)
+        coverage_complete = None
+        generic_project = True
+        _bind_generic_export_to_input(rows, generic_tree)
+    else:
+        assert survey_root is not None
+        assert coverage_path is not None
+        assert rules_manifest_path is not None
+        survey, locations, groups, baseline = load_survey(survey_root)
+        if write_back_path is not None or runtime_path is not None:
+            verify_source_baseline(survey, baseline)
+        rules_manifest = read_rules_manifest(rules_manifest_path)
+        coverage_projection, generic_candidates, coverage_complete = _coverage_projection(
+            coverage_path,
+            survey,
+            locations,
+            groups,
+            rules_manifest,
+        )
+        generic_tree = None
+        generic_expected_files = None
+        generic_recipes = _generic_manifest(generic_manifest_path)
+        owner_values: set[str | None] = set()
+        for row in rows:
+            owner = row.get("owner")
+            owner_values.add(owner if isinstance(owner, str) else None)
+        if None in owner_values and len(owner_values) > 1:
+            fail(
+                str(translations_path),
+                "RPG Maker 与 Generic 导出不能混在一个文件",
+                "分别执行译后 QA",
+            )
+        generic_project = generic_recipes is not None or owner_values == {None}
+        if generic_project and any(row.get("owner") is not None for row in rows):
+            fail(
+                str(translations_path),
+                "Generic manifest 与 RPG Maker Translation export 不匹配",
+                "使用对应项目的导出",
+            )
+        if generic_project:
+            if generic_recipes is not None:
+                _bind_generic_manifest(generic_recipes, generic_candidates, locations)
+                _bind_generic_export_to_manifest(rows, generic_recipes)
+        else:
+            if generic_recipes is not None:
+                fail(
+                    str(generic_manifest_path),
+                    "RPG Maker Translation export 不应附带 Generic manifest",
+                    "只为对应 Generic 项目单独执行 QA",
+                )
+            _bind_rpg_export_to_coverage(rows, coverage_projection)
+
+    if standalone_generic and any(row.get("owner") is not None for row in rows):
         fail(
             str(translations_path),
-            "Generic manifest 与 RPG Maker Translation export 不匹配",
-            "使用对应项目的导出",
+            "standalone Generic 输入与 RPG Maker Translation export 不匹配",
+            "使用该 Generic 项目的完整 translation export",
         )
-    if generic_project:
-        if generic_manifest is not None:
-            _bind_generic_manifest(generic_manifest, generic_candidates, locations)
-            _bind_generic_export_to_manifest(rows, generic_manifest)
-    else:
-        if generic_manifest is not None:
-            fail(
-                str(generic_manifest_path),
-                "RPG Maker Translation export 不应附带 Generic manifest",
-                "只为对应 Generic 项目单独执行 QA",
-            )
-        _bind_rpg_export_to_coverage(rows, coverage_projection)
     terms = _terminology(terminology_path)
     findings = [finding for row in rows for finding in _translation_findings(row, terms)]
-    findings.extend(
-        _survey_findings(
-            locations,
-            {cast(str, row["manual_id"]) for row in rows},
-            check_builtin=not generic_project,
+    if not standalone_generic:
+        findings.extend(
+            _survey_findings(
+                locations,
+                {cast(str, row["manual_id"]) for row in rows},
+                check_builtin=not generic_project,
+            )
         )
-    )
     # 现行 Translation export 没有项目目标语言；精确源文残留只能形成 Review，
     # 即使写回和运行证据齐全，也不能据此证明全量语言方向正确。
     unverified: list[str] = ["translation_language_pair_unbound"]
-    if generic_project and generic_manifest is None:
+    if standalone_generic:
+        unverified.extend(
+            [
+                "generic_external_source_mapping_unverified",
+                "generic_reverse_conversion_unverified",
+                "generic_actual_consumer_unverified",
+            ]
+        )
+    elif generic_project and generic_recipes is None:
         unverified.append("generic_manifest_missing")
-    if not coverage_complete:
+    if coverage_complete is False:
         unverified.append("survey_coverage_incomplete")
     write_back_findings, write_back_unverified, write_back_root, write_back_fact = _write_back_findings(
         write_back_path,
         rows,
-        generic_manifest,
+        generic_recipes,
         generic_project=generic_project,
-        engine=cast(str, survey["engine"]),
+        engine=cast(str, survey["engine"]) if survey is not None else None,
+        generic_expected_files=generic_expected_files,
+        strict_generic_text=standalone_generic,
     )
-    runtime_findings, runtime_unverified = _runtime_findings(
-        runtime_path,
-        survey,
-        baseline,
-        write_back_root,
-        generic_project=generic_project,
-    )
+    if standalone_generic:
+        runtime_findings: list[dict[str, JsonValue]] = []
+        runtime_unverified: list[str] = []
+    else:
+        assert survey is not None
+        assert baseline is not None
+        runtime_findings, runtime_unverified = _runtime_findings(
+            runtime_path,
+            survey,
+            baseline,
+            write_back_root,
+            generic_project=generic_project,
+        )
     findings.extend(write_back_findings)
     findings.extend(runtime_findings)
     unverified.extend(write_back_unverified)
     unverified.extend(runtime_unverified)
     unverified = list(dict.fromkeys(unverified))
+    if generic_tree is not None:
+        refreshed_tree = _read_generic_tree(
+            generic_tree.root,
+            "Generic JSONL 输入根",
+            only_jsonl=False,
+        )
+        if refreshed_tree != generic_tree:
+            fail(
+                str(generic_tree.root),
+                "Generic JSONL 输入在 QA 期间发生变化",
+                "等待输入稳定后重新执行完整 QA",
+            )
+    if _file_fact(translations_path, "ATT Translation export JSONL") != translation_export_fact:
+        fail(
+            str(translations_path),
+            "Translation export 在 QA 期间发生变化",
+            "等待导出稳定后重新执行完整 QA",
+        )
     for number, finding in enumerate(findings, start=1):
         finding["finding_id"] = f"finding-{number:06d}"
     review_groups = _group_heuristic_findings(findings)
@@ -1758,9 +2089,7 @@ def _scan(args: argparse.Namespace) -> int:
     heuristic_findings = sum(finding.get("analysis_status") == "heuristic_review" for finding in findings)
     summary: dict[str, JsonValue] = {
         "qa_status": status,
-        "translation_export": _file_fact(translations_path, "ATT Translation export JSONL"),
-        "coverage": _file_fact(coverage_path, "finalize coverage.json"),
-        "rules_manifest": _file_fact(rules_manifest_path, "rules-manifest.json"),
+        "translation_export": translation_export_fact,
         "write_back": write_back_fact,
         "translations": len(rows),
         "findings": len(findings),
@@ -1769,8 +2098,16 @@ def _scan(args: argparse.Namespace) -> int:
         "counts": dict(sorted(counts.items())),
         "revision_ids": revision_ids,
         "unverified": unverified,
-        "survey_game_root": survey.get("game_root", ""),
     }
+    if generic_tree is not None:
+        summary["generic_input"] = generic_tree.fact
+    else:
+        assert coverage_path is not None
+        assert rules_manifest_path is not None
+        assert survey is not None
+        summary["coverage"] = _file_fact(coverage_path, "finalize coverage.json")
+        summary["rules_manifest"] = _file_fact(rules_manifest_path, "rules-manifest.json")
+        summary["survey_game_root"] = survey.get("game_root", "")
     metrics: dict[str, JsonValue] = {
         "translation_entries_scanned": len(rows),
         "survey_locations_checked": len(locations),
@@ -1817,7 +2154,32 @@ def _manual(args: argparse.Namespace) -> int:
     current = _file_fact(Path(path_value), "QA 使用的 Translation export")
     if current["bytes"] != bytes_value or current["sha256"] != digest_value:
         fail(path_value, "Translation export 在 QA 后发生变化", "重新运行 translation_qa.py scan")
-    protect_outputs([args.output], inputs=[scan_root, Path(path_value)], replace=args.replace)
+    protected_inputs = [scan_root, Path(path_value)]
+    generic_input_fact = summary.get("generic_input")
+    if generic_input_fact is not None:
+        if not isinstance(generic_input_fact, dict):
+            fail(str(scan_root), "QA 摘要的 Generic 输入基线无效", "重新运行 translation_qa.py scan")
+        expected_path = generic_input_fact.get("path")
+        if not isinstance(expected_path, str):
+            fail(str(scan_root), "QA 摘要缺少 Generic 输入路径", "重新运行 translation_qa.py scan")
+        current_tree = _read_generic_tree(
+            Path(expected_path), "QA 使用的 Generic JSONL 输入根", only_jsonl=False
+        )
+        if current_tree.fact != generic_input_fact:
+            fail(expected_path, "Generic JSONL 输入在 QA 后发生变化", "重新运行 translation_qa.py scan")
+        protected_inputs.append(current_tree.root)
+    write_back_fact = summary.get("write_back")
+    if write_back_fact is not None:
+        if not isinstance(write_back_fact, dict):
+            fail(str(scan_root), "QA 摘要的 WriteBack 基线无效", "重新运行 translation_qa.py scan")
+        write_back_path = write_back_fact.get("path")
+        if not isinstance(write_back_path, str):
+            fail(str(scan_root), "QA 摘要缺少 WriteBack 路径", "重新运行 translation_qa.py scan")
+        write_back_root = require_directory(Path(write_back_path), "QA 使用的 WriteBack 目录")
+        if _directory_fact(write_back_root) != write_back_fact:
+            fail(write_back_path, "WriteBack 输出在 QA 后发生变化", "重新运行 translation_qa.py scan")
+        protected_inputs.append(write_back_root)
+    protect_outputs([args.output], inputs=protected_inputs, replace=args.replace)
     selected_groups = cast(list[str], args.review_group)
     if len(selected_groups) != len(set(selected_groups)) or any(not value for value in selected_groups):
         fail("--review-group", "Review 组为空或重复", "每个 review_group_id 只传一次")

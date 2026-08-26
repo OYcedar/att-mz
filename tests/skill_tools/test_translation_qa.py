@@ -35,10 +35,114 @@ def write_json(path: Path, value: object) -> None:
 
 
 def write_jsonl(path: Path, values: Sequence[object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in values),
         encoding="utf-8",
+        newline="\n",
     )
+
+
+def write_standalone_generic_input(tmp_path: Path) -> tuple[Path, list[dict[str, object]]]:
+    root = tmp_path / "generic-input"
+    (root / "story").mkdir(parents=True)
+    (root / "empty.jsonl").write_text("", encoding="utf-8")
+    (root / "ignored.txt").write_text("ordinary ignored file", encoding="utf-8")
+    groups = [
+        {
+            "id": "opening",
+            "kind": "dialogue",
+            "units": [
+                {"id": "line-1", "text": "Start\nNow"},
+                {"id": "line-2", "text": "Name: Alice"},
+            ],
+        },
+        {
+            "id": "menu",
+            "kind": "ui",
+            "units": [{"id": "start", "text": "Begin"}],
+        },
+    ]
+    write_jsonl(root / "story" / "dialogue.jsonl", groups)
+    rows: list[dict[str, object]] = [
+        {
+            "manual_id": "story/dialogue.jsonl:line1:unit1:text",
+            "source": ["Start", "Now"],
+            "translation": ["开始", "现在"],
+            "state": "current",
+            "origin": "automatic",
+            "type": "free",
+        },
+        {
+            "manual_id": "story/dialogue.jsonl:line1:unit2:text",
+            "source": ["Name: Alice"],
+            "translation": ["名称：爱丽丝"],
+            "state": "current",
+            "origin": "manual",
+            "type": "free",
+        },
+        {
+            "manual_id": "story/dialogue.jsonl:line2:unit1:text",
+            "source": ["Begin"],
+            "translation": ["开始游戏"],
+            "state": "current",
+            "origin": "automatic",
+            "type": "free",
+        },
+    ]
+    return root, rows
+
+
+def write_standalone_generic_write_back(tmp_path: Path, rows: Sequence[Mapping[str, object]]) -> Path:
+    root = tmp_path / "generic-write-back"
+    (root / "story").mkdir(parents=True)
+    (root / "empty.jsonl").write_text("", encoding="utf-8")
+    by_id = {cast(str, row["manual_id"]): row for row in rows}
+    write_jsonl(
+        root / "story" / "dialogue.jsonl",
+        [
+            {
+                "id": "opening",
+                "kind": "dialogue",
+                "units": [
+                    {
+                        "id": "line-1",
+                        "text": "\n".join(
+                            cast(
+                                list[str],
+                                by_id["story/dialogue.jsonl:line1:unit1:text"]["translation"],
+                            )
+                        ),
+                    },
+                    {
+                        "id": "line-2",
+                        "text": "\n".join(
+                            cast(
+                                list[str],
+                                by_id["story/dialogue.jsonl:line1:unit2:text"]["translation"],
+                            )
+                        ),
+                    },
+                ],
+            },
+            {
+                "id": "menu",
+                "kind": "ui",
+                "units": [
+                    {
+                        "id": "start",
+                        "text": "\n".join(
+                            cast(
+                                list[str],
+                                by_id["story/dialogue.jsonl:line2:unit1:text"]["translation"],
+                            )
+                        ),
+                    }
+                ],
+            },
+        ],
+    )
+    return root
 
 
 def png_bytes(width: int = 80, height: int = 80) -> bytes:
@@ -382,6 +486,311 @@ def _complete_rpg_qa_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     write_back = write_rpg_write_back(tmp_path, rows)
     runtime = write_runtime_report(tmp_path, write_back)
     return translations, survey, coverage, write_back, runtime
+
+
+def test_standalone_generic_qa_binds_input_export_write_back_and_manual_output(tmp_path: Path) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    write_back = write_standalone_generic_write_back(tmp_path, rows)
+    output = tmp_path / "generic-qa"
+
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--write-back",
+            write_back,
+            "--output",
+            output,
+        ]
+    )
+    summary = json.loads((output / "qa-summary.json").read_text(encoding="utf-8"))
+    assert summary["qa_status"] == "unverified"
+    assert "coverage" not in summary
+    assert "rules_manifest" not in summary
+    assert summary["generic_input"]["files"] == 2
+    assert summary["generic_input"]["groups"] == 2
+    assert summary["generic_input"]["units"] == 3
+    assert summary["findings"] == 0
+    assert summary["unverified"] == [
+        "translation_language_pair_unbound",
+        "generic_external_source_mapping_unverified",
+        "generic_reverse_conversion_unverified",
+        "generic_actual_consumer_unverified",
+    ]
+    assert (output / "findings.jsonl").read_text(encoding="utf-8") == ""
+    assert (output / "review-groups.jsonl").read_text(encoding="utf-8") == ""
+
+    manual_ids = tmp_path / "manual-ids.jsonl"
+    run_script(["manual", "--scan", output, "--output", manual_ids])
+    assert manual_ids.read_text(encoding="utf-8") == ""
+
+
+def test_standalone_generic_qa_marks_missing_write_back_and_external_consumers_unverified(
+    tmp_path: Path,
+) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    output = tmp_path / "generic-qa"
+
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--output",
+            output,
+        ]
+    )
+    summary = json.loads((output / "qa-summary.json").read_text(encoding="utf-8"))
+    assert summary["qa_status"] == "unverified"
+    assert "write_back_output_missing" in summary["unverified"]
+    assert "generic_external_source_mapping_unverified" in summary["unverified"]
+    assert "generic_reverse_conversion_unverified" in summary["unverified"]
+    assert "generic_actual_consumer_unverified" in summary["unverified"]
+
+
+def test_standalone_generic_manual_rechecks_the_input_baseline(tmp_path: Path) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    output = tmp_path / "generic-qa"
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--output",
+            output,
+        ]
+    )
+    source = generic_input / "story" / "dialogue.jsonl"
+    source.write_text(
+        source.read_text(encoding="utf-8").replace('"Begin"', '"Begin now"'),
+        encoding="utf-8",
+    )
+
+    result = run_script(
+        ["manual", "--scan", output, "--output", tmp_path / "manual-ids.jsonl"],
+        expected=1,
+    )
+    assert "Generic JSONL 输入在 QA 后发生变化" in result.stderr
+
+
+@pytest.mark.parametrize("corruption", ["order", "source"])
+def test_standalone_generic_qa_rejects_translation_export_mismatch(tmp_path: Path, corruption: str) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    if corruption == "order":
+        rows[0], rows[1] = rows[1], rows[0]
+    else:
+        rows[0]["source"] = ["Different source"]
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+
+    result = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--output",
+            tmp_path / "generic-qa",
+        ],
+        expected=1,
+    )
+    assert "当前 JSONL 输入" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing_file", "group_identity", "current_text", "invalid_line_endings"]
+)
+def test_standalone_generic_qa_rejects_write_back_structure_or_text_mismatch(
+    tmp_path: Path, corruption: str
+) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    write_back = write_standalone_generic_write_back(tmp_path, rows)
+    if corruption == "missing_file":
+        (write_back / "empty.jsonl").unlink()
+    elif corruption != "invalid_line_endings":
+        output_file = write_back / "story" / "dialogue.jsonl"
+        groups = [json.loads(line) for line in output_file.read_text(encoding="utf-8").splitlines()]
+        if corruption == "group_identity":
+            groups[0]["id"] = "different-group"
+        else:
+            groups[0]["units"][0]["text"] = "完全不同的正文"
+        write_jsonl(output_file, groups)
+    else:
+        output_file = write_back / "story" / "dialogue.jsonl"
+        output_file.write_bytes(output_file.read_bytes().replace(b"\n", b"\r\n"))
+
+    result = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--write-back",
+            write_back,
+            "--output",
+            tmp_path / "generic-qa",
+        ],
+        expected=1,
+    )
+    assert "WriteBack" in result.stderr or "write_back" in result.stderr
+
+
+def test_standalone_generic_qa_accepts_retained_source_and_marks_layout_transform_unverified(
+    tmp_path: Path,
+) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    write_back = write_standalone_generic_write_back(tmp_path, rows)
+    rows[1]["translation"] = None
+    rows[1]["state"] = "pending"
+    rows[1]["origin"] = "none"
+    output_file = write_back / "story" / "dialogue.jsonl"
+    groups = [json.loads(line) for line in output_file.read_text(encoding="utf-8").splitlines()]
+    groups[0]["units"][1]["text"] = "Name: Alice"
+    groups[1]["units"][0]["text"] = "开始\n游戏"
+    write_jsonl(output_file, groups)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    output = tmp_path / "generic-qa"
+
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--write-back",
+            write_back,
+            "--output",
+            output,
+        ]
+    )
+    summary = json.loads((output / "qa-summary.json").read_text(encoding="utf-8"))
+    assert summary["qa_status"] == "needs_review"
+    assert summary["counts"]["extracted_not_translated"] == 1
+    assert "generic_write_back_text_transform_unverified" in summary["unverified"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (["--coverage", "unused.json"], "standalone Generic 模式不接受 coverage"),
+        (["--generic-manifest", "unused.json"], "standalone Generic 模式不接受 Survey"),
+        (["--runtime-report", "unused.json"], "standalone Generic 模式不接受 RPG Maker"),
+    ],
+)
+def test_standalone_generic_evidence_rejects_survey_only_options(
+    tmp_path: Path, extra: list[str], expected: str
+) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    result = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            *extra,
+            "--output",
+            tmp_path / "generic-qa",
+        ],
+        expected=1,
+    )
+    assert expected in result.stderr
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["blank_line", "duplicate_key", "unknown_field", "duplicate_group", "invalid_text"],
+)
+def test_standalone_generic_input_uses_the_strict_jsonl_contract(tmp_path: Path, corruption: str) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    source = generic_input / "story" / "dialogue.jsonl"
+    groups = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+    if corruption == "blank_line":
+        source.write_text("\n" + source.read_text(encoding="utf-8"), encoding="utf-8")
+    elif corruption == "duplicate_key":
+        source.write_text(
+            '{"id":"a","id":"b","kind":"x","units":[{"id":"u","text":"t"}]}\n', encoding="utf-8"
+        )
+    elif corruption == "unknown_field":
+        groups[0]["extra"] = True
+        write_jsonl(source, groups)
+    elif corruption == "duplicate_group":
+        groups[1]["id"] = groups[0]["id"]
+        write_jsonl(source, groups)
+    else:
+        groups[0]["units"][0]["text"] = "bad\rtext"
+        write_jsonl(source, groups)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--generic-input",
+            generic_input,
+            "--output",
+            tmp_path / "generic-qa",
+        ],
+        expected=1,
+    )
+
+
+def test_scan_requires_exactly_one_complete_evidence_mode(tmp_path: Path) -> None:
+    generic_input, rows = write_standalone_generic_input(tmp_path)
+    translations = tmp_path / "generic-translations.jsonl"
+    write_jsonl(translations, rows)
+    both = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            generic_input,
+            "--generic-input",
+            generic_input,
+            "--output",
+            tmp_path / "both",
+        ],
+        expected=2,
+    )
+    assert "not allowed with argument" in both.stderr
+
+    missing_coverage = run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            generic_input,
+            "--output",
+            tmp_path / "missing-coverage",
+        ],
+        expected=1,
+    )
+    assert "Survey 模式缺少 coverage" in missing_coverage.stderr
 
 
 @pytest.mark.parametrize(

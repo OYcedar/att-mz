@@ -148,17 +148,22 @@ Manual 不检查语言质量、术语、文风、语境或源语残留，这些�
 - 目标语自然度、UI 长度和可读性；
 - 源语言残留、拒绝语、模型说明、JSON 痕迹和异常转义。
 
-标准流程使用 `translation_qa.py scan` 一次读取 `translation export`、survey、coverage、coverage
-同目录的逐规则 manifest、术语、
-可选的 ATT 当前实际 `write_back` 目录以及 NW.js 运行记录，生成 `qa-summary.json`、完整机器明细 `findings.jsonl` 和
+`translation_qa.py scan` 使用两套互斥来源证据。MV/MZ 及由 RPG Maker Survey 分配出来的
+Generic 使用 `--survey + --coverage`；`coverage` 同目录的逐规则 manifest 也属于这套证据。
+没有 RPG Maker Survey 的独立 Generic 项目改用 `--generic-input <当前 JSONL 根>`，工具直接严格
+读取当前输入、重建全部自然 ID，并核对完整 `translation export`。`--generic-manifest` 和
+`--runtime-report` 只属于 Survey 模式，不能与 `--generic-input` 混用。两种模式都可读取术语和
+ATT 当前实际 `write_back` 目录，并生成 `qa-summary.json`、完整机器明细 `findings.jsonl` 和
 紧凑的 `review-groups.jsonl`。Agent 先读 Review 组及少量样例，只有决定处理某组时才按
 `review_group_id` 查看对应明细；不得把数千条启发式命中逐项读完后再分类。`manual` 默认只
 输出确定问题的自然 ID，使用一个或多个 `--review-group` 才加入已审核的启发式组。状态只取
 `clean`、`needs_review` 或 `unverified`；问题数量不会使该工具非零退出，也不会把结构合法
 译文改成 Rejected。
-不存在独立的 WriteBack preview 报告契约；QA 必须读取真实输出并核对其与 survey、coverage、
-translation export 和运行观察的来源关系。任一必要关系无法证明时，没有静态 finding 也只能是
-`unverified`。
+不存在独立的 WriteBack preview 报告契约；QA 必须读取真实输出。Survey 模式核对其与 survey、
+coverage、translation export 和运行观察的来源关系；standalone Generic 模式核对输入/输出文件
+集合、Group/Unit 身份与顺序、Current 译文以及应保留的原文。WriteBack 允许的断行、补空白和
+标点处理无法只靠 Translation export 还原时，保留对应未验证项。任一必要关系无法证明时，没有
+静态 finding 也只能是 `unverified`。
 Coverage 不能自行证明 Rules Unit。QA 必须从 Survey 位置、实际 Rule recipe 和 pattern 重新投影
 `manual_id`、原文、类型、控制契约与所有权，并核对 Rules disposition 的全部候选都有唯一实际
 Rule 消费；空投影或只改 coverage 的伪所有权属于输入不一致。
@@ -173,6 +178,8 @@ NW.js 场景证据还必须包含完整观察 hooks 和安装轮询、严格递�
 Generic 有精确 recipe 时按实际 Unit 输出核对原文序列，并区分译文已有残留与 WriteBack 新引入
 残留。RPG Maker 尚无完整 Unit 写回 recipe 时，只能把同一输出文件内出现的源文精确文字序列列为
 启发式 Review，并继续保留 Unit 映射未验证；不得把文件级命中冒充精确 Unit 结论。
+standalone Generic 的当前 JSONL 只证明 ATT 内部输入、导出和 WriteBack 链路；外部来源映射、
+反向转换和实际消费者没有通用证据格式，必须分别保留为 `unverified`，由任务中的真实外部流程闭合。
 
 ## 8. WriteBack、实际消费者与组合项目
 
