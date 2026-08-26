@@ -260,10 +260,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] Một phiên SQLite tương tác khác đang hoạt động
     [backup_incomplete] Bản sao lưu SQLite chưa đạt trạng thái hoàn tất
     [request_serialization_failed] Không thể tuần tự hóa yêu cầu mô hình
+    [http_client_build_failed] Không thể tạo HTTP client cho dịch vụ mô hình
+    [dns_resolution_failed] Phân giải DNS thất bại
+    [tcp_connection_failed] Kết nối TCP thất bại
+    [request_send_failed] Không thể gửi yêu cầu HTTP
+    [response_read_failed] Không thể đọc phản hồi HTTP
+    [tls_handshake_failed] Bắt tay TLS thất bại
+    [connect_timed_out] Kết nối TCP đã hết thời gian
+    [read_timed_out] Đọc phản hồi HTTP đã hết thời gian
+    [request_timed_out] Yêu cầu HTTP vượt quá tổng thời gian chờ
+    [response_decode_failed] Không thể giải mã phản hồi HTTP
+    [redirect_rejected] Chuyển hướng HTTP bị từ chối
     [response_parsing_failed] Phản hồi mô hình không phải JSON hợp lệ
+    [model_stream_invalid_json] Một sự kiện luồng mô hình không phải JSON hợp lệ
+    [model_stream_invalid_utf8] Luồng mô hình chứa UTF-8 không hợp lệ
+    [model_stream_error_event] Luồng mô hình trả về sự kiện lỗi dịch vụ
+    [model_stream_unclosed_event] Sự kiện SSE chưa được đóng bằng dòng trống
+    [model_stream_missing_finish] Luồng Chat thiếu finish_reason
+    [model_stream_missing_responses_terminal] Luồng Responses thiếu sự kiện kết thúc
+    [model_stream_event_type_mismatch] Tên sự kiện SSE không khớp với kiểu JSON
+    [model_stream_duplicate_choice] Luồng mô hình lặp lại cùng một choice
+    [model_stream_output_after_finish] Luồng mô hình tiếp tục xuất sau finish
+    [model_stream_unexpected_done] Luồng Responses trả về [DONE] ngoài dự kiến
     [invalid_response_contract] Phản hồi mô hình không đáp ứng hợp đồng phản hồi bắt buộc
-    [model_stream_incomplete] Luồng mô hình kết thúc trước khi có kết quả cuối rõ ràng
-    [transport_failed] Truyền tải HTTP thất bại trước khi nhận được phản hồi hợp lệ
     [lua_compilation_failed] Không thể biên dịch chương trình Lua chính
     [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy
     [rules_pattern_match_failed] Không thể đánh giá mẫu PCRE2 của Rules
@@ -328,6 +347,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = Trạng thái HTTP { $status }
+diagnostic-http-route-direct = Kết nối trực tiếp (không dùng proxy)
+diagnostic-http-route-proxy = Qua proxy được chỉ định { $proxy }
 diagnostic-retry-after = Retry-After: { $seconds } giây
 diagnostic-provider-code = Mã nhà cung cấp: { $code }
 diagnostic-provider-type = Loại nhà cung cấp: { $kind }

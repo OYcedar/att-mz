@@ -263,10 +263,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] Ya hay otra sesión interactiva de SQLite activa
     [backup_incomplete] La copia de seguridad de SQLite no llegó a completarse
     [request_serialization_failed] No se pudo serializar la solicitud al modelo
+    [http_client_build_failed] No se pudo crear el cliente HTTP del servicio de modelos
+    [dns_resolution_failed] Falló la resolución DNS
+    [tcp_connection_failed] Falló la conexión TCP
+    [request_send_failed] No se pudo enviar la solicitud HTTP
+    [response_read_failed] No se pudo leer la respuesta HTTP
+    [tls_handshake_failed] Falló el protocolo de enlace TLS
+    [connect_timed_out] Se agotó el tiempo de conexión TCP
+    [read_timed_out] Se agotó el tiempo de lectura de la respuesta HTTP
+    [request_timed_out] La solicitud HTTP superó el tiempo total
+    [response_decode_failed] No se pudo decodificar la respuesta HTTP
+    [redirect_rejected] Se rechazó la redirección HTTP
     [response_parsing_failed] La respuesta del modelo no es JSON válido
+    [model_stream_invalid_json] Un evento del flujo del modelo no es JSON válido
+    [model_stream_invalid_utf8] El flujo del modelo contiene UTF-8 no válido
+    [model_stream_error_event] El flujo del modelo devolvió un evento de error del servicio
+    [model_stream_unclosed_event] Un evento SSE no terminó con una línea en blanco
+    [model_stream_missing_finish] Al flujo Chat le falta finish_reason
+    [model_stream_missing_responses_terminal] Al flujo Responses le falta el evento terminal
+    [model_stream_event_type_mismatch] El nombre del evento SSE no coincide con el tipo JSON
+    [model_stream_duplicate_choice] El flujo del modelo repitió la misma choice
+    [model_stream_output_after_finish] El flujo del modelo continuó después de finish
+    [model_stream_unexpected_done] El flujo Responses devolvió un [DONE] inesperado
     [invalid_response_contract] La respuesta del modelo no cumple el contrato requerido
-    [model_stream_incomplete] El flujo del modelo terminó antes de un resultado terminal explícito
-    [transport_failed] El transporte HTTP falló antes de recibir una respuesta válida
     [lua_compilation_failed] No se pudo compilar el programa Lua principal
     [lua_execution_failed] El programa Lua principal falló durante la ejecución
     [rules_pattern_match_failed] No se pudo evaluar el patrón PCRE2 de Rules
@@ -331,6 +350,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = Estado HTTP { $status }
+diagnostic-http-route-direct = Conexión directa (sin proxy)
+diagnostic-http-route-proxy = Mediante el proxy explícito { $proxy }
 diagnostic-retry-after = Retry-After: { $seconds } segundos
 diagnostic-provider-code = Código del proveedor: { $code }
 diagnostic-provider-type = Tipo del proveedor: { $kind }

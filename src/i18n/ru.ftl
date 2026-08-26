@@ -265,10 +265,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] Другой интерактивный сеанс SQLite уже активен
     [backup_incomplete] Резервное копирование SQLite не достигло состояния завершения
     [request_serialization_failed] Не удалось сериализовать запрос к модели
+    [http_client_build_failed] Не удалось создать HTTP-клиент сервиса моделей
+    [dns_resolution_failed] Не удалось разрешить DNS-имя
+    [tcp_connection_failed] Не удалось установить TCP-соединение
+    [request_send_failed] Не удалось отправить HTTP-запрос
+    [response_read_failed] Не удалось прочитать HTTP-ответ
+    [tls_handshake_failed] Ошибка согласования TLS
+    [connect_timed_out] Истекло время ожидания TCP-соединения
+    [read_timed_out] Истекло время чтения HTTP-ответа
+    [request_timed_out] HTTP-запрос превысил общий тайм-аут
+    [response_decode_failed] Не удалось декодировать HTTP-ответ
+    [redirect_rejected] HTTP-перенаправление отклонено
     [response_parsing_failed] Ответ модели не является допустимым JSON
+    [model_stream_invalid_json] Событие потока модели не является допустимым JSON
+    [model_stream_invalid_utf8] Поток модели содержит недопустимый UTF-8
+    [model_stream_error_event] Поток модели вернул событие ошибки сервиса
+    [model_stream_unclosed_event] Событие SSE не закрыто пустой строкой
+    [model_stream_missing_finish] В потоке Chat отсутствует finish_reason
+    [model_stream_missing_responses_terminal] В потоке Responses отсутствует конечное событие
+    [model_stream_event_type_mismatch] Имя события SSE не совпадает с типом JSON
+    [model_stream_duplicate_choice] Поток модели повторил один и тот же choice
+    [model_stream_output_after_finish] Поток модели продолжил вывод после finish
+    [model_stream_unexpected_done] Поток Responses вернул неожиданный [DONE]
     [invalid_response_contract] Ответ модели не соответствует обязательному контракту
-    [model_stream_incomplete] Поток модели завершился до явного конечного результата
-    [transport_failed] Перед получением допустимого ответа произошла ошибка транспорта HTTP
     [lua_compilation_failed] Не удалось скомпилировать основную программу Lua
     [lua_execution_failed] Ошибка во время выполнения основной программы Lua
     [rules_pattern_match_failed] Не удалось вычислить шаблон PCRE2 Rules
@@ -333,6 +352,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = Статус HTTP { $status }
+diagnostic-http-route-direct = Прямое соединение (без прокси)
+diagnostic-http-route-proxy = Через явно заданный прокси { $proxy }
 diagnostic-retry-after = Retry-After: { $seconds } с
 diagnostic-provider-code = Код провайдера: { $code }
 diagnostic-provider-type = Тип провайдера: { $kind }

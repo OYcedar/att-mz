@@ -79,6 +79,10 @@ diagnostic.project_log
 直接原因；`impact` 说明业务状态是否未改、进度保留、已经生效、需要恢复或结果未知；
 `help` 说明修改方法。五项都必须是非空、经过安全处理的单行文本。
 
+HTTP 传输诊断的 `object` 只使用安全 Endpoint；`reason` 说明直连或显式代理以及类型化原因。
+Endpoint 和代理都只含 scheme、host、可选 port，不写 path、query、原始正文、OS code、请求 ID
+或凭据。
+
 诊断 payload 不保存 `report`、`effect`、`stage`、`issue`、`resolution`、内部状态
 code、数据库行、owner、group location、unit role、编码位置、SQLite 查询 ID/code、原始
 供应商请求 ID 或 expected/actual fingerprint。主错误与清理错误需要分别处理时，分别写成

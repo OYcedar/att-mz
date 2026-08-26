@@ -527,6 +527,10 @@ pub(crate) enum UiMessage<'a> {
     DiagnosticHttpStatus {
         status: u64,
     },
+    DiagnosticHttpRouteDirect,
+    DiagnosticHttpRouteProxy {
+        proxy: &'a str,
+    },
     DiagnosticRetryAfter {
         seconds: u64,
     },
@@ -899,6 +903,8 @@ impl UiMessage<'_> {
             Self::DiagnosticFailureValue { .. } => "diagnostic-failure-value",
             Self::DiagnosticConfigurationRuleValue { .. } => "diagnostic-configuration-rule-value",
             Self::DiagnosticHttpStatus { .. } => "diagnostic-http-status",
+            Self::DiagnosticHttpRouteDirect => "diagnostic-http-route-direct",
+            Self::DiagnosticHttpRouteProxy { .. } => "diagnostic-http-route-proxy",
             Self::DiagnosticRetryAfter { .. } => "diagnostic-retry-after",
             Self::DiagnosticProviderCode { .. } => "diagnostic-provider-code",
             Self::DiagnosticProviderType { .. } => "diagnostic-provider-type",
@@ -1277,6 +1283,9 @@ impl UiMessage<'_> {
             Self::DiagnosticHttpStatus { status } => {
                 set_number(&mut arguments, "status", status);
             }
+            Self::DiagnosticHttpRouteProxy { proxy } => {
+                set_text(&mut arguments, "proxy", proxy);
+            }
             Self::DiagnosticRetryAfter { seconds } => {
                 set_number(&mut arguments, "seconds", seconds);
             }
@@ -1426,6 +1435,7 @@ impl UiMessage<'_> {
             | Self::CliParseFailure
             | Self::DiagnosticErrorHeading
             | Self::DiagnosticWarningHeading
+            | Self::DiagnosticHttpRouteDirect
             | Self::PlanSourceExplicit
             | Self::PlanSourceProjectState
             | Self::PlanSourceProductDefault
@@ -1667,11 +1677,21 @@ mod tests {
             "generic_extract_required",
             "interactive_session_already_open",
             "internal_invariant",
+            "http_client_build_failed",
             "invalid_content",
             "invalid_encoding",
             "invalid_path",
             "invalid_response_contract",
-            "model_stream_incomplete",
+            "model_stream_duplicate_choice",
+            "model_stream_error_event",
+            "model_stream_event_type_mismatch",
+            "model_stream_invalid_json",
+            "model_stream_invalid_utf8",
+            "model_stream_missing_finish",
+            "model_stream_missing_responses_terminal",
+            "model_stream_output_after_finish",
+            "model_stream_unclosed_event",
+            "model_stream_unexpected_done",
             "invalid_syntax",
             "invalid_value",
             "journal_corrupt",
@@ -1689,6 +1709,16 @@ mod tests {
             "recovery_required",
             "reparse_point_forbidden",
             "request_serialization_failed",
+            "connect_timed_out",
+            "dns_resolution_failed",
+            "read_timed_out",
+            "redirect_rejected",
+            "request_send_failed",
+            "request_timed_out",
+            "response_decode_failed",
+            "response_read_failed",
+            "tcp_connection_failed",
+            "tls_handshake_failed",
             "unsupported_windows_code_page",
             "resource_limit",
             "resource_limit_exceeded",
@@ -1709,7 +1739,6 @@ mod tests {
             "target_already_exists",
             "transaction_outcome_unknown",
             "transaction_rolled_back",
-            "transport_failed",
             "unavailable",
             "unexpected_artifact",
             "worker_channel_closed",
@@ -1981,6 +2010,10 @@ mod tests {
                 maximum: 0,
             },
             UiMessage::DiagnosticHttpStatus { status: 429 },
+            UiMessage::DiagnosticHttpRouteDirect,
+            UiMessage::DiagnosticHttpRouteProxy {
+                proxy: "http://proxy.example.test:8080",
+            },
             UiMessage::DiagnosticRetryAfter { seconds: 30 },
             UiMessage::DiagnosticProviderCode { code: "rate_limit" },
             UiMessage::DiagnosticProviderType { kind: "request" },

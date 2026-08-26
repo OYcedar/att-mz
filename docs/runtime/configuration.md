@@ -147,6 +147,10 @@ parameters = '''
 流式传输只改变 HTTP 接收方式；ATT 会等待协议的完整终态，再把组装后的同一份 Assistant
 正文交给翻译验收和任务记录，不提交或记录尚未结束的响应片段。
 
+`connect_timeout_ms` 限制建连，`read_timeout_ms` 限制单次响应读取，`request_timeout_ms`
+限制从发送开始到完整响应结束的总时长；准入和限速等待不计入总时长。传输失败诊断会区分
+DNS、TCP、TLS、发送、读取以及连接、读取、总超时，并说明本次使用直连还是显式代理。
+
 `rate_limit` 整表可省略；一旦给出，两个值都必须为正。`proxy` 取 `false` 或一个
 不含凭据的 URL。`parameters` 是严格 JSON object，顶层留给 ATT 的 `model`、`stream`
 及所选协议的 `messages` 或 `input` 不出现在这里；Responses 的 `background` 也由 ATT

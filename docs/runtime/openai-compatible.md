@@ -62,9 +62,10 @@ Responses 的 `input`，role 与字符串 content 保持不变。Client 的严�
 的 `background` 固定为 `false`，这些字段都不得由 parameters 覆盖。ATT 不执行后台任务轮询。
 供应商私有字段原样发给供应商，ATT 自己不解释。API key 只以 Bearer Header 的形式发送。
 
-`connect_timeout_ms` 管建立连接，`read_timeout_ms` 管连续读取完整 JSON 或 SSE 数据，
-`request_timeout_ms` 管完整 HTTP 请求；本地许可和限速等待属于调度，不在它们的
-计时范围内。
+`connect_timeout_ms` 管 DNS、TCP 与 TLS 建连，`read_timeout_ms` 管每次响应头、完整 JSON、
+错误正文或 SSE chunk 的读取，`request_timeout_ms` 是从开始发送到完整响应终止的外围总
+deadline。总 deadline 覆盖建连、发送、响应头、错误正文、完整 JSON 和整个 SSE；本地许可、
+共享冷却和限速等待属于调度，不在它们的计时范围内。
 
 ## 3. 成功响应
 
@@ -132,7 +133,8 @@ Responses 的每条 `data` 必须是带字符串 `type` 的 JSON event：
 ## 4. 失败与重试
 
 Retryable 包含 DNS/连接/发送/读取（包括 SSE chunk）/完整请求超时或中断，HTTP 408、429、500、
-502、503、504，以及 HTTP 200 流式响应中无法形成完整协议终态的 JSON、SSE 事件或成功信封。
+502、503、504、Cloudflare 520–524，以及 HTTP 200 流式响应中无法形成完整协议终态的 JSON、
+SSE 事件或成功信封。
 后者不接受或保存任何半截正文，只重新执行完整模型请求。`Retry-After` 支持秒数和 HTTP-date，
 并受 Client `max_retry_after_ms` 约束。Translate 按 Client `retry_delays_ms` 执行有限重试；
 本地等待不消耗重试次数。普通 429 的 `Retry-After` 对同一 Client 的所有请求生效：等待结束前，
@@ -155,8 +157,8 @@ attempt 只在真实外部 HTTP 发送开始时计数。等待许可、限速、
   准入；本次 Translate 为 Failed，退出码为 `1`；
 - 普通 429 等待超过 `max_retry_after_ms` 或重试耗尽时，当前 Task 为 Unavailable，并停止
   后续请求和 Task 准入；Translate 为 Incomplete，退出码仍为 `0`；
-- DNS、连接、读取、超时、HTTP 500 等普通可重试问题耗尽时，只有当前 Task 为
-  Unavailable，后续 Task 仍可继续；
+- DNS、连接、读取、超时、HTTP 500、502–504 或 520–524 等普通可重试问题耗尽时，只有当前
+  Task 为 Unavailable，后续 Task 仍可继续；
 - 外部请求失败确认前已经准入且获得有效响应的 Task 仍按自然顺序验收，并在当前 CAS 仍成立时
   提交；失败 Task 自身不提交，失败后不再补充新的 Task。数据库提交、内部验收或取消失败仍按
   各自状态边界决定是否允许后续副作用。
@@ -164,17 +166,19 @@ attempt 只在真实外部 HTTP 发送开始时计数。等待许可、限速、
 任务准入满足 `planned = started + not_started`。服务停止后没有开始的任务计入
 `not_started`；不得把请求门拒绝误计为一次已开始任务，也不得补造完成进度。
 
-Fatal 包含请求构造失败、TLS/证书问题、其他不可重试 HTTP 状态，以及非流式 200 响应的无效
-JSON 或成功信封。流式 200 的事件 JSON、核心字段、错误事件和终态问题进入上述有限重试；预算
+Fatal 包含请求构造失败、TLS/证书问题、其他不可重试 HTTP 状态（包括 525、526），以及非流式
+200 响应的无效 JSON 或成功信封。流式 200 的事件 JSON、核心字段、错误事件和终态问题进入上述有限重试；预算
 耗尽后该 Task 为 Unavailable，不把已经收到的增量片段交给调用方。非 200 状态诊断会说明 HTTP
 状态、`Retry-After`、供应商 code/type，以及标准 `error` 信封中经过闭集替换和单行清理的
-`message`；流式失败区分事件 JSON、服务错误事件、缺少明确终态或其他信封违反，但不回显事件
-正文。完整错误正文不落盘。
+`message`；流式失败分别说明无效 UTF-8、事件 JSON、未以空行闭合的 SSE 事件、服务错误事件、
+Chat 缺少 `finish_reason`、Responses 缺少终态、event/type 不一致、重复 choice、finish 后继续
+输出或 Responses 意外出现 `[DONE]`，不回显事件正文。完整错误正文不落盘。
 
-内部错误区分 DNS、连接、发送、读取、TLS、timeout、HTTP status、响应 JSON 和成功信封
-错误。进入 CLI、项目日志和任务记录前，只呈现 Endpoint 对象、直接原因、状态影响和处理办法；必要
-时附 HTTP 状态、Retry-After、供应商 code/type 或 JSON 行列。Endpoint 只公开 scheme、host
-和可选 port，不记录 path、query、凭据或供应商请求 ID，也不从后端正文解析内部状态。
+内部错误区分 DNS、TCP 连接、发送、读取、TLS、连接超时、读取超时、总超时、HTTP status、
+响应 JSON 和成功信封错误。进入 CLI、项目日志和任务记录前，只呈现 Endpoint 对象、直连或
+显式代理路由、类型化直接原因、状态影响和处理办法；必要时附 HTTP 状态、Retry-After、供应商
+code/type 或 JSON 行列。Endpoint 与代理只公开 scheme、host 和可选 port，不记录 path、query、
+凭据、原始 OS code 或供应商请求 ID，也不从后端正文解析内部状态。
 
 ## 5. 生命周期
 
@@ -184,7 +188,8 @@ shutdown 关上入口：新请求不再开始，尚未进入 HTTP 的等待者�
 收到非 200 响应头后，运行根先暂停该 Client 的替补请求，再读取和分类正文。401、403
 可直接确认永久停止；其他非 200 在类型化分类完成前也不会释放替补准入。普通 500 分类
 完成后恢复准入；429 进入共享等待或停止；永久额度、账户错误关闭入口。这个决定门保证
-慢错误正文不会让实际调用数突破错误发生时已经活动的请求窗口。
+慢错误正文不会让实际调用数突破错误发生时已经活动的请求窗口。总 deadline 在错误正文读取
+期间到期时，取消安全的决定守卫会解除这次临时门控，后续任务仍按普通总超时语义继续准入。
 
 ## 6. 敏感信息闭集唯一权威
 

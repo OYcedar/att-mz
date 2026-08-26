@@ -263,10 +263,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] Another interactive SQLite session is already active
     [backup_incomplete] The SQLite backup did not reach a completed state
     [request_serialization_failed] The model request could not be serialized
+    [http_client_build_failed] The model-service HTTP client could not be created
+    [dns_resolution_failed] DNS resolution failed
+    [tcp_connection_failed] The TCP connection failed
+    [request_send_failed] The HTTP request could not be sent
+    [response_read_failed] The HTTP response could not be read
+    [tls_handshake_failed] The TLS handshake failed
+    [connect_timed_out] The TCP connection timed out
+    [read_timed_out] Reading the HTTP response timed out
+    [request_timed_out] The HTTP request exceeded its total timeout
+    [response_decode_failed] The HTTP response could not be decoded
+    [redirect_rejected] The HTTP redirect was rejected
     [response_parsing_failed] The model response is not valid JSON
+    [model_stream_invalid_json] A model stream event is not valid JSON
+    [model_stream_invalid_utf8] The model stream contains invalid UTF-8
+    [model_stream_error_event] The model stream returned a service error event
+    [model_stream_unclosed_event] An SSE event was not closed by a blank line
+    [model_stream_missing_finish] The Chat model stream is missing finish_reason
+    [model_stream_missing_responses_terminal] The Responses model stream is missing its terminal event
+    [model_stream_event_type_mismatch] The SSE event name and JSON type do not match
+    [model_stream_duplicate_choice] The model stream repeated the same choice
+    [model_stream_output_after_finish] The model stream continued after finish
+    [model_stream_unexpected_done] The Responses model stream returned an unexpected [DONE]
     [invalid_response_contract] The model response does not satisfy the required response contract
-    [model_stream_incomplete] The model stream ended before an explicit terminal result
-    [transport_failed] The HTTP transport failed before a valid response arrived
     [lua_compilation_failed] the Lua main program could not be compiled
     [lua_execution_failed] The Lua main program failed while it was running
     [rules_pattern_match_failed] The Rules PCRE2 pattern could not be evaluated
@@ -331,6 +350,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = HTTP status { $status }
+diagnostic-http-route-direct = Direct connection (no proxy)
+diagnostic-http-route-proxy = Via explicit proxy { $proxy }
 diagnostic-retry-after = Retry-After: { $seconds } seconds
 diagnostic-provider-code = Provider code: { $code }
 diagnostic-provider-type = Provider type: { $kind }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::i18n::{UiLocalizer, UiMessage};
 
 use super::{
-    ConfigurationIssue, DiagnosticIssue, DiagnosticStage, HttpIssue, PlaceholderIssue,
+    ConfigurationIssue, DiagnosticIssue, DiagnosticStage, HttpIssue, HttpRoute, PlaceholderIssue,
     PlaceholderRuleSource, TranslationIssue,
 };
 
@@ -522,6 +522,16 @@ fn render_diagnostic_reason(
                     message: &message.to_string(),
                 }));
             }
+        }
+        DiagnosticIssue::Http(HttpIssue::Transport { route, .. }) => {
+            details.push(match route {
+                HttpRoute::Direct => localizer.format(UiMessage::DiagnosticHttpRouteDirect),
+                HttpRoute::ExplicitProxy { endpoint } => {
+                    localizer.format(UiMessage::DiagnosticHttpRouteProxy {
+                        proxy: &endpoint.to_string(),
+                    })
+                }
+            });
         }
         DiagnosticIssue::Http(
             HttpIssue::RequestSerialization { line, column, .. }

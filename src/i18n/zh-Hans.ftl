@@ -260,10 +260,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] 已有 SQLite 交互会话处于活动状态
     [backup_incomplete] SQLite 备份没有完成
     [request_serialization_failed] 无法序列化模型请求
+    [http_client_build_failed] 无法创建模型服务 HTTP Client
+    [dns_resolution_failed] DNS 解析失败
+    [tcp_connection_failed] TCP 连接失败
+    [request_send_failed] HTTP 请求发送失败
+    [response_read_failed] HTTP 响应读取失败
+    [tls_handshake_failed] TLS 握手失败
+    [connect_timed_out] TCP 连接超时
+    [read_timed_out] HTTP 响应读取超时
+    [request_timed_out] HTTP 请求超过总超时
+    [response_decode_failed] HTTP 响应解码失败
+    [redirect_rejected] HTTP 重定向被拒绝
     [response_parsing_failed] 模型响应不是有效 JSON
+    [model_stream_invalid_json] 模型流事件不是有效 JSON
+    [model_stream_invalid_utf8] 模型流包含无效 UTF-8
+    [model_stream_error_event] 模型流返回了服务错误事件
+    [model_stream_unclosed_event] 模型流的 SSE 事件未以空行闭合
+    [model_stream_missing_finish] Chat 模型流缺少 finish_reason
+    [model_stream_missing_responses_terminal] Responses 模型流缺少终态事件
+    [model_stream_event_type_mismatch] 模型流的 SSE event 与 JSON type 不一致
+    [model_stream_duplicate_choice] 模型流重复返回同一 choice
+    [model_stream_output_after_finish] 模型流在 finish 后继续输出
+    [model_stream_unexpected_done] Responses 模型流意外返回 [DONE]
     [invalid_response_contract] 模型响应不符合所需响应契约
-    [model_stream_incomplete] 模型流在明确终态前结束
-    [transport_failed] 收到有效响应前 HTTP 传输失败
     [lua_compilation_failed] Lua 主程序编译失败
     [lua_execution_failed] Lua 主程序运行失败
     [rules_pattern_match_failed] 无法执行 Rules 的 PCRE2 模式
@@ -328,6 +347,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = HTTP 状态 { $status }
+diagnostic-http-route-direct = 直接连接（未使用代理）
+diagnostic-http-route-proxy = 通过显式代理 { $proxy }
 diagnostic-retry-after = Retry-After：{ $seconds } 秒
 diagnostic-provider-code = 服务方 code：{ $code }
 diagnostic-provider-type = 服务方 type：{ $kind }

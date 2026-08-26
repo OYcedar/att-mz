@@ -263,10 +263,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] Une autre session SQLite interactive est déjà active
     [backup_incomplete] La sauvegarde SQLite n’a pas atteint l’état terminé
     [request_serialization_failed] La requête du modèle n’a pas pu être sérialisée
+    [http_client_build_failed] Le client HTTP du service de modèles n’a pas pu être créé
+    [dns_resolution_failed] La résolution DNS a échoué
+    [tcp_connection_failed] La connexion TCP a échoué
+    [request_send_failed] La requête HTTP n’a pas pu être envoyée
+    [response_read_failed] La réponse HTTP n’a pas pu être lue
+    [tls_handshake_failed] La négociation TLS a échoué
+    [connect_timed_out] La connexion TCP a expiré
+    [read_timed_out] La lecture de la réponse HTTP a expiré
+    [request_timed_out] La requête HTTP a dépassé son délai total
+    [response_decode_failed] La réponse HTTP n’a pas pu être décodée
+    [redirect_rejected] La redirection HTTP a été refusée
     [response_parsing_failed] La réponse du modèle n’est pas un JSON valide
+    [model_stream_invalid_json] Un événement du flux du modèle n’est pas un JSON valide
+    [model_stream_invalid_utf8] Le flux du modèle contient un UTF-8 invalide
+    [model_stream_error_event] Le flux du modèle a renvoyé un événement d’erreur du service
+    [model_stream_unclosed_event] Un événement SSE n’a pas été fermé par une ligne vide
+    [model_stream_missing_finish] Le flux Chat ne contient pas finish_reason
+    [model_stream_missing_responses_terminal] Le flux Responses ne contient pas d’événement terminal
+    [model_stream_event_type_mismatch] Le nom d’événement SSE et le type JSON ne correspondent pas
+    [model_stream_duplicate_choice] Le flux du modèle a répété la même choice
+    [model_stream_output_after_finish] Le flux du modèle a continué après finish
+    [model_stream_unexpected_done] Le flux Responses a renvoyé un [DONE] inattendu
     [invalid_response_contract] La réponse du modèle ne respecte pas le contrat de réponse requis
-    [model_stream_incomplete] Le flux du modèle s’est terminé avant un résultat terminal explicite
-    [transport_failed] Le transport HTTP a échoué avant l’arrivée d’une réponse valide
     [lua_compilation_failed] Le programme Lua principal n’a pas pu être compilé
     [lua_execution_failed] Le programme Lua principal a échoué pendant son exécution
     [rules_pattern_match_failed] Le motif PCRE2 de Rules n’a pas pu être évalué
@@ -331,6 +350,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = Statut HTTP { $status }
+diagnostic-http-route-direct = Connexion directe (sans proxy)
+diagnostic-http-route-proxy = Via le proxy explicite { $proxy }
 diagnostic-retry-after = Retry-After : { $seconds } secondes
 diagnostic-provider-code = Code du fournisseur : { $code }
 diagnostic-provider-type = Type du fournisseur : { $kind }

@@ -2188,11 +2188,29 @@ impl std::fmt::Display for HttpEndpoint {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub(crate) enum HttpRoute {
+    Direct,
+    ExplicitProxy { endpoint: HttpEndpoint },
+}
+
+impl HttpRoute {
+    pub(crate) fn display_value(&self) -> String {
+        match self {
+            Self::Direct => "direct".to_owned(),
+            Self::ExplicitProxy { endpoint } => format!("proxy {endpoint}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HttpTransportPhase {
+    Request,
     Connect,
     Send,
+    ReadResponseHeaders,
     ReadErrorResponse,
     ReadSuccessResponse,
 }
@@ -2200,8 +2218,10 @@ pub(crate) enum HttpTransportPhase {
 impl HttpTransportPhase {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Request => "request",
             Self::Connect => "connect",
             Self::Send => "send",
+            Self::ReadResponseHeaders => "read_response_headers",
             Self::ReadErrorResponse => "read_error_response",
             Self::ReadSuccessResponse => "read_success_response",
         }
@@ -2212,11 +2232,13 @@ impl HttpTransportPhase {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HttpTransportKind {
     Dns,
-    Connect,
+    TcpConnect,
     Send,
     Read,
     Tls,
-    Timeout,
+    ConnectTimeout,
+    ReadTimeout,
+    TotalTimeout,
     Decode,
     Redirect,
 }
@@ -2235,11 +2257,13 @@ impl HttpTransportKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Dns => "dns",
-            Self::Connect => "connect",
+            Self::TcpConnect => "tcp_connect",
             Self::Send => "send",
             Self::Read => "read",
             Self::Tls => "tls",
-            Self::Timeout => "timeout",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::ReadTimeout => "read_timeout",
+            Self::TotalTimeout => "total_timeout",
             Self::Decode => "decode",
             Self::Redirect => "redirect",
         }
@@ -2283,7 +2307,9 @@ pub(crate) enum HttpEnvelopeViolation {
     ChoiceAfterFinish,
     InvalidFieldType,
     EventTypeMismatch,
-    StreamEndedBeforeTerminal,
+    UnclosedSseEvent,
+    MissingResponsesTerminal,
+    UnexpectedDoneMarker,
     InvalidContract,
 }
 
@@ -2304,7 +2330,9 @@ impl HttpEnvelopeViolation {
             Self::ChoiceAfterFinish => "choice_after_finish",
             Self::InvalidFieldType => "invalid_field_type",
             Self::EventTypeMismatch => "event_type_mismatch",
-            Self::StreamEndedBeforeTerminal => "stream_ended_before_terminal",
+            Self::UnclosedSseEvent => "unclosed_sse_event",
+            Self::MissingResponsesTerminal => "missing_responses_terminal",
+            Self::UnexpectedDoneMarker => "unexpected_done_marker",
             Self::InvalidContract => "invalid_contract",
         }
     }
@@ -2330,6 +2358,7 @@ pub(crate) enum HttpIssue {
     },
     Transport {
         endpoint: HttpEndpoint,
+        route: HttpRoute,
         phase: HttpTransportPhase,
         transport: HttpTransportKind,
         io_kind: Option<super::SafeIoKind>,
@@ -2379,7 +2408,7 @@ impl HttpIssue {
                 ..
             } => "http.transport.dns",
             Self::Transport {
-                transport: HttpTransportKind::Connect,
+                transport: HttpTransportKind::TcpConnect,
                 ..
             } => "http.transport.connect",
             Self::Transport {
@@ -2387,14 +2416,33 @@ impl HttpIssue {
                 ..
             } => "http.transport.tls",
             Self::Transport {
-                transport: HttpTransportKind::Timeout,
+                transport: HttpTransportKind::ConnectTimeout,
                 ..
-            } => "http.transport.timeout",
+            } => "http.transport.connect_timeout",
+            Self::Transport {
+                transport: HttpTransportKind::ReadTimeout,
+                ..
+            } => "http.transport.read_timeout",
+            Self::Transport {
+                transport: HttpTransportKind::TotalTimeout,
+                ..
+            } => "http.transport.total_timeout",
             Self::Transport {
                 transport: HttpTransportKind::Read,
                 ..
             } => "http.transport.read",
-            Self::Transport { .. } => "http.transport.send",
+            Self::Transport {
+                transport: HttpTransportKind::Send,
+                ..
+            } => "http.transport.send",
+            Self::Transport {
+                transport: HttpTransportKind::Decode,
+                ..
+            } => "http.transport.decode",
+            Self::Transport {
+                transport: HttpTransportKind::Redirect,
+                ..
+            } => "http.transport.redirect",
             Self::Status { .. } => "http.status",
             Self::ResponseJson { .. } => "http.response_json",
             Self::InvalidEnvelope { .. } => "http.invalid_envelope",
@@ -2421,25 +2469,64 @@ impl HttpIssue {
         match self {
             Self::InvalidProxy => "invalid_value",
             Self::InvalidCertificate => "invalid_encoding",
-            Self::ClientBuild => "transport_failed",
+            Self::ClientBuild => "http_client_build_failed",
             Self::WaitCancelled { .. } => "lock_cancelled",
             Self::ExecutorClosed { .. } => "executor_closed",
             Self::RequestSerialization { .. } => "request_serialization_failed",
-            Self::Transport { .. } => "transport_failed",
+            Self::Transport { transport, .. } => match transport {
+                HttpTransportKind::Dns => "dns_resolution_failed",
+                HttpTransportKind::TcpConnect => "tcp_connection_failed",
+                HttpTransportKind::Send => "request_send_failed",
+                HttpTransportKind::Read => "response_read_failed",
+                HttpTransportKind::Tls => "tls_handshake_failed",
+                HttpTransportKind::ConnectTimeout => "connect_timed_out",
+                HttpTransportKind::ReadTimeout => "read_timed_out",
+                HttpTransportKind::TotalTimeout => "request_timed_out",
+                HttpTransportKind::Decode => "response_decode_failed",
+                HttpTransportKind::Redirect => "redirect_rejected",
+            },
             Self::Status { .. } => "external_service_rejected",
             Self::ResponseJson { .. } => "response_parsing_failed",
             Self::InvalidEnvelope {
                 violation: HttpEnvelopeViolation::InvalidStreamEvent,
                 ..
-            } => "response_parsing_failed",
+            } => "model_stream_invalid_json",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::InvalidStreamEncoding,
+                ..
+            } => "model_stream_invalid_utf8",
             Self::InvalidEnvelope {
                 violation: HttpEnvelopeViolation::StreamErrorEvent,
                 ..
-            } => "external_service_rejected",
+            } => "model_stream_error_event",
             Self::InvalidEnvelope {
-                violation: HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                violation: HttpEnvelopeViolation::UnclosedSseEvent,
                 ..
-            } => "model_stream_incomplete",
+            } => "model_stream_unclosed_event",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::MissingFinishReason,
+                ..
+            } => "model_stream_missing_finish",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::MissingResponsesTerminal,
+                ..
+            } => "model_stream_missing_responses_terminal",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::EventTypeMismatch,
+                ..
+            } => "model_stream_event_type_mismatch",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::DuplicateChoice,
+                ..
+            } => "model_stream_duplicate_choice",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::ChoiceAfterFinish,
+                ..
+            } => "model_stream_output_after_finish",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::UnexpectedDoneMarker,
+                ..
+            } => "model_stream_unexpected_done",
             Self::InvalidEnvelope { .. } => "invalid_response_contract",
         }
     }
@@ -2464,12 +2551,14 @@ impl HttpIssue {
         match self {
             Self::Transport {
                 endpoint,
+                route,
                 phase,
                 transport,
                 io_kind,
                 raw_os_code,
             } => {
                 facts.push(("endpoint", endpoint.to_string()));
+                facts.push(("route", route.display_value()));
                 facts.push(("phase", phase.as_str().to_owned()));
                 facts.push(("transport", transport.as_str().to_owned()));
                 if let Some(kind) = io_kind {
@@ -2699,19 +2788,27 @@ mod http_tests {
         for (violation, expected_summary) in [
             (
                 HttpEnvelopeViolation::InvalidStreamEvent,
-                "response_parsing_failed",
+                "model_stream_invalid_json",
             ),
             (
                 HttpEnvelopeViolation::StreamErrorEvent,
-                "external_service_rejected",
+                "model_stream_error_event",
             ),
             (
-                HttpEnvelopeViolation::StreamEndedBeforeTerminal,
-                "model_stream_incomplete",
+                HttpEnvelopeViolation::UnclosedSseEvent,
+                "model_stream_unclosed_event",
             ),
             (
                 HttpEnvelopeViolation::MissingFinishReason,
-                "invalid_response_contract",
+                "model_stream_missing_finish",
+            ),
+            (
+                HttpEnvelopeViolation::MissingResponsesTerminal,
+                "model_stream_missing_responses_terminal",
+            ),
+            (
+                HttpEnvelopeViolation::UnexpectedDoneMarker,
+                "model_stream_unexpected_done",
             ),
         ] {
             let issue = HttpIssue::InvalidEnvelope {

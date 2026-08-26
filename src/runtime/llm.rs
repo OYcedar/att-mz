@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -18,8 +18,8 @@ use url::Url;
 
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, HttpEndpoint, HttpEnvelopeViolation, HttpIssue, HttpJsonCategory,
-    HttpResponseReadFailure, HttpTransportKind, HttpTransportPhase, SafeIdentifier, SafeText,
-    StateEffect,
+    HttpResponseReadFailure, HttpRoute, HttpTransportKind, HttpTransportPhase, SafeIdentifier,
+    SafeText, StateEffect,
 };
 use crate::llm::{
     ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmFinishReason,
@@ -314,12 +314,14 @@ pub(crate) struct OpenAiCompatibleExecutor {
     client: Client,
     active_capacity: Arc<Semaphore>,
     lifecycle: Arc<LlmLifecycle>,
+    route: LlmProxyConfiguration,
 }
 
 impl OpenAiCompatibleExecutor {
     pub(crate) fn new(
         configuration: OpenAiExecutorConfiguration,
     ) -> Result<Self, OpenAiExecutorBuildError> {
+        let route = configuration.proxy.clone();
         let mut builder = Client::builder()
             .redirect(redirect::Policy::none())
             .no_proxy()
@@ -344,6 +346,7 @@ impl OpenAiCompatibleExecutor {
             client,
             active_capacity: Arc::new(Semaphore::new(configuration.max_active_requests.get())),
             lifecycle: Arc::new(LlmLifecycle::new(configuration.max_retry_after)),
+            route,
         })
     }
 
@@ -375,53 +378,79 @@ impl OpenAiCompatibleExecutor {
         // 等待活动许可期间可能刚收到新的 Retry-After；发送前必须再次观察共享门控。
         self.lifecycle.wait_for_retry_gate().await?;
 
+        on_attempt_started();
+        let network_phase = AtomicU8::new(encode_network_phase(HttpTransportPhase::Request));
+        let result = match tokio::time::timeout(
+            client.request_timeout,
+            self.execute_network_attempt(client, request_body, &network_phase),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(retryable(OpenAiCompatibleError::TotalTimeout {
+                phase: decode_network_phase(network_phase.load(Ordering::Acquire)),
+            })),
+        };
+        drop(active_permit);
+        drop(job);
+        result
+    }
+
+    async fn execute_network_attempt(
+        &self,
+        client: &OpenAiCompatibleClient,
+        request_body: Vec<u8>,
+        network_phase: &AtomicU8,
+    ) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
         let request = self
             .client
             .post(client.url.clone())
             .header(CONTENT_TYPE, "application/json")
-            .timeout(client.request_timeout)
             .bearer_auth(client.api_key.expose_secret())
             .body(request_body);
-
-        on_attempt_started();
         let response = match request.send().await {
             Ok(response) => response,
-            Err(source) => {
-                drop(active_permit);
-                drop(job);
-                return Err(classify_transport_error(HttpTransportPhase::Send, source));
-            }
+            Err(source) => return Err(classify_transport_error(HttpTransportPhase::Send, source)),
         };
         let status = response.status();
+        network_phase.store(
+            encode_network_phase(if status == StatusCode::OK {
+                HttpTransportPhase::ReadSuccessResponse
+            } else {
+                HttpTransportPhase::ReadErrorResponse
+            }),
+            Ordering::Release,
+        );
         let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
         if status != StatusCode::OK {
             let redactor = ApiKeyRedactor::new(client.api_key.clone());
-            let decision_held =
-                if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-                    let preliminary = OpenAiCompatibleError::HttpStatus {
-                        status: status.as_u16(),
-                        provider_code: None,
-                        provider_type: None,
-                        provider_message: None,
-                        response_body_error: None,
-                        service_status: LlmServiceStatus::PermanentAuthorization,
-                    };
-                    let diagnostic = DiagnosticReport::new(
-                        StateEffect::ProgressPreserved,
-                        preliminary.diagnostic_for_endpoint(
-                            safe_http_endpoint_with_redactor(&client.url, &redactor),
-                            retry_after,
-                        ),
-                    );
-                    self.lifecycle
-                        .stop_for_service(LlmServiceStatus::PermanentAuthorization, diagnostic);
-                    false
-                } else {
-                    // provider code 可能把普通非 2xx 进一步确认为 quota/account 永久错误。
-                    // 在完整读取并分类响应前，不允许等待中的 worker 补位发送。
-                    self.lifecycle.hold_service_decision();
-                    true
+            let route = safe_http_route_with_redactor(&self.route, &redactor);
+            let mut decision = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            {
+                let preliminary = OpenAiCompatibleError::HttpStatus {
+                    status: status.as_u16(),
+                    provider_code: None,
+                    provider_type: None,
+                    provider_message: None,
+                    response_body_error: None,
+                    service_status: LlmServiceStatus::PermanentAuthorization,
                 };
+                let diagnostic = DiagnosticReport::new(
+                    StateEffect::ProgressPreserved,
+                    preliminary.diagnostic_for_endpoint(
+                        safe_http_endpoint_with_redactor(&client.url, &redactor),
+                        route.clone(),
+                        retry_after,
+                    ),
+                );
+                self.lifecycle
+                    .stop_for_service(LlmServiceStatus::PermanentAuthorization, diagnostic);
+                None
+            } else {
+                // provider code 可能把普通非 2xx 进一步确认为 quota/account 永久错误。
+                // 在完整读取并分类响应前，不允许等待中的 worker 补位发送。
+                Some(ServiceDecisionGuard::new(self.lifecycle.as_ref()))
+            };
             let provider_body = response.bytes().await;
             let (provider_error, response_body_error) = match provider_body {
                 Ok(body) => (parse_provider_error(&body).unwrap_or_default(), None),
@@ -454,17 +483,19 @@ impl OpenAiCompatibleExecutor {
                     StateEffect::ProgressPreserved,
                     error.diagnostic_for_endpoint(
                         safe_http_endpoint_with_redactor(&client.url, &redactor),
+                        route,
                         retry_after,
                     ),
                 );
                 self.lifecycle.stop_for_service(service_status, diagnostic);
             } else if service_status == LlmServiceStatus::RateLimited {
                 // 保持 header 阶段建立的决定门，直到请求状态机确认重试或耗尽。
-                debug_assert!(decision_held);
-            } else if decision_held {
-                self.lifecycle.resolve_service_decision();
+                decision
+                    .take()
+                    .expect("429 必须在读取正文前建立准入决定门")
+                    .retain();
             }
-            let result = if is_retryable_status(status) && !service_status.is_permanent() {
+            return if is_retryable_status(status) && !service_status.is_permanent() {
                 Err(LlmRequestError::Retryable {
                     source: error,
                     retry_after,
@@ -472,12 +503,9 @@ impl OpenAiCompatibleExecutor {
             } else {
                 Err(LlmRequestError::Fatal(error))
             };
-            drop(active_permit);
-            drop(job);
-            return result;
         }
 
-        let result = if client.stream {
+        if client.stream {
             match parse_streaming_success_response(client.protocol, response).await {
                 Err(LlmRequestError::Fatal(source @ OpenAiCompatibleError::ParseResponse(_)))
                 | Err(LlmRequestError::Fatal(
@@ -496,10 +524,7 @@ impl OpenAiCompatibleExecutor {
                     source,
                 )),
             }
-        };
-        drop(active_permit);
-        drop(job);
-        result
+        }
     }
 }
 
@@ -543,6 +568,7 @@ impl LlmRequestExecutor for OpenAiCompatibleExecutor {
         let redactor = ApiKeyRedactor::new(client.api_key.clone());
         source.diagnostic_for_endpoint(
             safe_http_endpoint_with_redactor(&client.url, &redactor),
+            safe_http_route_with_redactor(&self.route, &redactor),
             retry_after,
         )
     }
@@ -568,6 +594,9 @@ pub(crate) enum OpenAiCompatibleError {
         phase: HttpTransportPhase,
         source: reqwest::Error,
     },
+    TotalTimeout {
+        phase: HttpTransportPhase,
+    },
     HttpStatus {
         status: u16,
         provider_code: Option<String>,
@@ -589,6 +618,7 @@ impl fmt::Display for OpenAiCompatibleError {
             Self::ExecutorClosed => formatter.write_str("LLM 根已关闭"),
             Self::SerializeRequest(_) => formatter.write_str("无法序列化 LLM 请求"),
             Self::Transport { .. } => formatter.write_str("LLM HTTP 传输失败"),
+            Self::TotalTimeout { .. } => formatter.write_str("LLM HTTP 请求超过总超时"),
             Self::HttpStatus { status, .. } => write!(formatter, "LLM HTTP 状态 {status}"),
             Self::ParseResponse(_) => formatter.write_str("LLM 成功响应不是有效 JSON"),
             Self::InvalidResponseWire { violation } => {
@@ -617,12 +647,13 @@ impl OpenAiCompatibleError {
     /// 只公开 endpoint 的 scheme/host/port；路径、查询、请求和响应正文不会进入诊断。
     #[cfg(test)]
     pub(crate) fn diagnostic(&self, endpoint: &Url, retry_after: Option<Duration>) -> Diagnostic {
-        self.diagnostic_for_endpoint(safe_http_endpoint(endpoint), retry_after)
+        self.diagnostic_for_endpoint(safe_http_endpoint(endpoint), HttpRoute::Direct, retry_after)
     }
 
     fn diagnostic_for_endpoint(
         &self,
         endpoint: HttpEndpoint,
+        route: HttpRoute,
         retry_after: Option<Duration>,
     ) -> Diagnostic {
         let issue = match self {
@@ -638,12 +669,21 @@ impl OpenAiCompatibleError {
                 let io = error_chain_io(source);
                 HttpIssue::Transport {
                     endpoint,
+                    route,
                     phase: *phase,
                     transport: typed_transport_kind(source, *phase),
                     io_kind: io.map(|source| source.kind().into()),
                     raw_os_code: io.and_then(std::io::Error::raw_os_error),
                 }
             }
+            Self::TotalTimeout { phase } => HttpIssue::Transport {
+                endpoint,
+                route,
+                phase: *phase,
+                transport: HttpTransportKind::TotalTimeout,
+                io_kind: None,
+                raw_os_code: None,
+            },
             Self::HttpStatus {
                 status,
                 provider_code,
@@ -699,6 +739,7 @@ impl LlmRequestFailure for OpenAiCompatibleError {
         matches!(
             self,
             Self::Transport { .. }
+                | Self::TotalTimeout { .. }
                 | Self::HttpStatus { .. }
                 | Self::ParseResponse(_)
                 | Self::InvalidResponseWire { .. }
@@ -1077,16 +1118,14 @@ async fn parse_streaming_success_response(
                 }
             }
             if !sse.is_idle() {
-                return Err(invalid_response(
-                    HttpEnvelopeViolation::StreamEndedBeforeTerminal,
-                ));
+                return Err(invalid_response(HttpEnvelopeViolation::UnclosedSseEvent));
             }
             return match protocol {
                 OpenAiProtocol::ChatCompletions => {
-                    chat.complete(HttpEnvelopeViolation::StreamEndedBeforeTerminal)
+                    chat.complete(HttpEnvelopeViolation::MissingFinishReason)
                 }
                 OpenAiProtocol::Responses => Err(invalid_response(
-                    HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                    HttpEnvelopeViolation::MissingResponsesTerminal,
                 )),
             };
         };
@@ -1132,7 +1171,9 @@ fn parse_responses_stream_event(
     event: SseEvent,
 ) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
     if event.data == b"[DONE]" {
-        return Err(invalid_response(HttpEnvelopeViolation::InvalidContract));
+        return Err(invalid_response(
+            HttpEnvelopeViolation::UnexpectedDoneMarker,
+        ));
     }
     let wire = parse_stream_json(&event.data)?;
     let object = wire
@@ -1278,6 +1319,18 @@ fn safe_http_endpoint_with_redactor(endpoint: &Url, redactor: &ApiKeyRedactor) -
     safe_http_endpoint_with_host(endpoint, &redactor.redact(host))
 }
 
+fn safe_http_route_with_redactor(
+    route: &LlmProxyConfiguration,
+    redactor: &ApiKeyRedactor,
+) -> HttpRoute {
+    match route {
+        LlmProxyConfiguration::Disabled => HttpRoute::Direct,
+        LlmProxyConfiguration::Explicit(endpoint) => HttpRoute::ExplicitProxy {
+            endpoint: safe_http_endpoint_with_redactor(endpoint, redactor),
+        },
+    }
+}
+
 fn safe_http_endpoint_with_host(endpoint: &Url, host: &str) -> HttpEndpoint {
     let scheme = match endpoint.scheme() {
         "http" => crate::diagnostic::HttpScheme::Http,
@@ -1285,6 +1338,29 @@ fn safe_http_endpoint_with_host(endpoint: &Url, host: &str) -> HttpEndpoint {
         _ => unreachable!("LLM endpoint 在配置边界已经确认使用 HTTP(S)"),
     };
     HttpEndpoint::new(scheme, host, endpoint.port())
+}
+
+fn encode_network_phase(phase: HttpTransportPhase) -> u8 {
+    match phase {
+        HttpTransportPhase::Request => 0,
+        HttpTransportPhase::Connect => 1,
+        HttpTransportPhase::Send => 2,
+        HttpTransportPhase::ReadResponseHeaders => 3,
+        HttpTransportPhase::ReadErrorResponse => 4,
+        HttpTransportPhase::ReadSuccessResponse => 5,
+    }
+}
+
+fn decode_network_phase(value: u8) -> HttpTransportPhase {
+    match value {
+        0 => HttpTransportPhase::Request,
+        1 => HttpTransportPhase::Connect,
+        2 => HttpTransportPhase::Send,
+        3 => HttpTransportPhase::ReadResponseHeaders,
+        4 => HttpTransportPhase::ReadErrorResponse,
+        5 => HttpTransportPhase::ReadSuccessResponse,
+        _ => unreachable!("只保存已经编码的 HTTP 网络阶段"),
+    }
 }
 
 fn http_json_category(source: &serde_json::Error) -> HttpJsonCategory {
@@ -1312,7 +1388,7 @@ fn typed_transport_kind(source: &reqwest::Error, phase: HttpTransportPhase) -> H
         return HttpTransportKind::Tls;
     }
     if reqwest_error_chain_matches(source, reqwest::Error::is_timeout) {
-        return HttpTransportKind::Timeout;
+        return timeout_transport_kind(phase);
     }
     if reqwest_error_chain_matches(source, reqwest::Error::is_connect)
         && error_chain_io(source)
@@ -1322,7 +1398,7 @@ fn typed_transport_kind(source: &reqwest::Error, phase: HttpTransportPhase) -> H
         return HttpTransportKind::Dns;
     }
     if reqwest_error_chain_matches(source, reqwest::Error::is_connect) {
-        return HttpTransportKind::Connect;
+        return HttpTransportKind::TcpConnect;
     }
     if matches!(
         phase,
@@ -1338,11 +1414,23 @@ fn typed_transport_kind(source: &reqwest::Error, phase: HttpTransportPhase) -> H
         return HttpTransportKind::Redirect;
     }
     match phase {
-        HttpTransportPhase::ReadErrorResponse | HttpTransportPhase::ReadSuccessResponse => {
-            HttpTransportKind::Read
-        }
-        HttpTransportPhase::Connect => HttpTransportKind::Connect,
+        HttpTransportPhase::Request => HttpTransportKind::Send,
+        HttpTransportPhase::ReadResponseHeaders
+        | HttpTransportPhase::ReadErrorResponse
+        | HttpTransportPhase::ReadSuccessResponse => HttpTransportKind::Read,
+        HttpTransportPhase::Connect => HttpTransportKind::TcpConnect,
         HttpTransportPhase::Send => HttpTransportKind::Send,
+    }
+}
+
+fn timeout_transport_kind(phase: HttpTransportPhase) -> HttpTransportKind {
+    match phase {
+        HttpTransportPhase::Request => HttpTransportKind::TotalTimeout,
+        HttpTransportPhase::Connect => HttpTransportKind::ConnectTimeout,
+        HttpTransportPhase::Send
+        | HttpTransportPhase::ReadResponseHeaders
+        | HttpTransportPhase::ReadErrorResponse
+        | HttpTransportPhase::ReadSuccessResponse => HttpTransportKind::ReadTimeout,
     }
 }
 
@@ -1352,6 +1440,10 @@ fn effective_transport_phase(
 ) -> HttpTransportPhase {
     if reqwest_error_chain_matches(source, reqwest::Error::is_connect) {
         HttpTransportPhase::Connect
+    } else if declared == HttpTransportPhase::Send
+        && reqwest_error_chain_matches(source, reqwest::Error::is_timeout)
+    {
+        HttpTransportPhase::ReadResponseHeaders
     } else {
         declared
     }
@@ -1389,7 +1481,10 @@ where
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+    matches!(
+        status.as_u16(),
+        408 | 429 | 500 | 502 | 503 | 504 | 520..=524
+    )
 }
 
 fn classify_service_status(
@@ -1593,6 +1688,35 @@ fn parse_responses_response(
 
 fn invalid_response(violation: HttpEnvelopeViolation) -> LlmRequestError<OpenAiCompatibleError> {
     LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire { violation })
+}
+
+/// 非成功响应读取正文期间也可能被总超时取消；守卫确保取消不会永久堵住共享准入。
+struct ServiceDecisionGuard<'a> {
+    lifecycle: &'a LlmLifecycle,
+    resolve_on_drop: bool,
+}
+
+impl<'a> ServiceDecisionGuard<'a> {
+    fn new(lifecycle: &'a LlmLifecycle) -> Self {
+        lifecycle.hold_service_decision();
+        Self {
+            lifecycle,
+            resolve_on_drop: true,
+        }
+    }
+
+    /// 429 的决定门由请求重试状态机在继续或耗尽时解除。
+    fn retain(mut self) {
+        self.resolve_on_drop = false;
+    }
+}
+
+impl Drop for ServiceDecisionGuard<'_> {
+    fn drop(&mut self) {
+        if self.resolve_on_drop {
+            self.lifecycle.resolve_service_decision();
+        }
+    }
 }
 
 struct LlmLifecycle {
@@ -1826,6 +1950,7 @@ mod tests {
         AsyncDelay, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
         execute_llm_request_with_retry,
     };
+    use crate::i18n::{UiLocale, UiLocalizer};
 
     use super::*;
 
@@ -1970,12 +2095,26 @@ mod tests {
     }
 
     fn executor(max_active_requests: usize) -> OpenAiCompatibleExecutor {
+        executor_with_network(
+            max_active_requests,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            LlmProxyConfiguration::Disabled,
+        )
+    }
+
+    fn executor_with_network(
+        max_active_requests: usize,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        proxy: LlmProxyConfiguration,
+    ) -> OpenAiCompatibleExecutor {
         OpenAiCompatibleExecutor::new(OpenAiExecutorConfiguration::new(
             non_zero_usize(max_active_requests),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            connect_timeout,
+            read_timeout,
             Duration::from_secs(60),
-            LlmProxyConfiguration::Disabled,
+            proxy,
         ))
         .expect("测试 LLM 根应构造成功")
     }
@@ -2184,6 +2323,76 @@ mod tests {
             requests,
             first_request_seen,
             release_first: gate_first.then_some(release_sender),
+            worker,
+        }
+    }
+
+    fn spawn_delayed_response_server(delay: Duration, response: Vec<u8>) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试监听应成功");
+        let address = listener.local_addr().expect("测试监听地址应可读");
+        let (request_sender, requests) = mpsc::channel();
+        let (seen_sender, first_request_seen) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("llm-delayed-response-server".to_owned())
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("测试请求应可接受");
+                let request = read_http_request(&mut stream);
+                request_sender.send(request).expect("测试请求应可记录");
+                seen_sender.send(()).expect("测试请求应可通知");
+                thread::sleep(delay);
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            })
+            .expect("延迟响应测试服务器应创建成功");
+        TestServer {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            requests,
+            first_request_seen,
+            release_first: None,
+            worker,
+        }
+    }
+
+    fn spawn_slow_error_body_then_success_server(delay: Duration) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试监听应成功");
+        let address = listener.local_addr().expect("测试监听地址应可读");
+        let (request_sender, requests) = mpsc::channel();
+        let (seen_sender, first_request_seen) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("llm-slow-error-body-server".to_owned())
+            .spawn(move || {
+                let (mut first, _) = listener.accept().expect("首个测试请求应可接受");
+                request_sender
+                    .send(read_http_request(&mut first))
+                    .expect("首个测试请求应可记录");
+                seen_sender.send(()).expect("首个测试请求应可通知");
+                let body = br#"{"error":{"code":"temporary","type":"upstream"}}"#;
+                let headers = format!(
+                    "HTTP/1.1 524 A Timeout Occurred\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                first.write_all(headers.as_bytes()).expect("524 响应头应可写入");
+                first.flush().expect("524 响应头应可刷新");
+                thread::sleep(delay);
+                let _ = first.write_all(body);
+                let _ = first.flush();
+                drop(first);
+
+                let (mut second, _) = listener.accept().expect("后续测试请求应可接受");
+                request_sender
+                    .send(read_http_request(&mut second))
+                    .expect("后续测试请求应可记录");
+                second
+                    .write_all(&success_response("later", "later", "[]"))
+                    .expect("后续成功响应应可写入");
+                second.flush().expect("后续成功响应应可刷新");
+            })
+            .expect("慢错误正文测试服务器应创建成功");
+        TestServer {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            requests,
+            first_request_seen,
+            release_first: None,
             worker,
         }
     }
@@ -2727,6 +2936,43 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_reports_duplicate_choice_and_output_after_finish_precisely() {
+        let duplicate = ChatCompletionsStream::default().accept(SseEvent {
+            event_type: None,
+            data: br#"{"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null},{"index":0,"delta":{"content":"b"},"finish_reason":null}]}"#.to_vec(),
+        });
+        assert!(matches!(
+            duplicate,
+            Err(LlmRequestError::Fatal(
+                OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::DuplicateChoice,
+                }
+            ))
+        ));
+
+        let mut finished = ChatCompletionsStream::default();
+        finished
+            .accept(SseEvent {
+                event_type: None,
+                data: br#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_vec(),
+            })
+            .expect("带 finish 的首个 choice 应先等待流终止");
+        assert!(matches!(
+            finished.accept(SseEvent {
+                event_type: None,
+                data:
+                    br#"{"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}"#
+                        .to_vec(),
+            }),
+            Err(LlmRequestError::Fatal(
+                OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::ChoiceAfterFinish,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn successful_wire_rejects_missing_or_duplicate_index_zero_and_invalid_core_fields() {
         for body in [
             br#"[]"#.as_slice(),
@@ -2886,44 +3132,85 @@ mod tests {
         assert_eq!(incomplete.content(), "");
         assert_eq!(incomplete.finish_reason(), &LlmFinishReason::Length);
 
-        for event in [
-            SseEvent {
-                event_type: Some(b"response.completed".to_vec()),
-                data: br#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#.to_vec(),
-            },
-            SseEvent {
-                event_type: None,
-                data: br#"{"type":"response.failed","response":{"status":"failed"}}"#.to_vec(),
-            },
-            SseEvent {
-                event_type: Some(b"error".to_vec()),
-                data: br#"{"type":"error","message":"failed"}"#.to_vec(),
-            },
-            SseEvent {
-                event_type: None,
-                data: b"[DONE]".to_vec(),
-            },
+        for (event, expected) in [
+            (
+                SseEvent {
+                    event_type: Some(b"response.completed".to_vec()),
+                    data: br#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#.to_vec(),
+                },
+                HttpEnvelopeViolation::EventTypeMismatch,
+            ),
+            (
+                SseEvent {
+                    event_type: None,
+                    data: br#"{"type":"response.failed","response":{"status":"failed"}}"#.to_vec(),
+                },
+                HttpEnvelopeViolation::StreamErrorEvent,
+            ),
+            (
+                SseEvent {
+                    event_type: Some(b"error".to_vec()),
+                    data: br#"{"type":"error","message":"failed"}"#.to_vec(),
+                },
+                HttpEnvelopeViolation::StreamErrorEvent,
+            ),
+            (
+                SseEvent {
+                    event_type: None,
+                    data: b"[DONE]".to_vec(),
+                },
+                HttpEnvelopeViolation::UnexpectedDoneMarker,
+            ),
         ] {
             assert!(matches!(
                 parse_responses_stream_event(event),
-                Err(LlmRequestError::Fatal(
-                    OpenAiCompatibleError::InvalidResponseWire { .. }
-                ))
+                Err(LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire {
+                    violation,
+                })) if violation == expected
             ));
         }
     }
 
     #[test]
     fn retryable_http_status_set_is_exact() {
-        for status in [408, 429, 500, 502, 503, 504] {
+        for status in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524] {
             assert!(is_retryable_status(
                 StatusCode::from_u16(status).expect("测试状态码有效")
             ));
         }
-        for status in [200, 400, 401, 403, 404, 409, 422, 501, 505] {
+        for status in [200, 400, 401, 403, 404, 409, 422, 501, 505, 519, 525, 526] {
             assert!(!is_retryable_status(
                 StatusCode::from_u16(status).expect("测试状态码有效")
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudflare_tls_statuses_525_and_526_are_not_retried() {
+        for (status, label) in [
+            (525_u16, "525 SSL Handshake Failed"),
+            (526, "526 Invalid SSL Certificate"),
+        ] {
+            let server = spawn_test_server(
+                vec![status_response(
+                    label,
+                    "Content-Type: application/json\r\n",
+                    r#"{"error":{"code":"tls_failure","type":"gateway"}}"#,
+                )],
+                false,
+            );
+            let client = client_with_rate(&server.endpoint, Map::new(), 60_000, 2);
+            let executor = executor(1);
+            assert!(matches!(
+                executor.request(&client, &[]).await,
+                Err(LlmRequestError::Fatal(OpenAiCompatibleError::HttpStatus {
+                    status: actual,
+                    ..
+                })) if actual == status
+            ));
+            assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+            executor.shutdown().await;
+            server.worker.join().expect("测试服务器应正常退出");
         }
     }
 
@@ -3321,6 +3608,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_stream_clean_eof_without_terminal_reports_missing_terminal() {
+        let body = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n";
+        let server = spawn_test_server(vec![sse_response(body, body.len())], false);
+        let base = server
+            .endpoint
+            .strip_suffix("/chat/completions")
+            .expect("测试服务器 endpoint 应使用 Chat 后缀");
+        let client =
+            client_with_protocol_and_stream(base, OpenAiProtocol::Responses, true, Map::new());
+        let executor = executor(1);
+
+        assert!(matches!(
+            executor.request(&client, &[]).await,
+            Err(LlmRequestError::Retryable {
+                source: OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::MissingResponsesTerminal,
+                },
+                retry_after: None,
+            })
+        ));
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
     async fn clean_eof_after_finish_is_complete_but_missing_finish_and_truncation_retry() {
         let finished_without_done = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete\"},\"finish_reason\":\"stop\"}]}\n\n";
         let unterminated = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
@@ -3355,7 +3668,7 @@ mod tests {
             missing_finish,
             Err(LlmRequestError::Retryable {
                 source: OpenAiCompatibleError::InvalidResponseWire {
-                    violation: HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                    violation: HttpEnvelopeViolation::MissingFinishReason,
                 },
                 retry_after: None,
             })
@@ -3365,7 +3678,7 @@ mod tests {
             residual,
             Err(LlmRequestError::Retryable {
                 source: OpenAiCompatibleError::InvalidResponseWire {
-                    violation: HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                    violation: HttpEnvelopeViolation::UnclosedSseEvent,
                 },
                 retry_after: None,
             })
@@ -3558,6 +3871,32 @@ mod tests {
             .expect("第二个任务不应 panic")
             .expect("第二个请求应成功");
         server.requests.recv().expect("许可释放后应发送第二个请求");
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn request_total_timeout_starts_after_local_active_admission() {
+        let server = spawn_test_server(vec![success_response("ok", "ok", "[]")], false);
+        let mut client = client_with_rate(&server.endpoint, Map::new(), 60_000, 2);
+        client.request_timeout = Duration::from_millis(200);
+        let executor = executor(1);
+        let held = Arc::clone(&executor.active_capacity)
+            .acquire_owned()
+            .await
+            .expect("测试应先占用活动许可");
+
+        let request_executor = executor.clone();
+        let request = tokio::spawn(async move { request_executor.request(&client, &[]).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!request.is_finished(), "本地准入等待不得消耗请求总超时");
+        drop(held);
+        request
+            .await
+            .expect("请求任务不应 panic")
+            .expect("获得本地许可后的请求应成功");
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");
     }
@@ -3871,13 +4210,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_server_error_does_not_stop_later_http_requests() {
+    async fn http_524_retries_and_then_accepts_the_successful_response() {
         let server = spawn_test_server(
             vec![
                 status_response(
-                    "500 Internal Server Error",
+                    "524 A Timeout Occurred",
                     "Content-Type: application/json\r\n",
-                    r#"{"error":{"code":"server_error","type":"temporary"}}"#,
+                    r#"{"error":{"code":"upstream_timeout","type":"temporary"}}"#,
+                ),
+                success_response("retried-response", "retried-request", "[]"),
+            ],
+            false,
+        );
+        let client = client_with_rate(&server.endpoint, Map::new(), 60_000, 2);
+        let executor = executor(1);
+        let cancellation = CooperativeCancellation::default();
+
+        let execution = execute_llm_request_with_retry(
+            &executor,
+            &client,
+            &[ChatMessage::new(ChatMessageRole::User, "retry-524")],
+            LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &cancellation,
+        )
+        .await;
+        assert!(matches!(
+            execution.into_parts().0,
+            LlmRequestExecutionOutcome::Response { .. }
+        ));
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn exhausted_http_524_does_not_stop_later_http_requests() {
+        let server = spawn_test_server(
+            vec![
+                status_response(
+                    "524 A Timeout Occurred",
+                    "Content-Type: application/json\r\n",
+                    r#"{"error":{"code":"upstream_timeout","type":"temporary"}}"#,
                 ),
                 success_response("later-response", "later-request", "[]"),
             ],
@@ -3890,7 +4266,7 @@ mod tests {
         let first = execute_llm_request_with_retry(
             &executor,
             &client,
-            &[ChatMessage::new(ChatMessageRole::User, "server-error")],
+            &[ChatMessage::new(ChatMessageRole::User, "upstream-timeout")],
             LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
             &ImmediateDelay,
             &cancellation,
@@ -4230,29 +4606,261 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_failure_is_retryable() {
+    async fn connection_timeout_is_retryable_and_distinct_from_total_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("测试端口应可占用");
         let endpoint = format!(
             "http://{}/v1/chat/completions",
             listener.local_addr().expect("测试地址应可读")
         );
-        let client = client(&endpoint, Map::new());
-        let executor = executor(1);
+        drop(listener);
+        let mut client = client(&endpoint, Map::new());
+        client.request_timeout = Duration::from_secs(1);
+        let executor = executor_with_network(
+            1,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            LlmProxyConfiguration::Disabled,
+        );
+
+        let result = executor
+            .request(
+                &client,
+                &[ChatMessage::new(ChatMessageRole::User, "content")],
+            )
+            .await;
+        let Err(LlmRequestError::Retryable {
+            source,
+            retry_after: None,
+        }) = result
+        else {
+            panic!("TCP 连接超时必须可重试，实际为 {result:?}");
+        };
+        let diagnostic = LlmRequestExecutor::request_diagnostic(&executor, &client, &source, None);
+        let value = serde_json::to_value(&diagnostic).expect("TCP 诊断应可序列化");
+        assert_eq!(value["issue"]["details"]["transport"], "connect_timeout");
+        assert_eq!(value["issue"]["details"]["phase"], "connect");
+        assert_eq!(value["issue"]["details"]["route"]["kind"], "direct");
+        let fields = crate::diagnostic::render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, diagnostic),
+            &UiLocalizer::new(UiLocale::English),
+        );
+        assert!(fields.reason.contains("TCP connection timed out"));
+        assert!(fields.reason.contains("Direct connection"));
+        assert!(!fields.reason.contains("raw_os_code"));
+        executor.shutdown().await;
+    }
+
+    #[test]
+    fn timeout_categories_follow_the_actual_network_boundary() {
+        assert_eq!(
+            timeout_transport_kind(HttpTransportPhase::Connect),
+            HttpTransportKind::ConnectTimeout
+        );
+        assert_eq!(
+            timeout_transport_kind(HttpTransportPhase::Request),
+            HttpTransportKind::TotalTimeout
+        );
+        for phase in [
+            HttpTransportPhase::Send,
+            HttpTransportPhase::ReadResponseHeaders,
+            HttpTransportPhase::ReadErrorResponse,
+            HttpTransportPhase::ReadSuccessResponse,
+        ] {
+            assert_eq!(
+                timeout_transport_kind(phase),
+                HttpTransportKind::ReadTimeout
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_header_read_timeout_is_distinct_from_total_timeout() {
+        let server = spawn_delayed_response_server(
+            Duration::from_millis(100),
+            success_response("delayed", "delayed", "[]"),
+        );
+        let client = client(&server.endpoint, Map::new());
+        let executor = executor_with_network(
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            LlmProxyConfiguration::Disabled,
+        );
+
+        let result = executor.request(&client, &[]).await;
+        let Err(LlmRequestError::Retryable {
+            source,
+            retry_after: None,
+        }) = result
+        else {
+            panic!("响应头读取超时必须可重试，实际为 {result:?}");
+        };
+        assert!(matches!(
+            &source,
+            OpenAiCompatibleError::Transport {
+                phase: HttpTransportPhase::ReadResponseHeaders,
+                ..
+            }
+        ));
+        let diagnostic = LlmRequestExecutor::request_diagnostic(&executor, &client, &source, None);
+        let value = serde_json::to_value(diagnostic).expect("读取超时诊断应可序列化");
+        assert_eq!(value["issue"]["details"]["transport"], "read_timeout");
+        assert_eq!(value["issue"]["details"]["phase"], "read_response_headers");
+
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn total_timeout_during_error_body_releases_shared_admission() {
+        let server = spawn_slow_error_body_then_success_server(Duration::from_millis(100));
+        let mut client = client_with_rate(&server.endpoint, Map::new(), 60_000, 2);
+        client.request_timeout = Duration::from_millis(30);
+        let executor = executor_with_network(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            LlmProxyConfiguration::Disabled,
+        );
 
         assert!(matches!(
-            executor
-                .request(
-                    &client,
-                    &[ChatMessage::new(ChatMessageRole::User, "content")]
-                )
-                .await,
+            executor.request(&client, &[]).await,
             Err(LlmRequestError::Retryable {
-                source: OpenAiCompatibleError::Transport { .. },
+                source: OpenAiCompatibleError::TotalTimeout {
+                    phase: HttpTransportPhase::ReadErrorResponse,
+                },
                 retry_after: None,
             })
         ));
+        assert_eq!(
+            executor
+                .lifecycle
+                .state
+                .lock()
+                .expect("LLM 生命周期锁不应中毒")
+                .pending_service_decisions,
+            0,
+            "总超时取消错误正文读取后必须解除服务决定门"
+        );
+
+        client.request_timeout = Duration::from_secs(1);
+        tokio::time::timeout(Duration::from_secs(1), executor.request(&client, &[]))
+            .await
+            .expect("总超时后后续请求不得被决定门卡住")
+            .expect("总超时后后续请求应成功");
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+
         executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_route_is_preserved_without_sensitive_url_parts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试代理端口应可占用");
+        let proxy_address = listener.local_addr().expect("测试代理地址应可读");
         drop(listener);
+        let proxy = Url::parse(&format!(
+            "http://{proxy_address}/private-path?token=test-secret"
+        ))
+        .expect("测试代理 URL 有效");
+        let executor = executor_with_network(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            LlmProxyConfiguration::Explicit(proxy),
+        );
+        let client = client(
+            "http://model.example.test/private-model-path?api_key=test-secret",
+            Map::new(),
+        );
+
+        let result = executor.request(&client, &[]).await;
+        let Err(LlmRequestError::Retryable {
+            source,
+            retry_after: None,
+        }) = result
+        else {
+            panic!("代理 TCP 连接失败必须可重试，实际为 {result:?}");
+        };
+        let diagnostic = LlmRequestExecutor::request_diagnostic(&executor, &client, &source, None);
+        let wire = serde_json::to_string(&diagnostic).expect("代理诊断应可序列化");
+        assert!(wire.contains("explicit_proxy"));
+        assert!(wire.contains("127.0.0.1"));
+        for forbidden in [
+            "test-secret",
+            "private-path",
+            "private-model-path",
+            "api_key",
+        ] {
+            assert!(!wire.contains(forbidden), "代理诊断泄漏了 {forbidden}");
+        }
+        let fields = crate::diagnostic::render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, diagnostic),
+            &UiLocalizer::new(UiLocale::English),
+        );
+        assert!(fields.reason.contains("Via explicit proxy"));
+        assert!(!fields.reason.contains("private-path"));
+        executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_peer_on_https_endpoint_reports_tls_handshake_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试 TLS 端口应可占用");
+        let address = listener.local_addr().expect("测试 TLS 地址应可读");
+        let worker = thread::Builder::new()
+            .name("llm-invalid-tls-server".to_owned())
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("TLS 测试连接应可接受");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("TLS 测试读取超时应可设置");
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer);
+            })
+            .expect("TLS 测试服务器应创建成功");
+        let client = client(
+            &format!("https://{address}/v1/chat/completions"),
+            Map::new(),
+        );
+        let executor = executor(1);
+
+        let result = executor.request(&client, &[]).await;
+        let source = match result {
+            Err(LlmRequestError::Fatal(source @ OpenAiCompatibleError::Transport { .. })) => source,
+            other => panic!("TLS 握手失败必须是不可重试的类型化传输错误，实际为 {other:?}"),
+        };
+        let diagnostic = LlmRequestExecutor::request_diagnostic(&executor, &client, &source, None);
+        let value = serde_json::to_value(diagnostic).expect("TLS 诊断应可序列化");
+        assert_eq!(value["issue"]["details"]["transport"], "tls");
+        assert_eq!(value["issue"]["details"]["route"]["kind"], "direct");
+        executor.shutdown().await;
+        worker.join().expect("TLS 测试服务器应正常退出");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unresolved_windows_host_reports_dns_instead_of_tcp_connect() {
+        let client = client(
+            "http://att-host-must-not-exist.invalid/v1/chat/completions",
+            Map::new(),
+        );
+        let executor = executor_with_network(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            LlmProxyConfiguration::Disabled,
+        );
+        let result = executor.request(&client, &[]).await;
+        let source = match result {
+            Err(LlmRequestError::Retryable { source, .. }) => source,
+            other => panic!("DNS 失败必须可重试，实际为 {other:?}"),
+        };
+        let diagnostic = LlmRequestExecutor::request_diagnostic(&executor, &client, &source, None);
+        let value = serde_json::to_value(diagnostic).expect("DNS 诊断应可序列化");
+        assert_eq!(value["issue"]["details"]["transport"], "dns");
+        executor.shutdown().await;
     }
 
     #[tokio::test]

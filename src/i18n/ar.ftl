@@ -267,10 +267,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] جلسة SQLite تفاعلية أخرى نشطة بالفعل
     [backup_incomplete] لم تصل نسخة SQLite الاحتياطية إلى حالة الاكتمال
     [request_serialization_failed] تعذر إجراء تسلسل لطلب النموذج
+    [http_client_build_failed] تعذر إنشاء عميل HTTP لخدمة النموذج
+    [dns_resolution_failed] فشل تحليل DNS
+    [tcp_connection_failed] فشل اتصال TCP
+    [request_send_failed] تعذر إرسال طلب HTTP
+    [response_read_failed] تعذرت قراءة استجابة HTTP
+    [tls_handshake_failed] فشلت مصافحة TLS
+    [connect_timed_out] انتهت مهلة اتصال TCP
+    [read_timed_out] انتهت مهلة قراءة استجابة HTTP
+    [request_timed_out] تجاوز طلب HTTP المهلة الإجمالية
+    [response_decode_failed] تعذر فك ترميز استجابة HTTP
+    [redirect_rejected] رُفضت إعادة توجيه HTTP
     [response_parsing_failed] استجابة النموذج ليست JSON صالحًا
+    [model_stream_invalid_json] حدث تدفق النموذج ليس JSON صالحًا
+    [model_stream_invalid_utf8] يحتوي تدفق النموذج على UTF-8 غير صالح
+    [model_stream_error_event] أعاد تدفق النموذج حدث خطأ من الخدمة
+    [model_stream_unclosed_event] لم يُغلق حدث SSE بسطر فارغ
+    [model_stream_missing_finish] يفتقد تدفق Chat إلى finish_reason
+    [model_stream_missing_responses_terminal] يفتقد تدفق Responses إلى حدث نهائي
+    [model_stream_event_type_mismatch] لا يتطابق اسم حدث SSE مع نوع JSON
+    [model_stream_duplicate_choice] كرر تدفق النموذج choice نفسه
+    [model_stream_output_after_finish] واصل تدفق النموذج الإخراج بعد finish
+    [model_stream_unexpected_done] أعاد تدفق Responses علامة [DONE] غير متوقعة
     [invalid_response_contract] استجابة النموذج لا تستوفي عقد الاستجابة المطلوب
-    [model_stream_incomplete] انتهى تدفق النموذج قبل نتيجة نهائية صريحة
-    [transport_failed] فشل نقل HTTP قبل وصول استجابة صالحة
     [lua_compilation_failed] تعذر تجميع برنامج Lua الرئيسي
     [lua_execution_failed] فشل برنامج Lua الرئيسي أثناء التشغيل
     [rules_pattern_match_failed] تعذر تقييم نمط PCRE2 في Rules
@@ -335,6 +354,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = حالة HTTP ‏{ $status }
+diagnostic-http-route-direct = اتصال مباشر (بلا وكيل)
+diagnostic-http-route-proxy = عبر الوكيل الصريح { $proxy }
 diagnostic-retry-after = Retry-After: ‏{ $seconds } ثانية
 diagnostic-provider-code = رمز المزوّد: { $code }
 diagnostic-provider-type = نوع المزوّد: { $kind }

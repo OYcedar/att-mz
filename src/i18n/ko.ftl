@@ -260,10 +260,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] 다른 대화형 SQLite 세션이 이미 활성 상태입니다
     [backup_incomplete] SQLite 백업이 완료 상태에 도달하지 못했습니다
     [request_serialization_failed] 모델 요청을 직렬화할 수 없습니다
+    [http_client_build_failed] 모델 서비스 HTTP 클라이언트를 만들지 못했습니다
+    [dns_resolution_failed] DNS 확인에 실패했습니다
+    [tcp_connection_failed] TCP 연결에 실패했습니다
+    [request_send_failed] HTTP 요청을 보내지 못했습니다
+    [response_read_failed] HTTP 응답을 읽지 못했습니다
+    [tls_handshake_failed] TLS 핸드셰이크에 실패했습니다
+    [connect_timed_out] TCP 연결 시간이 초과되었습니다
+    [read_timed_out] HTTP 응답 읽기 시간이 초과되었습니다
+    [request_timed_out] HTTP 요청이 전체 제한 시간을 초과했습니다
+    [response_decode_failed] HTTP 응답을 디코딩하지 못했습니다
+    [redirect_rejected] HTTP 리디렉션이 거부되었습니다
     [response_parsing_failed] 모델 응답이 유효한 JSON이 아닙니다
+    [model_stream_invalid_json] 모델 스트림 이벤트가 유효한 JSON이 아닙니다
+    [model_stream_invalid_utf8] 모델 스트림에 잘못된 UTF-8이 있습니다
+    [model_stream_error_event] 모델 스트림이 서비스 오류 이벤트를 반환했습니다
+    [model_stream_unclosed_event] SSE 이벤트가 빈 줄로 닫히지 않았습니다
+    [model_stream_missing_finish] Chat 스트림에 finish_reason이 없습니다
+    [model_stream_missing_responses_terminal] Responses 스트림에 종료 이벤트가 없습니다
+    [model_stream_event_type_mismatch] SSE 이벤트 이름과 JSON type이 일치하지 않습니다
+    [model_stream_duplicate_choice] 모델 스트림이 같은 choice를 중복 반환했습니다
+    [model_stream_output_after_finish] 모델 스트림이 finish 뒤에도 출력을 계속했습니다
+    [model_stream_unexpected_done] Responses 스트림이 예기치 않은 [DONE]을 반환했습니다
     [invalid_response_contract] 모델 응답이 필수 응답 계약을 충족하지 않습니다
-    [model_stream_incomplete] 모델 스트림이 명시적인 최종 결과 전에 종료되었습니다
-    [transport_failed] 유효한 응답을 받기 전에 HTTP 전송이 실패했습니다
     [lua_compilation_failed] Lua 주 프로그램을 컴파일할 수 없습니다
     [lua_execution_failed] Lua 주 프로그램 실행 중 오류가 발생했습니다
     [rules_pattern_match_failed] Rules PCRE2 패턴을 평가할 수 없습니다
@@ -328,6 +347,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = HTTP 상태 { $status }
+diagnostic-http-route-direct = 직접 연결(프록시 없음)
+diagnostic-http-route-proxy = 명시적 프록시 { $proxy } 경유
 diagnostic-retry-after = Retry-After: { $seconds }초
 diagnostic-provider-code = 공급자 code: { $code }
 diagnostic-provider-type = 공급자 type: { $kind }

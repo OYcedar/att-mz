@@ -260,10 +260,29 @@ diagnostic-failure-value = { $code ->
     [interactive_session_already_open] 別の対話型 SQLite セッションがすでに実行中です
     [backup_incomplete] SQLite バックアップが完了状態に達しませんでした
     [request_serialization_failed] モデルリクエストをシリアル化できませんでした
+    [http_client_build_failed] モデルサービスの HTTP クライアントを作成できませんでした
+    [dns_resolution_failed] DNS 名前解決に失敗しました
+    [tcp_connection_failed] TCP 接続に失敗しました
+    [request_send_failed] HTTP リクエストを送信できませんでした
+    [response_read_failed] HTTP 応答を読み取れませんでした
+    [tls_handshake_failed] TLS ハンドシェイクに失敗しました
+    [connect_timed_out] TCP 接続がタイムアウトしました
+    [read_timed_out] HTTP 応答の読み取りがタイムアウトしました
+    [request_timed_out] HTTP リクエストが総タイムアウトを超えました
+    [response_decode_failed] HTTP 応答をデコードできませんでした
+    [redirect_rejected] HTTP リダイレクトが拒否されました
     [response_parsing_failed] モデル応答が有効な JSON ではありません
+    [model_stream_invalid_json] モデルストリームのイベントが有効な JSON ではありません
+    [model_stream_invalid_utf8] モデルストリームに無効な UTF-8 が含まれています
+    [model_stream_error_event] モデルストリームがサービスエラーイベントを返しました
+    [model_stream_unclosed_event] SSE イベントが空行で閉じられていません
+    [model_stream_missing_finish] Chat ストリームに finish_reason がありません
+    [model_stream_missing_responses_terminal] Responses ストリームに終端イベントがありません
+    [model_stream_event_type_mismatch] SSE イベント名と JSON type が一致しません
+    [model_stream_duplicate_choice] モデルストリームが同じ choice を重複して返しました
+    [model_stream_output_after_finish] モデルストリームが finish 後も出力を続けました
+    [model_stream_unexpected_done] Responses ストリームが予期しない [DONE] を返しました
     [invalid_response_contract] モデル応答が必要な応答契約を満たしていません
-    [model_stream_incomplete] モデルストリームが明確な終端結果の前に終了しました
-    [transport_failed] 有効な応答を受け取る前に HTTP 転送が失敗しました
     [lua_compilation_failed] Lua メインプログラムをコンパイルできませんでした
     [lua_execution_failed] Lua メインプログラムの実行中に失敗しました
     [rules_pattern_match_failed] Rules の PCRE2 パターンを評価できませんでした
@@ -328,6 +347,8 @@ diagnostic-configuration-rule-value = { $code ->
    *[other] __ATT_FALLBACK__
 }
 diagnostic-http-status = HTTP ステータス { $status }
+diagnostic-http-route-direct = 直接接続（プロキシなし）
+diagnostic-http-route-proxy = 明示的なプロキシ { $proxy } 経由
 diagnostic-retry-after = Retry-After：{ $seconds } 秒
 diagnostic-provider-code = プロバイダー code：{ $code }
 diagnostic-provider-type = プロバイダー type：{ $kind }
