@@ -15,10 +15,9 @@ use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyEncodeError,
 };
 use crate::rpg_maker::text::TextGroupKind;
-use crate::translation::placeholder::placeholder_bindings_match_within_slot;
 use crate::translation::placeholder_projection::{
-    LanguageTextProjectionError, project_protected_text_from_shared_with_cancellation,
-    project_protected_text_with_cancellation,
+    LanguageTextProjectionError, SourceBoundPlaceholderError,
+    project_protected_text_from_shared_with_cancellation, project_protected_text_with_cancellation,
 };
 
 #[cfg(test)]
@@ -28,7 +27,7 @@ use super::pipeline::TranslationUnitRejectionReason;
 use super::pipeline::{AppliedPlaceholder, GroupContextFingerprint, TranslationUnitIdentity};
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
-    RpgMakerBuiltinPlaceholderProfile,
+    RpgMakerBuiltinPlaceholderProfile, RpgMakerSourceBoundPlaceholderError,
 };
 use crate::translation::planning_resource::CompiledTerminology;
 
@@ -172,27 +171,33 @@ impl ResolvedTranslationSemantics {
                     )));
                 }
             };
-            let candidate = match self.placeholder_service.protect_profile_with_cancellation(
-                self.engine,
-                kind,
-                &target_id,
-                profile,
-                candidate,
-                &[],
-                &self.custom_placeholders,
-                &mut ensure_running,
-            )? {
-                Ok(candidate) => candidate,
-                Err(source) => {
-                    return Ok(Err(ResolvedTranslationSemanticError::ProtectPlaceholder(
-                        source,
-                    )));
-                }
-            };
-            Ok(Ok(placeholder_bindings_match_within_slot(
-                source.placeholders(),
-                candidate.placeholders(),
-            )))
+            match self
+                .placeholder_service
+                .bind_profile_candidate_with_cancellation(
+                    &source,
+                    self.engine,
+                    kind,
+                    &target_id,
+                    profile,
+                    candidate,
+                    &self.custom_placeholders,
+                    &mut ensure_running,
+                )? {
+                Ok(_) => Ok(Ok(true)),
+                Err(RpgMakerSourceBoundPlaceholderError::Protection(source)) => Ok(Err(
+                    ResolvedTranslationSemanticError::ProtectPlaceholder(source),
+                )),
+                Err(RpgMakerSourceBoundPlaceholderError::Binding(
+                    SourceBoundPlaceholderError::Projection(source),
+                )) => Ok(Err(ResolvedTranslationSemanticError::ProjectLanguageText(
+                    source,
+                ))),
+                Err(RpgMakerSourceBoundPlaceholderError::Binding(
+                    SourceBoundPlaceholderError::Multiset(_)
+                    | SourceBoundPlaceholderError::AmbiguousOriginal { .. }
+                    | SourceBoundPlaceholderError::UnexpectedPlaceholder,
+                )) => Ok(Ok(false)),
+            }
         };
         match (identity.source_content(), candidate) {
             (TextUnitContent::Value(source), TextUnitContent::Value(candidate)) => {
@@ -1198,7 +1203,7 @@ mod tests {
         assert_eq!(
             prepared
                 .accept(&candidate)
-                .expect("正文中的裸尖括号不应被猜成 opaque 外壳"),
+                .expect("模型 token 已唯一标出 wrapper 边界"),
             PreparedTranslationAcceptance::Accepted("<Help:炎之剑<说明>追加>".to_owned())
         );
         assert_eq!(
@@ -1216,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_shell_candidate_rejects_repeated_missing_bindings_as_ambiguous() {
+    fn custom_shell_candidate_binds_repeated_fragments_in_natural_order() {
         let semantics = semantics_with(
             RpgMakerEngine::Mz,
             Vec::new(),
@@ -1229,14 +1234,34 @@ mod tests {
             .prepare(TextGroupKind::DatabaseEntry, "<x>一つ目</x><x>二つ目</x>")
             .expect("两个结构化壳应建立四个独立 Custom 绑定");
 
-        assert!(matches!(
+        assert_eq!(
             prepared
                 .accept("<x>第一项</x><x>第二项</x>")
-                .expect("无法唯一归位应是普通候选拒绝"),
-            PreparedTranslationAcceptance::Rejected(PreparedTranslationRejection::Candidate(
-                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. }
-            ))
-        ));
+                .expect("完整自然顺序应确定每个 wrapper binding"),
+            PreparedTranslationAcceptance::Accepted("<x>第一项</x><x>第二项</x>".to_owned())
+        );
+    }
+
+    #[test]
+    fn candidate_source_binding_survives_a_translated_lookbehind_label() {
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"(?<=Name: )[A-Za-z0-9-]+",
+            )],
+        );
+        let prepared = semantics
+            .prepare(TextGroupKind::DatabaseEntry, "Name: abc-123 翻訳")
+            .expect("源文凭据应由 lookbehind 规则保护");
+
+        assert_eq!(
+            prepared
+                .accept("名称：abc-123 译文")
+                .expect("译文标签变化后仍应按源文 binding 验收"),
+            PreparedTranslationAcceptance::Accepted("名称：abc-123 译文".to_owned())
+        );
     }
 
     #[test]
@@ -1308,19 +1333,17 @@ mod tests {
     }
 
     #[test]
-    fn candidate_keeps_strict_ambiguity_for_repeated_original_placeholders() {
+    fn candidate_binds_repeated_original_placeholders_in_natural_order() {
         let prepared = ResolvedTranslationSemantics::for_test()
             .prepare(TextGroupKind::EventDialogue, r"\C[2]翻訳\C[2]")
             .expect("重复控制符原文应可准备");
 
-        assert!(matches!(
+        assert_eq!(
             prepared
                 .accept(r"\C[2]译文\C[2]")
-                .expect("占位符歧义应是普通拒绝"),
-            PreparedTranslationAcceptance::Rejected(PreparedTranslationRejection::Candidate(
-                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { .. }
-            ))
-        ));
+                .expect("自然顺序应确定重复控制符 binding"),
+            PreparedTranslationAcceptance::Accepted(r"\C[2]译文\C[2]".to_owned())
+        );
     }
 
     #[test]

@@ -13,8 +13,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aho_corasick::{Anchored, MatchKind, automaton::Automaton, nfa::noncontiguous::NFA};
-
 #[cfg(test)]
 use crate::diagnostic::RpgMakerModelNonStopFinishReason;
 use crate::diagnostic::{
@@ -25,13 +23,11 @@ use crate::diagnostic::{
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
-use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
 pub(crate) use crate::execution::llm_request::AsyncDelay;
 use crate::execution::llm_request::{
     LlmRequestAttemptEvidence, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
     execute_llm_request_with_retry_observed,
 };
-use crate::fingerprint::Sha256FramedHasher;
 use crate::language::{
     LanguageId, LanguageModule, LanguageModuleError, LanguageModuleKind,
     LanguageOperationCancelled, LanguagePair, LanguageText, LanguageTextSegment,
@@ -51,7 +47,7 @@ use crate::translation::candidate_validation::{
 };
 use crate::translation::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
-    PlaceholderTextScan,
+    SourceBoundPlaceholderError, bind_source_placeholder_literals_in_lines_with_cancellation,
 };
 use crate::translation::placeholder_token;
 use crate::translation::task_planning::TaskId;
@@ -64,11 +60,11 @@ use crate::translation_protocol::{
 use super::pipeline::rpg_maker_diagnostic_unit;
 use super::pipeline::{
     AcceptedTranslationDecision, AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
-    NonEmptyTaskItems, PlaceholderRuleOrigin, RejectedTranslationCandidate,
-    RejectedTranslationTarget, RpgMakerExecutableTask, RpgMakerTranslationExecutionProfile,
-    RpgMakerTranslationTaskExecutor, RpgMakerTranslationTaskIndex, TranslationPatch,
-    TranslationProtocolDiagnostic, TranslationTaskOutcome, TranslationTaskOutcomeContext,
-    TranslationTaskUnavailableReason, TranslationUnitRejectionReason, UnresolvedTranslationUnit,
+    NonEmptyTaskItems, RejectedTranslationCandidate, RejectedTranslationTarget,
+    RpgMakerExecutableTask, RpgMakerTranslationExecutionProfile, RpgMakerTranslationTaskExecutor,
+    RpgMakerTranslationTaskIndex, TranslationPatch, TranslationProtocolDiagnostic,
+    TranslationTaskOutcome, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
+    TranslationUnitRejectionReason, UnresolvedTranslationUnit,
 };
 use super::placeholder::PlaceholderProtectionError;
 use super::profile::{ResolvedRpgMakerTranslationResources, RpgMakerTranslationProfile};
@@ -2346,19 +2342,37 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
         ensure_running()?;
         initial_scans.push(placeholder_bindings.scan_with_cancellation(line, &mut ensure_running)?);
     }
-    let normalized_original =
-        match normalize_original_placeholder_literals_in_lines_with_cancellation(
-            &mut lines,
-            placeholders,
-            placeholder_bindings,
-            &initial_scans,
-            &mut ensure_running,
-        )? {
-            Ok(normalized) => normalized,
-            Err(source) => {
-                return Ok(Err(source));
-            }
-        };
+    let normalized_original = match bind_source_placeholder_literals_in_lines_with_cancellation(
+        &mut lines,
+        placeholders,
+        placeholder_bindings,
+        &initial_scans,
+        &mut ensure_running,
+    )? {
+        Ok(normalized) => normalized,
+        Err(SourceBoundPlaceholderError::AmbiguousOriginal { original }) => {
+            return Ok(Err(TranslationCandidateValidationError::Rejected(
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original },
+            )));
+        }
+        Err(SourceBoundPlaceholderError::Projection(source)) => {
+            return Ok(Err(
+                TranslationCandidateValidationError::LanguageProjection(source),
+            ));
+        }
+        Err(SourceBoundPlaceholderError::Multiset(source)) => {
+            return Ok(Err(TranslationCandidateValidationError::Rejected(
+                multiset_rejection(source),
+            )));
+        }
+        Err(SourceBoundPlaceholderError::UnexpectedPlaceholder) => {
+            return Ok(Err(TranslationCandidateValidationError::Rejected(
+                TranslationUnitRejectionReason::PlaceholderMismatch {
+                    token: String::new(),
+                },
+            )));
+        }
+    };
     let line_scans = if normalized_original {
         let mut scans = Vec::with_capacity(lines.len());
         for line in &lines {
@@ -2598,18 +2612,38 @@ fn validate_and_restore_translation_at(
     let placeholder_bindings = PlaceholderBindingIndex::new(placeholders)
         .map_err(TranslationCandidateValidationError::LanguageProjection)?;
     let initial_scan = placeholder_bindings.scan(&translation);
-    let normalized_original =
-        match normalize_original_placeholder_literals_in_lines_with_cancellation(
-            std::slice::from_mut(&mut translation),
-            placeholders,
-            &placeholder_bindings,
-            std::slice::from_ref(&initial_scan),
-            || Ok::<_, std::convert::Infallible>(()),
-        ) {
-            Ok(Ok(normalized)) => normalized,
-            Ok(Err(source)) => return Err(source),
-            Err(unreachable) => match unreachable {},
-        };
+    let normalized_original = match bind_source_placeholder_literals_in_lines_with_cancellation(
+        std::slice::from_mut(&mut translation),
+        placeholders,
+        &placeholder_bindings,
+        std::slice::from_ref(&initial_scan),
+        || Ok::<_, std::convert::Infallible>(()),
+    ) {
+        Ok(Ok(normalized)) => normalized,
+        Ok(Err(SourceBoundPlaceholderError::AmbiguousOriginal { original })) => {
+            return Err(TranslationCandidateValidationError::Rejected(
+                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original },
+            ));
+        }
+        Ok(Err(SourceBoundPlaceholderError::Projection(source))) => {
+            return Err(TranslationCandidateValidationError::LanguageProjection(
+                source,
+            ));
+        }
+        Ok(Err(SourceBoundPlaceholderError::Multiset(source))) => {
+            return Err(TranslationCandidateValidationError::Rejected(
+                multiset_rejection(source),
+            ));
+        }
+        Ok(Err(SourceBoundPlaceholderError::UnexpectedPlaceholder)) => {
+            return Err(TranslationCandidateValidationError::Rejected(
+                TranslationUnitRejectionReason::PlaceholderMismatch {
+                    token: String::new(),
+                },
+            ));
+        }
+        Err(unreachable) => match unreachable {},
+    };
     let scanned = if normalized_original {
         placeholder_bindings.scan(&translation)
     } else {
@@ -2845,551 +2879,6 @@ enum TranslationCandidateValidationError {
     },
 }
 
-fn normalize_original_placeholder_literals_in_lines_with_cancellation<E>(
-    lines: &mut [String],
-    placeholders: &[AppliedPlaceholder],
-    placeholder_bindings: &PlaceholderBindingIndex,
-    scans: &[PlaceholderTextScan],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Result<bool, TranslationCandidateValidationError>, E> {
-    debug_assert_eq!(lines.len(), scans.len());
-    let mut groups = Vec::<OriginalPlaceholderGroup>::new();
-    let mut fingerprints =
-        std::collections::HashMap::<crate::fingerprint::Sha256Fingerprint, Vec<usize>>::new();
-    for (binding_index, placeholder) in placeholders.iter().enumerate() {
-        ensure_running()?;
-        let fingerprint = response_text_fingerprint_with_cancellation(
-            placeholder.original(),
-            &mut ensure_running,
-        )?;
-        let bucket = fingerprints.entry(fingerprint).or_default();
-        let mut group_index = None;
-        for candidate in bucket.iter().copied() {
-            if response_text_equal_with_cancellation(
-                placeholders[groups[candidate].representative].original(),
-                placeholder.original(),
-                &mut ensure_running,
-            )? {
-                group_index = Some(candidate);
-                break;
-            }
-        }
-        let group_index = match group_index {
-            Some(group_index) => group_index,
-            None => {
-                let group_index = groups.len();
-                groups.push(OriginalPlaceholderGroup {
-                    representative: binding_index,
-                    bindings: Vec::new(),
-                });
-                bucket.push(group_index);
-                group_index
-            }
-        };
-        groups[group_index].bindings.push(binding_index);
-    }
-    let token_counts = placeholder_bindings
-        .all_binding_token_occurrences_with_cancellation(scans, &mut ensure_running)?;
-    let group_order = sorted_original_placeholder_group_order_with_cancellation(
-        &groups,
-        placeholders,
-        &mut ensure_running,
-    )?;
-
-    let mut group_token_states = Vec::with_capacity(groups.len());
-    for group in &groups {
-        ensure_running()?;
-        let mut all_tokens_present = true;
-        let mut has_builtin = false;
-        for &binding_index in &group.bindings {
-            ensure_running()?;
-            all_tokens_present &= token_counts[binding_index] != 0;
-            has_builtin |= placeholders[binding_index].origin() == PlaceholderRuleOrigin::BuiltIn;
-        }
-        group_token_states.push(OriginalPlaceholderGroupTokenState {
-            all_tokens_present,
-            has_builtin,
-        });
-    }
-    let mut groups_requiring_scan = Vec::new();
-    for &group_index in &group_order {
-        ensure_running()?;
-        let state = group_token_states[group_index];
-        if !state.all_tokens_present || state.has_builtin {
-            groups_requiring_scan.push(group_index);
-        }
-    }
-    let occurrences = match index_original_placeholder_occurrences_with_cancellation(
-        lines,
-        scans,
-        &groups,
-        placeholders,
-        &groups_requiring_scan,
-        &mut ensure_running,
-    )? {
-        Ok(occurrences) => occurrences,
-        Err(source) => {
-            return Ok(Err(
-                TranslationCandidateValidationError::LanguageProjection(source),
-            ));
-        }
-    };
-
-    let mut replacements = Vec::<OriginalPlaceholderLiteralReplacement<'_>>::new();
-    for group_index in group_order {
-        ensure_running()?;
-        let group = &groups[group_index];
-        let original = placeholders[group.representative].original();
-        let matched = occurrences.by_group[group_index];
-        if matched.count == 0 {
-            continue;
-        }
-        let state = group_token_states[group_index];
-        if state.all_tokens_present {
-            if state.has_builtin {
-                return Ok(Err(TranslationCandidateValidationError::Rejected(
-                    TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
-                        original: clone_response_processing_text_with_cancellation(
-                            original,
-                            &mut ensure_running,
-                        )?,
-                    },
-                )));
-            }
-            continue;
-        }
-        if group.bindings.len() != 1 {
-            return Ok(Err(TranslationCandidateValidationError::Rejected(
-                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
-                    original: clone_response_processing_text_with_cancellation(
-                        original,
-                        &mut ensure_running,
-                    )?,
-                },
-            )));
-        }
-        let binding_index = group.bindings[0];
-        let binding = &placeholders[binding_index];
-        if token_counts[binding_index] == 0 && matched.count == 1 {
-            let (line_index, start, end) = matched.first.expect("一次匹配必须保留精确位置");
-            replacements.push(OriginalPlaceholderLiteralReplacement {
-                line_index,
-                start,
-                end,
-                token: binding.token(),
-                original,
-            });
-        } else {
-            return Ok(Err(TranslationCandidateValidationError::Rejected(
-                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
-                    original: clone_response_processing_text_with_cancellation(
-                        original,
-                        &mut ensure_running,
-                    )?,
-                },
-            )));
-        }
-    }
-
-    stable_sort_original_replacements_with_cancellation(&mut replacements, &mut ensure_running)?;
-    for pair in replacements.windows(2) {
-        ensure_running()?;
-        let [previous, current] = pair else {
-            unreachable!("windows(2) 始终返回两个元素");
-        };
-        if previous.line_index == current.line_index && current.start < previous.end {
-            return Ok(Err(TranslationCandidateValidationError::Rejected(
-                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous {
-                    original: clone_response_processing_text_with_cancellation(
-                        current.original,
-                        &mut ensure_running,
-                    )?,
-                },
-            )));
-        }
-    }
-    let changed = !replacements.is_empty();
-    let mut replacement_index = 0_usize;
-    for (line_index, line) in lines.iter_mut().enumerate() {
-        ensure_running()?;
-        let first = replacement_index;
-        while replacements
-            .get(replacement_index)
-            .is_some_and(|replacement| replacement.line_index == line_index)
-        {
-            ensure_running()?;
-            replacement_index += 1;
-        }
-        if first == replacement_index {
-            continue;
-        }
-        let line_replacements = &replacements[first..replacement_index];
-        let mut capacity = line.len();
-        for replacement in line_replacements {
-            ensure_running()?;
-            capacity = capacity
-                .checked_sub(replacement.end - replacement.start)
-                .and_then(|capacity| capacity.checked_add(replacement.token.len()))
-                .expect("Placeholder 规范化结果长度必须能由 usize 表示");
-        }
-        let original_line = std::mem::take(line);
-        let mut rebuilt = String::with_capacity(capacity);
-        let mut cursor = 0_usize;
-        for replacement in line_replacements {
-            append_response_processing_text_with_cancellation(
-                &mut rebuilt,
-                &original_line[cursor..replacement.start],
-                &mut ensure_running,
-            )?;
-            append_response_processing_text_with_cancellation(
-                &mut rebuilt,
-                replacement.token,
-                &mut ensure_running,
-            )?;
-            cursor = replacement.end;
-        }
-        append_response_processing_text_with_cancellation(
-            &mut rebuilt,
-            &original_line[cursor..],
-            &mut ensure_running,
-        )?;
-        *line = rebuilt;
-    }
-    ensure_running()?;
-    Ok(Ok(changed))
-}
-
-struct OriginalPlaceholderGroup {
-    representative: usize,
-    bindings: Vec<usize>,
-}
-
-#[derive(Clone, Copy)]
-struct OriginalPlaceholderGroupTokenState {
-    all_tokens_present: bool,
-    has_builtin: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct OriginalPlaceholderOccurrences {
-    count: u8,
-    first: Option<(usize, usize, usize)>,
-}
-
-struct OriginalPlaceholderOccurrenceIndex {
-    by_group: Vec<OriginalPlaceholderOccurrences>,
-    #[cfg(test)]
-    scanned_lines: usize,
-}
-
-fn index_original_placeholder_occurrences_with_cancellation<E>(
-    lines: &[String],
-    scans: &[PlaceholderTextScan],
-    groups: &[OriginalPlaceholderGroup],
-    placeholders: &[AppliedPlaceholder],
-    groups_requiring_scan: &[usize],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Result<OriginalPlaceholderOccurrenceIndex, LanguageTextProjectionError>, E> {
-    debug_assert_eq!(lines.len(), scans.len());
-    let mut by_group = Vec::with_capacity(groups.len());
-    for _ in groups {
-        ensure_running()?;
-        by_group.push(OriginalPlaceholderOccurrences::default());
-    }
-    if groups_requiring_scan.is_empty() {
-        return Ok(Ok(OriginalPlaceholderOccurrenceIndex {
-            by_group,
-            #[cfg(test)]
-            scanned_lines: 0,
-        }));
-    }
-
-    let mut patterns = Vec::with_capacity(groups_requiring_scan.len());
-    for &group_index in groups_requiring_scan {
-        ensure_running()?;
-        let original = placeholders[groups[group_index].representative].original();
-        if original.is_empty() {
-            return Ok(Err(LanguageTextProjectionError::TokenIndexConstruction));
-        }
-        patterns.push(clone_response_processing_text_with_cancellation(
-            original,
-            &mut ensure_running,
-        )?);
-    }
-    let pattern_count = patterns.len();
-    let matcher = match build_original_placeholder_matcher_with_cancellation(
-        patterns,
-        &mut ensure_running,
-    )? {
-        Ok(matcher) => matcher,
-        Err(source) => return Ok(Err(source)),
-    };
-    #[cfg(test)]
-    let mut scanned_lines = 0_usize;
-    for (line_index, (line, scan)) in lines.iter().zip(scans).enumerate() {
-        ensure_running()?;
-        #[cfg(test)]
-        {
-            scanned_lines += 1;
-        }
-        let mut state = match matcher.start_state(Anchored::No) {
-            Ok(state) => state,
-            Err(_) => return Ok(Err(LanguageTextProjectionError::TokenIndexConstruction)),
-        };
-        let mut chunk_start = 0_usize;
-        for chunk in line
-            .as_bytes()
-            .chunks(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES)
-        {
-            ensure_running()?;
-            for (chunk_offset, &byte) in chunk.iter().enumerate() {
-                state = matcher.next_state(Anchored::No, state, byte);
-                if !matcher.is_match(state) {
-                    continue;
-                }
-                let end = chunk_start + chunk_offset + 1;
-                for match_index in 0..matcher.match_len(state) {
-                    ensure_running()?;
-                    let pattern_id = matcher.match_pattern(state, match_index);
-                    let pattern_index = pattern_id.as_usize();
-                    let start = end - matcher.pattern_len(pattern_id);
-                    if token_ranges_overlap(scan.token_ranges(), start, end) {
-                        continue;
-                    }
-
-                    debug_assert!(pattern_index < pattern_count);
-                    let group_index = groups_requiring_scan[pattern_index];
-                    let matched = &mut by_group[group_index];
-                    if matched.count == 0 {
-                        matched.first = Some((line_index, start, end));
-                    }
-                    matched.count = matched.count.saturating_add(1).min(2);
-                }
-            }
-            chunk_start += chunk.len();
-        }
-    }
-    ensure_running()?;
-    Ok(Ok(OriginalPlaceholderOccurrenceIndex {
-        by_group,
-        #[cfg(test)]
-        scanned_lines,
-    }))
-}
-
-fn build_original_placeholder_matcher_with_cancellation<E>(
-    patterns: Vec<String>,
-    ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Result<NFA, LanguageTextProjectionError>, E> {
-    run_original_placeholder_matcher_build_with_cancellation(
-        patterns,
-        |patterns| {
-            NFA::builder()
-                .match_kind(MatchKind::Standard)
-                .build(patterns.iter().map(String::as_bytes))
-                .map_err(|_| ())
-        },
-        ensure_running,
-    )
-}
-
-fn run_original_placeholder_matcher_build_with_cancellation<E>(
-    patterns: Vec<String>,
-    build: impl FnOnce(Vec<String>) -> Result<NFA, ()> + Send + 'static,
-    ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Result<NFA, LanguageTextProjectionError>, E> {
-    match run_isolated_operation(
-        "att-response-placeholder-matcher",
-        move || build(patterns),
-        ensure_running,
-    ) {
-        Ok(Ok(matcher)) => Ok(Ok(matcher)),
-        Ok(Err(())) | Err(IsolatedOperationError::Start { .. }) => {
-            Ok(Err(LanguageTextProjectionError::TokenIndexConstruction))
-        }
-        Err(IsolatedOperationError::Cancelled(cancellation)) => Err(cancellation),
-    }
-}
-
-fn token_ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
-    let candidate = ranges.partition_point(|&(_, token_end)| token_end <= start);
-    ranges
-        .get(candidate)
-        .is_some_and(|&(token_start, _)| token_start < end)
-}
-
-fn response_text_fingerprint_with_cancellation<E>(
-    text: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<crate::fingerprint::Sha256Fingerprint, E> {
-    let chunk_size = NonZeroUsize::new(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES)
-        .expect("取消检查块大小必须非零");
-    let mut hasher = Sha256FramedHasher::new(b"att.response-placeholder-original");
-    hasher.try_frame_chunks(1, text.as_bytes(), chunk_size, ensure_running)?;
-    Ok(hasher.finish())
-}
-
-fn response_text_equal_with_cancellation<E>(
-    left: &str,
-    right: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    if left.len() != right.len() {
-        ensure_running()?;
-        return Ok(false);
-    }
-    for (left, right) in left
-        .as_bytes()
-        .chunks(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES)
-        .zip(
-            right
-                .as_bytes()
-                .chunks(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES),
-        )
-    {
-        ensure_running()?;
-        if left != right {
-            return Ok(false);
-        }
-    }
-    ensure_running()?;
-    Ok(true)
-}
-
-fn response_text_cmp_with_cancellation<E>(
-    left: &str,
-    right: &str,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<std::cmp::Ordering, E> {
-    for (left, right) in left
-        .as_bytes()
-        .chunks(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES)
-        .zip(
-            right
-                .as_bytes()
-                .chunks(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES),
-        )
-    {
-        ensure_running()?;
-        let ordering = left.cmp(right);
-        if ordering != std::cmp::Ordering::Equal {
-            return Ok(ordering);
-        }
-    }
-    ensure_running()?;
-    Ok(left.len().cmp(&right.len()))
-}
-
-fn sorted_original_placeholder_group_order_with_cancellation<E>(
-    groups: &[OriginalPlaceholderGroup],
-    placeholders: &[AppliedPlaceholder],
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Vec<usize>, E> {
-    let mut order = Vec::with_capacity(groups.len());
-    let mut scratch = Vec::with_capacity(groups.len());
-    for index in 0..groups.len() {
-        ensure_running()?;
-        order.push(index);
-        scratch.push(0_usize);
-    }
-    let mut width = 1_usize;
-    while width < order.len() {
-        let run_width = width.saturating_mul(2);
-        let mut run_start = 0_usize;
-        while run_start < order.len() {
-            let middle = run_start.saturating_add(width).min(order.len());
-            let run_end = run_start.saturating_add(run_width).min(order.len());
-            let mut left = run_start;
-            let mut right = middle;
-            let mut output = run_start;
-            while output < run_end {
-                ensure_running()?;
-                let take_left = right == run_end
-                    || (left < middle
-                        && response_text_cmp_with_cancellation(
-                            placeholders[groups[order[left]].representative].original(),
-                            placeholders[groups[order[right]].representative].original(),
-                            ensure_running,
-                        )? != std::cmp::Ordering::Greater);
-                scratch[output] = if take_left {
-                    let index = order[left];
-                    left += 1;
-                    index
-                } else {
-                    let index = order[right];
-                    right += 1;
-                    index
-                };
-                output += 1;
-            }
-            run_start = run_end;
-        }
-        std::mem::swap(&mut order, &mut scratch);
-        width = run_width;
-    }
-    ensure_running()?;
-    Ok(order)
-}
-
-fn stable_sort_original_replacements_with_cancellation<E>(
-    replacements: &mut Vec<OriginalPlaceholderLiteralReplacement<'_>>,
-    ensure_running: &mut impl FnMut() -> Result<(), E>,
-) -> Result<(), E> {
-    let mut scratch = Vec::with_capacity(replacements.len());
-    for replacement in replacements.iter().copied() {
-        ensure_running()?;
-        scratch.push(replacement);
-    }
-    let mut width = 1_usize;
-    while width < replacements.len() {
-        let run_width = width.saturating_mul(2);
-        let mut run_start = 0_usize;
-        while run_start < replacements.len() {
-            let middle = run_start.saturating_add(width).min(replacements.len());
-            let run_end = run_start.saturating_add(run_width).min(replacements.len());
-            let mut left = run_start;
-            let mut right = middle;
-            let mut output = run_start;
-            while output < run_end {
-                ensure_running()?;
-                let left_key = replacements.get(left).map(|replacement| {
-                    (replacement.line_index, replacement.start, replacement.end)
-                });
-                let right_key = replacements.get(right).map(|replacement| {
-                    (replacement.line_index, replacement.start, replacement.end)
-                });
-                let take_left = right == run_end
-                    || (left < middle
-                        && left_key.expect("左归并项必须存在")
-                            <= right_key.expect("右归并项必须存在"));
-                scratch[output] = if take_left {
-                    let replacement = replacements[left];
-                    left += 1;
-                    replacement
-                } else {
-                    let replacement = replacements[right];
-                    right += 1;
-                    replacement
-                };
-                output += 1;
-            }
-            run_start = run_end;
-        }
-        std::mem::swap(replacements, &mut scratch);
-        width = run_width;
-    }
-    ensure_running()
-}
-
-#[derive(Clone, Copy)]
-struct OriginalPlaceholderLiteralReplacement<'a> {
-    line_index: usize,
-    start: usize,
-    end: usize,
-    token: &'a str,
-    original: &'a str,
-}
-
 fn multiset_rejection(error: PlaceholderMultisetError) -> TranslationUnitRejectionReason {
     match error {
         PlaceholderMultisetError::Mismatch { token } => {
@@ -3428,10 +2917,9 @@ fn validate_token_multiset(
 mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
-    use std::convert::Infallible;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use super::*;
     use crate::fingerprint::Sha256Fingerprint;
@@ -4705,216 +4193,6 @@ mod tests {
             accepted.accepted()[0].translation(),
             &TextUnitContent::Value("<Help:炎之剑>装备后攻击力上升。".to_owned())
         );
-    }
-
-    #[test]
-    fn overlapping_original_echoes_are_rejected_as_ambiguous() {
-        let placeholders = vec![AppliedPlaceholder::new(
-            "⟦ATT_CUSTOM_WHOLE_0000⟧",
-            "aa",
-            PlaceholderRuleOrigin::Custom,
-            "CUSTOM",
-            "event_dialogue",
-            PlaceholderSegment::Whole,
-        )];
-        let bindings =
-            PlaceholderBindingIndex::new(&placeholders).expect("测试 token 索引应可建立");
-        let mut lines = vec!["aaa".to_owned()];
-        let scans = lines
-            .iter()
-            .map(|line| bindings.scan(line))
-            .collect::<Vec<_>>();
-
-        let result = normalize_original_placeholder_literals_in_lines_with_cancellation(
-            &mut lines,
-            &placeholders,
-            &bindings,
-            &scans,
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("测试没有请求取消");
-
-        assert!(matches!(
-            result,
-            Err(TranslationCandidateValidationError::Rejected(
-                TranslationUnitRejectionReason::PlaceholderNormalizationAmbiguous { original }
-            )) if original == "aa"
-        ));
-    }
-
-    #[test]
-    fn token_overlapping_echo_does_not_hide_adjacent_natural_echo() {
-        let missing_token = "⟦ATT_CUSTOM_WHOLE_0000⟧";
-        let present_token = "⟦ATT_OTHER_WHOLE_0001⟧";
-        let placeholders = vec![
-            AppliedPlaceholder::new(
-                missing_token,
-                "⟧⟧",
-                PlaceholderRuleOrigin::Custom,
-                "CUSTOM",
-                "event_dialogue",
-                PlaceholderSegment::Whole,
-            ),
-            AppliedPlaceholder::new(
-                present_token,
-                "<other>",
-                PlaceholderRuleOrigin::Custom,
-                "OTHER",
-                "event_dialogue",
-                PlaceholderSegment::Whole,
-            ),
-        ];
-        let bindings =
-            PlaceholderBindingIndex::new(&placeholders).expect("测试 token 索引应可建立");
-        let mut lines = vec![format!("{present_token}⟧⟧")];
-        let scans = lines
-            .iter()
-            .map(|line| bindings.scan(line))
-            .collect::<Vec<_>>();
-
-        let changed = normalize_original_placeholder_literals_in_lines_with_cancellation(
-            &mut lines,
-            &placeholders,
-            &bindings,
-            &scans,
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("测试没有请求取消")
-        .expect("token 外唯一回显应该可以规范化");
-
-        assert!(changed);
-        assert_eq!(lines, [format!("{present_token}{missing_token}")]);
-    }
-
-    #[test]
-    fn active_original_matcher_build_observes_cancellation() {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let caller_cancelled = Arc::clone(&cancelled);
-        let (started_sender, started_receiver) = mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = mpsc::sync_channel(1);
-        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
-        let (result_sender, result_receiver) = mpsc::sync_channel(1);
-        let caller = std::thread::spawn(move || {
-            let result = run_original_placeholder_matcher_build_with_cancellation(
-                vec!["aa".to_owned()],
-                move |_| {
-                    started_sender
-                        .send(())
-                        .expect("应通知测试 matcher worker 已启动");
-                    release_receiver.recv().expect("应释放测试 matcher worker");
-                    finished_sender
-                        .send(())
-                        .expect("应通知测试 matcher worker 已结束");
-                    Err(())
-                },
-                move || {
-                    if caller_cancelled.load(Ordering::Acquire) {
-                        Err("cancelled")
-                    } else {
-                        Ok(())
-                    }
-                },
-            );
-            result_sender.send(result).expect("应返回 matcher 构建结果");
-        });
-
-        started_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("matcher worker 应在取消前实际开始运行");
-        cancelled.store(true, Ordering::Release);
-        let result = result_receiver.recv_timeout(std::time::Duration::from_secs(1));
-        release_sender
-            .send(())
-            .expect("取消测试必须释放 matcher worker");
-        finished_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("取消测试必须回收 matcher worker 的纯计算");
-        caller.join().expect("matcher 调用线程应正常结束");
-
-        assert!(matches!(result, Ok(Err("cancelled"))));
-    }
-
-    #[test]
-    fn thousands_of_distinct_original_placeholders_scan_a_long_candidate_once() {
-        const PLACEHOLDER_COUNT: usize = 2_048;
-
-        let placeholders = (0..PLACEHOLDER_COUNT)
-            .map(|index| {
-                AppliedPlaceholder::new(
-                    format!("⟦ATT_STRESS_WHOLE_{index:04}⟧"),
-                    format!("<ORIGINAL_{index:04}>"),
-                    PlaceholderRuleOrigin::Custom,
-                    "STRESS",
-                    "all",
-                    PlaceholderSegment::Whole,
-                )
-            })
-            .collect::<Vec<_>>();
-        let bindings = PlaceholderBindingIndex::new(&placeholders).expect("token 索引应可建立");
-        let mut candidate =
-            "长".repeat(RESPONSE_PROCESSING_CANCELLATION_CHECK_BYTES * 4 / "长".len());
-        let mut expected = candidate.clone();
-        for placeholder in &placeholders {
-            candidate.push('|');
-            candidate.push_str(placeholder.original());
-            expected.push('|');
-            expected.push_str(placeholder.token());
-        }
-        let scans = vec![bindings.scan(&candidate)];
-        let groups = placeholders
-            .iter()
-            .enumerate()
-            .map(|(binding_index, _)| OriginalPlaceholderGroup {
-                representative: binding_index,
-                bindings: vec![binding_index],
-            })
-            .collect::<Vec<_>>();
-        let group_indices = (0..groups.len()).collect::<Vec<_>>();
-        let indexed = index_original_placeholder_occurrences_with_cancellation(
-            std::slice::from_ref(&candidate),
-            &scans,
-            &groups,
-            &placeholders,
-            &group_indices,
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("测试没有请求取消")
-        .expect("多模式索引应可建立");
-        assert_eq!(
-            indexed.scanned_lines, 1,
-            "所有原片段必须在同一次候选扫描中完成匹配"
-        );
-        assert!(
-            indexed.by_group.iter().all(|matched| matched.count == 1),
-            "每个 distinct 原片段都应精确匹配一次"
-        );
-
-        let normalized = normalize_original_placeholder_literals_in_lines_with_cancellation(
-            std::slice::from_mut(&mut candidate),
-            &placeholders,
-            &bindings,
-            &scans,
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("测试没有请求取消")
-        .expect("唯一原片段应可规范化");
-        assert!(normalized);
-        assert_eq!(candidate, expected);
-
-        candidate.push_str("|<ORIGINAL_0000>");
-        let all_tokens_present_scan = vec![bindings.scan(&candidate)];
-        let unchanged = candidate.clone();
-        let normalized = normalize_original_placeholder_literals_in_lines_with_cancellation(
-            std::slice::from_mut(&mut candidate),
-            &placeholders,
-            &bindings,
-            &all_tokens_present_scan,
-            || Ok::<_, Infallible>(()),
-        )
-        .expect("测试没有请求取消")
-        .expect("Custom 原片段在对应 token 已存在时属于自然文本");
-        assert!(!normalized);
-        assert_eq!(candidate, unchanged);
     }
 
     #[test]

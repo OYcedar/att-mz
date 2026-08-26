@@ -45,6 +45,7 @@ use crate::rpg_maker::text::{
 use crate::rpg_maker::translate::pipeline::{ExpectedLineShape, TranslationUnitIdentity};
 use crate::rpg_maker::translate::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, RpgMakerBuiltinPlaceholderProfile,
+    RpgMakerSourceBoundPlaceholderError,
 };
 use crate::rpg_maker::translate::planner::expected_line_shape;
 use crate::rpg_maker::translate::semantics::{
@@ -61,9 +62,7 @@ use crate::runtime::windows::{
 use crate::translation::candidate_validation::{
     CandidateTextShape, ProvenInvariantViolation, validate_candidate_text,
 };
-use crate::translation::placeholder::{
-    PlaceholderRuleDefinition, placeholder_bindings_match_within_slot,
-};
+use crate::translation::placeholder::PlaceholderRuleDefinition;
 use crate::translation::planning_resource::CompiledTerminology;
 
 const MANUAL_SQLITE_CANCELLATION_CHECK_OPERATIONS: i32 = 1_000;
@@ -1262,27 +1261,35 @@ impl ManualPlaceholderValidator {
                         .and_then(|result| {
                             result.map_err(|_| "无法读取原文 Placeholder".to_owned())
                         })?;
-                    let candidate = service
-                        .protect_profile_with_cancellation(
-                            *engine,
-                            kind,
-                            &entry.id,
-                            profile,
-                            candidate,
-                            &[],
-                            compiled,
-                            || Ok::<_, std::convert::Infallible>(()),
-                        )
-                        .map_err(|unreachable| match unreachable {})
-                        .and_then(|result| {
-                            result.map_err(|_| "无法读取译文 Placeholder".to_owned())
-                        })?;
-                    placeholder_bindings_match_within_slot(
-                        source.placeholders(),
-                        candidate.placeholders(),
-                    )
-                    .then_some(())
-                    .ok_or_else(|| "译文没有保留原文中的控制码或 Placeholder".to_owned())
+                    let bound = match service.bind_profile_candidate_with_cancellation(
+                        &source,
+                        *engine,
+                        kind,
+                        &entry.id,
+                        profile,
+                        candidate,
+                        compiled,
+                        || Ok::<_, std::convert::Infallible>(()),
+                    ) {
+                        Ok(bound) => bound,
+                        Err(unreachable) => match unreachable {},
+                    };
+                    match bound {
+                        Ok(_) => Ok(()),
+                        Err(RpgMakerSourceBoundPlaceholderError::Binding(
+                            crate::translation::placeholder_projection::SourceBoundPlaceholderError::Multiset(_)
+                            | crate::translation::placeholder_projection::SourceBoundPlaceholderError::AmbiguousOriginal { .. }
+                            | crate::translation::placeholder_projection::SourceBoundPlaceholderError::UnexpectedPlaceholder,
+                        )) => Err(
+                            "译文没有保留原文中的控制码或 Placeholder".to_owned(),
+                        ),
+                        Err(RpgMakerSourceBoundPlaceholderError::Protection(_)
+                        | RpgMakerSourceBoundPlaceholderError::Binding(
+                            crate::translation::placeholder_projection::SourceBoundPlaceholderError::Projection(_),
+                        )) => {
+                            Err("无法验证译文 Placeholder".to_owned())
+                        }
+                    }
                 };
                 match entry.kind {
                     ManualTranslationType::Fixed => {
@@ -5564,6 +5571,55 @@ mod tests {
         let service = GenericPlaceholderService::default();
         let compiled = service.compile(Vec::new()).unwrap();
         ManualPlaceholderValidator::Generic { service, compiled }
+    }
+
+    #[test]
+    fn rpg_maker_manual_placeholder_check_uses_the_source_binding() {
+        let service = Pcre2PlaceholderService::new().expect("内置 Placeholder 应可编译");
+        let compiled = service
+            .compile_custom(vec![PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"(?<=Name: )[A-Za-z0-9-]+",
+            )])
+            .expect("lookbehind Placeholder 规则应有效");
+        let role = TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应有效"));
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::Data(StandardDataFile::Skills),
+            vec![RpgMakerLocationStep::ArrayIndex(798)],
+        );
+        let profile = RpgMakerBuiltinPlaceholderProfile::for_location(
+            RpgMakerEngine::Mz,
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            &location,
+            &role,
+        );
+        let entry = indexed_entry(
+            ManualTranslationType::Fixed,
+            &["Name: abc-123", "Name: def-456"],
+        );
+        let validator = ManualPlaceholderValidator::RpgMaker {
+            engine: RpgMakerEngine::Mz,
+            service,
+            compiled,
+            profiles: HashMap::from([(entry.id.clone(), profile)]),
+        };
+
+        validator
+            .validate(
+                &entry,
+                &["名称：abc-123".to_owned(), "名称：def-456".to_owned()],
+            )
+            .expect("标签翻译后，源文绑定的凭据仍应通过 Manual check");
+        assert!(
+            validator
+                .validate(
+                    &entry,
+                    &["名称：def-456".to_owned(), "名称：abc-123".to_owned()],
+                )
+                .is_err(),
+            "Fixed Manual 的 Placeholder 不得跨源文槽位交换"
+        );
     }
 
     #[test]

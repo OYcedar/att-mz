@@ -28,11 +28,12 @@ use crate::rpg_maker::model::{
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerSource, TextGroupKind};
 use crate::rpg_maker::translate::pipeline::{
-    AppliedPlaceholder, TranslationPlaceholderProjectionFailure, TranslationPlanningFailureReason,
+    TranslationPlaceholderProjectionFailure, TranslationPlanningFailureReason,
     placeholder_projection_diagnostic, placeholder_protection_diagnostic,
 };
 use crate::rpg_maker::translate::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, RpgMakerBuiltinPlaceholderProfile,
+    RpgMakerSourceBoundPlaceholderError,
 };
 use crate::rpg_maker::translate::planner::{
     placeholder_projection_planning_failure, placeholder_protection_planning_failure,
@@ -46,8 +47,9 @@ use crate::translation::layout_rules::{
     compile_layout_rules,
 };
 use crate::translation::placeholder::PlaceholderRestoreError;
-use crate::translation::placeholder::placeholder_bindings_match_within_slot;
-use crate::translation::placeholder_projection::PlaceholderMultisetError;
+use crate::translation::placeholder_projection::{
+    PlaceholderMultisetError, SourceBoundPlaceholderError,
+};
 use crate::translation::text_layout::layout_text;
 use crate::translation::write_back_text::{
     PunctuationRepairError, PunctuationRepairOutcome, repair_punctuation_with_cancellation,
@@ -311,17 +313,22 @@ fn repair_rpg_maker_punctuation_text(
         }
         Err(()) => return Ok(OperationCompletion::Cancelled),
     };
-    let translation = match protect(translation) {
+    let translation = match context
+        .placeholder_service
+        .bind_profile_candidate_with_cancellation(
+            &source,
+            context.engine,
+            kind,
+            target_id,
+            profile,
+            translation,
+            &context.placeholder_rules,
+            || ensure_candidate_validation_running(cancellation),
+        ) {
         Ok(Ok(translation)) => translation,
-        Ok(Err(source)) => {
-            return Err(TranslationPlanningFailureReason::PlaceholderProtection {
-                failure: placeholder_protection_planning_failure(source),
-            });
-        }
+        Ok(Err(source)) => return Err(source_bound_placeholder_planning_failure(source)),
         Err(()) => return Ok(OperationCompletion::Cancelled),
     };
-    validate_placeholder_bindings(source.placeholders(), translation.placeholders())
-        .map_err(|failure| TranslationPlanningFailureReason::PlaceholderProjection { failure })?;
     let repaired = match repair_punctuation_with_cancellation(&source, &translation, || {
         ensure_candidate_validation_running(cancellation)
     }) {
@@ -347,6 +354,7 @@ struct RpgMakerLaidOutText {
 
 #[allow(clippy::too_many_arguments)]
 fn layout_rpg_maker_text_with_cancellation(
+    source: &str,
     text: &str,
     kind: TextGroupKind,
     target_id: &str,
@@ -356,22 +364,19 @@ fn layout_rpg_maker_text_with_cancellation(
     complete_continuation_whitespace: bool,
     cancellation: &CooperativeCancellation,
 ) -> Result<OperationCompletion<Option<RpgMakerLaidOutText>>, TranslationPlanningFailureReason> {
-    if max_fullwidth_chars.is_none() && !complete_continuation_whitespace {
-        return Ok(OperationCompletion::Completed(None));
-    }
-    let protected = match context
+    let source = match context
         .placeholder_service
         .protect_profile_with_cancellation(
             context.engine,
             kind,
             target_id,
             profile,
-            text,
+            source,
             &[],
             &context.placeholder_rules,
             || ensure_candidate_validation_running(cancellation),
         ) {
-        Ok(Ok(protected)) => protected,
+        Ok(Ok(source)) => source,
         Ok(Err(source)) => {
             return Err(TranslationPlanningFailureReason::PlaceholderProtection {
                 failure: placeholder_protection_planning_failure(source),
@@ -379,6 +384,25 @@ fn layout_rpg_maker_text_with_cancellation(
         }
         Err(()) => return Ok(OperationCompletion::Cancelled),
     };
+    let protected = match context
+        .placeholder_service
+        .bind_profile_candidate_with_cancellation(
+            &source,
+            context.engine,
+            kind,
+            target_id,
+            profile,
+            text,
+            &context.placeholder_rules,
+            || ensure_candidate_validation_running(cancellation),
+        ) {
+        Ok(Ok(protected)) => protected,
+        Ok(Err(source)) => return Err(source_bound_placeholder_planning_failure(source)),
+        Err(()) => return Ok(OperationCompletion::Cancelled),
+    };
+    if max_fullwidth_chars.is_none() && !complete_continuation_whitespace {
+        return Ok(OperationCompletion::Completed(None));
+    }
     let Some(layout) = layout_text(
         protected.text(),
         max_fullwidth_chars,
@@ -465,6 +489,7 @@ fn layout_unit_with_cancellation(
     );
     let is_value = matches!(translation, TextUnitContent::Value(_));
     let joined;
+    let source_joined;
     let text = match translation {
         TextUnitContent::Value(value) => value.as_str(),
         TextUnitContent::Lines(lines) => {
@@ -472,7 +497,15 @@ fn layout_unit_with_cancellation(
             &joined
         }
     };
+    let source = match &unit.source_content {
+        TextUnitContent::Value(value) => value.as_str(),
+        TextUnitContent::Lines(lines) => {
+            source_joined = lines.join("\n");
+            &source_joined
+        }
+    };
     let laid_out = layout_rpg_maker_text_with_cancellation(
+        source,
         text,
         kind,
         &target_id,
@@ -615,17 +648,22 @@ fn validate_text_placeholder_bindings(
         }
         Err(()) => return Ok(OperationCompletion::Cancelled),
     };
-    let translation = match protect(translation) {
-        Ok(Ok(translation)) => translation,
-        Ok(Err(source)) => {
-            return Err(TranslationPlanningFailureReason::PlaceholderProtection {
-                failure: placeholder_protection_planning_failure(source),
-            });
-        }
+    match context
+        .placeholder_service
+        .bind_profile_candidate_with_cancellation(
+            &source,
+            context.engine,
+            kind,
+            target_id,
+            profile,
+            translation,
+            &context.placeholder_rules,
+            || ensure_candidate_validation_running(cancellation),
+        ) {
+        Ok(Ok(_)) => {}
+        Ok(Err(source)) => return Err(source_bound_placeholder_planning_failure(source)),
         Err(()) => return Ok(OperationCompletion::Cancelled),
-    };
-    validate_placeholder_bindings(source.placeholders(), translation.placeholders())
-        .map_err(|failure| TranslationPlanningFailureReason::PlaceholderProjection { failure })?;
+    }
     Ok(OperationCompletion::Completed(()))
 }
 
@@ -637,19 +675,30 @@ fn ensure_candidate_validation_running(cancellation: &CooperativeCancellation) -
     }
 }
 
-fn validate_placeholder_bindings(
-    expected: &[AppliedPlaceholder],
-    actual: &[AppliedPlaceholder],
-) -> Result<(), TranslationPlaceholderProjectionFailure> {
-    if placeholder_bindings_match_within_slot(expected, actual) {
-        return Ok(());
-    }
-    Err(
-        TranslationPlaceholderProjectionFailure::ChangedSegmentCount {
-            expected: expected.len(),
-            actual: actual.len(),
+fn source_bound_placeholder_planning_failure(
+    source: RpgMakerSourceBoundPlaceholderError,
+) -> TranslationPlanningFailureReason {
+    match source {
+        RpgMakerSourceBoundPlaceholderError::Protection(source) => {
+            TranslationPlanningFailureReason::PlaceholderProtection {
+                failure: placeholder_protection_planning_failure(source),
+            }
+        }
+        RpgMakerSourceBoundPlaceholderError::Binding(SourceBoundPlaceholderError::Projection(
+            source,
+        )) => TranslationPlanningFailureReason::PlaceholderProjection {
+            failure: placeholder_projection_planning_failure(source),
         },
-    )
+        RpgMakerSourceBoundPlaceholderError::Binding(SourceBoundPlaceholderError::Multiset(
+            source,
+        )) => layout_restore_planning_failure(PlaceholderRestoreError::Multiset(source)),
+        RpgMakerSourceBoundPlaceholderError::Binding(
+            SourceBoundPlaceholderError::AmbiguousOriginal { .. }
+            | SourceBoundPlaceholderError::UnexpectedPlaceholder,
+        ) => TranslationPlanningFailureReason::PlaceholderProjection {
+            failure: TranslationPlaceholderProjectionFailure::SourceBindingMismatch,
+        },
+    }
 }
 
 fn aligned_replacement_lines(unit: &RpgMakerWriteBackUnit) -> Option<Vec<String>> {
@@ -2709,30 +2758,6 @@ fn plan_rpg_maker_write_back_group(
 
         let (owner, kind, group_location, mut units, recipes, mutation_claims) = group.into_parts();
         if let Some(candidate_validation) = candidate_validation {
-            for unit in &units {
-                let validated = validate_unit_translation_with_cancellation(
-                    unit,
-                    owner,
-                    kind,
-                    &group_location,
-                    candidate_validation,
-                    cancellation,
-                )
-                .map_err(|reason| {
-                    RpgMakerWriteBackGroupPlanningError::InvalidPlaceholder(
-                        RpgMakerWriteBackPlaceholderValidationError::new(
-                            owner,
-                            kind,
-                            group_location.clone(),
-                            unit.role.clone(),
-                            reason,
-                        ),
-                    )
-                })?;
-                let OperationCompletion::Completed(()) = validated else {
-                    return Ok(OperationCompletion::Cancelled);
-                };
-            }
             if repair_punctuation {
                 for unit in &mut units {
                     let repaired = repair_unit_punctuation_with_cancellation(
@@ -2781,6 +2806,39 @@ fn plan_rpg_maker_write_back_group(
                     )
                 })?;
                 let OperationCompletion::Completed(()) = laid_out else {
+                    return Ok(OperationCompletion::Cancelled);
+                };
+            }
+            for unit in &units {
+                if unit.translation_content.is_none()
+                    || !matches!(
+                        unit.role,
+                        TextUnitRole::DialogueSpeaker | TextUnitRole::Choices
+                    )
+                    || (repair_punctuation && !unit.manual)
+                {
+                    continue;
+                }
+                let validated = validate_unit_translation_with_cancellation(
+                    unit,
+                    owner,
+                    kind,
+                    &group_location,
+                    candidate_validation,
+                    cancellation,
+                )
+                .map_err(|reason| {
+                    RpgMakerWriteBackGroupPlanningError::InvalidPlaceholder(
+                        RpgMakerWriteBackPlaceholderValidationError::new(
+                            owner,
+                            kind,
+                            group_location.clone(),
+                            unit.role.clone(),
+                            reason,
+                        ),
+                    )
+                })?;
+                let OperationCompletion::Completed(()) = validated else {
                     return Ok(OperationCompletion::Cancelled);
                 };
             }
@@ -3178,6 +3236,48 @@ mod tests {
             placeholder_rules,
             "[]".to_owned(),
         )
+    }
+
+    #[test]
+    fn write_back_placeholder_validation_uses_source_binding_after_label_translation() {
+        let placeholder_service =
+            Pcre2PlaceholderService::new().expect("测试内置 Placeholder 必须可编译");
+        let placeholder_rules = placeholder_service
+            .compile_custom(vec![
+                crate::translation::placeholder::PlaceholderRuleDefinition::new(
+                    Some(vec!["database_entry".to_owned()]),
+                    r"(?<=Name: )[A-Za-z0-9-]+",
+                ),
+            ])
+            .expect("lookbehind Placeholder 规则必须有效");
+        let context = RpgMakerWriteBackCandidateValidationContext::new(
+            RpgMakerEngine::Mz,
+            placeholder_service,
+            placeholder_rules,
+            "lookbehind".to_owned(),
+        );
+
+        let result = validate_text_placeholder_bindings(
+            "Name: abc-123",
+            "名称：abc-123",
+            TextGroupKind::DatabaseEntry,
+            "database:Actors.json:1:name",
+            RpgMakerBuiltinPlaceholderProfile::for_location(
+                RpgMakerEngine::Mz,
+                RpgMakerAssetOwner::Builtin,
+                TextGroupKind::DatabaseEntry,
+                &RpgMakerLocation::value(
+                    RpgMakerSource::data(StandardDataFile::Actors),
+                    vec![RpgMakerLocationStep::index(1)],
+                ),
+                &TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应有效")),
+            ),
+            &context,
+            &CooperativeCancellation::default(),
+        )
+        .expect("源绑定验收不应成为规划错误");
+
+        assert_eq!(result, OperationCompletion::Completed(()));
     }
 
     #[test]

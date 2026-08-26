@@ -10,8 +10,9 @@ use std::io::{self, BufReader, Read};
 use crate::fingerprint::Sha256Fingerprint;
 use crate::translation::placeholder::{
     PlaceholderProtectionError, PlaceholderRestoreError, PlaceholderRuleCompilationError,
-    PlaceholderService, placeholder_bindings_match_within_slot,
+    PlaceholderService, candidate_placeholder_bindings_are_source_subset,
 };
+use crate::translation::placeholder_projection::SourceBoundPlaceholderError;
 
 pub(crate) use crate::translation::placeholder::{
     CompiledPlaceholderRules as GenericCompiledPlaceholderRules,
@@ -20,6 +21,25 @@ pub(crate) use crate::translation::placeholder::{
 };
 
 const RESOURCE_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum GenericSourceBoundPlaceholderError {
+    Protection(PlaceholderProtectionError),
+    Projection(crate::translation::placeholder_projection::LanguageTextProjectionError),
+    Mismatch,
+}
+
+impl From<GenericSourceBoundPlaceholderError> for GenericPlaceholderError {
+    fn from(source: GenericSourceBoundPlaceholderError) -> Self {
+        match source {
+            GenericSourceBoundPlaceholderError::Protection(source) => Self::Protection(source),
+            GenericSourceBoundPlaceholderError::Projection(source) => {
+                Self::Restore(PlaceholderRestoreError::Projection(source))
+            }
+            GenericSourceBoundPlaceholderError::Mismatch => Self::ManualTranslationMismatch,
+        }
+    }
+}
 
 /// Generic 不增加内置规则，只把当前 kind 原值交给公共 scope 匹配。
 #[derive(Clone, Copy, Debug, Default)]
@@ -137,6 +157,71 @@ impl GenericPlaceholderService {
             ensure_running,
         )
         .map(|result| result.map_err(GenericPlaceholderError::Protection))
+    }
+
+    /// 按源文 binding 保护候选；完整规则扫描只负责拒绝源 binding 之外的新身份。
+    pub(crate) fn bind_target_candidate_with_cancellation<E>(
+        &self,
+        source: &GenericProtectedText,
+        target_id: &str,
+        kind: &str,
+        candidate: &str,
+        compiled: &GenericCompiledPlaceholderRules,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<GenericProtectedText, GenericSourceBoundPlaceholderError>, E> {
+        if source.placeholders().is_empty() {
+            let candidate = match self.protect_compiled_target_with_cancellation(
+                target_id,
+                kind,
+                candidate,
+                compiled,
+                &mut ensure_running,
+            )? {
+                Ok(candidate) => candidate,
+                Err(source) => {
+                    return Ok(Err(GenericSourceBoundPlaceholderError::Protection(source)));
+                }
+            };
+            if candidate.placeholders().is_empty() {
+                ensure_running()?;
+                return Ok(Ok(candidate));
+            }
+            return Ok(Err(GenericSourceBoundPlaceholderError::Mismatch));
+        }
+        let discovered = match self.protect_compiled_target_with_cancellation(
+            target_id,
+            kind,
+            candidate,
+            compiled,
+            &mut ensure_running,
+        )? {
+            Ok(discovered) => discovered,
+            Err(source) => {
+                return Ok(Err(GenericSourceBoundPlaceholderError::Protection(source)));
+            }
+        };
+        let candidate =
+            match source.bind_candidate_with_cancellation(candidate, &mut ensure_running)? {
+                Ok(candidate) => candidate,
+                Err(SourceBoundPlaceholderError::Projection(source)) => {
+                    return Ok(Err(GenericSourceBoundPlaceholderError::Projection(source)));
+                }
+                Err(
+                    SourceBoundPlaceholderError::Multiset(_)
+                    | SourceBoundPlaceholderError::AmbiguousOriginal { .. }
+                    | SourceBoundPlaceholderError::UnexpectedPlaceholder,
+                ) => {
+                    return Ok(Err(GenericSourceBoundPlaceholderError::Mismatch));
+                }
+            };
+        if !candidate_placeholder_bindings_are_source_subset(
+            source.placeholders(),
+            discovered.placeholders(),
+        ) {
+            return Ok(Err(GenericSourceBoundPlaceholderError::Mismatch));
+        }
+        ensure_running()?;
+        Ok(Ok(candidate))
     }
 
     /// 使用已经编译的规则保护文本，只暴露此阶段实际可能产生的匹配错误。
@@ -391,7 +476,8 @@ pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>
         Ok(source) => source,
         Err(error) => return Ok(Err(error)),
     };
-    let candidate = match service.protect_target_with_cancellation(
+    let candidate = match service.bind_target_candidate_with_cancellation(
+        &source,
         target_id,
         kind,
         translation,
@@ -399,42 +485,10 @@ pub(crate) fn validate_translation_placeholders_and_binding_with_cancellation<E>
         &mut ensure_running,
     )? {
         Ok(candidate) => candidate,
-        Err(error) => return Ok(Err(error)),
+        Err(error) => return Ok(Err(error.into())),
     };
-    validate_protected_translation_placeholders_with_cancellation(
-        &source,
-        &candidate,
-        ensure_running,
-    )
-}
-
-/// 比较已经完成保护的原文和译文，供 WriteBack 复验当前候选。
-pub(crate) fn validate_protected_translation_placeholders_with_cancellation<E>(
-    source: &GenericProtectedText,
-    candidate: &GenericProtectedText,
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Result<Sha256Fingerprint, GenericPlaceholderError>, E> {
-    if !protected_translation_placeholder_binding_matches_with_cancellation(
-        source,
-        candidate,
-        &mut ensure_running,
-    )? {
-        return Ok(Err(GenericPlaceholderError::ManualTranslationMismatch));
-    }
     ensure_running()?;
-    Ok(Ok(source.binding_fingerprint()))
-}
-
-pub(crate) fn protected_translation_placeholder_binding_matches_with_cancellation<E>(
-    source: &GenericProtectedText,
-    candidate: &GenericProtectedText,
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<bool, E> {
-    ensure_running()?;
-    let matches =
-        placeholder_bindings_match_within_slot(source.placeholders(), candidate.placeholders());
-    ensure_running()?;
-    Ok(matches)
+    Ok(Ok(candidate.binding_fingerprint()))
 }
 
 /// Generic 适配边界为公共 Placeholder 失败补充资源阶段。
@@ -615,6 +669,89 @@ mod tests {
             "{speaker}向{target}问候",
         )
         .expect("人工译文保持 Placeholder 顺序与身份时应通过");
+    }
+
+    #[test]
+    fn source_bound_validation_does_not_require_a_translated_label_to_match_lookbehind() {
+        let resource = r#"[{"order":"preserve","pattern":"(?<=Name: )[A-Za-z0-9-]+"}]"#;
+
+        validate_manual_translation_placeholders(
+            resource,
+            "dialogue",
+            "Name: abc-123",
+            "名称：abc-123",
+        )
+        .expect("源文已经绑定的凭据不应依赖译文标签再次满足 lookbehind");
+
+        assert!(matches!(
+            validate_manual_translation_placeholders(
+                resource,
+                "dialogue",
+                "Name: abc-123",
+                "名称：abc-123；Name: def-456",
+            ),
+            Err(GenericPlaceholderError::ManualTranslationMismatch)
+        ));
+    }
+
+    #[test]
+    fn source_bound_validation_preserves_wrapper_topology_and_rejects_new_matches() {
+        let wrapper = r#"[{"order":"preserve","pattern":"<tag>(?<text>.*?)</tag>"}]"#;
+        validate_manual_translation_placeholders(
+            wrapper,
+            "description",
+            "<tag>source</tag>",
+            "<tag>译文</tag>",
+        )
+        .expect("wrapper 的源文边界应按绑定保留");
+        assert!(matches!(
+            validate_manual_translation_placeholders(
+                wrapper,
+                "description",
+                "<tag>source</tag>",
+                "</tag>译文<tag>",
+            ),
+            Err(GenericPlaceholderError::ManualTranslationMismatch)
+        ));
+
+        let whole = r#"[{"order":"preserve","pattern":"\\{[^}]+\\}"}]"#;
+        assert!(matches!(
+            validate_manual_translation_placeholders(
+                whole,
+                "dialogue",
+                "Hello {name}",
+                "你好 {name}，新增 {other}",
+            ),
+            Err(GenericPlaceholderError::ManualTranslationMismatch)
+        ));
+    }
+
+    #[test]
+    fn source_bound_validation_honors_the_declared_reorder_policy() {
+        let reorder = r#"[{"order":"reorder_within_slot","pattern":"\\{[^}]+\\}"}]"#;
+
+        validate_manual_translation_placeholders(
+            reorder,
+            "dialogue",
+            "{first} then {second}",
+            "{second}，然后 {first}",
+        )
+        .expect("允许换序的同槽 Placeholder 应按身份多重集验收");
+    }
+
+    #[test]
+    fn zero_source_binding_fast_path_still_rejects_a_new_placeholder() {
+        let resource = r#"[{"order":"preserve","pattern":"\\{[^}]+\\}"}]"#;
+
+        assert!(matches!(
+            validate_manual_translation_placeholders(
+                resource,
+                "dialogue",
+                "plain source",
+                "译文 {invented}",
+            ),
+            Err(GenericPlaceholderError::ManualTranslationMismatch)
+        ));
     }
 
     #[test]

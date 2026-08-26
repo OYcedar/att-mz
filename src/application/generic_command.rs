@@ -2528,7 +2528,6 @@ fn ensure_generic_prompt_preparation_running(
 struct GenericValidationFact {
     locator: GenericUnitLocator,
     kind: String,
-    source_text: String,
     protected: GenericProtectedText,
     analysis: LanguageAnalysis,
 }
@@ -3531,7 +3530,6 @@ fn prepare_generic_translation(
                         GenericValidationFact {
                             locator,
                             kind: clone_generic_cpu_text(group.kind(), cancellation)?,
-                            source_text: clone_generic_cpu_text(unit.source_text(), cancellation)?,
                             protected,
                             analysis,
                         },
@@ -5271,7 +5269,8 @@ fn validate_generic_reuse_with_cancellation(
     };
     let service = GenericPlaceholderService::default();
     let target_id = fact.locator.readable_id();
-    let context = match service.protect_target_with_cancellation(
+    let context = match service.bind_target_candidate_with_cancellation(
+        &fact.protected,
         &target_id,
         &fact.kind,
         &final_translation,
@@ -5281,7 +5280,7 @@ fn validate_generic_reuse_with_cancellation(
         Ok(context) => context,
         Err(source) => {
             return Ok(Err(generic_candidate_placeholder_problem(
-                source,
+                source.into(),
                 placeholder_rule_source,
                 &fact.locator,
             )?));
@@ -5341,7 +5340,8 @@ fn validate_generic_candidate_fact_with_cancellation(
         Err(source) => return Ok(Err(generic_response_placeholder_problem(&source))),
     };
     let target_id = fact.locator.readable_id();
-    let candidate_protected = match service.protect_target_with_cancellation(
+    let candidate_protected = match service.bind_target_candidate_with_cancellation(
+        &fact.protected,
         &target_id,
         &fact.kind,
         &restored,
@@ -5351,7 +5351,7 @@ fn validate_generic_candidate_fact_with_cancellation(
         Ok(protected) => protected,
         Err(source) => {
             return Ok(Err(generic_candidate_placeholder_problem(
-                source,
+                source.into(),
                 placeholder_rule_source,
                 &fact.locator,
             )?));
@@ -5392,24 +5392,6 @@ fn validate_generic_candidate_fact_with_cancellation(
         Ok(translation) => translation,
         Err(problem) => return Ok(Err(problem)),
     };
-    match crate::generic::validate_translation_placeholders_with_cancellation(
-        &service,
-        placeholder_rules,
-        &target_id,
-        &fact.kind,
-        &fact.source_text,
-        &final_translation,
-        || ensure_generic_response_processing_running(cancellation),
-    )? {
-        Ok(()) => {}
-        Err(source) => {
-            return Ok(Err(generic_candidate_placeholder_problem(
-                source,
-                placeholder_rule_source,
-                &fact.locator,
-            )?));
-        }
-    }
     if contains_reserved_prefix_with_cancellation(&final_translation, cancellation)? {
         return Ok(Err(GenericResponseDestinationProblem::ReservedToken));
     }
@@ -10217,7 +10199,6 @@ mod tests {
                         unit: 1,
                     },
                     kind: "dialogue".to_owned(),
-                    source_text: "こんにちは {name}".to_owned(),
                     analysis: language_module.analyze_source(&language_text),
                     protected,
                 },

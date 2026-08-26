@@ -11,14 +11,29 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{
+    AhoCorasick, AhoCorasickBuilder, Anchored, MatchKind, automaton::Automaton,
+    nfa::noncontiguous::NFA,
+};
 
-use super::placeholder::{AppliedPlaceholder, PlaceholderWrapperCaptureShape};
+use super::placeholder::{
+    AppliedPlaceholder, PlaceholderRuleOrigin, PlaceholderWrapperCaptureShape,
+};
 use super::placeholder_token;
+use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageText, LanguageTextSegment};
 
 const PROJECTION_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+/// 把候选中的源文保护片段重新绑定到源文已经建立的 Placeholder 身份时的失败。
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SourceBoundPlaceholderError {
+    Projection(LanguageTextProjectionError),
+    Multiset(PlaceholderMultisetError),
+    AmbiguousOriginal { original: String },
+    UnexpectedPlaceholder,
+}
 
 /// 从已保护文本建立语言模块可见的自然文本与不透明边界。
 ///
@@ -931,6 +946,470 @@ impl PlaceholderBindingIndex {
     }
 }
 
+/// 按源文已经建立的 binding，把候选中唯一可归属的原始保护片段转换成受信 token。
+///
+/// 候选可能来自模型、人工入口或既有 Current。这里不重新解释译文上下文中的规则；源文
+/// binding 的原片段、数量和槽位才是预期事实。后续仍由 `PlaceholderBindingIndex` 验证
+/// token 多重集、顺序和 wrapper 拓扑，调用方再扫描剩余自然文本以拒绝新增 Placeholder。
+pub(crate) fn bind_source_placeholder_literals_in_lines_with_cancellation<E>(
+    lines: &mut [String],
+    placeholders: &[AppliedPlaceholder],
+    placeholder_bindings: &PlaceholderBindingIndex,
+    scans: &[PlaceholderTextScan],
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<bool, SourceBoundPlaceholderError>, E> {
+    debug_assert_eq!(lines.len(), scans.len());
+    let mut groups = Vec::<OriginalPlaceholderGroup>::new();
+    let mut fingerprints = HashMap::<Sha256Fingerprint, Vec<usize>>::new();
+    for (binding_index, placeholder) in placeholders.iter().enumerate() {
+        ensure_running()?;
+        let fingerprint = projection_text_fingerprint_with_cancellation(
+            placeholder.original(),
+            &mut ensure_running,
+        )?;
+        let bucket = fingerprints.entry(fingerprint).or_default();
+        let mut group_index = None;
+        for candidate in bucket.iter().copied() {
+            if projection_text_equal_with_cancellation(
+                placeholders[groups[candidate].representative].original(),
+                placeholder.original(),
+                &mut ensure_running,
+            )? {
+                group_index = Some(candidate);
+                break;
+            }
+        }
+        let group_index = match group_index {
+            Some(group_index) => group_index,
+            None => {
+                let group_index = groups.len();
+                groups.push(OriginalPlaceholderGroup {
+                    representative: binding_index,
+                    bindings: Vec::new(),
+                });
+                bucket.push(group_index);
+                group_index
+            }
+        };
+        groups[group_index].bindings.push(binding_index);
+    }
+
+    let token_counts = placeholder_bindings
+        .all_binding_token_occurrences_with_cancellation(scans, &mut ensure_running)?;
+    let mut group_indices = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        ensure_running()?;
+        if group
+            .bindings
+            .iter()
+            .any(|binding_index| token_counts[*binding_index] == 0)
+            || group.bindings.iter().any(|binding_index| {
+                placeholders[*binding_index].origin() == PlaceholderRuleOrigin::BuiltIn
+            })
+        {
+            group_indices.push(group_index);
+        }
+    }
+    let occurrences = match index_original_placeholder_occurrences_with_cancellation(
+        lines,
+        scans,
+        &groups,
+        placeholders,
+        &group_indices,
+        &mut ensure_running,
+    )? {
+        Ok(occurrences) => occurrences,
+        Err(source) => return Ok(Err(SourceBoundPlaceholderError::Projection(source))),
+    };
+
+    let mut replacements = Vec::<OriginalPlaceholderLiteralReplacement<'_>>::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        ensure_running()?;
+        let matched = &occurrences.by_group[group_index];
+        if matched.count == 0 {
+            continue;
+        }
+        let original = placeholders[group.representative].original();
+        let missing = group
+            .bindings
+            .iter()
+            .copied()
+            .filter(|binding_index| token_counts[*binding_index] == 0)
+            .collect::<Vec<_>>();
+        // 相同原片段全部以自然顺序出现时，源 binding 顺序能够确定其身份；与已有 token
+        // 混排时，最终顺序检查继续证明相对位置。数量多或少都无法唯一归属。
+        if matched.count != missing.len() {
+            return Ok(Err(ambiguous_source_original(
+                original,
+                &mut ensure_running,
+            )?));
+        }
+        for (&binding_index, &(line_index, start, end)) in missing.iter().zip(&matched.positions) {
+            ensure_running()?;
+            replacements.push(OriginalPlaceholderLiteralReplacement {
+                line_index,
+                start,
+                end,
+                token: placeholders[binding_index].token(),
+                original,
+            });
+        }
+    }
+
+    stable_sort_original_replacements_with_cancellation(&mut replacements, &mut ensure_running)?;
+    for pair in replacements.windows(2) {
+        ensure_running()?;
+        let [previous, current] = pair else {
+            unreachable!("windows(2) 始终返回两个元素");
+        };
+        if previous.line_index == current.line_index && current.start < previous.end {
+            return Ok(Err(ambiguous_source_original(
+                current.original,
+                &mut ensure_running,
+            )?));
+        }
+    }
+
+    let changed = !replacements.is_empty();
+    let mut replacement_index = 0_usize;
+    for (line_index, line) in lines.iter_mut().enumerate() {
+        ensure_running()?;
+        let first = replacement_index;
+        while replacements
+            .get(replacement_index)
+            .is_some_and(|replacement| replacement.line_index == line_index)
+        {
+            ensure_running()?;
+            replacement_index += 1;
+        }
+        if first == replacement_index {
+            continue;
+        }
+        let line_replacements = &replacements[first..replacement_index];
+        let mut capacity = line.len();
+        for replacement in line_replacements {
+            ensure_running()?;
+            capacity = capacity
+                .checked_sub(replacement.end - replacement.start)
+                .and_then(|capacity| capacity.checked_add(replacement.token.len()))
+                .expect("Placeholder 绑定结果长度必须能由 usize 表示");
+        }
+        let original_line = std::mem::take(line);
+        let mut rebuilt = String::with_capacity(capacity);
+        let mut cursor = 0_usize;
+        for replacement in line_replacements {
+            append_projection_text_with_cancellation(
+                &mut rebuilt,
+                &original_line[cursor..replacement.start],
+                &mut ensure_running,
+            )?;
+            append_projection_text_with_cancellation(
+                &mut rebuilt,
+                replacement.token,
+                &mut ensure_running,
+            )?;
+            cursor = replacement.end;
+        }
+        append_projection_text_with_cancellation(
+            &mut rebuilt,
+            &original_line[cursor..],
+            &mut ensure_running,
+        )?;
+        *line = rebuilt;
+    }
+    ensure_running()?;
+    Ok(Ok(changed))
+}
+
+fn ambiguous_source_original<E>(
+    original: &str,
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<SourceBoundPlaceholderError, E> {
+    Ok(SourceBoundPlaceholderError::AmbiguousOriginal {
+        original: clone_projection_text_with_cancellation(original, ensure_running)?,
+    })
+}
+
+struct OriginalPlaceholderGroup {
+    representative: usize,
+    bindings: Vec<usize>,
+}
+
+#[derive(Default)]
+struct OriginalPlaceholderOccurrences {
+    count: usize,
+    positions: Vec<(usize, usize, usize)>,
+}
+
+struct OriginalPlaceholderOccurrenceIndex {
+    by_group: Vec<OriginalPlaceholderOccurrences>,
+    #[cfg(test)]
+    scanned_lines: usize,
+}
+
+fn index_original_placeholder_occurrences_with_cancellation<E>(
+    lines: &[String],
+    scans: &[PlaceholderTextScan],
+    groups: &[OriginalPlaceholderGroup],
+    placeholders: &[AppliedPlaceholder],
+    groups_requiring_scan: &[usize],
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<OriginalPlaceholderOccurrenceIndex, LanguageTextProjectionError>, E> {
+    debug_assert_eq!(lines.len(), scans.len());
+    let mut by_group = Vec::with_capacity(groups.len());
+    for _ in groups {
+        ensure_running()?;
+        by_group.push(OriginalPlaceholderOccurrences::default());
+    }
+    if groups_requiring_scan.is_empty() {
+        return Ok(Ok(OriginalPlaceholderOccurrenceIndex {
+            by_group,
+            #[cfg(test)]
+            scanned_lines: 0,
+        }));
+    }
+    if let [group_index] = groups_requiring_scan {
+        return index_single_original_placeholder_occurrences_with_cancellation(
+            lines,
+            scans,
+            groups,
+            placeholders,
+            *group_index,
+            by_group,
+            ensure_running,
+        );
+    }
+
+    let mut patterns = Vec::with_capacity(groups_requiring_scan.len());
+    for &group_index in groups_requiring_scan {
+        ensure_running()?;
+        let original = placeholders[groups[group_index].representative].original();
+        if original.is_empty() {
+            return Ok(Err(LanguageTextProjectionError::TokenIndexConstruction));
+        }
+        patterns.push(clone_projection_text_with_cancellation(
+            original,
+            &mut ensure_running,
+        )?);
+    }
+    let pattern_count = patterns.len();
+    let matcher = match build_original_placeholder_matcher_with_cancellation(
+        patterns,
+        &mut ensure_running,
+    )? {
+        Ok(matcher) => matcher,
+        Err(source) => return Ok(Err(source)),
+    };
+    #[cfg(test)]
+    let mut scanned_lines = 0_usize;
+    for (line_index, (line, scan)) in lines.iter().zip(scans).enumerate() {
+        ensure_running()?;
+        #[cfg(test)]
+        {
+            scanned_lines += 1;
+        }
+        let mut state = match matcher.start_state(Anchored::No) {
+            Ok(state) => state,
+            Err(_) => return Ok(Err(LanguageTextProjectionError::TokenIndexConstruction)),
+        };
+        let mut chunk_start = 0_usize;
+        for chunk in line.as_bytes().chunks(PROJECTION_CANCELLATION_CHECK_BYTES) {
+            ensure_running()?;
+            for (chunk_offset, &byte) in chunk.iter().enumerate() {
+                state = matcher.next_state(Anchored::No, state, byte);
+                if !matcher.is_match(state) {
+                    continue;
+                }
+                let end = chunk_start + chunk_offset + 1;
+                for match_index in 0..matcher.match_len(state) {
+                    ensure_running()?;
+                    let pattern_id = matcher.match_pattern(state, match_index);
+                    let pattern_index = pattern_id.as_usize();
+                    let start = end - matcher.pattern_len(pattern_id);
+                    if token_ranges_overlap(scan.token_ranges(), start, end) {
+                        continue;
+                    }
+
+                    debug_assert!(pattern_index < pattern_count);
+                    let group_index = groups_requiring_scan[pattern_index];
+                    let matched = &mut by_group[group_index];
+                    let retained_limit = groups[group_index].bindings.len().saturating_add(1);
+                    if matched.positions.len() < retained_limit {
+                        matched.positions.push((line_index, start, end));
+                    }
+                    matched.count = matched.count.saturating_add(1).min(retained_limit);
+                }
+            }
+            chunk_start += chunk.len();
+        }
+    }
+    ensure_running()?;
+    Ok(Ok(OriginalPlaceholderOccurrenceIndex {
+        by_group,
+        #[cfg(test)]
+        scanned_lines,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_single_original_placeholder_occurrences_with_cancellation<E>(
+    lines: &[String],
+    scans: &[PlaceholderTextScan],
+    groups: &[OriginalPlaceholderGroup],
+    placeholders: &[AppliedPlaceholder],
+    group_index: usize,
+    mut by_group: Vec<OriginalPlaceholderOccurrences>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<OriginalPlaceholderOccurrenceIndex, LanguageTextProjectionError>, E> {
+    let pattern = placeholders[groups[group_index].representative]
+        .original()
+        .as_bytes();
+    if pattern.is_empty() {
+        return Ok(Err(LanguageTextProjectionError::TokenIndexConstruction));
+    }
+    let mut prefix_lengths = Vec::with_capacity(pattern.len());
+    prefix_lengths.push(0_usize);
+    let mut matched = 0_usize;
+    for pattern_index in 1..pattern.len() {
+        if pattern_index.is_multiple_of(PROJECTION_CANCELLATION_CHECK_BYTES) {
+            ensure_running()?;
+        }
+        while matched > 0 && pattern[pattern_index] != pattern[matched] {
+            matched = prefix_lengths[matched - 1];
+        }
+        if pattern[pattern_index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix_lengths.push(matched);
+    }
+
+    #[cfg(test)]
+    let mut scanned_lines = 0_usize;
+    for (line_index, (line, scan)) in lines.iter().zip(scans).enumerate() {
+        ensure_running()?;
+        #[cfg(test)]
+        {
+            scanned_lines += 1;
+        }
+        let mut matched = 0_usize;
+        for (byte_index, &byte) in line.as_bytes().iter().enumerate() {
+            if byte_index.is_multiple_of(PROJECTION_CANCELLATION_CHECK_BYTES) {
+                ensure_running()?;
+            }
+            while matched > 0 && byte != pattern[matched] {
+                matched = prefix_lengths[matched - 1];
+            }
+            if byte == pattern[matched] {
+                matched += 1;
+            }
+            if matched != pattern.len() {
+                continue;
+            }
+            let end = byte_index + 1;
+            let start = end - pattern.len();
+            if !token_ranges_overlap(scan.token_ranges(), start, end) {
+                let retained_limit = groups[group_index].bindings.len().saturating_add(1);
+                let occurrences = &mut by_group[group_index];
+                if occurrences.positions.len() < retained_limit {
+                    occurrences.positions.push((line_index, start, end));
+                }
+                occurrences.count = occurrences.count.saturating_add(1).min(retained_limit);
+            }
+            matched = prefix_lengths[matched - 1];
+        }
+    }
+    ensure_running()?;
+    Ok(Ok(OriginalPlaceholderOccurrenceIndex {
+        by_group,
+        #[cfg(test)]
+        scanned_lines,
+    }))
+}
+
+fn build_original_placeholder_matcher_with_cancellation<E>(
+    patterns: Vec<String>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<NFA, LanguageTextProjectionError>, E> {
+    let mut total_bytes = 0_usize;
+    for pattern in &patterns {
+        ensure_running()?;
+        total_bytes = total_bytes.saturating_add(pattern.len());
+    }
+    if total_bytes <= PROJECTION_CANCELLATION_CHECK_BYTES {
+        let matcher = NFA::builder()
+            .match_kind(MatchKind::Standard)
+            .build(patterns.iter().map(String::as_bytes))
+            .map_err(|_| LanguageTextProjectionError::TokenIndexConstruction);
+        ensure_running()?;
+        return Ok(matcher);
+    }
+    run_original_placeholder_matcher_build_with_cancellation(
+        patterns,
+        |patterns| {
+            NFA::builder()
+                .match_kind(MatchKind::Standard)
+                .build(patterns.iter().map(String::as_bytes))
+                .map_err(|_| ())
+        },
+        ensure_running,
+    )
+}
+
+fn run_original_placeholder_matcher_build_with_cancellation<E>(
+    patterns: Vec<String>,
+    build: impl FnOnce(Vec<String>) -> Result<NFA, ()> + Send + 'static,
+    ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Result<NFA, LanguageTextProjectionError>, E> {
+    match run_isolated_operation(
+        "att-placeholder-source-binding-matcher",
+        move || build(patterns),
+        ensure_running,
+    ) {
+        Ok(Ok(matcher)) => Ok(Ok(matcher)),
+        Ok(Err(())) | Err(IsolatedOperationError::Start { .. }) => {
+            Ok(Err(LanguageTextProjectionError::TokenIndexConstruction))
+        }
+        Err(IsolatedOperationError::Cancelled(cancellation)) => Err(cancellation),
+    }
+}
+
+fn token_ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    let candidate = ranges.partition_point(|&(_, token_end)| token_end <= start);
+    ranges
+        .get(candidate)
+        .is_some_and(|&(token_start, _)| token_start < end)
+}
+
+fn stable_sort_original_replacements_with_cancellation<E>(
+    replacements: &mut [OriginalPlaceholderLiteralReplacement<'_>],
+    ensure_running: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let order = stable_sorted_order_with_cancellation(
+        replacements.len(),
+        ensure_running,
+        |left, right, ensure_running| {
+            ensure_running()?;
+            let left = &replacements[left];
+            let right = &replacements[right];
+            Ok((left.line_index, left.start, left.end).cmp(&(
+                right.line_index,
+                right.start,
+                right.end,
+            )))
+        },
+    )?;
+    apply_projection_order_with_cancellation(replacements, order, ensure_running)
+}
+
+#[derive(Clone, Copy)]
+struct OriginalPlaceholderLiteralReplacement<'a> {
+    line_index: usize,
+    start: usize,
+    end: usize,
+    token: &'a str,
+    original: &'a str,
+}
+
 fn wrapper_capture_shape(
     start: usize,
     end: usize,
@@ -1717,6 +2196,220 @@ mod tests {
             presence_polls < PLACEHOLDER_COUNT * 16,
             "逐行索引应只遍历实际出现的 token，polls={presence_polls}"
         );
+    }
+
+    #[test]
+    fn source_binding_uses_the_exact_source_fragment_without_candidate_rule_context() {
+        let placeholder = applied_with_original("⟦ATT_SECRET_WHOLE_0000⟧", "abc-123");
+        let placeholders = [placeholder];
+        let bindings = PlaceholderBindingIndex::new(&placeholders).expect("索引应有效");
+        let mut lines = vec!["名称：abc-123".to_owned()];
+        let scans = vec![bindings.scan(&lines[0])];
+
+        let changed = bind_source_placeholder_literals_in_lines_with_cancellation(
+            &mut lines,
+            &placeholders,
+            &bindings,
+            &scans,
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("测试没有请求取消")
+        .expect("唯一源片段应可绑定");
+
+        assert!(changed);
+        assert_eq!(lines, ["名称：⟦ATT_SECRET_WHOLE_0000⟧"]);
+    }
+
+    #[test]
+    fn single_source_pattern_fast_path_keeps_overlapping_matches_ambiguous() {
+        let placeholders = [applied_with_original("⟦ATT_TEST_WHOLE_0000⟧", "aa")];
+        let bindings = PlaceholderBindingIndex::new(&placeholders).expect("索引应有效");
+        let mut lines = vec!["aaa".to_owned()];
+        let scans = vec![bindings.scan(&lines[0])];
+
+        assert!(matches!(
+            bind_source_placeholder_literals_in_lines_with_cancellation(
+                &mut lines,
+                &placeholders,
+                &bindings,
+                &scans,
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试没有请求取消"),
+            Err(SourceBoundPlaceholderError::AmbiguousOriginal { original }) if original == "aa"
+        ));
+    }
+
+    #[test]
+    fn source_binding_orders_repeated_originals_and_rejects_extra_or_overlapping_matches() {
+        let repeated = [
+            applied_with_original("⟦ATT_FIRST_WHOLE_0000⟧", "same"),
+            applied_with_original("⟦ATT_SECOND_WHOLE_0001⟧", "same"),
+        ];
+        let repeated_bindings =
+            PlaceholderBindingIndex::new(&repeated).expect("重复原片段仍可建立 token 索引");
+        let mut repeated_lines = vec!["same / same".to_owned()];
+        let repeated_scans = vec![repeated_bindings.scan(&repeated_lines[0])];
+        assert!(
+            bind_source_placeholder_literals_in_lines_with_cancellation(
+                &mut repeated_lines,
+                &repeated,
+                &repeated_bindings,
+                &repeated_scans,
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试没有请求取消")
+            .expect("完整自然顺序应能确定重复原片段的 binding")
+        );
+        assert_eq!(
+            repeated_lines,
+            ["⟦ATT_FIRST_WHOLE_0000⟧ / ⟦ATT_SECOND_WHOLE_0001⟧"]
+        );
+
+        let mut extra_lines = vec!["same / same / same".to_owned()];
+        let extra_scans = vec![repeated_bindings.scan(&extra_lines[0])];
+        assert!(matches!(
+            bind_source_placeholder_literals_in_lines_with_cancellation(
+                &mut extra_lines,
+                &repeated,
+                &repeated_bindings,
+                &extra_scans,
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试没有请求取消"),
+            Err(SourceBoundPlaceholderError::AmbiguousOriginal { original }) if original == "same"
+        ));
+
+        let overlapping = [
+            applied_with_original("⟦ATT_LONG_WHOLE_0000⟧", "abc"),
+            applied_with_original("⟦ATT_SHORT_WHOLE_0001⟧", "bc"),
+        ];
+        let overlapping_bindings =
+            PlaceholderBindingIndex::new(&overlapping).expect("重叠原片段仍可建立 token 索引");
+        let mut overlapping_lines = vec!["abc".to_owned()];
+        let overlapping_scans = vec![overlapping_bindings.scan(&overlapping_lines[0])];
+        assert!(matches!(
+            bind_source_placeholder_literals_in_lines_with_cancellation(
+                &mut overlapping_lines,
+                &overlapping,
+                &overlapping_bindings,
+                &overlapping_scans,
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试没有请求取消"),
+            Err(SourceBoundPlaceholderError::AmbiguousOriginal { .. })
+        ));
+    }
+
+    #[test]
+    fn source_binding_leaves_raw_text_for_residual_rules_when_the_token_is_present() {
+        let token = "⟦ATT_TEST_WHOLE_0000⟧";
+        let placeholders = [applied_with_original(token, "protected")];
+        let bindings = PlaceholderBindingIndex::new(&placeholders).expect("索引应有效");
+        let mut lines = vec![format!("{token} protected")];
+        let scans = vec![bindings.scan(&lines[0])];
+
+        assert!(
+            !bind_source_placeholder_literals_in_lines_with_cancellation(
+                &mut lines,
+                &placeholders,
+                &bindings,
+                &scans,
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试没有请求取消")
+            .expect("已有 token 时裸文本应留给适用规则扫描")
+        );
+        assert_eq!(lines, [format!("{token} protected")]);
+    }
+
+    #[test]
+    fn source_original_matcher_scans_each_candidate_line_once() {
+        const PLACEHOLDER_COUNT: usize = 512;
+        let placeholders = (0..PLACEHOLDER_COUNT)
+            .map(|index| {
+                applied_with_original(
+                    &format!("⟦ATT_TEST_WHOLE_{index:04}⟧"),
+                    &format!("<SOURCE_{index:04}>"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bindings = PlaceholderBindingIndex::new(&placeholders).expect("索引应有效");
+        let candidate = placeholders
+            .iter()
+            .map(|placeholder| placeholder.original())
+            .collect::<Vec<_>>()
+            .join("|");
+        let lines = vec![candidate];
+        let scans = vec![bindings.scan(&lines[0])];
+        let groups = placeholders
+            .iter()
+            .enumerate()
+            .map(|(binding_index, _)| OriginalPlaceholderGroup {
+                representative: binding_index,
+                bindings: vec![binding_index],
+            })
+            .collect::<Vec<_>>();
+        let group_indices = (0..groups.len()).collect::<Vec<_>>();
+
+        let indexed = index_original_placeholder_occurrences_with_cancellation(
+            &lines,
+            &scans,
+            &groups,
+            &placeholders,
+            &group_indices,
+            || Ok::<_, Infallible>(()),
+        )
+        .expect("测试没有请求取消")
+        .expect("多模式索引应可建立");
+
+        assert_eq!(indexed.scanned_lines, 1);
+        assert!(indexed.by_group.iter().all(|matched| matched.count == 1));
+    }
+
+    #[test]
+    fn active_source_original_matcher_build_observes_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let caller_cancelled = Arc::clone(&cancelled);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let caller = std::thread::spawn(move || {
+            let result = run_original_placeholder_matcher_build_with_cancellation(
+                vec!["aa".to_owned()],
+                move |_| {
+                    started_sender.send(()).expect("应通知 matcher 已启动");
+                    release_receiver.recv().expect("应释放 matcher worker");
+                    finished_sender.send(()).expect("应通知 matcher 已结束");
+                    Err(())
+                },
+                move || {
+                    if caller_cancelled.load(Ordering::Acquire) {
+                        Err("cancelled")
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            result_sender.send(result).expect("应返回 matcher 构建结果");
+        });
+
+        started_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("matcher worker 应实际开始运行");
+        cancelled.store(true, Ordering::Release);
+        let result = result_receiver.recv_timeout(std::time::Duration::from_secs(1));
+        release_sender.send(()).expect("取消测试必须释放 worker");
+        finished_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("取消测试必须回收纯计算");
+        caller.join().expect("matcher 调用线程应正常结束");
+
+        assert!(matches!(result, Ok(Err("cancelled"))));
     }
 
     #[test]

@@ -1270,6 +1270,9 @@ pub(crate) fn placeholder_projection_diagnostic(
             }
         }
         TranslationPlaceholderProjectionFailure::UnusedOrderedToken => Problem::UnusedOrderedToken,
+        TranslationPlaceholderProjectionFailure::SourceBindingMismatch => {
+            Problem::SourceBindingMismatch
+        }
     }
 }
 
@@ -1363,6 +1366,7 @@ pub(crate) enum TranslationPlaceholderProjectionFailure {
         segment_index: usize,
     },
     UnusedOrderedToken,
+    SourceBindingMismatch,
 }
 
 /// 任务在确定计划中的序号。

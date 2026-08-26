@@ -35,8 +35,7 @@ use super::jsonl::{
     serialize_groups_with_cancellation,
 };
 use super::placeholder::{
-    GenericCompiledPlaceholderRules, GenericPlaceholderService,
-    protected_translation_placeholder_binding_matches_with_cancellation,
+    GenericCompiledPlaceholderRules, GenericPlaceholderService, GenericSourceBoundPlaceholderError,
 };
 use super::project::GenericStoredSnapshot;
 use super::translate::GenericUnitKey;
@@ -721,7 +720,8 @@ fn validate_translation_candidate(
             });
         }
     };
-    let translation_view = match service.protect_compiled_target_with_cancellation(
+    let translation_view = match service.bind_target_candidate_with_cancellation(
+        &source_view,
         &target_id,
         context.kind,
         translation,
@@ -729,23 +729,26 @@ fn validate_translation_candidate(
         || ensure_write_back_running(cancellation),
     )? {
         Ok(translation) => translation,
-        Err(source) => {
+        Err(GenericSourceBoundPlaceholderError::Protection(source)) => {
             return Err(GenericWriteBackError::PlaceholderProtection {
                 unit: unit_locator(),
                 side: GenericWriteBackTextSide::Translation,
                 source,
             });
         }
+        Err(GenericSourceBoundPlaceholderError::Projection(source)) => {
+            return Err(GenericWriteBackError::LanguageProjection {
+                unit: unit_locator(),
+                side: GenericWriteBackTextSide::Translation,
+                source,
+            });
+        }
+        Err(GenericSourceBoundPlaceholderError::Mismatch) => {
+            return Err(GenericWriteBackError::PlaceholderBindingMismatch {
+                unit: unit_locator(),
+            });
+        }
     };
-    if !protected_translation_placeholder_binding_matches_with_cancellation(
-        &source_view,
-        &translation_view,
-        || ensure_write_back_running(cancellation),
-    )? {
-        return Err(GenericWriteBackError::PlaceholderBindingMismatch {
-            unit: unit_locator(),
-        });
-    }
     Ok(ValidatedGenericTranslation {
         source: source_view,
         translation: translation_view,
@@ -1400,6 +1403,59 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
             "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规,杂项</msg>\"}]}\n"
+        );
+    }
+
+    #[test]
+    fn candidate_write_back_uses_source_binding_when_the_label_is_translated() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir(&source_root).unwrap();
+        fs::write(
+            source_root.join("scene.jsonl"),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"Name: abc-123\"}]}\n",
+        )
+        .unwrap();
+        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "source-bound-write-back".parse().unwrap(),
+            workspace_root: temp.path().join("project"),
+            source_root: Some(source_root),
+            source_language: Some(LanguageId::parse("en").unwrap()),
+            target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+        })
+        .unwrap();
+        store.extract().unwrap();
+        let (stored, live) = store.ensure_input_current().unwrap();
+        let mut translations = GenericUnitMap::new();
+        translations
+            .insert_with_cancellation(
+                GenericUnitKey::new("g".to_owned(), "u".to_owned()),
+                GenericCurrentTranslation::new("名称：abc-123".to_owned(), true),
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        let placeholder_rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                Some(vec!["dialogue".to_owned()]),
+                r"(?<=Name: )[A-Za-z0-9-]+",
+            )])
+            .expect("lookbehind Placeholder 规则必须有效");
+        let layout_rules = empty_layout_rules(&live);
+
+        let candidate = build_write_back_candidate_with_cancellation(
+            &stored,
+            &live,
+            &translations,
+            &placeholder_rules,
+            &layout_rules,
+            GenericWriteBackTextOptions::new(false, false),
+            &CooperativeCancellation::default(),
+        )
+        .expect("译文标签变化不应使已绑定的凭据失效");
+
+        assert_eq!(
+            std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"名称：abc-123\"}]}\n"
         );
     }
 

@@ -455,6 +455,7 @@ pub(crate) enum RpgMakerPlaceholderProjectionProblem {
         segment_index: usize,
     },
     UnusedOrderedToken,
+    SourceBindingMismatch,
 }
 
 impl RpgMakerPlaceholderProjectionProblem {
@@ -531,6 +532,9 @@ impl RpgMakerPlaceholderProjectionProblem {
             ],
             Self::UnusedOrderedToken => {
                 vec![("projection_failure", "unused_ordered_token".to_owned())]
+            }
+            Self::SourceBindingMismatch => {
+                vec![("projection_failure", "source_binding_mismatch".to_owned())]
             }
         }
     }
@@ -6832,6 +6836,9 @@ impl RpgMakerIssue {
                 }
                 RpgMakerPlaceholderProjectionProblem::UnusedOrderedToken => {
                     "translation.placeholder.unused_ordered_token"
+                }
+                RpgMakerPlaceholderProjectionProblem::SourceBindingMismatch => {
+                    "translation.placeholder.source_binding_mismatch"
                 }
             },
             RpgMakerProblem::ResponseProcessing { problem, .. } => problem.code(),

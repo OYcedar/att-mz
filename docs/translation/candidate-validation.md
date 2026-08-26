@@ -30,8 +30,8 @@ Translate 的 `Complete` 只说明计划内 Unit 都有结构合法的当前译�
 | 固定空槽 | ATT 的明确产品契约规定：`fixed` 源槽除 U+000C 外只含结构空白时，该槽没有可翻译正文，候选必须是精确空字符串；Extract 负责冻结这些槽位 | 源 `['接受', ' ', '取消']` 的候选为 `['接受', '文字', '取消']` | 当前 Unit | Rejected |
 | 可见槽不得被翻译为空 | 非空源槽是当前明确存在的文字；翻译入口不承担删除文字的含义 | 源 `['Accept', '', 'Cancel']` 的候选为 `['', '', '取消']` | 当前 Unit | Rejected；确需删除文字只能使用使用者主动选择的原始数据库 Lua |
 | 字段字符格式 | 当前 Unit 的形状明确规定允许的字符；`fixed` 用数组槽表达分行，槽内不允许 CR、LF、NUL 或 BOM；允许自由重排的正文可以按该字段契约包含 LF，但仍不允许 CR、NUL 或 BOM | `fixed` 单槽含 `\n`，或任一不允许这些字符的字段含 `\r`、U+0000 或 U+FEFF | 当前 Unit | Rejected |
-| 已确认 Custom Placeholder | 当前项目 Placeholder 资源由使用者或 Agent 明确确认了自然 ID、scope、精确 pattern、wrapper 和顺序策略 | 精确协议壳缺失、重复、跨槽，或非空 `text` 子槽变成纯空白 | 当前 Unit | Rejected；普通 Custom 的协议字节身份保持精确 |
-| 已确认 RPG Maker 内建控制 | 当前项目的引擎、标准物理字段和 ATT 现行内建控制规则共同确定该 Unit 的控制 token | 已确认控制 token 缺失、增加或换槽 | 当前 Unit | Rejected；插件新增或未知外形只产生 Review |
+| 已确认 Custom Placeholder | 当前项目 Placeholder 资源由使用者或 Agent 明确确认了自然 ID、scope、精确 pattern、wrapper 和顺序策略；预期身份来自源文实际 binding，不要求 pattern 在译文上下文再次命中 | 精确协议壳缺失、重复、跨槽、无法唯一绑定，或非空 `text` 子槽变成纯空白 | 当前 Unit | Rejected；普通 Custom 的协议字节身份保持精确 |
+| 已确认 RPG Maker 内建控制 | 当前项目的引擎、标准物理字段和 ATT 现行内建控制规则共同确定该 Unit 的控制 token；完整候选扫描只用于发现源 binding 之外的新身份 | 已确认控制 token 缺失、增加或换槽 | 当前 Unit | Rejected；插件新增或未知外形只产生 Review |
 | 当前状态未变化 | 提交时的来源、上下文、Unit 形状、人工译文和事务快照必须等于规划时事实 | 规划后原文或人工译文已改变 | 当前 Unit 及必须同事务提交的传播成员 | 不覆盖新状态；记录未提交或当前操作失败 |
 | 物化保持结构与原子性 | JSON、事件命令、Mutation Claim、目录发布和 SQLite 事务由各自现行规格定义 | 写回需要修改未声明字段、事务结果未知或发布恢复失败 | 当前事务或当前发布目标 | 不发布不确定结果；保留类型化恢复事实 |
 

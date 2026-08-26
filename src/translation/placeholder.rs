@@ -31,6 +31,7 @@ use crate::language::LanguageText;
 
 use super::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
+    SourceBoundPlaceholderError, bind_source_placeholder_literals_in_lines_with_cancellation,
 };
 use super::placeholder_token;
 
@@ -1816,51 +1817,30 @@ impl AppliedPlaceholder {
     }
 }
 
-/// 比较同一逻辑槽的原文与候选 Placeholder 契约。
-///
-/// token 编号只服务本次保护过程，不属于跨两次扫描的身份。实际身份由来源、规则、原片段
-/// 和 wrapper 段共同决定；允许换序的 FormatArgument 只参与多重集比较，其余项仍保持
-/// 相对顺序。
-pub(crate) fn placeholder_bindings_match_within_slot(
+/// 候选规则扫描只负责发现源 binding 之外的新 Placeholder，不重新证明预期片段是否存在。
+pub(crate) fn candidate_placeholder_bindings_are_source_subset(
     source: &[AppliedPlaceholder],
     candidate: &[AppliedPlaceholder],
 ) -> bool {
-    if source.len() != candidate.len() {
-        return false;
-    }
-
-    let mut matched = vec![false; candidate.len()];
-    for expected in source {
-        let Some(index) = candidate.iter().enumerate().position(|(index, actual)| {
-            !matched[index] && placeholder_binding_identity_eq(expected, actual)
+    let mut matched = vec![false; source.len()];
+    for actual in candidate {
+        let Some(index) = source.iter().enumerate().position(|(index, expected)| {
+            !matched[index] && placeholder_rule_identity_eq(expected, actual)
         }) else {
             return false;
         };
         matched[index] = true;
     }
-
-    source
-        .iter()
-        .filter(|binding| binding.order_policy == PlaceholderOrderPolicy::Preserve)
-        .zip(
-            candidate
-                .iter()
-                .filter(|binding| binding.order_policy == PlaceholderOrderPolicy::Preserve),
-        )
-        .all(|(expected, actual)| placeholder_binding_identity_eq(expected, actual))
+    true
 }
 
-pub(crate) fn placeholder_binding_identity_eq(
-    left: &AppliedPlaceholder,
-    right: &AppliedPlaceholder,
-) -> bool {
+fn placeholder_rule_identity_eq(left: &AppliedPlaceholder, right: &AppliedPlaceholder) -> bool {
     left.semantic_identity == right.semantic_identity
         && left.origin == right.origin
         && left.label == right.label
         && left.scope == right.scope
         && left.segment == right.segment
         && left.order_policy == right.order_policy
-        && left.wrapper == right.wrapper
 }
 
 /// 一次保护的完整可逆结果。
@@ -1927,6 +1907,55 @@ impl ProtectedText {
             Arc::clone(&self.placeholders),
             ensure_running,
         )
+    }
+
+    /// 使用源文保护阶段已经建立的 binding 验收候选，而不要求同一规则再次匹配译文环境。
+    pub(crate) fn bind_candidate_with_cancellation<E>(
+        &self,
+        candidate: &str,
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, SourceBoundPlaceholderError>, E> {
+        let bindings = match PlaceholderBindingIndex::from_vec_shared_with_cancellation(
+            Arc::clone(&self.placeholders),
+            &mut ensure_running,
+        )? {
+            Ok(bindings) => bindings,
+            Err(source) => return Ok(Err(SourceBoundPlaceholderError::Projection(source))),
+        };
+        let mut lines = vec![clone_placeholder_text_with_cancellation(
+            candidate,
+            &mut ensure_running,
+        )?];
+        let initial_scan = bindings.scan_with_cancellation(&lines[0], &mut ensure_running)?;
+        let normalized = match bind_source_placeholder_literals_in_lines_with_cancellation(
+            &mut lines,
+            self.placeholders(),
+            &bindings,
+            std::slice::from_ref(&initial_scan),
+            &mut ensure_running,
+        )? {
+            Ok(normalized) => normalized,
+            Err(source) => return Ok(Err(source)),
+        };
+        let scan = if normalized {
+            bindings.scan_with_cancellation(&lines[0], &mut ensure_running)?
+        } else {
+            initial_scan
+        };
+        if let Err(source) = bindings.validate_multiset_with_cancellation(
+            std::slice::from_ref(&scan),
+            bindings.all_binding_indices(),
+            &mut ensure_running,
+        )? {
+            return Ok(Err(SourceBoundPlaceholderError::Multiset(source)));
+        }
+        let text = lines.pop().expect("单槽候选必须保留一个文本");
+        ensure_running()?;
+        Ok(Ok(Self {
+            text,
+            placeholders: Arc::clone(&self.placeholders),
+            binding_fingerprint: self.binding_fingerprint,
+        }))
     }
 
     /// 验证 token 数量与原顺序后，按绑定直接交错恢复原片段。

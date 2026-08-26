@@ -29,8 +29,9 @@ Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留
 保留但已不适用于当前语言对或 Group 语境的正文不会写回，对应 Unit 保留当前原文；
 WriteBack 不删除这些正文，也不把保留原文伪装成已翻译。
 
-WriteBack 重新执行当前 Placeholder 与结构强校验；源语言残留仍只是一项 Review，不会拒绝
-候选。随后按[配置规格](../runtime/configuration.md#4-writeback-正文开关)执行独立标点修复和
+WriteBack 重新执行当前 Placeholder 与结构强校验。Placeholder 预期使用源文已经建立的
+binding，不要求规则在译文上下文再次命中；完整候选的规则扫描只检查源 binding 之外的新身份。
+源语言残留仍只是一项 Review，不会拒绝候选。随后按[配置规格](../runtime/configuration.md#4-writeback-正文开关)执行独立标点修复和
 续行补空白，并按[WriteBack 排版规则](../translation/write-back-layout-rules.md)只处理明确
 命中的 Unit。
 
