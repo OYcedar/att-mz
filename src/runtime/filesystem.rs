@@ -8608,12 +8608,21 @@ mod tests {
             fs::write(source.join("value.txt"), index.to_string()).expect("应该可写入来源");
             let result = temporary.path().join(format!("result-{index}"));
             let mut command = subprocess_command("create", &target, &source);
-            command.env("FILESYSTEM_PUBLISHER_CHILD_RESULT", &result);
+            command
+                .env("FILESYSTEM_PUBLISHER_CHILD_RESULT", &result)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
             children.push(command.spawn().expect("应该可启动发布子进程"));
             results.push(result);
         }
-        for mut child in children {
-            assert!(child.wait().expect("应该可等待发布子进程").success());
+        for child in children {
+            let output = child.wait_with_output().expect("应该可等待发布子进程");
+            assert!(
+                output.status.success(),
+                "发布子进程异常退出；stdout：{}；stderr：{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let outcomes = results
             .iter()

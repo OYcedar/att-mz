@@ -23,7 +23,7 @@ use crate::translation::layout_rules::{
 };
 use crate::translation::placeholder::{PlaceholderProtectionError, PlaceholderRestoreError};
 use crate::translation::placeholder_projection::LanguageTextProjectionError;
-use crate::translation::text_layout::{LayoutTextSyntax, layout_text};
+use crate::translation::text_layout::layout_text;
 use crate::translation::write_back_text::{
     PunctuationRepairError, PunctuationRepairOutcome, repair_punctuation_with_cancellation,
 };
@@ -609,7 +609,6 @@ fn build_write_back_file(
                         layout_view.translation.text(),
                         max_width,
                         text_options.complete_continuation_whitespace,
-                        LayoutTextSyntax::Plain,
                     ) {
                         let protected = layout.joined_text();
                         let restored = match layout_view

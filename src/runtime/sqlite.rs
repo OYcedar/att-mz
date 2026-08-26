@@ -5,7 +5,7 @@ use std::error::Error;
 use std::ffi::{c_int, c_void};
 use std::fmt;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File};
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
@@ -33,8 +33,8 @@ use crate::runtime::performance::{
     RunPerformanceCounters, SqliteTransactionControl, SqliteTransactionScope,
 };
 use crate::runtime::windows::{
-    FileIdentity, WindowsFsError, delete_regular_file_if_identity, pin_directory_without_reparse,
-    pin_path_without_reparse,
+    FileIdentity, PinnedPath, WindowsFsError, create_new_pinned_database_file,
+    delete_regular_file_if_identity, pin_directory_without_reparse, pin_path_without_reparse,
 };
 use crate::storage::sqlite::{
     CreateDatabaseError, ExecuteFinalTransactionError, ExecuteTransactionError,
@@ -278,12 +278,32 @@ impl Drop for AttSqliteCancellationSuspension {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ClaimedDatabasePathHook(Arc<dyn Fn(&Path) + Send + Sync + 'static>);
+
+#[cfg(test)]
+impl ClaimedDatabasePathHook {
+    fn call(&self, path: &Path) {
+        (self.0)(path);
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for ClaimedDatabasePathHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClaimedDatabasePathHook(..)")
+    }
+}
+
 /// SQLite 根的内部执行资源。
 #[derive(Clone, Debug)]
 pub(crate) struct RusqliteStorageConfiguration {
     worker_stack_bytes: NonZeroUsize,
     #[cfg(test)]
     fixed_short_worker_threads: Option<NonZeroUsize>,
+    #[cfg(test)]
+    claimed_database_path_hook: Option<ClaimedDatabasePathHook>,
 }
 
 impl RusqliteStorageConfiguration {
@@ -292,6 +312,8 @@ impl RusqliteStorageConfiguration {
             worker_stack_bytes: NonZeroUsize::new(4 * 1024 * 1024).expect("产品 worker 栈必须非零"),
             #[cfg(test)]
             fixed_short_worker_threads: None,
+            #[cfg(test)]
+            claimed_database_path_hook: None,
         }
     }
 
@@ -303,7 +325,17 @@ impl RusqliteStorageConfiguration {
         Self {
             worker_stack_bytes,
             fixed_short_worker_threads: Some(short_worker_threads),
+            claimed_database_path_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_claimed_database_path_hook(
+        mut self,
+        hook: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> Self {
+        self.claimed_database_path_hook = Some(ClaimedDatabasePathHook(Arc::new(hook)));
+        self
     }
 }
 
@@ -2532,6 +2564,190 @@ fn initialize_new_database(
     }
 }
 
+#[derive(Clone, Copy)]
+enum DatabaseTargetPurpose {
+    Create,
+    Snapshot,
+}
+
+impl DatabaseTargetPurpose {
+    const fn absolute_path_operation(self) -> &'static str {
+        match self {
+            Self::Create => "建立新数据库绝对路径",
+            Self::Snapshot => "建立快照目标绝对路径",
+        }
+    }
+
+    const fn pin_parent_operation(self) -> &'static str {
+        match self {
+            Self::Create => "固定新数据库父目录",
+            Self::Snapshot => "固定快照目标父目录",
+        }
+    }
+
+    const fn claim_operation(self) -> &'static str {
+        match self {
+            Self::Create => "原子占有并固定新数据库路径",
+            Self::Snapshot => "原子占有并固定快照目标路径",
+        }
+    }
+
+    const fn identity_operation(self) -> &'static str {
+        match self {
+            Self::Create => "读取新数据库初始物理身份",
+            Self::Snapshot => "读取快照目标初始物理身份",
+        }
+    }
+
+    const fn held_identity_operation(self) -> &'static str {
+        match self {
+            Self::Create => "复核固定的新数据库物理身份",
+            Self::Snapshot => "复核固定的快照目标物理身份",
+        }
+    }
+
+    const fn final_path_operation(self) -> &'static str {
+        match self {
+            Self::Create => "复核新数据库最终路径身份",
+            Self::Snapshot => "复核快照目标最终路径身份",
+        }
+    }
+
+    const fn final_identity_operation(self) -> &'static str {
+        match self {
+            Self::Create => "读取新数据库最终物理身份",
+            Self::Snapshot => "读取快照目标最终物理身份",
+        }
+    }
+
+    const fn identity_changed_message(self) -> &'static str {
+        match self {
+            Self::Create => "新数据库物理身份在初始化期间发生变化",
+            Self::Snapshot => "快照目标物理身份在 online backup 期间发生变化",
+        }
+    }
+}
+
+enum DatabaseTargetClaimError {
+    AlreadyExists,
+    NotCreated(SqliteRuntimeError),
+    OutcomeUnknown(SqliteRuntimeError),
+}
+
+/// 从原子占有路径开始，到 SQLite 操作和最终复核结束为止固定同一个目标对象。
+struct ClaimedDatabaseTarget {
+    _parent: PinnedPath,
+    file: File,
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+fn claim_database_target(
+    requested_path: &Path,
+    purpose: DatabaseTargetPurpose,
+    config: &RusqliteStorageConfiguration,
+) -> Result<ClaimedDatabaseTarget, DatabaseTargetClaimError> {
+    let absolute = std::path::absolute(requested_path).map_err(|source| {
+        DatabaseTargetClaimError::NotCreated(SqliteRuntimeError::io(
+            purpose.absolute_path_operation(),
+            requested_path,
+            source,
+        ))
+    })?;
+    let parent_path = absolute.parent().ok_or_else(|| {
+        DatabaseTargetClaimError::NotCreated(SqliteRuntimeError::InvalidTarget {
+            path: absolute.clone(),
+        })
+    })?;
+    let file_name = absolute.file_name().ok_or_else(|| {
+        DatabaseTargetClaimError::NotCreated(SqliteRuntimeError::InvalidTarget {
+            path: absolute.clone(),
+        })
+    })?;
+    let parent = pin_directory_without_reparse(parent_path).map_err(|source| {
+        DatabaseTargetClaimError::NotCreated(SqliteRuntimeError::windows_file_system(
+            purpose.pin_parent_operation(),
+            parent_path,
+            source,
+        ))
+    })?;
+    let stable_path = parent.resolved_path().join(file_name);
+    let file = match create_new_pinned_database_file(&stable_path) {
+        Ok(file) => file,
+        Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(DatabaseTargetClaimError::AlreadyExists);
+        }
+        Err(source) => {
+            return Err(DatabaseTargetClaimError::NotCreated(
+                SqliteRuntimeError::windows_file_system(
+                    purpose.claim_operation(),
+                    &stable_path,
+                    source,
+                ),
+            ));
+        }
+    };
+    let identity = FileIdentity::of(&file, &stable_path).map_err(|source| {
+        DatabaseTargetClaimError::OutcomeUnknown(SqliteRuntimeError::windows_file_system(
+            purpose.identity_operation(),
+            &stable_path,
+            source,
+        ))
+    })?;
+
+    #[cfg(test)]
+    if let Some(hook) = &config.claimed_database_path_hook {
+        hook.call(&stable_path);
+    }
+    #[cfg(not(test))]
+    let _ = config;
+
+    Ok(ClaimedDatabaseTarget {
+        _parent: parent,
+        file,
+        path: stable_path,
+        identity,
+    })
+}
+
+fn verify_claimed_database_identity(
+    claim: &ClaimedDatabaseTarget,
+    purpose: DatabaseTargetPurpose,
+) -> Result<(), SqliteRuntimeError> {
+    let held_identity = FileIdentity::of(&claim.file, &claim.path).map_err(|source| {
+        SqliteRuntimeError::windows_file_system(
+            purpose.held_identity_operation(),
+            &claim.path,
+            source,
+        )
+    })?;
+    if held_identity != claim.identity {
+        return Err(SqliteRuntimeError::Internal(
+            purpose.identity_changed_message(),
+        ));
+    }
+
+    // 原占有句柄和父目录链仍未释放；这次按路径复核因此既检查最终可见名称，
+    // 又不会在“复核”和返回之间重新打开一个可替换窗口。
+    let final_path = pin_path_without_reparse(&claim.path).map_err(|source| {
+        SqliteRuntimeError::windows_file_system(purpose.final_path_operation(), &claim.path, source)
+    })?;
+    let final_identity = FileIdentity::of(final_path.file(), &claim.path).map_err(|source| {
+        SqliteRuntimeError::windows_file_system(
+            purpose.final_identity_operation(),
+            &claim.path,
+            source,
+        )
+    })?;
+    if final_identity == claim.identity {
+        Ok(())
+    } else {
+        Err(SqliteRuntimeError::Internal(
+            purpose.identity_changed_message(),
+        ))
+    }
+}
+
 fn run_create_database(
     path: &Path,
     commands: &[SqliteCommand],
@@ -2541,62 +2757,20 @@ fn run_create_database(
     for command in commands {
         validate_command(command, config).map_err(CreateDatabaseError::NotCreated)?;
     }
-    let absolute = std::path::absolute(path).map_err(|source| {
-        CreateDatabaseError::NotCreated(SqliteRuntimeError::io(
-            "建立新数据库绝对路径",
-            path,
-            source,
-        ))
-    })?;
-    let parent_path = absolute.parent().ok_or_else(|| {
-        CreateDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
-            path: absolute.clone(),
-        })
-    })?;
-    let file_name = absolute.file_name().ok_or_else(|| {
-        CreateDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
-            path: absolute.clone(),
-        })
-    })?;
-    let parent = pin_directory_without_reparse(parent_path).map_err(|source| {
-        CreateDatabaseError::NotCreated(SqliteRuntimeError::windows_file_system(
-            "固定新数据库父目录",
-            parent_path,
-            source,
-        ))
-    })?;
-    let stable_path = parent.resolved_path().join(file_name);
-    let placeholder = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stable_path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+    let claim = match claim_database_target(path, DatabaseTargetPurpose::Create, config) {
+        Ok(claim) => claim,
+        Err(DatabaseTargetClaimError::AlreadyExists) => {
             return Err(CreateDatabaseError::AlreadyExists);
         }
-        Err(error) => {
-            return Err(CreateDatabaseError::NotCreated(SqliteRuntimeError::io(
-                "原子占有新数据库路径",
-                &stable_path,
-                error,
-            )));
+        Err(DatabaseTargetClaimError::NotCreated(source)) => {
+            return Err(CreateDatabaseError::NotCreated(source));
+        }
+        Err(DatabaseTargetClaimError::OutcomeUnknown(source)) => {
+            return Err(CreateDatabaseError::OutcomeUnknown(source));
         }
     };
-    let main_identity = match FileIdentity::of(&placeholder, &stable_path) {
-        Ok(identity) => identity,
-        Err(source) => {
-            drop(placeholder);
-            return Err(CreateDatabaseError::OutcomeUnknown(
-                SqliteRuntimeError::windows_file_system(
-                    "固定新数据库物理身份",
-                    &stable_path,
-                    source,
-                ),
-            ));
-        }
-    };
-    drop(placeholder);
+    let stable_path = claim.path.clone();
+    let main_identity = claim.identity;
     let paths = database_artifact_paths(&stable_path);
     let main = TrackedDatabaseArtifact {
         path: stable_path.clone(),
@@ -2606,6 +2780,7 @@ fn run_create_database(
     for sidecar in &paths[1..] {
         match fs::symlink_metadata(sidecar) {
             Ok(_) => {
+                drop(claim);
                 let cleanup = cleanup_database_artifacts(
                     &paths,
                     std::slice::from_ref(&main),
@@ -2624,6 +2799,7 @@ fn run_create_database(
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
+                drop(claim);
                 let cleanup = cleanup_database_artifacts(
                     &paths,
                     std::slice::from_ref(&main),
@@ -2642,11 +2818,13 @@ fn run_create_database(
     }
 
     match initialize_new_database(&stable_path, &paths[1..], commands, config, performance) {
-        Ok(()) => Ok(()),
+        Ok(()) => verify_claimed_database_identity(&claim, DatabaseTargetPurpose::Create)
+            .map_err(CreateDatabaseError::OutcomeUnknown),
         Err(failure) => {
             let failure = *failure;
             let mut tracked = vec![main];
             tracked.extend(failure.sidecars);
+            drop(claim);
             let cleanup = cleanup_database_artifacts(&paths, &tracked, failure.assessment);
             Err(creation_failure(failure.primary, cleanup))
         }
@@ -2704,63 +2882,21 @@ fn run_snapshot_database(
     config: &RusqliteStorageConfiguration,
 ) -> Result<(), SnapshotDatabaseError<SqliteRuntimeError>> {
     let source = snapshot_source_connection(source_path, config)?;
-    let absolute = std::path::absolute(destination_path).map_err(|source| {
-        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::io(
-            "建立快照目标绝对路径",
-            destination_path,
-            source,
-        ))
-    })?;
-    let parent_path = absolute.parent().ok_or_else(|| {
-        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
-            path: absolute.clone(),
-        })
-    })?;
-    let file_name = absolute.file_name().ok_or_else(|| {
-        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::InvalidTarget {
-            path: absolute.clone(),
-        })
-    })?;
-    let parent = pin_directory_without_reparse(parent_path).map_err(|source| {
-        SnapshotDatabaseError::NotCreated(SqliteRuntimeError::windows_file_system(
-            "固定快照目标父目录",
-            parent_path,
-            source,
-        ))
-    })?;
-    let stable_path = parent.resolved_path().join(file_name);
-    let placeholder = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stable_path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(SnapshotDatabaseError::DestinationAlreadyExists);
-        }
-        Err(error) => {
-            return Err(SnapshotDatabaseError::NotCreated(SqliteRuntimeError::io(
-                "原子占有快照目标路径",
-                &stable_path,
-                error,
-            )));
-        }
-    };
-    let main_identity = match FileIdentity::of(&placeholder, &stable_path) {
-        Ok(identity) => identity,
-        Err(source) => {
-            drop(placeholder);
-            return Err(SnapshotDatabaseError::OutcomeUnknown(
-                SqliteRuntimeError::windows_file_system(
-                    "固定快照目标物理身份",
-                    &stable_path,
-                    source,
-                ),
-            ));
-        }
-    };
-    drop(placeholder);
-
+    let claim =
+        match claim_database_target(destination_path, DatabaseTargetPurpose::Snapshot, config) {
+            Ok(claim) => claim,
+            Err(DatabaseTargetClaimError::AlreadyExists) => {
+                return Err(SnapshotDatabaseError::DestinationAlreadyExists);
+            }
+            Err(DatabaseTargetClaimError::NotCreated(source)) => {
+                return Err(SnapshotDatabaseError::NotCreated(source));
+            }
+            Err(DatabaseTargetClaimError::OutcomeUnknown(source)) => {
+                return Err(SnapshotDatabaseError::OutcomeUnknown(source));
+            }
+        };
+    let stable_path = claim.path.clone();
+    let main_identity = claim.identity;
     let paths = database_artifact_paths(&stable_path);
     let main = TrackedDatabaseArtifact {
         path: stable_path.clone(),
@@ -2770,6 +2906,7 @@ fn run_snapshot_database(
     for sidecar in &paths[1..] {
         match fs::symlink_metadata(sidecar) {
             Ok(_) => {
+                drop(claim);
                 let cleanup = cleanup_database_artifacts(
                     &paths,
                     std::slice::from_ref(&main),
@@ -2788,6 +2925,7 @@ fn run_snapshot_database(
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
+                drop(claim);
                 let cleanup = cleanup_database_artifacts(
                     &paths,
                     std::slice::from_ref(&main),
@@ -2814,6 +2952,7 @@ fn run_snapshot_database(
             let (sidecars, assessment) = observe_sidecar_artifacts(&paths[1..]);
             let mut tracked = vec![main];
             tracked.extend(sidecars);
+            drop(claim);
             let cleanup = cleanup_database_artifacts(&paths, &tracked, assessment);
             return Err(snapshot_failure(
                 SqliteRuntimeError::driver("打开快照目标数据库", source),
@@ -2859,30 +2998,13 @@ fn run_snapshot_database(
         let (sidecars, assessment) = observe_sidecar_artifacts(&paths[1..]);
         let mut tracked = vec![main];
         tracked.extend(sidecars);
+        drop(claim);
         let cleanup = cleanup_database_artifacts(&paths, &tracked, assessment);
         return Err(snapshot_failure(primary, cleanup));
     }
 
-    let pinned = pin_path_without_reparse(&stable_path).map_err(|source| {
-        SnapshotDatabaseError::OutcomeUnknown(SqliteRuntimeError::windows_file_system(
-            "复核快照目标物理身份",
-            &stable_path,
-            source,
-        ))
-    })?;
-    let final_identity = FileIdentity::of(pinned.file(), &stable_path).map_err(|source| {
-        SnapshotDatabaseError::OutcomeUnknown(SqliteRuntimeError::windows_file_system(
-            "读取快照目标最终身份",
-            &stable_path,
-            source,
-        ))
-    })?;
-    if final_identity != main_identity {
-        return Err(SnapshotDatabaseError::OutcomeUnknown(
-            SqliteRuntimeError::Internal("快照目标物理身份在 online backup 期间发生变化"),
-        ));
-    }
-    Ok(())
+    verify_claimed_database_identity(&claim, DatabaseTargetPurpose::Snapshot)
+        .map_err(SnapshotDatabaseError::OutcomeUnknown)
 }
 
 type TransactionSessionResult = Result<(), ExecuteTransactionError<SqliteRuntimeError>>;
@@ -4592,6 +4714,26 @@ mod tests {
         )]
     }
 
+    fn create_foreign_guard_database(path: &Path) {
+        let connection = Connection::open(path).expect("外来 SQLite 应可建立");
+        connection
+            .execute_batch(
+                "CREATE TABLE foreign_guard (value TEXT NOT NULL);\
+                 INSERT INTO foreign_guard (value) VALUES ('foreign-unchanged');",
+            )
+            .expect("外来 SQLite 标记应可写入");
+    }
+
+    fn read_foreign_guard(path: &Path) -> String {
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("外来 SQLite 必须仍位于原路径")
+        .query_row("SELECT value FROM foreign_guard", [], |row| row.get(0))
+        .expect("外来 SQLite 标记不得被改写")
+    }
+
     #[tokio::test]
     async fn performance_counters_cover_every_successful_transaction_control_scope() {
         let directory = TestDirectory::new();
@@ -5870,6 +6012,130 @@ mod tests {
             fs::read(database).expect("外来替换对象不得被误删"),
             b"foreign"
         );
+    }
+
+    #[tokio::test]
+    async fn production_create_keeps_the_claimed_identity_pinned_during_initialization() {
+        let directory = TestDirectory::new();
+        let database = directory.database("pinned-create.db");
+        let foreign = directory.database("pinned-create-foreign.db");
+        create_foreign_guard_database(&foreign);
+        let attempted = Arc::new(AtomicBool::new(false));
+        let replacement_blocked = Arc::new(AtomicBool::new(false));
+        let hook_attempted = Arc::clone(&attempted);
+        let hook_replacement_blocked = Arc::clone(&replacement_blocked);
+        let hook_foreign = foreign.clone();
+        let config = configuration().with_claimed_database_path_hook(move |claimed| {
+            hook_attempted.store(true, Ordering::Release);
+            match fs::remove_file(claimed) {
+                Ok(()) => fs::rename(&hook_foreign, claimed)
+                    .expect("未固定身份时应能把外来 SQLite 换入创建窗口"),
+                Err(_) => hook_replacement_blocked.store(true, Ordering::Release),
+            }
+        });
+        let storage = RusqliteStorage::start(config).expect("根应可启动");
+
+        storage
+            .create_new_database(database.clone(), schema_commands())
+            .await
+            .expect("替换尝试不得破坏本次数据库初始化");
+        storage.shutdown().await.expect("根应可关闭");
+
+        assert!(
+            attempted.load(Ordering::Acquire),
+            "测试必须穿过生产创建路径的占有后窗口"
+        );
+        assert!(
+            replacement_blocked.load(Ordering::Acquire),
+            "初始化期间必须阻止目标被删除或替换"
+        );
+        assert_eq!(read_foreign_guard(&foreign), "foreign-unchanged");
+        let connection = Connection::open_with_flags(
+            database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("创建结果应可读取");
+        let initialized: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'values_table'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应可确认本次 schema");
+        let foreign_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'foreign_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应可确认没有写入外来数据库");
+        assert_eq!(initialized, 1);
+        assert_eq!(foreign_tables, 0);
+    }
+
+    #[tokio::test]
+    async fn production_snapshot_keeps_the_claimed_identity_pinned_during_backup() {
+        let directory = TestDirectory::new();
+        let source = directory.database("pinned-snapshot-source.db");
+        let destination = directory.database("pinned-snapshot.db");
+        let foreign = directory.database("pinned-snapshot-foreign.db");
+        let source_connection = Connection::open(&source).expect("快照源应可建立");
+        source_connection
+            .execute_batch(
+                "CREATE TABLE source_value (value TEXT NOT NULL);\
+                 INSERT INTO source_value (value) VALUES ('source-copy');",
+            )
+            .expect("快照源数据应可建立");
+        drop(source_connection);
+        create_foreign_guard_database(&foreign);
+
+        let attempted = Arc::new(AtomicBool::new(false));
+        let replacement_blocked = Arc::new(AtomicBool::new(false));
+        let hook_attempted = Arc::clone(&attempted);
+        let hook_replacement_blocked = Arc::clone(&replacement_blocked);
+        let hook_foreign = foreign.clone();
+        let config = configuration().with_claimed_database_path_hook(move |claimed| {
+            hook_attempted.store(true, Ordering::Release);
+            match fs::remove_file(claimed) {
+                Ok(()) => fs::rename(&hook_foreign, claimed)
+                    .expect("未固定身份时应能把外来 SQLite 换入备份窗口"),
+                Err(_) => hook_replacement_blocked.store(true, Ordering::Release),
+            }
+        });
+        let storage = RusqliteStorage::start(config).expect("根应可启动");
+
+        storage
+            .snapshot_database(source, destination.clone())
+            .await
+            .expect("替换尝试不得破坏 online backup");
+        storage.shutdown().await.expect("根应可关闭");
+
+        assert!(
+            attempted.load(Ordering::Acquire),
+            "测试必须穿过生产快照路径的占有后窗口"
+        );
+        assert!(
+            replacement_blocked.load(Ordering::Acquire),
+            "online backup 期间必须阻止目标被删除或替换"
+        );
+        assert_eq!(read_foreign_guard(&foreign), "foreign-unchanged");
+        let connection = Connection::open_with_flags(
+            destination,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("快照结果应可读取");
+        let copied: String = connection
+            .query_row("SELECT value FROM source_value", [], |row| row.get(0))
+            .expect("快照应包含源数据");
+        let foreign_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'foreign_guard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应可确认没有覆盖外来数据库");
+        assert_eq!(copied, "source-copy");
+        assert_eq!(foreign_tables, 0);
     }
 
     #[tokio::test]

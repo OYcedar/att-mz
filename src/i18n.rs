@@ -1656,6 +1656,7 @@ mod tests {
             "invalid_encoding",
             "invalid_path",
             "invalid_response_contract",
+            "model_stream_incomplete",
             "invalid_syntax",
             "invalid_value",
             "journal_corrupt",

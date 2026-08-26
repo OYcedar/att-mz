@@ -1,6 +1,6 @@
 //! RPG Maker 固定位置文本与标准事件块的完整 Builtin 快照提取。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -22,6 +22,7 @@ use crate::rpg_maker::dialogue::{
 use crate::rpg_maker::model::{
     DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget, DirectTextPart,
     DirectTextRecipe, MutationClaim, TextProjectionRecipe, TextUnitContent, TextUnitRole,
+    choice_branch_value_is_integer,
 };
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::semantic_order::{
@@ -419,31 +420,11 @@ impl BuiltinDocumentError {
                             command_code: *command_code,
                         }
                     }
-                    BuiltinDocumentFailure::ChoiceIndexInvalid {
-                        actual,
-                        option_count,
-                    } => RpgMakerBuiltinDocumentProblem::ChoiceIndexInvalid {
-                        actual: *actual,
-                        option_count: *option_count,
-                    },
-                    BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index } => {
-                        RpgMakerBuiltinDocumentProblem::DuplicateChoiceBranch {
-                            choice_index: *choice_index,
-                        }
-                    }
-                    BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index } => {
-                        RpgMakerBuiltinDocumentProblem::ChoiceBranchTextMismatch {
-                            choice_index: *choice_index,
-                        }
+                    BuiltinDocumentFailure::ChoiceIndexInvalid => {
+                        RpgMakerBuiltinDocumentProblem::ChoiceIndexInvalid
                     }
                     BuiltinDocumentFailure::ChoiceEndMissing => {
                         RpgMakerBuiltinDocumentProblem::ChoiceEndMissing
-                    }
-                    BuiltinDocumentFailure::ChoiceBranchesIncomplete { expected, actual } => {
-                        RpgMakerBuiltinDocumentProblem::ChoiceBranchesIncomplete {
-                            expected: *expected,
-                            actual: *actual,
-                        }
                     }
                 },
             )),
@@ -507,24 +488,9 @@ enum BuiltinDocumentFailure {
     EventCodeMustBeInteger,
     EventParametersMissing,
     EventIndentMustBeInteger,
-    ContinuationWithoutStart {
-        command_code: i64,
-    },
-    ChoiceIndexInvalid {
-        actual: Option<i64>,
-        option_count: usize,
-    },
-    DuplicateChoiceBranch {
-        choice_index: usize,
-    },
-    ChoiceBranchTextMismatch {
-        choice_index: usize,
-    },
+    ContinuationWithoutStart { command_code: i64 },
+    ChoiceIndexInvalid,
     ChoiceEndMissing,
-    ChoiceBranchesIncomplete {
-        expected: usize,
-        actual: usize,
-    },
 }
 
 impl fmt::Display for BuiltinDocumentFailure {
@@ -541,18 +507,8 @@ impl fmt::Display for BuiltinDocumentFailure {
             Self::ContinuationWithoutStart { command_code } => {
                 write!(formatter, "事件指令 {command_code} 缺少对应的起始指令")
             }
-            Self::ChoiceIndexInvalid { .. } => {
-                formatter.write_str("402 选项索引必须指向当前 102 的一个选项")
-            }
-            Self::DuplicateChoiceBranch { choice_index } => {
-                write!(formatter, "当前 102 重复包含选项分支 {choice_index}")
-            }
-            Self::ChoiceBranchTextMismatch { choice_index } => {
-                write!(formatter, "402 分支文本与 102 选项 {choice_index} 不一致")
-            }
-            Self::ChoiceEndMissing | Self::ChoiceBranchesIncomplete { .. } => {
-                formatter.write_str("102 必须包含完整且唯一的同层 402 分支以及 404 结束指令")
-            }
+            Self::ChoiceIndexInvalid => formatter.write_str("402 分支值必须是整数"),
+            Self::ChoiceEndMissing => formatter.write_str("102 缺少同层 404 结束指令"),
         }
     }
 }
@@ -1487,6 +1443,7 @@ fn project_mz_dialogue(
     let speaker_location = parameter_location(source, list_steps, start_index, 4);
     let direct_speaker = match parameters.get(4) {
         None => None,
+        Some(value) if mz_speaker_value_is_falsy(value) => None,
         Some(value) => {
             let speaker = expect_string(value, &speaker_location)?;
             if is_structural_blank(speaker) {
@@ -1548,6 +1505,17 @@ fn project_mz_dialogue(
     .map_err(Into::into)
 }
 
+/// MZ core 会在 `Game_Message.setSpeakerName` 中把 JavaScript falsy 值归一为空字符串。
+/// JSON 不会承载 `undefined` 或 `NaN`，因此这里只需覆盖其余可达的 falsy 值。
+fn mz_speaker_value_is_falsy(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => true,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text.is_empty(),
+        Value::Bool(true) | Value::Array(_) | Value::Object(_) => false,
+    }
+}
+
 fn project_mv_dialogue(
     projector: &mut MvDialogueProjector,
     group_location: RpgMakerLocation,
@@ -1581,7 +1549,6 @@ struct PendingChoiceExtraction {
     choices_location: RpgMakerLocation,
     group_location: RpgMakerLocation,
     choice_texts: Vec<String>,
-    branch_indexes: BTreeSet<usize>,
     recipes: Vec<TextProjectionRecipe>,
     covered_values: Vec<RpgMakerLocation>,
 }
@@ -1611,48 +1578,17 @@ impl PendingChoiceExtraction {
             command_field_location(source, list_steps, command_index, "indent"),
         ]);
         let index_location = parameter_location(source, list_steps, command_index, 0);
-        let raw_choice_index = parameters.first().and_then(Value::as_i64);
-        let choice_index = raw_choice_index
-            .and_then(|index| usize::try_from(index).ok())
-            .filter(|index| *index < self.choice_texts.len())
-            .ok_or_else(|| {
-                BuiltinDocumentError::new(
-                    index_location.clone(),
-                    BuiltinDocumentFailure::ChoiceIndexInvalid {
-                        actual: raw_choice_index,
-                        option_count: self.choice_texts.len(),
-                    },
-                )
-            })?;
-        if !self.branch_indexes.insert(choice_index) {
+        // MV/MZ core 的 setupChoices 只从 102 读取显示文案；command402 只读取
+        // parameters[0] 与实际选择的整数比较。不可达整数分支仍是可保留的运行时状态；
+        // 其余 402 参数属于编辑器冗余数据，冻结但不翻译。
+        if !choice_branch_value_is_integer(parameters.first()) {
             return Err(BuiltinDocumentError::new(
-                index_location.clone(),
-                BuiltinDocumentFailure::DuplicateChoiceBranch { choice_index },
-            )
-            .into());
-        }
-        let text_location = parameter_location(source, list_steps, command_index, 1);
-        let branch_text = parameter_string(parameters, 1, &text_location)?;
-        if branch_text != self.choice_texts[choice_index] {
-            return Err(BuiltinDocumentError::new(
-                text_location,
-                BuiltinDocumentFailure::ChoiceBranchTextMismatch { choice_index },
+                index_location,
+                BuiltinDocumentFailure::ChoiceIndexInvalid,
             )
             .into());
         }
         self.covered_values.push(index_location);
-        self.covered_values.push(text_location.clone());
-        self.recipes.push(TextProjectionRecipe::Direct(
-            DirectTextRecipe::new(
-                text_location,
-                branch_text,
-                vec![DirectTextPart::LineSlot {
-                    role: TextUnitRole::Choices,
-                    source_line_index: choice_index,
-                }],
-            )
-            .map_err(SnapshotModelError::Projection)?,
-        ));
         Ok(())
     }
 
@@ -1666,17 +1602,6 @@ impl PendingChoiceExtraction {
             command_field_location(source, list_steps, end_index, "code"),
             command_field_location(source, list_steps, end_index, "indent"),
         ]);
-        if self.branch_indexes.len() != self.choice_texts.len() {
-            return Err(BuiltinDocumentError::new(
-                self.group_location.clone(),
-                BuiltinDocumentFailure::ChoiceBranchesIncomplete {
-                    expected: self.choice_texts.len(),
-                    actual: self.branch_indexes.len(),
-                },
-            )
-            .into());
-        }
-
         self.recipes.push(TextProjectionRecipe::Claim(
             MutationClaim::event_block(self.group_location.clone(), self.covered_values)
                 .map_err(SnapshotModelError::Projection)?,
@@ -1762,7 +1687,6 @@ fn begin_choices(
         choices_location,
         group_location,
         choice_texts,
-        branch_indexes: BTreeSet::new(),
         recipes,
         covered_values,
     }))
@@ -2859,8 +2783,8 @@ mod tests {
         assert_eq!(unit_lines(choices, TextUnitRole::Choices), ["接受", "拒绝"]);
         assert_eq!(
             choices.recipes().len(),
-            5,
-            "102、两个 402 与冻结 404 的结构 Claim 都必须物化"
+            3,
+            "只有 102 选项正文及冻结事件结构 Claim 才属于翻译投影"
         );
         assert_eq!(choices.mutation_claims().claims().len(), 1);
 
@@ -2943,31 +2867,43 @@ mod tests {
     }
 
     #[test]
-    fn choices_require_complete_matching_same_indent_branches() {
-        for list in [
-            json!([
+    fn choices_use_only_102_text_and_preserve_unreachable_or_editor_only_402_data() {
+        let mut documents = complete_documents();
+        documents.insert_document(
+            RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+            json!([null, {"list": [
                 {"code": 102, "indent": 0, "parameters": [["是", "否"]]},
-                {"code": 402, "indent": 0, "parameters": [0, "错误文本"]},
-                {"code": 402, "indent": 0, "parameters": [1, "否"]},
+                {"code": 402, "indent": 0, "parameters": [0, {"editorOnly": "旧标签"}]},
+                {"code": 402, "indent": 0, "parameters": [2]},
                 {"code": 404, "indent": 0, "parameters": []}
-            ]),
-            json!([
-                {"code": 102, "indent": 0, "parameters": [["是", "否"]]},
-                {"code": 402, "indent": 0, "parameters": [0, "是"]},
-                {"code": 404, "indent": 0, "parameters": []}
-            ]),
-        ] {
-            let mut documents = complete_documents();
-            documents.insert_document(
-                RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
-                json!([null, {"list": list}]),
-            );
+            ]}]),
+        );
 
-            assert!(matches!(
-                build_builtin_snapshot(&documents),
-                Err(BuildBuiltinSnapshotError::Malformed(_))
-            ));
-        }
+        let snapshot = build_builtin_snapshot(&documents)
+            .expect("运行时只比较 402 整数；越界、标签、重复与未建分支都应保持原样而不拒绝");
+        let choices = snapshot
+            .groups()
+            .iter()
+            .find(|group| {
+                group.kind() == TextGroupKind::EventChoices
+                    && group
+                        .group_location()
+                        .to_string()
+                        .starts_with("data/CommonEvents.json")
+            })
+            .expect("应建立选项组");
+        assert_eq!(unit_lines(choices, TextUnitRole::Choices), ["是", "否"]);
+        assert_eq!(choices.recipes().len(), 3);
+        assert!(choices.recipes().iter().all(|recipe| match recipe {
+            TextProjectionRecipe::Direct(recipe) => {
+                recipe
+                    .target()
+                    .to_string()
+                    .contains("list[0].parameters[0]")
+            }
+            TextProjectionRecipe::Claim(_) => true,
+            TextProjectionRecipe::Dialogue(_) => false,
+        }));
     }
 
     #[test]
@@ -3175,13 +3111,10 @@ mod tests {
             (
                 json!([
                     {"code": 102, "indent": 0, "parameters": [["一", "二"]]},
-                    {"code": 402, "indent": 0, "parameters": [0, "一"]},
+                    {"code": 402, "indent": 0, "parameters": [0.5, "编辑器标签"]},
                     {"code": 404, "indent": 0, "parameters": []}
                 ]),
-                BuiltinDocumentFailure::ChoiceBranchesIncomplete {
-                    expected: 2,
-                    actual: 1,
-                },
+                BuiltinDocumentFailure::ChoiceIndexInvalid,
             ),
             (
                 json!([
@@ -3257,30 +3190,64 @@ mod tests {
     }
 
     #[test]
-    fn mz_null_native_speaker_is_an_invalid_string_value() {
-        let mut documents = complete_documents();
-        documents.insert_document(
-            RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
-            json!([null, {"list": [
-                {"code": 101, "parameters": ["", 0, 0, 2, null]},
-                {"code": 401, "parameters": ["正文"]},
-                {"code": 0, "parameters": []}
-            ]}]),
-        );
+    fn mz_native_speaker_follows_core_falsy_normalization_and_rejects_truthy_non_strings() {
+        for falsy in [json!(null), json!(false), json!(0), json!(0.0), json!("")] {
+            let mut documents = complete_documents();
+            documents.insert_document(
+                RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                json!([null, {"list": [
+                    {"code": 101, "parameters": ["", 0, 0, 2, falsy]},
+                    {"code": 401, "parameters": ["正文"]},
+                    {"code": 0, "parameters": []}
+                ]}]),
+            );
 
-        let error = build_builtin_snapshot(&documents)
-            .expect_err("MZ 101.parameters[4] 的 null 不得被视为缺失 Speaker");
-        let BuildBuiltinSnapshotError::Malformed(error) = error else {
-            panic!("MZ 原生 Speaker 类型错误必须保持文档结构错误语义");
-        };
-        assert_eq!(
-            error.location(),
-            "data/CommonEvents.json[1].list[0].parameters[4]"
-        );
-        assert_eq!(error.reason, BuiltinDocumentFailure::ExpectedString);
-        let wire =
-            serde_json::to_value(error.diagnostic_report()).expect("Builtin 文档错误必须可序列化");
-        assert_eq!(wire["primary"]["code"], "rpg_maker.builtin.expected_string");
+            let snapshot = build_builtin_snapshot(&documents)
+                .expect("MZ core 会把可达的 JavaScript falsy Speaker 归一为空字符串");
+            let dialogue = snapshot
+                .groups()
+                .iter()
+                .find(|group| {
+                    group.kind() == TextGroupKind::EventDialogue
+                        && group
+                            .group_location()
+                            .to_string()
+                            .starts_with("data/CommonEvents.json")
+                })
+                .expect("正文仍应形成对话组");
+            assert!(
+                dialogue
+                    .units()
+                    .iter()
+                    .all(|unit| unit.role() != &TextUnitRole::DialogueSpeaker)
+            );
+        }
+
+        for truthy_non_string in [json!(true), json!(1), json!([]), json!({})] {
+            let mut documents = complete_documents();
+            documents.insert_document(
+                RpgMakerDocumentId::Data(StandardDataFile::CommonEvents),
+                json!([null, {"list": [
+                    {"code": 101, "parameters": ["", 0, 0, 2, truthy_non_string]},
+                    {"code": 401, "parameters": ["正文"]},
+                    {"code": 0, "parameters": []}
+                ]}]),
+            );
+
+            let error = build_builtin_snapshot(&documents)
+                .expect_err("truthy 非字符串会进入 MZ 姓名框文本消费者，必须拒绝损坏协议");
+            let BuildBuiltinSnapshotError::Malformed(error) = error else {
+                panic!("MZ 原生 Speaker 类型错误必须保持文档结构错误语义");
+            };
+            assert_eq!(
+                error.location(),
+                "data/CommonEvents.json[1].list[0].parameters[4]"
+            );
+            assert_eq!(error.reason, BuiltinDocumentFailure::ExpectedString);
+            let wire = serde_json::to_value(error.diagnostic_report())
+                .expect("Builtin 文档错误必须可序列化");
+            assert_eq!(wire["primary"]["code"], "rpg_maker.builtin.expected_string");
+        }
     }
 
     #[test]

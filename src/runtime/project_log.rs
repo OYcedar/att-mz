@@ -856,6 +856,39 @@ pub(crate) enum TranslationEngineSummary {
     RpgMaker(RpgMakerTranslationSummary),
 }
 
+impl TranslationEngineSummary {
+    fn is_consistent(self) -> bool {
+        match self {
+            Self::Generic(summary) => {
+                let Some(model_writes) = summary.planned_units.checked_sub(summary.remaining_units)
+                else {
+                    return false;
+                };
+                let Some(maximum_writes) = model_writes.checked_add(summary.reused_units) else {
+                    return false;
+                };
+                model_writes <= summary.accepted_units
+                    && summary.accepted_units <= summary.planned_units
+                    && model_writes <= summary.written_units
+                    && summary.written_units <= maximum_writes
+            }
+            Self::RpgMaker(summary) => {
+                summary.accepted_decisions <= summary.written_locations
+                    && summary.remaining_decisions <= summary.remaining_locations
+            }
+        }
+    }
+
+    const fn has_no_remaining_work(self) -> bool {
+        match self {
+            Self::Generic(summary) => summary.remaining_units == 0,
+            Self::RpgMaker(summary) => {
+                summary.remaining_decisions == 0 && summary.remaining_locations == 0
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TranslationFinished {
@@ -2335,9 +2368,20 @@ impl ProducerState {
                     return Err(EmitError::DuplicateTask(task.ordinal()));
                 }
             }
-            ProjectLogEvent::TaskFinished { task, outcome, .. } => {
+            ProjectLogEvent::TaskFinished {
+                task,
+                attempts,
+                outcome,
+                ..
+            } => {
                 if self.task_total != Some(task.total) {
                     return Err(EmitError::InconsistentTaskTotal);
+                }
+                if *attempts == 0 {
+                    return Err(EmitError::InvalidTaskAttempts {
+                        ordinal: task.ordinal(),
+                        attempts: *attempts,
+                    });
                 }
                 if !self.tasks_started.contains(&task.ordinal())
                     || self
@@ -2405,6 +2449,31 @@ impl ProducerState {
                     );
                     if !summary_matches {
                         return Err(EmitError::EngineSummaryMismatch);
+                    }
+                    let summary = match result {
+                        TranslationFinished::NoWork { summary, .. }
+                        | TranslationFinished::Complete { summary, .. }
+                        | TranslationFinished::Incomplete { summary, .. }
+                        | TranslationFinished::Failed {
+                            summary: Some(summary),
+                            ..
+                        }
+                        | TranslationFinished::Cancelled {
+                            summary: Some(summary),
+                            ..
+                        } => Some(*summary),
+                        TranslationFinished::Failed { summary: None, .. }
+                        | TranslationFinished::Cancelled { summary: None, .. }
+                        | TranslationFinished::NotStarted => None,
+                    };
+                    if summary.is_some_and(|summary| !summary.is_consistent())
+                        || matches!(
+                            result,
+                            TranslationFinished::NoWork { .. }
+                                | TranslationFinished::Complete { .. }
+                        ) && summary.is_some_and(|summary| !summary.has_no_remaining_work())
+                    {
+                        return Err(EmitError::TaskSummaryMismatch);
                     }
                 } else if !self.tasks_started.is_empty() {
                     return Err(EmitError::TaskSummaryMismatch);
@@ -2561,6 +2630,10 @@ pub(crate) enum EmitError {
     InvalidRunPlanTransaction,
     DuplicateTask(u64),
     InvalidTaskTransition(u64),
+    InvalidTaskAttempts {
+        ordinal: u64,
+        attempts: u64,
+    },
     InconsistentTaskTotal,
     DuplicateTranslationFinished,
     DuplicatePublication,
@@ -2615,6 +2688,12 @@ impl fmt::Display for EmitError {
             Self::DuplicateTask(ordinal) => write!(formatter, "任务 {ordinal} 重复开始"),
             Self::InvalidTaskTransition(ordinal) => {
                 write!(formatter, "任务 {ordinal} 的终态转换无效")
+            }
+            Self::InvalidTaskAttempts { ordinal, attempts } => {
+                write!(
+                    formatter,
+                    "任务 {ordinal} 的实际模型 attempt 数无效：{attempts}"
+                )
             }
             Self::InconsistentTaskTotal => formatter.write_str("任务事件的 total 不一致"),
             Self::DuplicateTranslationFinished => {
@@ -2685,6 +2764,9 @@ impl EmitError {
             }
             Self::InvalidTaskTransition(ordinal) => {
                 ObservabilityContractViolation::InvalidTaskTransition { ordinal }
+            }
+            Self::InvalidTaskAttempts { ordinal, attempts } => {
+                ObservabilityContractViolation::InvalidTaskAttempts { ordinal, attempts }
             }
             Self::InconsistentTaskTotal => ObservabilityContractViolation::InconsistentTaskTotal,
             Self::DuplicateTranslationFinished => {
@@ -4618,6 +4700,18 @@ mod tests {
                 diagnostic_report(StateEffect::ProgressPreserved),
             )
             .expect("任务诊断必须记录");
+        assert_eq!(
+            logger.emit(ProjectLogEvent::TaskFinished {
+                task,
+                attempts: 0,
+                outcome: TaskFinishedOutcome::Partial { diagnostic },
+            }),
+            Err(EmitError::InvalidTaskAttempts {
+                ordinal: 1,
+                attempts: 0,
+            }),
+            "已写 task.started 的任务仍必须携带至少一次真实 HTTP attempt"
+        );
         logger
             .emit(ProjectLogEvent::TaskFinished {
                 task,
@@ -4641,9 +4735,29 @@ mod tests {
                 request_admission_stopped: false,
             }),
         };
+        assert_eq!(
+            logger.emit(ProjectLogEvent::TranslationFinished { result }),
+            Err(EmitError::TaskSummaryMismatch),
+            "已写入 Unit 仍被同时计入 remaining 时必须拒绝矛盾汇总"
+        );
+        let result = TranslationFinished::Incomplete {
+            tasks,
+            summary: TranslationEngineSummary::Generic(GenericTranslationSummary {
+                cleared_units: 0,
+                planned_units: 1,
+                remaining_units: 0,
+                reused_units: 0,
+                accepted_units: 1,
+                written_units: 1,
+                conflicted_units: 0,
+                response_problems: 1,
+                recoverable_request_exhaustions: 0,
+                request_admission_stopped: false,
+            }),
+        };
         logger
             .emit(ProjectLogEvent::TranslationFinished { result })
-            .expect("翻译必须有终态");
+            .expect("一致的翻译汇总必须建立终态");
         assert_eq!(
             logger.emit(ProjectLogEvent::TranslationFinished { result }),
             Err(EmitError::DuplicateTranslationFinished)
@@ -4665,6 +4779,27 @@ mod tests {
             .expect("必须有翻译终态");
         assert_eq!(finished["level"], "warn");
         assert_eq!(finished["payload"]["result"]["tasks"]["not_started"], 0);
+    }
+
+    #[test]
+    fn generic_summary_keeps_reuse_writes_separate_from_model_planned_units() {
+        let summary = TranslationEngineSummary::Generic(GenericTranslationSummary {
+            cleared_units: 0,
+            planned_units: 0,
+            remaining_units: 0,
+            reused_units: 1,
+            accepted_units: 0,
+            written_units: 1,
+            conflicted_units: 0,
+            response_problems: 0,
+            recoverable_request_exhaustions: 0,
+            request_admission_stopped: false,
+        });
+
+        assert!(
+            summary.is_consistent(),
+            "既有译文复用不属于模型计划 Unit，正常复用写入不得被日志契约拒绝"
+        );
     }
 
     #[test]

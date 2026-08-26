@@ -209,16 +209,10 @@ pub(crate) fn deduplicate_translation_candidates(
         .collect::<Vec<_>>();
 
     let mut outcomes = vec![None; candidates.len()];
-    let mut invalidations = Vec::new();
+    let invalidations = Vec::new();
     let mut reuses = Vec::new();
     for family in families {
-        plan_family(
-            &family,
-            &candidates,
-            &mut outcomes,
-            &mut invalidations,
-            &mut reuses,
-        );
+        plan_family(&family, &candidates, &mut outcomes, &mut reuses);
     }
 
     TranslationDeduplicationResult {
@@ -235,7 +229,6 @@ fn plan_family(
     family: &Family,
     candidates: &[TranslationDeduplicationCandidate],
     outcomes: &mut [Option<TranslationDeduplicationOutcome>],
-    invalidations: &mut Vec<TranslationInvalidation>,
     reuses: &mut Vec<TranslationReuse>,
 ) {
     let mut current_indices = Vec::<usize>::new();
@@ -266,7 +259,7 @@ fn plan_family(
         let seed_index = first_current_index.expect("存在 Current 译文时必须记录其自然顺序首项");
         plan_reuse_family(family, candidates, seed_index, outcomes, reuses);
     } else if !unresolved_indices.is_empty() {
-        plan_active_members(&unresolved_indices, candidates, outcomes, invalidations);
+        plan_active_members(&unresolved_indices, candidates, outcomes);
     }
 }
 
@@ -324,7 +317,6 @@ fn plan_active_members(
     member_indices: &[usize],
     candidates: &[TranslationDeduplicationCandidate],
     outcomes: &mut [Option<TranslationDeduplicationOutcome>],
-    invalidations: &mut Vec<TranslationInvalidation>,
 ) {
     let leader_index = member_indices[0];
     let leader = &candidates[leader_index];
@@ -333,9 +325,11 @@ fn plan_active_members(
         .copied()
         .filter(|&index| index != leader_index)
         .map(|index| {
-            TranslationPropagationTarget::new(
+            TranslationPropagationTarget::with_previous(
                 candidates[index].identity.clone(),
                 candidates[index].state_context,
+                candidates[index].translation.clone(),
+                candidates[index].translation_state,
             )
         })
         .collect();
@@ -352,22 +346,6 @@ fn plan_active_members(
                 leader: Box::new(leader.identity.clone()),
             },
         });
-    }
-
-    for &index in member_indices {
-        let candidate = &candidates[index];
-        if candidate.invalidated {
-            invalidations.push(TranslationInvalidation::new(
-                candidate.identity.clone(),
-                candidate
-                    .translation
-                    .clone()
-                    .expect("只有已有译文的候选项才可能失效"),
-                candidate
-                    .translation_state
-                    .expect("已有译文必须同时具有 translation_state"),
-            ));
-        }
     }
 }
 
@@ -1501,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_translation_without_current_seed_is_invalidated_atomically() {
+    fn stale_translation_without_current_seed_is_retained_for_atomic_replacement() {
         let stale_context = state_context(1);
         let pending_context = state_context(2);
         let stale_translation = value("旧译文");
@@ -1539,10 +1517,7 @@ mod tests {
                     pending_context,
                 )]
         ));
-        assert_eq!(invalidations.len(), 1);
-        assert_eq!(invalidations[0].identity(), &first);
-        assert_eq!(invalidations[0].expected_translation(), &stale_translation);
-        assert_eq!(invalidations[0].expected_translation_state(), stale_state);
+        assert!(invalidations.is_empty());
         assert!(reuses.is_empty());
     }
 }

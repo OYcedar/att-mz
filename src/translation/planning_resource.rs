@@ -1129,14 +1129,12 @@ pub(crate) fn compile_terminology_with_cancellation(
             "term",
             &raw_entry.term,
             entry_number,
-            false,
             cancellation,
         )?;
         validate_term_string_with_cancellation(
             "translation",
             &raw_entry.translation,
             entry_number,
-            false,
             cancellation,
         )?;
         if raw_entry.triggers.is_empty() {
@@ -1172,13 +1170,7 @@ pub(crate) fn compile_terminology_with_cancellation(
             ensure_planning_resource_running(cancellation)
                 .map_err(|()| TerminologyDefinitionError::Cancelled)?;
             let trigger = &entries[entry_index].triggers[trigger_index];
-            validate_term_string_with_cancellation(
-                "trigger",
-                trigger,
-                entry_number,
-                true,
-                cancellation,
-            )?;
+            validate_term_string_with_cancellation("trigger", trigger, entry_number, cancellation)?;
             maximum_trigger_bytes = maximum_trigger_bytes.max(trigger.len());
 
             let trigger_fingerprint = terminology_text_fingerprint(
@@ -1326,12 +1318,9 @@ fn validate_term_string_with_cancellation(
     field: &'static str,
     value: &str,
     entry_number: usize,
-    allow_line_feed: bool,
     cancellation: &(impl PlanningResourceCancellation + ?Sized),
 ) -> Result<(), TerminologyDefinitionError> {
     let mut has_non_whitespace = false;
-    let mut first_is_whitespace = None;
-    let mut last_is_whitespace = false;
     let mut first_disallowed_control = None;
     let mut next_check = 0;
     for (offset, character) in value.char_indices() {
@@ -1340,14 +1329,8 @@ fn validate_term_string_with_cancellation(
                 .map_err(|()| TerminologyDefinitionError::Cancelled)?;
             next_check = offset.saturating_add(PLANNING_RESOURCE_CANCEL_CHECK_BYTES);
         }
-        let whitespace = character.is_whitespace();
-        first_is_whitespace.get_or_insert(whitespace);
-        last_is_whitespace = whitespace;
-        has_non_whitespace |= !whitespace;
-        if first_disallowed_control.is_none()
-            && character.is_control()
-            && (!allow_line_feed || character != '\n')
-        {
+        has_non_whitespace |= !character.is_whitespace();
+        if first_disallowed_control.is_none() && character.is_control() {
             first_disallowed_control = Some(character);
         }
     }
@@ -1355,12 +1338,6 @@ fn validate_term_string_with_cancellation(
         .map_err(|()| TerminologyDefinitionError::Cancelled)?;
     if !has_non_whitespace {
         return Err(TerminologyDefinitionError::BlankField {
-            entry_number,
-            field,
-        });
-    }
-    if first_is_whitespace.unwrap_or(false) || last_is_whitespace {
-        return Err(TerminologyDefinitionError::SurroundingWhitespace {
             entry_number,
             field,
         });
@@ -1592,13 +1569,6 @@ pub(crate) fn terminology_problem(
             entry_number: *entry_number,
             field: terminology_field(field),
         },
-        TerminologyDefinitionError::SurroundingWhitespace {
-            entry_number,
-            field,
-        } => TranslationPlanningResourceProblem::SurroundingWhitespace {
-            entry_number: *entry_number,
-            field: terminology_field(field),
-        },
         TerminologyDefinitionError::ControlCharacter {
             entry_number,
             field,
@@ -1681,10 +1651,6 @@ pub(crate) enum TerminologyDefinitionError {
         entry_number: usize,
         field: &'static str,
     },
-    SurroundingWhitespace {
-        entry_number: usize,
-        field: &'static str,
-    },
     ControlCharacter {
         entry_number: usize,
         field: &'static str,
@@ -1721,10 +1687,6 @@ impl fmt::Display for TerminologyDefinitionError {
                 entry_number,
                 field,
             } => write!(formatter, "术语 {entry_number} 的 {field} 不能为空白"),
-            Self::SurroundingWhitespace {
-                entry_number,
-                field,
-            } => write!(formatter, "术语 {entry_number} 的 {field} 含首尾空白"),
             Self::ControlCharacter {
                 entry_number,
                 field,
@@ -2411,15 +2373,6 @@ mod tests {
         ));
 
         assert!(matches!(
-            compile_terminology(vec![TerminologyEntry {
-                term: " A".to_owned(),
-                translation: "甲".to_owned(),
-                triggers: vec!["A".to_owned()],
-            }]),
-            Err(TerminologyDefinitionError::SurroundingWhitespace { .. })
-        ));
-
-        assert!(matches!(
             parse_terminology_toml(
                 r#"
                     [[term]]
@@ -2434,7 +2387,27 @@ mod tests {
     }
 
     #[test]
-    fn terminology_control_character_contract_distinguishes_values_from_triggers() {
+    fn terminology_preserves_surrounding_whitespace_as_identity() {
+        let entries = parse_terminology_toml(
+            r#"
+                [[term]]
+                term = ' A '
+                translation = ' 甲 '
+                triggers = [' x ']
+            "#
+            .as_bytes(),
+        )
+        .expect("首尾空白属于术语原值，不应在 TOML 边界被修改");
+        let terminology = compile_terminology(entries).expect("非空原值应可编译");
+        assert_eq!(terminology.entries()[0].term(), " A ");
+        assert_eq!(terminology.entries()[0].translation(), " 甲 ");
+        assert_eq!(terminology.entries()[0].triggers.as_slice(), [" x "]);
+        assert!(terminology.triggered_by(["x"]).is_empty());
+        assert_eq!(terminology.triggered_by(["前 x 后"])[0].term(), " A ");
+    }
+
+    #[test]
+    fn terminology_rejects_control_characters_in_every_text_field() {
         for (field, value) in [("term", "A\nB"), ("translation", "甲\t乙")] {
             let definition = TerminologyEntry {
                 term: if field == "term" { value } else { "A" }.to_owned(),
@@ -2450,15 +2423,7 @@ mod tests {
             ));
         }
 
-        let with_line_feed = compile_terminology(vec![TerminologyEntry {
-            term: "A".to_owned(),
-            translation: "甲".to_owned(),
-            triggers: vec!["前\n後".to_owned()],
-        }])
-        .expect("trigger 应允许内部 LF");
-        assert_eq!(with_line_feed.triggered_by(["前\n後"])[0].term(), "A");
-
-        for invalid in ["A\rB", "A\0B", "A\u{0085}B"] {
+        for invalid in ["A\nB", "A\rB", "A\0B", "A\u{0085}B"] {
             assert!(matches!(
                 compile_terminology(vec![TerminologyEntry {
                     term: "A".to_owned(),

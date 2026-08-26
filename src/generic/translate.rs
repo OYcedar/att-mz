@@ -14,13 +14,12 @@ use crate::diagnostic::{
     GenericUnitLocator as DiagnosticGenericUnitLocator,
 };
 use crate::execution::CooperativeCancellation;
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::fingerprint::Sha256Fingerprint;
 use crate::language::LanguagePair;
 use crate::translation::TranslationOrigin;
 use crate::translation::candidate_validation::{
     ProvenInvariantViolation, ReviewFinding, validate_reflowed_candidate_text_with_cancellation,
 };
-use crate::translation::planning_resource::CompiledTerminology;
 use crate::translation::task_planning::{
     StableGroupCharacters, TaskId, TaskPlanningError, TaskPlanningGroupLayout, TaskPlanningLayout,
     TaskPlanningScopeLayout, UnitTaskResponsibility, assign_task_ids, pack_complete_task_blocks,
@@ -316,15 +315,6 @@ impl CurrentContext {
     }
 }
 
-/// 自动翻译状态中由公共翻译能力提供的实际资源身份。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AutomaticStateResources {
-    pub(crate) prompt: Sha256Fingerprint,
-    pub(crate) client_semantics: Sha256Fingerprint,
-    pub(crate) language_module: Sha256Fingerprint,
-    pub(crate) terminology_hits: Sha256Fingerprint,
-}
-
 /// 测试中从受信持久化记录建立 PlanningUnit 所需的全部事实。
 ///
 /// 生产路径使用带取消检查的独立参数版本；这个测试夹具把同一组事实作为一个值传入，避免
@@ -338,7 +328,6 @@ struct StoredPlanningUnitInput<'a> {
     protected: &'a GenericProtectedText,
     terminology_indices: Vec<usize>,
     needs_translation: bool,
-    resources: AutomaticStateResources,
     retry_rejected: bool,
 }
 
@@ -385,7 +374,6 @@ impl PlanningUnit {
             input.protected,
             input.terminology_indices,
             input.needs_translation,
-            input.resources,
             input.retry_rejected,
             &CooperativeCancellation::default(),
         )
@@ -401,7 +389,6 @@ impl PlanningUnit {
         protected: &GenericProtectedText,
         terminology_indices: Vec<usize>,
         needs_translation: bool,
-        resources: AutomaticStateResources,
         retry_rejected: bool,
         cancellation: &CooperativeCancellation,
     ) -> Result<Self, GenericPlanningError> {
@@ -416,16 +403,11 @@ impl PlanningUnit {
             &key,
             unit.source_text(),
             group.context_fingerprint(),
-            placeholder_binding_fingerprint,
-            resources,
             cancellation,
         )?;
-        let current_translation = current_translation_for_stored_with_cancellation(
-            project,
-            group,
+        let current_translation = current_translation_for_expected_applicability_with_cancellation(
             unit,
-            placeholder_binding_fingerprint,
-            Some(resources),
+            automatic_state,
             cancellation,
         )?;
         let previous = unit
@@ -442,13 +424,15 @@ impl PlanningUnit {
                         .zip(&source_lines)
                         .all(|(stored, current)| stored == current)
                     && rejected.group_context == group.context_fingerprint()
-                    && rejected.planning_state == automatic_state
+                    && crate::translation::generic_automatic_applicability_is_current(
+                        rejected.planning_state,
+                        automatic_state,
+                    )
             });
-        let (expected_previous, invalidated_previous) = if current_translation.is_some() {
-            (previous, None)
-        } else {
-            (None, previous)
-        };
+        // 状态变化只决定本轮是否需要新候选。旧正文继续作为 CAS 的预期值保留，直到
+        // 替代候选通过验收并原子写入；请求失败、取消或额度不足不能先销毁它。
+        let expected_previous = previous;
+        let invalidated_previous = None;
         Ok(Self {
             locator: GenericPlanningUnitLocator::new(
                 relative_path,
@@ -526,13 +510,31 @@ impl PlanningUnit {
 
 /// 依据持久化来源类型和本次语义资源判断一个已有译文是否仍为 Current。
 ///
-/// 人工状态不依赖自动资源；缺少自动资源时只把自动译文视为无法证明为 Current。
+/// 人工状态不依赖自动状态；自动正文只绑定决定实际适用性的项目事实，不绑定 Client、
+/// Prompt、Profile、模型参数或语言检查阈值等未来请求策略。
 pub(crate) fn current_translation_for_stored_with_cancellation(
     project: &GenericProject,
     group: &GenericStoredGroup,
     unit: &GenericStoredUnit,
-    placeholder_binding_fingerprint: Sha256Fingerprint,
-    automatic_resources: Option<AutomaticStateResources>,
+    cancellation: &CooperativeCancellation,
+) -> Result<Option<String>, GenericPlanningError> {
+    let key = GenericUnitKey::new(
+        clone_translation_text(group.id(), cancellation)?,
+        clone_translation_text(unit.id(), cancellation)?,
+    );
+    let expected = automatic_translation_state_fingerprint_with_cancellation(
+        project.language_pair(),
+        &key,
+        unit.source_text(),
+        group.context_fingerprint(),
+        cancellation,
+    )?;
+    current_translation_for_expected_applicability_with_cancellation(unit, expected, cancellation)
+}
+
+fn current_translation_for_expected_applicability_with_cancellation(
+    unit: &GenericStoredUnit,
+    expected_automatic_applicability: Sha256Fingerprint,
     cancellation: &CooperativeCancellation,
 ) -> Result<Option<String>, GenericPlanningError> {
     ensure_translation_not_cancelled(cancellation)?;
@@ -545,24 +547,11 @@ pub(crate) fn current_translation_for_stored_with_cancellation(
             cancellation,
         )?));
     }
-    let key = GenericUnitKey::new(
-        clone_translation_text(group.id(), cancellation)?,
-        clone_translation_text(unit.id(), cancellation)?,
-    );
-    let expected = automatic_resources
-        .map(|resources| {
-            automatic_translation_state_fingerprint_with_cancellation(
-                project.language_pair(),
-                &key,
-                unit.source_text(),
-                group.context_fingerprint(),
-                placeholder_binding_fingerprint,
-                resources,
-                cancellation,
-            )
-        })
-        .transpose()?;
-    if expected == Some(translation.state_fingerprint()) {
+    // Placeholder 不属于正文适用性 digest，随后仍会按当前规则独立执行强验收。
+    if crate::translation::generic_automatic_applicability_is_current(
+        translation.state_fingerprint(),
+        expected_automatic_applicability,
+    ) {
         Ok(Some(clone_translation_text(
             translation.translation(),
             cancellation,
@@ -572,7 +561,7 @@ pub(crate) fn current_translation_for_stored_with_cancellation(
     }
 }
 
-/// 当前 Translate 已确认失效、必须在模型请求前清除的旧译文。
+/// 当前 Translate 证明违反强不变量、必须转入 Rejected 的旧译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedInvalidation {
     key: GenericUnitKey,
@@ -580,7 +569,7 @@ pub(crate) struct PlannedInvalidation {
     expected_source_text: String,
     expected_group_context: Sha256Fingerprint,
     expected_translation: GenericStoredTranslation,
-    violation: Option<ProvenInvariantViolation>,
+    violation: ProvenInvariantViolation,
     rejection_planning_state: Sha256Fingerprint,
 }
 
@@ -709,6 +698,8 @@ struct PlannedDestination {
     expected_group_context: Sha256Fingerprint,
     expected_state_fingerprint: Sha256Fingerprint,
     expected_previous: Option<GenericStoredTranslation>,
+    source_language: String,
+    target_language: String,
 }
 
 /// 一个不能跨 JSONL 文件的模型任务。
@@ -1100,7 +1091,11 @@ where
                     expected_translation,
                     &is_cancelled,
                 )?,
-                violation: fact.input.invalidation_violation.clone(),
+                violation: fact
+                    .input
+                    .invalidation_violation
+                    .clone()
+                    .expect("只有已经证明强不变量违反的正文才能进入失效计划"),
                 rejection_planning_state: fact.input.expected_state_fingerprint,
             });
         }
@@ -1236,6 +1231,18 @@ where
                         )?,
                         expected_group_context: fact.group_context,
                         expected_state_fingerprint: fact.input.expected_state_fingerprint,
+                        target_language: snapshot
+                            .project()
+                            .language_pair()
+                            .target()
+                            .as_str()
+                            .to_owned(),
+                        source_language: snapshot
+                            .project()
+                            .language_pair()
+                            .source()
+                            .as_str()
+                            .to_owned(),
                         expected_previous: fact
                             .input
                             .expected_previous
@@ -1278,6 +1285,18 @@ where
                     )?,
                     expected_group_context: fact.group_context,
                     expected_state_fingerprint: fact.input.expected_state_fingerprint,
+                    target_language: snapshot
+                        .project()
+                        .language_pair()
+                        .target()
+                        .as_str()
+                        .to_owned(),
+                    source_language: snapshot
+                        .project()
+                        .language_pair()
+                        .source()
+                        .as_str()
+                        .to_owned(),
                     expected_previous: fact
                         .input
                         .expected_previous
@@ -1356,6 +1375,18 @@ where
                 )?,
                 expected_group_context: fact.group_context,
                 expected_state_fingerprint: fact.input.expected_state_fingerprint,
+                target_language: snapshot
+                    .project()
+                    .language_pair()
+                    .target()
+                    .as_str()
+                    .to_owned(),
+                source_language: snapshot
+                    .project()
+                    .language_pair()
+                    .source()
+                    .as_str()
+                    .to_owned(),
                 expected_previous: fact
                     .input
                     .expected_previous
@@ -1697,6 +1728,9 @@ pub(crate) struct RejectedTranslation {
     expected_group_context: Sha256Fingerprint,
     violation: ProvenInvariantViolation,
     planning_state: Sha256Fingerprint,
+    source_language: String,
+    target_language: String,
+    expected_previous: Option<GenericStoredTranslation>,
 }
 
 impl RejectedTranslation {
@@ -1711,6 +1745,8 @@ impl RejectedTranslation {
             self.key.unit_id(),
             &readable_path,
             self.locator.role(),
+            &self.source_language,
+            &self.target_language,
             &self.source,
         );
         let readable_id = self.locator.natural_position().map_or_else(
@@ -1736,6 +1772,7 @@ impl RejectedTranslation {
             translation: self.translation,
             violation: self.violation,
             planning_state: self.planning_state,
+            expected_translation: self.expected_previous,
         }
     }
 }
@@ -1999,9 +2036,15 @@ where
                 .get_mut(&output_id)
                 .expect("已确认的模型输出必须仍属于当前 Generic 任务"),
         );
-        if let Err(problem) =
-            validate_candidate_text_with_cancellation(&candidate.text, &is_cancelled)?
-        {
+        let response_line_problem =
+            validate_response_lines_with_cancellation(&candidate.lines, &is_cancelled)?.err();
+        let candidate_problem = match response_line_problem {
+            Some(problem) => Some(problem),
+            None => {
+                validate_candidate_text_with_cancellation(&candidate.text, &is_cancelled)?.err()
+            }
+        };
+        if let Some(problem) = candidate_problem {
             let violation = generic_text_problem_violation(problem, &candidate.lines);
             for destination in destinations {
                 rejected.push(rejected_generic_destination(
@@ -2129,6 +2172,9 @@ fn rejected_generic_destination(
         expected_group_context: destination.expected_group_context,
         violation,
         planning_state: destination.expected_state_fingerprint,
+        source_language: destination.source_language,
+        target_language: destination.target_language,
+        expected_previous: destination.expected_previous,
     }
 }
 
@@ -2142,6 +2188,12 @@ fn generic_text_problem_violation(
             line_index: translation
                 .iter()
                 .position(|line| line.contains('\r'))
+                .unwrap_or_default(),
+        },
+        GenericResponseTextProblem::LineFeed => ProvenInvariantViolation::InvalidLineText {
+            line_index: translation
+                .iter()
+                .position(|line| line.contains('\n'))
                 .unwrap_or_default(),
         },
         GenericResponseTextProblem::Nul => ProvenInvariantViolation::InvalidLineText {
@@ -2320,6 +2372,35 @@ fn join_translation_lines_with_cancellation(
     Ok(translation)
 }
 
+fn validate_response_lines_with_cancellation(
+    lines: &[String],
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<Result<(), GenericResponseTextProblem>, GenericPlanningError> {
+    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+
+    // 数组项本身就是模型协议的分行边界；必须在 ATT 插入项间 LF 之前校验每项。
+    for line in lines {
+        let mut next_check = 0_usize;
+        for (offset, character) in line.char_indices() {
+            if offset >= next_check {
+                ensure_planning_not_cancelled(is_cancelled)?;
+                next_check = offset.saturating_add(CANCELLATION_CHECK_BYTES);
+            }
+            let problem = match character {
+                '\r' => Some(GenericResponseTextProblem::CarriageReturn),
+                '\n' => Some(GenericResponseTextProblem::LineFeed),
+                '\0' => Some(GenericResponseTextProblem::Nul),
+                _ => None,
+            };
+            if let Some(problem) = problem {
+                return Ok(Err(problem));
+            }
+        }
+    }
+    ensure_planning_not_cancelled(is_cancelled)?;
+    Ok(Ok(()))
+}
+
 fn validate_candidate_text_with_cancellation(
     candidate: &str,
     is_cancelled: &impl Fn() -> bool,
@@ -2361,24 +2442,15 @@ pub(crate) fn automatic_translation_state_fingerprint(
     key: &GenericUnitKey,
     source_text: &str,
     group_context: Sha256Fingerprint,
-    placeholder_binding: Sha256Fingerprint,
-    resources: AutomaticStateResources,
 ) -> Sha256Fingerprint {
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.translation-state.automatic");
-    frame_unit_semantics(
-        &mut hasher,
-        language_pair,
-        key,
+    crate::translation::generic_automatic_applicability_v2(
+        language_pair.source().as_str(),
+        language_pair.target().as_str(),
+        key.group_id(),
+        key.unit_id(),
         source_text,
         group_context,
-        placeholder_binding,
-    );
-    hasher
-        .frame(20, resources.prompt.as_bytes())
-        .frame(21, resources.client_semantics.as_bytes())
-        .frame(22, resources.language_module.as_bytes())
-        .frame(23, resources.terminology_hits.as_bytes());
-    hasher.finish()
+    )
 }
 
 fn automatic_translation_state_fingerprint_with_cancellation(
@@ -2386,105 +2458,17 @@ fn automatic_translation_state_fingerprint_with_cancellation(
     key: &GenericUnitKey,
     source_text: &str,
     group_context: Sha256Fingerprint,
-    placeholder_binding: Sha256Fingerprint,
-    resources: AutomaticStateResources,
     cancellation: &CooperativeCancellation,
 ) -> Result<Sha256Fingerprint, GenericPlanningError> {
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.translation-state.automatic");
-    frame_unit_semantics_with_cancellation(
-        &mut hasher,
-        language_pair,
-        key,
+    crate::translation::generic_automatic_applicability_v2_with_cancellation(
+        language_pair.source().as_str(),
+        language_pair.target().as_str(),
+        key.group_id(),
+        key.unit_id(),
         source_text,
         group_context,
-        placeholder_binding,
-        cancellation,
-    )?;
-    hasher
-        .frame(20, resources.prompt.as_bytes())
-        .frame(21, resources.client_semantics.as_bytes())
-        .frame(22, resources.language_module.as_bytes())
-        .frame(23, resources.terminology_hits.as_bytes());
-    ensure_translation_not_cancelled(cancellation)?;
-    Ok(hasher.finish())
-}
-
-/// 建立一个 Group 实际命中术语的稳定语义身份。
-///
-/// 调用方负责按自然顺序传入 `CompiledTerminology` 返回的命中索引。本函数由生产规划与
-/// Project Lua 最终校验共同使用，确保两条路径不会各自定义状态哈希。
-pub(crate) fn terminology_hit_fingerprint_with_cancellation<E>(
-    terminology: &CompiledTerminology,
-    indices: &[usize],
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Sha256Fingerprint, E> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-    let chunk_size = NonZeroUsize::new(CANCELLATION_CHECK_BYTES).expect("取消检查块大小必须非零");
-
-    ensure_running()?;
-    let mut hasher = Sha256FramedHasher::new(b"att.generic.terminology-hits");
-    for index in indices {
-        ensure_running()?;
-        let entry = &terminology.entries()[*index];
-        hasher
-            .try_frame_chunks(1, entry.term().as_bytes(), chunk_size, &mut ensure_running)?
-            .try_frame_chunks(
-                2,
-                entry.translation().as_bytes(),
-                chunk_size,
-                &mut ensure_running,
-            )?;
-    }
-    ensure_running()?;
-    Ok(hasher.finish())
-}
-
-#[cfg(test)]
-fn frame_unit_semantics(
-    hasher: &mut Sha256FramedHasher,
-    language_pair: &LanguagePair,
-    key: &GenericUnitKey,
-    source_text: &str,
-    group_context: Sha256Fingerprint,
-    placeholder_binding: Sha256Fingerprint,
-) {
-    hasher
-        .frame(1, language_pair.source().as_str().as_bytes())
-        .frame(2, language_pair.target().as_str().as_bytes())
-        .frame(3, key.group_id().as_bytes())
-        .frame(4, key.unit_id().as_bytes())
-        .frame(5, source_text.as_bytes())
-        .frame(6, group_context.as_bytes())
-        .frame(7, placeholder_binding.as_bytes());
-}
-
-#[allow(clippy::too_many_arguments)]
-fn frame_unit_semantics_with_cancellation(
-    hasher: &mut Sha256FramedHasher,
-    language_pair: &LanguagePair,
-    key: &GenericUnitKey,
-    source_text: &str,
-    group_context: Sha256Fingerprint,
-    placeholder_binding: Sha256Fingerprint,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPlanningError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-    let chunk_size = NonZeroUsize::new(CANCELLATION_CHECK_BYTES).expect("取消检查块大小必须非零");
-
-    for (tag, bytes) in [
-        (1, language_pair.source().as_str().as_bytes()),
-        (2, language_pair.target().as_str().as_bytes()),
-        (3, key.group_id().as_bytes()),
-        (4, key.unit_id().as_bytes()),
-        (5, source_text.as_bytes()),
-        (6, group_context.as_bytes()),
-        (7, placeholder_binding.as_bytes()),
-    ] {
-        hasher.try_frame_chunks(tag, bytes, chunk_size, || {
-            ensure_translation_not_cancelled(cancellation)
-        })?;
-    }
-    ensure_translation_not_cancelled(cancellation)
+        || ensure_translation_not_cancelled(cancellation),
+    )
 }
 
 fn ensure_translation_not_cancelled(
@@ -3171,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_current_tracks_semantics_while_manual_current_ignores_prompt_and_client() {
+    fn current_requires_exact_v2_applicability_not_future_request_policy() {
         let snapshot = stored_snapshot();
         let project = snapshot.project();
         let group = &snapshot.files()[0].groups()[0];
@@ -3184,20 +3168,11 @@ mod tests {
         let protected = placeholder_service
             .protect(group.kind(), original.source_text(), &placeholder_rules)
             .expect("无 Placeholder 的正文应能保护");
-        let binding = protected.binding_fingerprint();
-        let resources = AutomaticStateResources {
-            prompt: fingerprint(21),
-            client_semantics: fingerprint(22),
-            language_module: fingerprint(23),
-            terminology_hits: fingerprint(24),
-        };
         let automatic_state = automatic_translation_state_fingerprint(
             project.language_pair(),
             &key,
             original.source_text(),
             group.context_fingerprint(),
-            binding,
-            resources,
         );
         let automatic = GenericStoredUnit {
             translation: Some(GenericStoredTranslation {
@@ -3215,7 +3190,6 @@ mod tests {
             protected: &protected,
             terminology_indices: Vec::new(),
             needs_translation: true,
-            resources,
             retry_rejected: false,
         });
         assert_eq!(
@@ -3224,23 +3198,52 @@ mod tests {
             "目标译文本身不属于语义状态，直接 SQL 修改正文后仍应为 Current"
         );
 
-        let changed_resources = AutomaticStateResources {
-            prompt: fingerprint(25),
-            client_semantics: fingerprint(26),
-            ..resources
+        let untagged = GenericStoredUnit {
+            translation: Some(GenericStoredTranslation {
+                translation: "未标记状态的已有正文".to_owned(),
+                origin: TranslationOrigin::Automatic,
+                state_fingerprint: fingerprint(91),
+            }),
+            ..original.clone()
         };
-        let stale = PlanningUnit::from_stored(StoredPlanningUnitInput {
+        let pending = PlanningUnit::from_stored(StoredPlanningUnitInput {
             relative_path: Path::new("a.jsonl"),
             project,
             group,
+            unit: &untagged,
+            protected: &protected,
+            terminology_indices: Vec::new(),
+            needs_translation: true,
+            retry_rejected: false,
+        });
+        assert_eq!(pending.current_translation(), None);
+        assert!(pending.needs_candidate());
+        assert_eq!(
+            pending
+                .expected_previous
+                .as_ref()
+                .map(GenericStoredTranslation::translation),
+            Some("未标记状态的已有正文"),
+            "非 V2 状态不得成为 Current，但正文必须作为原子替换的旧值继续保留"
+        );
+
+        let mut changed_context = group.clone();
+        changed_context.context_fingerprint = fingerprint(92);
+        let stale = PlanningUnit::from_stored(StoredPlanningUnitInput {
+            relative_path: Path::new("a.jsonl"),
+            project,
+            group: &changed_context,
             unit: &automatic,
             protected: &protected,
             terminology_indices: Vec::new(),
             needs_translation: true,
-            resources: changed_resources,
             retry_rejected: false,
         });
-        assert!(stale.current_translation().is_none());
+        assert_eq!(
+            stale.current_translation(),
+            None,
+            "已 tagged 状态必须精确匹配当前正文适用事实"
+        );
 
         let manual = GenericStoredUnit {
             translation: Some(GenericStoredTranslation {
@@ -3258,7 +3261,6 @@ mod tests {
             protected: &protected,
             terminology_indices: Vec::new(),
             needs_translation: true,
-            resources: changed_resources,
             retry_rejected: false,
         });
         assert_eq!(current.current_translation(), Some("人工修订"));
@@ -3278,20 +3280,12 @@ mod tests {
         let protected = service
             .protect(group.kind(), original.source_text(), &rules)
             .unwrap();
-        let resources = AutomaticStateResources {
-            prompt: fingerprint(51),
-            client_semantics: fingerprint(52),
-            language_module: fingerprint(53),
-            terminology_hits: fingerprint(54),
-        };
         let key = GenericUnitKey::new(group.id().to_owned(), original.id().to_owned());
         let state = automatic_translation_state_fingerprint(
             project.language_pair(),
             &key,
             original.source_text(),
             group.context_fingerprint(),
-            protected.binding_fingerprint(),
-            resources,
         );
         snapshot.files[0].groups[0].units[0].rejected = Some(GenericStoredRejectedTranslation {
             readable_id: "a.jsonl:line1:unit1:text".to_owned(),
@@ -3313,7 +3307,6 @@ mod tests {
                 protected: &protected,
                 terminology_indices: Vec::new(),
                 needs_translation: true,
-                resources,
                 retry_rejected,
             })
         };
@@ -3341,6 +3334,60 @@ mod tests {
             1
         );
         assert_eq!(plan.skipped_rejected, 0);
+    }
+
+    #[test]
+    fn untagged_rejected_never_blocks_a_current_candidate() {
+        let mut snapshot = stored_snapshot();
+        snapshot.files.truncate(1);
+        snapshot.files[0].groups.truncate(1);
+        snapshot.files[0].groups[0].units.truncate(1);
+        let project = snapshot.project().clone();
+        let group = snapshot.files[0].groups[0].clone();
+        let original = group.units[0].clone();
+        let service = super::super::placeholder::GenericPlaceholderService::default();
+        let rules = service.compile(Vec::new()).unwrap();
+        let protected = service
+            .protect(group.kind(), original.source_text(), &rules)
+            .unwrap();
+        snapshot.files[0].groups[0].units[0].rejected = Some(GenericStoredRejectedTranslation {
+            readable_id: "old/path.jsonl:line9:unit9:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            source: vec![original.source_text().to_owned()],
+            candidate_json: "true".to_owned(),
+            translation: None,
+            group_context: group.context_fingerprint(),
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: fingerprint(73),
+        });
+
+        let matching = PlanningUnit::from_stored(StoredPlanningUnitInput {
+            relative_path: Path::new("renamed.jsonl"),
+            project: &project,
+            group: &group,
+            unit: &snapshot.files[0].groups[0].units[0],
+            protected: &protected,
+            terminology_indices: Vec::new(),
+            needs_translation: true,
+            retry_rejected: false,
+        });
+        assert!(!matching.is_skipped_rejected());
+        assert!(matching.needs_candidate());
+
+        let mut changed_group = group.clone();
+        changed_group.context_fingerprint = fingerprint(74);
+        let changed = PlanningUnit::from_stored(StoredPlanningUnitInput {
+            relative_path: Path::new("renamed.jsonl"),
+            project: &project,
+            group: &changed_group,
+            unit: &snapshot.files[0].groups[0].units[0],
+            protected: &protected,
+            terminology_indices: Vec::new(),
+            needs_translation: true,
+            retry_rejected: false,
+        });
+        assert!(!changed.is_skipped_rejected());
+        assert!(changed.needs_candidate());
     }
 
     #[test]
@@ -3375,6 +3422,64 @@ mod tests {
                 .problems()
                 .contains(&ResponseProblem::UnexpectedId { output_id: 99 })
         );
+    }
+
+    #[test]
+    fn response_array_items_reject_embedded_line_delimiters_but_allow_multiple_items() {
+        let snapshot = stored_snapshot();
+        let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .expect("规划应成功");
+        let task = &plan.tasks()[0];
+
+        let multiple_items = accept_response(
+            task,
+            r#"{"0":["甲","乙"],"1":["合法"]}"#,
+            TranslationResponseMode::new(false, false),
+            |_, _, candidate| Ok(candidate.to_owned()),
+        )
+        .expect("数组项之间的协议分行应合法");
+        assert_eq!(multiple_items.accepted().len(), 3);
+        assert_eq!(
+            multiple_items
+                .accepted()
+                .iter()
+                .filter(|translation| translation.translation == "甲\n乙")
+                .count(),
+            2,
+            "合法数组项应只在验收后由 ATT 使用 LF 连接"
+        );
+
+        for (invalid, expected) in [
+            ("甲\r乙", GenericResponseTextProblem::CarriageReturn),
+            ("甲\n乙", GenericResponseTextProblem::LineFeed),
+            ("甲\0乙", GenericResponseTextProblem::Nul),
+        ] {
+            let response = serde_json::json!({"0": [invalid], "1": ["合法"]}).to_string();
+            let acceptance = accept_response(
+                task,
+                &response,
+                TranslationResponseMode::new(false, false),
+                |_, _, candidate| Ok(candidate.to_owned()),
+            )
+            .expect("合法 JSON 中的逐项文本错误应只拒绝对应 ID");
+
+            assert_eq!(acceptance.accepted().len(), 1, "合法同级 ID 仍应保存");
+            assert_eq!(acceptance.rejected().len(), 2, "同文族的两个目标都应拒绝");
+            assert!(
+                acceptance
+                    .problems()
+                    .contains(&ResponseProblem::InvalidTranslation {
+                        output_id: 0,
+                        problem: expected,
+                    })
+            );
+            assert!(acceptance.rejected().iter().all(|rejected| matches!(
+                &rejected.violation,
+                ProvenInvariantViolation::InvalidLineText { line_index: 0 }
+            )));
+        }
     }
 
     #[test]
@@ -3616,7 +3721,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_translation_is_cleared_before_new_writes_expect_an_empty_slot() {
+    fn stale_translation_is_retained_until_a_replacement_commits() {
         let snapshot = stored_snapshot();
         let mut planning_units = planning(&snapshot);
         let stale = snapshot.files()[0].groups()[0].units()[1]
@@ -3628,19 +3733,16 @@ mod tests {
             .find(|unit| unit.key().group_id() == "g1" && unit.key().unit_id() == "u2")
             .expect("应该找到测试 Unit");
         stale_unit.current_translation = None;
-        stale_unit.expected_previous = None;
-        stale_unit.invalidated_previous = Some(stale.clone());
+        stale_unit.current_context = None;
+        stale_unit.expected_previous = Some(stale.clone());
+        stale_unit.invalidated_previous = None;
 
         let plan = plan_translation(&snapshot, &planning_units, |_, candidate| {
             Ok(candidate.to_owned())
         })
         .expect("失效译文应该可规划");
 
-        assert_eq!(plan.invalidations().len(), 1);
-        let clear = plan.invalidations()[0].clone().into_clear();
-        assert_eq!(clear.group_id, "g1");
-        assert_eq!(clear.unit_id, "u2");
-        assert_eq!(clear.expected_translation, stale);
+        assert!(plan.invalidations().is_empty());
         let destination = plan
             .tasks()
             .iter()
@@ -3650,9 +3752,37 @@ mod tests {
                 destination.key.group_id() == "g1" && destination.key.unit_id() == "u2"
             })
             .expect("失效 Unit 应重新参与模型任务");
-        assert!(
-            destination.expected_previous.is_none(),
-            "清除已在模型请求前提交，新写入必须 CAS 比较空译文槽"
-        );
+        assert_eq!(destination.expected_previous.as_ref(), Some(&stale));
+
+        let (task, output_id) = plan
+            .tasks()
+            .iter()
+            .find_map(|task| {
+                task.outputs.iter().find_map(|(output_id, destinations)| {
+                    destinations
+                        .iter()
+                        .any(|destination| {
+                            destination.key.group_id() == "g1" && destination.key.unit_id() == "u2"
+                        })
+                        .then_some((task, *output_id))
+                })
+            })
+            .expect("失效 Unit 应有模型输出 ID");
+        let response = format!(r#"{{"{}":3}}"#, output_id.get());
+        let acceptance = accept_response(
+            task,
+            &response,
+            TranslationResponseMode::new(false, false),
+            |_, _, candidate| Ok(candidate.to_owned()),
+        )
+        .expect("硬拒绝响应应该可以逐 ID 验收");
+        let rejected = acceptance
+            .rejected()
+            .iter()
+            .find(|rejected| rejected.key.group_id() == "g1" && rejected.key.unit_id() == "u2")
+            .expect("失效 Unit 的硬拒绝候选必须保留 CAS 旧值")
+            .clone()
+            .into_write();
+        assert_eq!(rejected.expected_translation, Some(stale));
     }
 }

@@ -17,7 +17,8 @@ use crate::translation::planning_resource::TerminologyEntry;
 use super::{
     ProjectLuaCallError, ProjectLuaEngineAdapter, ProjectLuaOutdatedTranslation,
     ProjectLuaTerminologyEntry, ProjectLuaTranslationContext, ProjectLuaTranslationFilter,
-    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, rollback_translation_api_savepoint,
+    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, current_translation_status,
+    with_translation_api_savepoint,
 };
 
 pub(crate) fn generic_project_lua_adapter_for_name(
@@ -147,15 +148,12 @@ impl GenericProjectLuaAdapter {
 }
 
 fn record_from_current(entry: &ManualTranslationEntry) -> ProjectLuaTranslationRecord {
-    let status = if entry.outdated_manual.is_some() {
-        ProjectLuaTranslationStatus::Outdated
-    } else if entry.current_translation.is_some() {
-        ProjectLuaTranslationStatus::Translated
-    } else if entry.needs_translation {
-        ProjectLuaTranslationStatus::Unfinished
-    } else {
-        ProjectLuaTranslationStatus::NotNeeded
-    };
+    let status = current_translation_status(
+        entry.current_translation.is_some(),
+        entry.rejected.is_some(),
+        entry.needs_translation,
+        entry.outdated_manual.is_some(),
+    );
     ProjectLuaTranslationRecord {
         id: entry.id.clone(),
         kind: entry.kind.as_str().to_owned(),
@@ -253,30 +251,12 @@ fn with_savepoint<T>(
     cancellation: &super::ProjectLuaCancellation,
     operation: impl FnOnce() -> Result<T, ProjectLuaCallError>,
 ) -> Result<T, ProjectLuaCallError> {
-    cancellation.ensure_running()?;
-    connection
-        .execute_batch("SAVEPOINT att_translation_api")
-        .map_err(sqlite_error)?;
-    match operation() {
-        Ok(value) => {
-            if let Err(error) = cancellation.ensure_running() {
-                return Err(rollback_translation_api_savepoint(
-                    connection,
-                    crate::diagnostic::LuaEngine::Generic,
-                    error,
-                ));
-            }
-            connection
-                .execute_batch("RELEASE att_translation_api")
-                .map_err(sqlite_error)?;
-            Ok(value)
-        }
-        Err(error) => Err(rollback_translation_api_savepoint(
-            connection,
-            crate::diagnostic::LuaEngine::Generic,
-            error,
-        )),
-    }
+    with_translation_api_savepoint(
+        connection,
+        crate::diagnostic::LuaEngine::Generic,
+        cancellation,
+        operation,
+    )
 }
 
 fn map_manual_error(error: ManualDatabaseError) -> ProjectLuaCallError {
@@ -342,6 +322,59 @@ mod tests {
                     .get::<_, i64>(0))
                 .expect("应读取回滚结果"),
             0
+        );
+    }
+
+    #[test]
+    fn successful_change_is_rolled_back_when_savepoint_release_fails() {
+        let connection = Connection::open_in_memory().expect("应建立测试数据库");
+        connection
+            .execute_batch("CREATE TABLE changed(value INTEGER NOT NULL); BEGIN IMMEDIATE;")
+            .expect("应建立测试表和外层事务");
+        connection
+            .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    rusqlite::hooks::AuthAction::Savepoint {
+                        operation: rusqlite::hooks::TransactionOperation::Release,
+                        savepoint_name: "att_translation_api",
+                    }
+                ) {
+                    rusqlite::hooks::Authorization::Deny
+                } else {
+                    rusqlite::hooks::Authorization::Allow
+                }
+            }))
+            .expect("应安装 RELEASE 故障注入");
+
+        let failure = with_savepoint(
+            &connection,
+            &super::super::ProjectLuaCancellation::default(),
+            || {
+                connection
+                    .execute("INSERT INTO changed(value) VALUES (1)", [])
+                    .map_err(sqlite_error)?;
+                Ok(())
+            },
+        )
+        .expect_err("RELEASE 失败不得把成功写入留给外层事务提交");
+
+        assert_eq!(failure.kind(), "cleanup_failed");
+        connection
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .expect("应移除 RELEASE 故障注入");
+        connection
+            .execute_batch("COMMIT")
+            .expect("外层脚本仍可捕获错误并提交");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM changed", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("应读取最终写入数"),
+            0,
+            "高级 API 返回错误后，外层 COMMIT 不得提交该操作的部分修改"
         );
     }
 

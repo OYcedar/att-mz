@@ -19,13 +19,26 @@ ATT 从项目数据库读取 Extract 已经明确整理的 Semantic Scope、Grou
 Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要模型、可以复用，或不能
 处理。
 
-自动译文状态绑定当前原文、完整 Group 语境、语言、实际术语、实际 Placeholder、Prompt、
-Profile 和 Client 语义。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
+自动译文的 V2 状态必须与当前原文、完整实际 Group 来源语境、项目语言对、位置、角色和
+写回结构精确匹配；随后 Translate 再独立执行当前 Placeholder 强验收，两项都成立才是
+Current。术语、Prompt、Profile、Client、模型参数和语言检查阈值只影响后续请求，不改变
+既有正文的 V2 身份。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
 模型提交也不能覆盖它。
 
-人工译文只在内部位置、Group kind、Unit 角色、写回 recipe、正文形状或原文变化时过期。
-上下文、相邻文本、语言、术语、Placeholder 配置、Prompt、Profile 和 Client 变化不影响
-已经应用的人工译文。
+人工译文只在内部位置、Group kind、Unit 角色、写回 recipe、正文形状、原文或项目语言对
+变化时过期。完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 变化
+不影响已经应用的人工译文。
+
+不匹配当前语言对或 Group 来源语境的自动正文和状态保留但不再是 Current，不参与模型语境、去重复用或
+WriteBack。Translate 不在请求模型之前删除它；替代候选通过验收后，按当前来源、Unit、
+Group 语境和旧译文状态执行 CAS 原子覆盖。请求失败、取消、额度不足、Partial 或提交冲突
+都保留读取时的正文；绑定事实恢复后，原 V2 状态可以重新匹配。
+
+Rejected 候选使用自己的 V2 适用性，不复用自动正文状态。候选原文、来源上下文、项目
+语言对、Unit 位置/角色/recipe 和完整 Group 来源语境必须仍匹配，Manual、Lua 与 Translate
+才把它视为当前；`readable_id` 仅展示。语言或 Extract 事实变化不删除同一自然 Unit 的候选，
+但旧候选不会预填给新目标语言；相关事实恢复后可以再次使用。改变 Client、Prompt、术语或
+语言检查阈值不重写历史候选，重新尝试由 `--retry-rejected` 明确触发。
 
 ## 2. 全局去重
 
@@ -76,6 +89,11 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 不变量的候选保存为 Rejected，默认后续 Translate 不重复请求；只有显式
 `--retry-rejected` 才重新请求。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
 
+已有自动译文经当前强不变量复核不通过时，准备事务按读取快照把正文和违反原因原子转入
+Rejected。`--retry-rejected` 的合法响应以准备完成后的空 Current 为提交基线；代表和全部
+传播目标仍在该基线时才整项写入，任一位置发生并发变化就整体回滚。请求失败或取消时保留
+Rejected 中的原正文和原因，不把它误报为 Current，也不丢失恢复证据。
+
 任务之间可以并发执行，确认和提交仍按自然顺序进行。已确认的前序进度落库后，后续
 失败或取消都不会把它带走。提交时重新检查当前来源、Unit、译文和语义状态，发现并发变化
 或当前人工译文时，不覆盖新状态。
@@ -84,12 +102,14 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 Translate 为 Failed 并退出 `1`。普通 429 的 `Retry-After` 由同一 Client 共享；等待超过配置
 上限或重试耗尽时，当前 Task 为 Unavailable，后续 Task 为 not_started，本次结果为
 Incomplete 并退出 `0`。普通网络、超时或 HTTP 500 重试耗尽只使当前 Task Unavailable，
-不会停止后续 Task。停止前已经活动且获得有效结果的 Task 仍按自然顺序验收和提交。
+不会停止后续 Task。停止前已经准入且获得有效结果的 Task 仍按自然顺序验收，并在当前 CAS
+成立时提交；单个外部请求失败不能让其他已经付费取得且通过验收的结果失效。
 
-每个实际开始的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
+每个已开始至少一次真实外部 HTTP attempt 的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
 NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed 同时写可读任务
-诊断。NotCommittedAfterEarlierFailure 仅表示已有可提交结果，但因更早任务失败没有写入，
-不伪造当前 Task 的新错误。每次命令恰好写
+诊断。NotCommittedAfterEarlierFailure 只用于更早的数据库提交、内部最终化或取消边界已经使
+后续副作用不再安全的情况；外部模型请求失败本身不能把后续合法响应改成这一状态，也不伪造
+当前 Task 的新错误。每次命令恰好写
 一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、Failed 或
 Cancelled。含 Partial 或 Unavailable 任务但业务结果明确时，Translate 结果是 Incomplete，
 退出码仍为 `0`；完整翻译目标尚未达成。CLI 明确显示 `状态：未完整`，并在 stderr 汇总
@@ -100,7 +120,8 @@ Partial、Unavailable、协议问题、可恢复请求耗尽、剩余决策和�
 written/remaining locations、remaining decisions、protocol diagnostics、recoverable request
 exhaustions、request admission stopped 和 reconciliation 计数。Task 计数始终满足
 `planned = started + not_started`；remaining decisions 与 remaining locations 按实际提交
-递减，不把已准入、冲突或停发后的工作伪装成已完成。Failed 与 Cancelled 在已经形成计划和
+递减，不把已准入、冲突或停发后的工作伪装成已完成。started 只在第一次真实 HTTP
+attempt 开始时计数；准入前失败、取消或停发仍计入 not_started。Failed 与 Cancelled 在已经形成计划和
 引擎汇总时，也把同一份计数和汇总写入 JSONL，并在 stderr 打印一次短汇总；规划前失败或
 提前取消不伪造引擎工作量。停止路径不补写 100%。Placeholder 等规划错误在任何模型请求前形成可读
 `diagnostic.run_plan`，保存类似 `Map023.json:event17:page1:dialogue42` 的位置、规则文件、

@@ -1244,24 +1244,9 @@ pub(crate) enum RpgMakerBuiltinDocumentProblem {
     EventCodeMustBeInteger,
     EventParametersMissing,
     EventIndentMustBeInteger,
-    ContinuationWithoutStart {
-        command_code: i64,
-    },
-    ChoiceIndexInvalid {
-        actual: Option<i64>,
-        option_count: usize,
-    },
-    DuplicateChoiceBranch {
-        choice_index: usize,
-    },
-    ChoiceBranchTextMismatch {
-        choice_index: usize,
-    },
+    ContinuationWithoutStart { command_code: i64 },
+    ChoiceIndexInvalid,
     ChoiceEndMissing,
-    ChoiceBranchesIncomplete {
-        expected: usize,
-        actual: usize,
-    },
 }
 
 impl RpgMakerBuiltinDocumentProblem {
@@ -1276,13 +1261,8 @@ impl RpgMakerBuiltinDocumentProblem {
             Self::EventParametersMissing => "rpg_maker.builtin.event_parameters_missing",
             Self::EventIndentMustBeInteger => "rpg_maker.builtin.event_indent_not_integer",
             Self::ContinuationWithoutStart { .. } => "rpg_maker.builtin.continuation_without_start",
-            Self::ChoiceIndexInvalid { .. } => "rpg_maker.builtin.choice_index_invalid",
-            Self::DuplicateChoiceBranch { .. } => "rpg_maker.builtin.choice_branch_duplicate",
-            Self::ChoiceBranchTextMismatch { .. } => {
-                "rpg_maker.builtin.choice_branch_text_mismatch"
-            }
+            Self::ChoiceIndexInvalid => "rpg_maker.builtin.choice_index_invalid",
             Self::ChoiceEndMissing => "rpg_maker.builtin.choice_end_missing",
-            Self::ChoiceBranchesIncomplete { .. } => "rpg_maker.builtin.choice_branches_incomplete",
         }
     }
 
@@ -1292,17 +1272,13 @@ impl RpgMakerBuiltinDocumentProblem {
             Self::MissingValue
             | Self::EventParametersMissing
             | Self::ContinuationWithoutStart { .. }
-            | Self::ChoiceEndMissing
-            | Self::ChoiceBranchesIncomplete { .. } => "missing_required_value",
-            Self::DuplicateChoiceBranch { .. } | Self::ChoiceBranchTextMismatch { .. } => {
-                "conflicting_values"
-            }
+            | Self::ChoiceEndMissing => "missing_required_value",
             Self::ExpectedObject
             | Self::ExpectedArray
             | Self::ExpectedString
             | Self::EventCodeMustBeInteger
             | Self::EventIndentMustBeInteger
-            | Self::ChoiceIndexInvalid { .. } => "invalid_value",
+            | Self::ChoiceIndexInvalid => "invalid_value",
         }
     }
 }
@@ -5087,11 +5063,7 @@ pub(crate) enum RpgMakerWriteBackMutationViolation {
     ChoiceStartNot102,
     FrozenChoicesMismatch,
     InvalidChoiceIndex,
-    ChoiceLabelNotString,
-    ChoiceLabelMismatch,
-    DuplicateChoiceIndex,
     MissingChoiceEnd,
-    IncompleteChoiceCoverage,
     ChoiceRecipeTargetMismatch,
     EventBodyStartOutOfBounds,
     EventBodyCodeMismatch,
@@ -5157,11 +5129,7 @@ impl RpgMakerWriteBackMutationViolation {
             Self::ChoiceStartNot102 => "choice_start_not_102",
             Self::FrozenChoicesMismatch => "frozen_choices_mismatch",
             Self::InvalidChoiceIndex => "invalid_choice_index",
-            Self::ChoiceLabelNotString => "choice_label_not_string",
-            Self::ChoiceLabelMismatch => "choice_label_mismatch",
-            Self::DuplicateChoiceIndex => "duplicate_choice_index",
             Self::MissingChoiceEnd => "missing_choice_end",
-            Self::IncompleteChoiceCoverage => "incomplete_choice_coverage",
             Self::ChoiceRecipeTargetMismatch => "choice_recipe_target_mismatch",
             Self::EventBodyStartOutOfBounds => "event_body_start_out_of_bounds",
             Self::EventBodyCodeMismatch => "event_body_code_mismatch",
@@ -5455,7 +5423,6 @@ pub(crate) enum RpgMakerExtractionStoreOperation {
     EncodeProjectDefinition,
     ReadOwnerState,
     ReadSnapshot,
-    ReadStoredUnits,
     ReadProjectDefinition,
     DecideClaimIndexMaintenance,
     DecideUnitIndexMaintenance,
@@ -5470,7 +5437,6 @@ impl RpgMakerExtractionStoreOperation {
             Self::EncodeProjectDefinition => "encode_project_definition",
             Self::ReadOwnerState => "read_owner_state",
             Self::ReadSnapshot => "read_snapshot",
-            Self::ReadStoredUnits => "read_stored_units",
             Self::ReadProjectDefinition => "read_project_definition",
             Self::DecideClaimIndexMaintenance => "decide_claim_index_maintenance",
             Self::DecideUnitIndexMaintenance => "decide_unit_index_maintenance",
@@ -5487,7 +5453,6 @@ impl RpgMakerExtractionStoreOperation {
             }
             Self::ReadOwnerState => "rpg_maker.extract.store.read_owner_state_failed",
             Self::ReadSnapshot => "rpg_maker.extract.store.read_snapshot_failed",
-            Self::ReadStoredUnits => "rpg_maker.extract.store.read_stored_units_failed",
             Self::ReadProjectDefinition => "rpg_maker.extract.store.read_project_definition_failed",
             Self::DecideClaimIndexMaintenance => {
                 "rpg_maker.extract.store.decide_claim_index_maintenance_failed"

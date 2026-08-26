@@ -29,9 +29,9 @@ use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation}
 pub(crate) use crate::execution::llm_request::AsyncDelay;
 use crate::execution::llm_request::{
     LlmRequestAttemptEvidence, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
-    execute_llm_request_with_retry,
+    execute_llm_request_with_retry_observed,
 };
-use crate::fingerprint::Sha256FramedHasher;
+use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{
     LanguageId, LanguageModule, LanguageModuleError, LanguageModuleKind,
     LanguageOperationCancelled, LanguagePair, LanguageText, LanguageTextSegment,
@@ -796,6 +796,10 @@ impl TranslationTaskEvidenceBuilder {
         self.attempt_count = self.attempt_count.max(evidence.attempt_count());
     }
 
+    const fn attempt_count(&self) -> usize {
+        self.attempt_count
+    }
+
     fn finish(
         self,
         response: Option<TranslationTaskResponseRecord>,
@@ -853,15 +857,15 @@ where
     fn failure_preserves_admitted_results(error: &Self::Error) -> bool {
         matches!(
             error,
-            RpgMakerTranslationTaskExecutionError::FatalRequest { source, .. }
-                if source.service_status().is_permanent()
+            RpgMakerTranslationTaskExecutionError::FatalRequest { .. }
         )
     }
 
-    async fn execute(
-        &self,
-        profile: &Self::Profile,
-        task: &RpgMakerExecutableTask,
+    async fn execute<'a>(
+        &'a self,
+        profile: &'a Self::Profile,
+        task: &'a RpgMakerExecutableTask,
+        on_task_started: Box<dyn FnOnce() + Send + 'a>,
     ) -> Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>> {
         let mut evidence = TranslationTaskEvidenceBuilder::new();
         if task.expected_outputs().is_empty() {
@@ -883,7 +887,7 @@ where
                 diagnostic,
             ));
         }
-        let request_execution = execute_llm_request_with_retry(
+        let request_execution = execute_llm_request_with_retry_observed(
             &self.llm,
             profile.llm_client(),
             task.messages(),
@@ -893,6 +897,7 @@ where
             ),
             &self.delay,
             &self.cancellation,
+            on_task_started,
         )
         .await;
         let (request_outcome, request_evidence) = request_execution.into_parts();
@@ -939,42 +944,25 @@ where
                     evidence.finish(None),
                 ));
             }
-            LlmRequestExecutionOutcome::Fatal {
-                attempt,
-                source,
-                diagnostic,
-            } => {
+            LlmRequestExecutionOutcome::Fatal { source, diagnostic } => {
                 return Err(TranslationTaskExecutionFailure::failed(
                     RpgMakerTranslationTaskExecutionError::FatalRequest {
-                        attempt: attempt.get(),
+                        attempt: evidence.attempt_count(),
                         source,
                     },
                     evidence.finish(None),
                     diagnostic,
                 ));
             }
-            LlmRequestExecutionOutcome::AdmissionStopped {
-                attempt,
-                diagnostic,
-                service_status,
-            } => {
-                let outcome = unavailable_after_request_failure(
-                    task,
-                    attempt,
-                    TranslationTaskUnavailableReason::RequestAdmissionStopped {
-                        diagnostic,
-                        service_status,
-                    },
-                );
-                return Ok(TranslationTaskExecution::new(
-                    outcome,
+            LlmRequestExecutionOutcome::AdmissionStopped { .. } => {
+                return Ok(TranslationTaskExecution::admission_stopped(
                     evidence.finish(None),
                 ));
             }
-            LlmRequestExecutionOutcome::Cancelled { attempt } => {
+            LlmRequestExecutionOutcome::Cancelled => {
                 return Err(TranslationTaskExecutionFailure::cancelled(
                     RpgMakerTranslationTaskExecutionError::LlmRequestCancelled {
-                        attempt: attempt.get(),
+                        attempt: evidence.attempt_count(),
                     },
                     evidence.finish(None),
                 ));
@@ -1084,8 +1072,20 @@ where
         task: RpgMakerExecutableTask,
     ) -> Result<TranslationTaskOutcome, RpgMakerTranslationTaskExecutionError<L::Error, R::Error>>
     {
-        match <Self as RpgMakerTranslationTaskExecutor>::execute(self, profile, &task).await {
-            Ok(execution) => Ok(execution.into_parts().0),
+        match <Self as RpgMakerTranslationTaskExecutor>::execute(
+            self,
+            profile,
+            &task,
+            Box::new(|| {}),
+        )
+        .await
+        {
+            Ok(execution) => match execution.into_parts().0 {
+                super::task_record::TranslationTaskExecutionState::Started(outcome) => Ok(outcome),
+                super::task_record::TranslationTaskExecutionState::AdmissionStopped => {
+                    panic!("测试便捷入口不能把未准入请求伪装成模型任务结果")
+                }
+            },
             Err(TranslationTaskExecutionFailure::Failed { source, .. })
             | Err(TranslationTaskExecutionFailure::Cancelled { source, .. }) => Err(source),
         }
@@ -1136,11 +1136,17 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FatalRequest { attempt: 0, source } => {
+                write!(formatter, "LLM 请求开始前不可恢复地失败：{source}")
+            }
             Self::FatalRequest { attempt, source } => {
                 write!(formatter, "第 {attempt} 次 LLM 请求不可重试：{source}")
             }
             Self::ProcessResponse { attempt, source } => {
                 write!(formatter, "第 {attempt} 次模型响应无法处理：{source}")
+            }
+            Self::LlmRequestCancelled { attempt: 0 } => {
+                formatter.write_str("LLM 请求在开始前已取消")
             }
             Self::LlmRequestCancelled { attempt } => {
                 write!(formatter, "第 {attempt} 次 LLM 请求已取消")
@@ -1500,6 +1506,7 @@ fn process_response(
                         expected,
                         identity,
                         expected.propagation_state_contexts()[index],
+                        expected.propagation_expected_previous()[index].clone(),
                         candidate_json.clone(),
                         Some(candidate_translation.clone()),
                         TranslationUnitRejectionReason::PlaceholderMismatch {
@@ -1582,10 +1589,17 @@ fn process_response(
             }
             let identity = &expected.propagation_targets()[index];
             let state_context = expected.propagation_state_contexts()[index];
-            propagation_targets.push(super::pipeline::TranslationPropagationTarget::new(
-                identity.clone(),
-                state_context,
-            ));
+            let expected_previous = expected.propagation_expected_previous()[index].clone();
+            propagation_targets.push(
+                super::pipeline::TranslationPropagationTarget::with_previous(
+                    identity.clone(),
+                    state_context,
+                    expected_previous
+                        .as_ref()
+                        .map(|(translation, _)| translation.clone()),
+                    expected_previous.map(|(_, state)| state),
+                ),
+            );
         }
         if let Err(ResponseProcessingCancelled) = ensure_running() {
             return Err(TranslationResponseTechnicalFailure::new(
@@ -1595,11 +1609,14 @@ fn process_response(
         }
         accepted.push(AcceptedTranslationDecision::new(
             expected.id(),
-            TranslationPatch::new(
+            TranslationPatch::with_previous(
                 expected.identity().clone(),
                 propagation_targets,
                 translation,
                 translation_state,
+                expected
+                    .expected_previous()
+                    .map(|(translation, state)| (translation.clone(), state)),
             ),
         ));
     }
@@ -2130,16 +2147,21 @@ fn unresolved_unit_with_rejected_candidate(
         expected.identity().clone(),
         expected
             .state_context()
-            .finish(expected.identity().source_content()),
+            .rejection_planning_state(expected.identity().source_content()),
+        expected
+            .expected_previous()
+            .map(|(translation, state)| (translation.clone(), state)),
     ));
-    for (identity, state_context) in expected
+    for ((identity, state_context), expected_previous) in expected
         .propagation_targets()
         .iter()
         .zip(expected.propagation_state_contexts().iter().copied())
+        .zip(expected.propagation_expected_previous())
     {
         targets.push(RejectedTranslationTarget::new(
             identity.clone(),
-            state_context.finish(identity.source_content()),
+            state_context.rejection_planning_state(identity.source_content()),
+            expected_previous.clone(),
         ));
     }
     UnresolvedTranslationUnit::with_rejected_candidate(
@@ -2154,6 +2176,7 @@ fn unresolved_propagation_target_with_rejected_candidate(
     expected: &ExpectedTranslationOutput,
     identity: &TranslationUnitIdentity,
     state_context: super::pipeline::TranslationStateContext,
+    expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
     candidate_json: String,
     translation: Option<Vec<String>>,
     reason: TranslationUnitRejectionReason,
@@ -2170,7 +2193,8 @@ fn unresolved_propagation_target_with_rejected_candidate(
             violation,
             vec![RejectedTranslationTarget::new(
                 identity.clone(),
-                state_context.finish(identity.source_content()),
+                state_context.rejection_planning_state(identity.source_content()),
+                expected_previous,
             )],
         ),
     )
@@ -3427,6 +3451,7 @@ mod tests {
         RpgMakerTranslationPlanningConfiguration, RpgMakerTranslationProfile,
         TranslationResponseMode,
     };
+    use crate::rpg_maker::translate::task_record::TranslationTaskExecutionState;
     use crate::runtime::cpu::CpuExecutorUnavailable;
     use crate::translation::profile::TranslationRequestConfiguration;
 
@@ -3489,6 +3514,10 @@ mod tests {
     impl LlmRequestFailure for FakeError {
         fn is_cancelled_wait(&self) -> bool {
             self.0 == "cancelled-wait"
+        }
+
+        fn request_was_sent(&self) -> bool {
+            self.0 != "cancelled-wait"
         }
     }
 
@@ -5579,6 +5608,54 @@ mod tests {
             Err(LlmRequestError::Fatal(FakeError("cancelled-wait")))
         }
 
+        async fn request_with_attempt_observer<'a>(
+            &'a self,
+            client: &'a Self::Client,
+            messages: &'a [ChatMessage],
+            _on_attempt_started: Box<dyn FnOnce() + Send + 'a>,
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            self.request(client, messages).await
+        }
+
+        fn request_diagnostic(
+            &self,
+            _client: &Self::Client,
+            _source: &Self::Error,
+            retry_after: Option<Duration>,
+        ) -> crate::diagnostic::Diagnostic {
+            fake_request_diagnostic(retry_after)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct AdmissionStoppedLlm;
+
+    impl LlmRequestExecutor for AdmissionStoppedLlm {
+        type Client = &'static str;
+        type Error = FakeError;
+
+        async fn request<'a>(
+            &'a self,
+            _client: &'a Self::Client,
+            _messages: &'a [ChatMessage],
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            Err(LlmRequestError::AdmissionStopped {
+                diagnostic: crate::diagnostic::DiagnosticReport::new(
+                    StateEffect::ProgressPreserved,
+                    fake_request_diagnostic(None),
+                ),
+            })
+        }
+
+        async fn request_with_attempt_observer<'a>(
+            &'a self,
+            client: &'a Self::Client,
+            messages: &'a [ChatMessage],
+            _on_attempt_started: Box<dyn FnOnce() + Send + 'a>,
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            self.request(client, messages).await
+        }
+
         fn request_diagnostic(
             &self,
             _client: &Self::Client,
@@ -5688,10 +5765,14 @@ mod tests {
                 &service,
                 &profile(),
                 &task,
+                Box::new(|| {}),
             )
             .await
             .expect("关闭任务记录不应改变业务结果");
-        let (outcome, evidence) = execution.into_parts();
+        let (state, evidence) = execution.into_parts();
+        let TranslationTaskExecutionState::Started(outcome) = state else {
+            panic!("成功模型响应必须形成已开始任务结果");
+        };
 
         assert_eq!(evidence.attempt_count(), outcome.attempts().get());
         assert!(
@@ -5732,6 +5813,7 @@ mod tests {
                 &service,
                 &profile,
                 &task,
+                Box::new(|| {}),
             )
             .await
         });
@@ -5763,8 +5845,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_admission_cancellation_is_returned_as_a_cancelled_started_task() {
+    async fn llm_admission_cancellation_does_not_start_a_model_task() {
         let cancellation = CooperativeCancellation::default();
+        let started = Arc::new(AtomicBool::new(false));
         let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
             CancellingLlm {
                 cancellation: cancellation.clone(),
@@ -5778,18 +5861,59 @@ mod tests {
         let task = task();
         let profile = profile();
 
-        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
-            .await
-            .expect_err("等待 LLM 本地入场时的合作取消必须返回取消终态");
+        let observed_started = Arc::clone(&started);
+        let failure = RpgMakerTranslationTaskExecutor::execute(
+            &service,
+            &profile,
+            &task,
+            Box::new(move || observed_started.store(true, Ordering::Release)),
+        )
+        .await
+        .expect_err("等待 LLM 本地入场时的合作取消必须返回取消终态");
         let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
             source,
-            RpgMakerTranslationTaskExecutionError::LlmRequestCancelled { attempt: 1 }
+            RpgMakerTranslationTaskExecutionError::LlmRequestCancelled { attempt: 0 }
         ));
-        assert_eq!(evidence.attempt_count(), 1);
+        assert_eq!(evidence.attempt_count(), 0);
+        assert!(!started.load(Ordering::Acquire));
         assert!(diagnostic.is_none());
         assert!(cancelled);
+    }
+
+    #[tokio::test]
+    async fn stopped_admission_is_not_represented_as_a_model_task_outcome() {
+        let started = Arc::new(AtomicBool::new(false));
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
+            AdmissionStoppedLlm,
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
+            CooperativeCancellation::default(),
+        );
+        let task = task();
+        let profile = profile();
+
+        let observed_started = Arc::clone(&started);
+        let execution = RpgMakerTranslationTaskExecutor::execute(
+            &service,
+            &profile,
+            &task,
+            Box::new(move || observed_started.store(true, Ordering::Release)),
+        )
+        .await
+        .expect("本地准入停止是未开始任务，不是执行失败");
+        let (state, evidence) = execution.into_parts();
+
+        assert!(matches!(
+            state,
+            TranslationTaskExecutionState::AdmissionStopped
+        ));
+        assert_eq!(evidence.attempt_count(), 0);
+        assert!(!started.load(Ordering::Acquire));
+        assert!(evidence.response().is_none());
     }
 
     #[tokio::test]
@@ -5817,9 +5941,10 @@ mod tests {
         let task = task();
         let profile = profile();
 
-        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
-            .await
-            .expect_err("等待响应 CPU 入场时的合作取消必须返回取消终态");
+        let failure =
+            RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task, Box::new(|| {}))
+                .await
+                .expect_err("等待响应 CPU 入场时的合作取消必须返回取消终态");
         let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
@@ -5875,9 +6000,10 @@ mod tests {
         let task = task();
         let profile = profile();
 
-        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
-            .await
-            .expect_err("已经进入 CPU 的响应处理必须观察共享取消");
+        let failure =
+            RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task, Box::new(|| {}))
+                .await
+                .expect_err("已经进入 CPU 的响应处理必须观察共享取消");
         let (source, evidence, diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
@@ -5922,9 +6048,10 @@ mod tests {
         let task = task_with_language_pair("en", "zh-Hant", 1);
         let profile = profile();
 
-        let failure = RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task)
-            .await
-            .expect_err("解析后的任务语言对不一致必须返回技术失败");
+        let failure =
+            RpgMakerTranslationTaskExecutor::execute(&service, &profile, &task, Box::new(|| {}))
+                .await
+                .expect_err("解析后的任务语言对不一致必须返回技术失败");
         let (source, evidence, _diagnostic, cancelled) = split_execution_failure(failure);
 
         assert!(matches!(
@@ -6149,6 +6276,13 @@ mod tests {
 
     #[tokio::test]
     async fn executor_stops_on_fatal_request() {
+        fn preserves_admitted_results<E: RpgMakerTranslationTaskExecutor>(
+            _executor: &E,
+            error: &E::Error,
+        ) -> bool {
+            E::failure_preserves_admitted_results(error)
+        }
+
         let service = RpgMakerTranslationTaskExecutionService::<
             _,
             _,
@@ -6168,10 +6302,18 @@ mod tests {
             CooperativeCancellation::default(),
         );
 
+        let error = service
+            .execute(&profile(), task())
+            .await
+            .expect_err("Fatal 请求必须上交执行错误");
         assert!(matches!(
-            service.execute(&profile(), task()).await,
-            Err(RpgMakerTranslationTaskExecutionError::FatalRequest { .. })
+            &error,
+            RpgMakerTranslationTaskExecutionError::FatalRequest { .. }
         ));
+        assert!(
+            preserves_admitted_results(&service, &error),
+            "外部请求失败只能停止新准入，不能丢弃其他已验收的并发结果"
+        );
     }
 
     #[test]

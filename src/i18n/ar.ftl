@@ -268,6 +268,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] تعذر إجراء تسلسل لطلب النموذج
     [response_parsing_failed] استجابة النموذج ليست JSON صالحًا
     [invalid_response_contract] استجابة النموذج لا تستوفي عقد الاستجابة المطلوب
+    [model_stream_incomplete] انتهى تدفق النموذج قبل نتيجة نهائية صريحة
     [transport_failed] فشل نقل HTTP قبل وصول استجابة صالحة
     [lua_compilation_failed] تعذر تجميع برنامج Lua الرئيسي
     [lua_execution_failed] فشل برنامج Lua الرئيسي أثناء التشغيل

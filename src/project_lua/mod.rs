@@ -245,6 +245,23 @@ impl ProjectLuaTranslationStatus {
     }
 }
 
+const fn current_translation_status(
+    has_current_translation: bool,
+    has_rejected_candidate: bool,
+    needs_translation: bool,
+    has_outdated_manual: bool,
+) -> ProjectLuaTranslationStatus {
+    if has_current_translation {
+        ProjectLuaTranslationStatus::Translated
+    } else if has_rejected_candidate || needs_translation {
+        ProjectLuaTranslationStatus::Unfinished
+    } else if has_outdated_manual {
+        ProjectLuaTranslationStatus::Outdated
+    } else {
+        ProjectLuaTranslationStatus::NotNeeded
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProjectLuaTranslationFilter {
     pub(crate) status: Option<ProjectLuaTranslationStatus>,
@@ -482,7 +499,15 @@ impl ProjectLuaRunRequest {
 #[derive(Default)]
 struct ProjectLuaCancellationState {
     requested: AtomicBool,
+    poisoned: AtomicBool,
+    poison: Mutex<Option<ProjectLuaIntegrityPoison>>,
     interrupt: Mutex<Option<InterruptHandle>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectLuaIntegrityPoison {
+    failure: ProjectLuaCallError,
+    outcome_unknown: bool,
 }
 
 /// 可由命令取消监督者跨线程触发的一次 Lua 取消令牌。
@@ -503,6 +528,10 @@ impl fmt::Debug for ProjectLuaCancellation {
 impl ProjectLuaCancellation {
     pub(crate) fn cancel(&self) {
         self.state.requested.store(true, Ordering::Release);
+        self.interrupt();
+    }
+
+    fn interrupt(&self) {
         let interrupt = self
             .state
             .interrupt
@@ -513,12 +542,48 @@ impl ProjectLuaCancellation {
         }
     }
 
+    fn poison(&self, failure: ProjectLuaCallError, outcome_unknown: bool) {
+        {
+            let mut poison = self
+                .state
+                .poison
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match poison.as_mut() {
+                Some(current) => current.outcome_unknown |= outcome_unknown,
+                None => {
+                    *poison = Some(ProjectLuaIntegrityPoison {
+                        failure,
+                        outcome_unknown,
+                    });
+                }
+            }
+        }
+        self.state.poisoned.store(true, Ordering::Release);
+        self.interrupt();
+    }
+
+    fn integrity_poison(&self) -> Option<ProjectLuaIntegrityPoison> {
+        if !self.state.poisoned.load(Ordering::Acquire) {
+            return None;
+        }
+        self.state
+            .poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn should_abort(&self) -> bool {
+        self.is_cancelled() || self.state.poisoned.load(Ordering::Acquire)
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.state.requested.load(Ordering::Acquire)
     }
 
     pub(crate) fn ensure_running(&self) -> Result<(), ProjectLuaCallError> {
-        if self.is_cancelled() {
+        if self.should_abort() {
             Err(ProjectLuaCallError::cancelled())
         } else {
             Ok(())
@@ -537,7 +602,7 @@ impl ProjectLuaCancellation {
             ));
         }
         *active = Some(interrupt);
-        if self.is_cancelled()
+        if self.should_abort()
             && let Some(interrupt) = active.as_ref()
         {
             interrupt.interrupt();
@@ -745,6 +810,8 @@ pub(crate) enum ProjectLuaRunError {
         failure: ProjectLuaFailure,
         rollback: ProjectLuaSqliteError,
     },
+    /// 高级翻译 API 的最外层 savepoint 在 RELEASE 报错后已经结束，无法判断修改是否提交。
+    SavepointOutcomeUnknown(ProjectLuaFailure),
 }
 
 impl fmt::Display for ProjectLuaRunError {
@@ -757,6 +824,9 @@ impl fmt::Display for ProjectLuaRunError {
                 formatter,
                 "Lua 失败且回滚结果未知；主失败：{failure}；回滚失败：{rollback}"
             ),
+            Self::SavepointOutcomeUnknown(failure) => {
+                write!(formatter, "Lua 高级翻译操作的提交结果未知：{failure}")
+            }
         }
     }
 }
@@ -768,6 +838,7 @@ impl Error for ProjectLuaRunError {
                 Some(failure)
             }
             Self::RollbackOutcomeUnknown { failure, .. } => Some(failure),
+            Self::SavepointOutcomeUnknown(failure) => Some(failure),
         }
     }
 }
@@ -807,6 +878,12 @@ impl ProjectLuaRunError {
                     StateEffect::OutcomeUnknown,
                     SqliteTransactionState::OutcomeUnknown,
                 ),
+            ),
+            Self::SavepointOutcomeUnknown(failure) => failure_report(
+                failure,
+                database_path,
+                StateEffect::OutcomeUnknown,
+                SqliteTransactionState::OutcomeUnknown,
             ),
         }
     }
@@ -1022,23 +1099,98 @@ const fn lua_sqlite_operation(operation: LuaOperation) -> SqliteOperation {
 fn rollback_translation_api_savepoint(
     connection: &Connection,
     engine: LuaEngine,
+    cancellation: &ProjectLuaCancellation,
     failure: ProjectLuaCallError,
 ) -> ProjectLuaCallError {
     if let Err(source) = connection.execute_batch("ROLLBACK TO att_translation_api") {
-        return failure.with_cleanup_failure(
+        let failure = failure.with_cleanup_failure(
             ProjectLuaCallError::sqlite(source)
                 .with_engine(engine)
                 .with_operation(LuaOperation::RollbackTransaction),
         );
+        cancellation.poison(failure.clone(), connection.is_autocommit());
+        return failure;
     }
     if let Err(source) = connection.execute_batch("RELEASE att_translation_api") {
-        return failure.with_cleanup_failure(
+        let failure = failure.with_cleanup_failure(
             ProjectLuaCallError::sqlite(source)
                 .with_engine(engine)
                 .with_operation(LuaOperation::RollbackTransaction),
         );
+        // ROLLBACK TO 已确认撤销本次正文；但保存点清理失败后不能让脚本继续并
+        // 猜测连接状态，必须由运行根终止脚本并最终化整个连接。
+        cancellation.poison(failure.clone(), false);
+        return failure;
     }
     failure
+}
+
+fn release_translation_api_savepoint(
+    connection: &Connection,
+    engine: LuaEngine,
+    cancellation: &ProjectLuaCancellation,
+) -> Result<(), ProjectLuaCallError> {
+    match connection.execute_batch("RELEASE att_translation_api") {
+        Ok(()) => Ok(()),
+        Err(source) => Err(handle_translation_api_release_failure(
+            connection,
+            engine,
+            cancellation,
+            source,
+        )),
+    }
+}
+
+fn handle_translation_api_release_failure(
+    connection: &Connection,
+    engine: LuaEngine,
+    cancellation: &ProjectLuaCancellation,
+    source: rusqlite::Error,
+) -> ProjectLuaCallError {
+    let failure = ProjectLuaCallError::sqlite(source).with_engine(engine);
+    if connection.is_autocommit() {
+        // 最外层 RELEASE 是提交点。SQLite 已结束事务却返回错误时，不能从
+        // 返回码推断提交还是自动回滚，也已经没有 savepoint 可供补偿。
+        cancellation.poison(failure.clone(), true);
+        return failure;
+    }
+    let failure = rollback_translation_api_savepoint(connection, engine, cancellation, failure);
+    // 即使补偿成功，原 RELEASE 失败也说明连接经历了异常最终化；禁止 pcall
+    // 吞掉错误后继续提交外层事务，由运行根统一回滚或确认无活动事务。
+    cancellation.poison(failure.clone(), false);
+    failure
+}
+
+fn with_translation_api_savepoint<T>(
+    connection: &Connection,
+    engine: LuaEngine,
+    cancellation: &ProjectLuaCancellation,
+    operation: impl FnOnce() -> Result<T, ProjectLuaCallError>,
+) -> Result<T, ProjectLuaCallError> {
+    cancellation.ensure_running()?;
+    connection
+        .execute_batch("SAVEPOINT att_translation_api")
+        .map_err(|source| ProjectLuaCallError::sqlite(source).with_engine(engine))?;
+    match operation() {
+        Ok(value) => {
+            if let Err(error) = cancellation.ensure_running() {
+                return Err(rollback_translation_api_savepoint(
+                    connection,
+                    engine,
+                    cancellation,
+                    error,
+                ));
+            }
+            release_translation_api_savepoint(connection, engine, cancellation)?;
+            Ok(value)
+        }
+        Err(error) => Err(rollback_translation_api_savepoint(
+            connection,
+            engine,
+            cancellation,
+            error,
+        )),
+    }
 }
 
 /// 在调用方已经打开的项目数据库上运行脚本。
@@ -1102,6 +1254,9 @@ fn execute_prepared(
             &hook_cancelled,
         )
     }));
+    if let Some(poison) = request.cancellation.integrity_poison() {
+        return finish_poisoned_execution(&connection, &request.cancellation, poison);
+    }
     let failure = match execution {
         Ok(Ok(())) if request.cancellation.is_cancelled() => Some(ProjectLuaFailure::Cancelled),
         Ok(Ok(())) => None,
@@ -1138,6 +1293,22 @@ fn execute_prepared(
     disable_sqlite_cancellation(&connection.borrow());
     request.cancellation.unregister_interrupt();
     Ok(())
+}
+
+fn finish_poisoned_execution(
+    connection: &Rc<RefCell<Connection>>,
+    cancellation: &ProjectLuaCancellation,
+    poison: ProjectLuaIntegrityPoison,
+) -> Result<(), ProjectLuaRunError> {
+    let _ = disable_script_authorizer(&connection.borrow());
+    disable_sqlite_cancellation(&connection.borrow());
+    cancellation.unregister_interrupt();
+    let failure = ProjectLuaFailure::Host(poison.failure);
+    if poison.outcome_unknown {
+        Err(ProjectLuaRunError::SavepointOutcomeUnknown(failure))
+    } else {
+        rollback(connection, failure)
+    }
 }
 
 fn rollback_after_failure(
@@ -1232,7 +1403,7 @@ fn install_sqlite_cancellation(
         SQLITE_CANCEL_CHECK_OPERATIONS,
         Some({
             let cancellation = cancellation.clone();
-            move || cancellation.is_cancelled()
+            move || cancellation.should_abort()
         }),
     ) {
         let _ = connection.borrow().busy_handler(None);
@@ -1254,11 +1425,11 @@ fn install_sqlite_cancellation(
 fn wait_for_project_lua_sqlite_unlock(_attempt: i32) -> bool {
     match PROJECT_LUA_BUSY_WAIT_MODE.with(|mode| mode.borrow().clone()) {
         Some(ProjectLuaBusyWaitMode::Cancellable(cancellation)) => {
-            if cancellation.is_cancelled() {
+            if cancellation.should_abort() {
                 return false;
             }
             std::thread::sleep(SQLITE_WAIT_POLL_INTERVAL);
-            !cancellation.is_cancelled()
+            !cancellation.should_abort()
         }
         Some(ProjectLuaBusyWaitMode::Finalizing) => {
             std::thread::sleep(SQLITE_WAIT_POLL_INTERVAL);

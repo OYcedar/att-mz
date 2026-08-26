@@ -944,6 +944,7 @@ impl GenericResponseValueProblem {
 pub(crate) enum GenericResponseTextProblem {
     Blank,
     CarriageReturn,
+    LineFeed,
     Nul,
     ByteOrderMark,
 }
@@ -970,6 +971,7 @@ impl GenericResponseTextProblem {
         match self {
             Self::Blank => "blank",
             Self::CarriageReturn => "carriage_return",
+            Self::LineFeed => "line_feed",
             Self::Nul => "nul",
             Self::ByteOrderMark => "byte_order_mark",
         }
@@ -1206,6 +1208,9 @@ impl GenericTaskResponseProblem {
                 GenericResponseTextProblem::CarriageReturn => {
                     "generic.translation.response.translation.carriage_return"
                 }
+                GenericResponseTextProblem::LineFeed => {
+                    "generic.translation.response.translation.line_feed"
+                }
                 GenericResponseTextProblem::Nul => "generic.translation.response.translation.nul",
                 GenericResponseTextProblem::ByteOrderMark => {
                     "generic.translation.response.translation.byte_order_mark"
@@ -1264,6 +1269,9 @@ impl GenericTaskResponseProblem {
                         }
                         GenericResponseTextProblem::CarriageReturn => {
                             "generic.translation.response.destination.carriage_return"
+                        }
+                        GenericResponseTextProblem::LineFeed => {
+                            "generic.translation.response.destination.line_feed"
                         }
                         GenericResponseTextProblem::Nul => {
                             "generic.translation.response.destination.nul"

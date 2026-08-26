@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -542,7 +542,10 @@ def iter_string_leaves(
     path: tuple[str | int, ...] = (),
     decoded_layers: int = 0,
     decode_positions: tuple[int, ...] = (),
+    decode_serialized_at: Callable[[tuple[str | int, ...], tuple[int, ...]], bool] | None = None,
 ) -> Iterator[StringLeaf]:
+    """枚举真实 string；每一层序列化 JSON 都必须由调用方单独授权。"""
+
     if isinstance(value, str):
         current = value
         layers = decoded_layers
@@ -555,7 +558,10 @@ def iter_string_leaves(
                     "检查循环或损坏的编码层",
                 )
             seen.add(current)
-            decoded = _try_decode(current, actual_path(path) or "嵌套 JSON string")
+            if decode_serialized_at is None or not decode_serialized_at(path, decode_positions):
+                decoded = None
+            else:
+                decoded = _try_decode(current, actual_path(path) or "嵌套 JSON string")
             if decoded is None:
                 yield StringLeaf(
                     path=path,
@@ -574,6 +580,7 @@ def iter_string_leaves(
                 path=path,
                 decoded_layers=layers,
                 decode_positions=decode_positions,
+                decode_serialized_at=decode_serialized_at,
             )
             return
     elif isinstance(value, list):
@@ -584,6 +591,7 @@ def iter_string_leaves(
                     path=(*path, index),
                     decoded_layers=decoded_layers,
                     decode_positions=decode_positions,
+                    decode_serialized_at=decode_serialized_at,
                 )
     elif isinstance(value, dict):
         for key, item in value.items():
@@ -592,6 +600,7 @@ def iter_string_leaves(
                 path=(*path, key),
                 decoded_layers=decoded_layers,
                 decode_positions=decode_positions,
+                decode_serialized_at=decode_serialized_at,
             )
 
 

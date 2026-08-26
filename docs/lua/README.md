@@ -53,6 +53,11 @@ ctx.terminology.list()
 译文时，`outdated_manual` 保存旧 `id`、`type`、`source` 和 `translation`。
 所有正文都是字符串数组。
 
+状态优先表达当前可消费事实：存在当前人工或自动译文时为 `translated`；没有当前译文但
+需要翻译或存在 Rejected 候选时为 `unfinished`；只有前两者都不成立且仍保留过期人工快照时
+才为 `outdated`；其余为 `not_needed`。Rejected 不得被误报为 `not_needed`，过期人工快照也
+不得遮蔽同一位置的当前译文。
+
 ### 2.2 context
 
 `ctx.translation.context(ids)` 一次接收多个可读 ID，并按请求顺序返回每个 ID 所属逻辑
@@ -79,6 +84,7 @@ end
 
 `ctx.translation.set(id, translation)` 只接受可读 ID 和非空字符串数组，复用 Manual 的
 type、数组形状、固定空槽、控制码和 Placeholder 检查。写入后人工译文优先于自动译文。
+人工记录绑定写入时的项目语言对，不绑定兄弟 Unit 或完整 Group 语境。
 
 `ctx.translation.clear(id)` 删除该位置的人工记录和自动译文，使当前条目回到未完成或
 不需要翻译的实际状态；它也可以清除只剩过期快照的位置。
@@ -141,6 +147,13 @@ ctx.db.execute("COMMIT")
 - 失败、取消或 panic 只回滚当时仍打开的事务；
 - 正常结束时仍有事务未关闭，ATT 报错并回滚该事务；
 - `pcall` 可以捕获 SQL 或高级 API 错误并继续。
+
+每次高级 `set` 或 `clear` 在自己的 savepoint 中完整成败。`RELEASE` 失败时，ATT 在事务仍
+活动时先回滚该高级操作；`RELEASE`、`ROLLBACK TO` 或 savepoint 清理失败都会立即毒化本次
+脚本执行，不能被 `pcall` 吞掉后继续提交外层事务。运行根随后回滚仍活动的根事务；根回滚
+失败按结果未知报告。最外层 `RELEASE` 报错且 SQLite 已经结束事务时，ATT 无法从返回码判断
+提交还是自动回滚，直接按结果未知报告，不伪称已经回滚。这不改变 raw SQL 和脚本显式事务
+在没有高级 API 清理失败时的责任边界。
 
 ATT 不在脚本结束时检查或修复业务状态。需要一组修改共同成败时，由脚本显式开始、提交或
 回滚事务；不需要时可以直接使用 autocommit。

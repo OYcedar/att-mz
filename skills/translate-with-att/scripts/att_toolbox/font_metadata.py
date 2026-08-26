@@ -131,8 +131,14 @@ def font_codepoints(path: Path) -> set[int]:
     return result
 
 
-def check_font_coverage(font: Path, extra_texts: Sequence[Path] = ()) -> FontCoverage:
+def check_font_coverage(
+    font: Path,
+    extra_texts: Sequence[Path] = (),
+    *,
+    extra_characters: str = "",
+) -> FontCoverage:
     characters = set(_BASELINE_CHARACTERS)
+    characters.update(extra_characters)
     for path in extra_texts:
         characters.update(path.read_text(encoding="utf-8-sig"))
     characters = {

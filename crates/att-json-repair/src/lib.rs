@@ -1320,7 +1320,6 @@ where
         let start = self.position;
         let opener = self.current_char();
         let quote = Quote::from_opener(opener).expect("caller checked quote");
-        let mut internal_double_quote_open = false;
         let opener_end = start + opener.len_utf8();
         self.advance_current()?;
         if quote.is_standard() {
@@ -1347,6 +1346,18 @@ where
             if quote.closes(character) {
                 let after = self.position + width;
                 let (next_position, next, had_whitespace) = self.peek_after_string_quote(after)?;
+                // `"a" "b"` 既可能是漏逗号的两个字符串，也可能是正文包含两个未转义
+                // 引号的一个字符串。空白不能替调用方消除这种歧义。
+                if self.policy == RepairPolicy::Conservative
+                    && role == StringRole::Value
+                    && had_whitespace
+                    && next.is_some_and(|next| Quote::from_opener(next).is_some())
+                {
+                    return Ok(Some(RepairError::new(
+                        RepairErrorKind::AmbiguousStringQuote,
+                        character_start,
+                    )));
+                }
                 if self.quote_can_close(role, next, had_whitespace) {
                     self.advance_current()?;
                     if quote.is_standard() {
@@ -1375,18 +1386,9 @@ where
                     }
                     return Ok(None);
                 }
-                if later_quote.is_none() && self.policy == RepairPolicy::Conservative {
-                    return Ok(Some(RepairError::new(
-                        RepairErrorKind::AmbiguousStringQuote,
-                        character_start,
-                    )));
-                }
-                if role == StringRole::Value
-                    && self.policy == RepairPolicy::Conservative
-                    && !internal_double_quote_open
-                    && !had_whitespace
-                    && next.is_some_and(|next| Quote::from_opener(next).is_some())
-                {
+                // 当前引号既可能是正文，也可能是边界并伴随其他语法缺失；后续引号不能
+                // 反向证明唯一意图，Conservative 不替调用方选择其中一种解释。
+                if self.policy == RepairPolicy::Conservative {
                     return Ok(Some(RepairError::new(
                         RepairErrorKind::AmbiguousStringQuote,
                         character_start,
@@ -1399,7 +1401,6 @@ where
                         character_start..self.position,
                         "\\\"",
                     );
-                    internal_double_quote_open = !internal_double_quote_open;
                 } else {
                     self.builder.copy(character_start..self.position);
                 }
@@ -2374,7 +2375,7 @@ mod tests {
 
     #[test]
     fn conservative_rejects_ambiguous_missing_array_values_and_adjacent_strings() {
-        for input in ["[1,,2]", "[,1]", "[\"a\"\"b\"]"] {
+        for input in ["[1,,2]", "[,1]", "[\"a\"\"b\"]", "[\"a\" \"b\"]"] {
             let error = repair(input, RepairPolicy::Conservative)
                 .expect_err("Conservative 不应替调用方选择缺值或相邻字符串的解释");
             assert!(matches!(
@@ -2415,10 +2416,12 @@ mod tests {
     }
 
     #[test]
-    fn repairs_unescaped_internal_double_quotes() {
-        let output = repaired("{\"text\":\"type: \"free\"\"}");
-        assert_eq!(output.json(), "{\"text\":\"type: \\\"free\\\"\"}");
-        assert_valid_json(&output);
+    fn conservative_rejects_ambiguous_internal_double_quotes() {
+        for input in ["{\"text\":\"type: \"free\"\"}", "{\"text\":\"a \"b\" c\"}"] {
+            let error = repair(input, RepairPolicy::Conservative)
+                .expect_err("内部双引号既可能是字符串边界也可能是正文，不得猜测");
+            assert_eq!(error.kind(), RepairErrorKind::AmbiguousStringQuote);
+        }
     }
 
     #[test]
@@ -2549,14 +2552,14 @@ mod tests {
         let mut quote_checks = 0_usize;
         let quoted_output = repair_with_cancellation(
             &quoted,
-            RepairPolicy::Conservative,
+            RepairPolicy::BestEffort,
             || -> Result<(), Infallible> {
                 quote_checks += 1;
                 Ok(())
             },
         )
         .expect("取消检查不会失败")
-        .expect("密集内部引号应可修复");
+        .expect("BestEffort 的密集内部引号选择仍应保持线性");
         assert_valid_json(&quoted_output);
         let quote_budget = quoted.len().div_ceil(CANCELLATION_INTERVAL) * 8 + 16;
         assert!(

@@ -69,18 +69,13 @@ pub(crate) enum LlmRequestExecutionOutcome<E> {
         service_status: LlmServiceStatus,
     },
     Fatal {
-        attempt: NonZeroUsize,
         source: E,
         diagnostic: DiagnosticReport,
     },
     AdmissionStopped {
-        attempt: NonZeroUsize,
         diagnostic: DiagnosticReport,
-        service_status: LlmServiceStatus,
     },
-    Cancelled {
-        attempt: NonZeroUsize,
-    },
+    Cancelled,
 }
 
 /// 共享请求状态机的终态与一次性证据。
@@ -127,6 +122,7 @@ fn finish<E>(
 }
 
 /// 执行一次逻辑 LLM 请求，并在同一状态机内完成有限网络重试。
+#[cfg(test)]
 pub(crate) async fn execute_llm_request_with_retry<L, D>(
     llm: &L,
     client: &L::Client,
@@ -139,12 +135,48 @@ where
     L: LlmRequestExecutor,
     D: AsyncDelay,
 {
-    execute_llm_request_with_retry_inner(llm, client, messages, policy, delay, cancellation, || {})
-        .await
+    execute_llm_request_with_retry_observed(
+        llm,
+        client,
+        messages,
+        policy,
+        delay,
+        cancellation,
+        || {},
+    )
+    .await
+}
+
+/// 执行共享请求状态机，并在第一次真实外部 attempt 开始时报告任务准入。
+pub(crate) async fn execute_llm_request_with_retry_observed<L, D, H>(
+    llm: &L,
+    client: &L::Client,
+    messages: &[ChatMessage],
+    policy: LlmRequestRetryPolicy<'_>,
+    delay: &D,
+    cancellation: &CooperativeCancellation,
+    on_first_attempt_started: H,
+) -> LlmRequestExecution<L::Error>
+where
+    L: LlmRequestExecutor,
+    D: AsyncDelay,
+    H: FnOnce() + Send,
+{
+    execute_llm_request_with_retry_inner(
+        llm,
+        client,
+        messages,
+        policy,
+        delay,
+        cancellation,
+        || {},
+        on_first_attempt_started,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_llm_request_with_retry_inner<L, D, H>(
+async fn execute_llm_request_with_retry_inner<L, D, H, S>(
     llm: &L,
     client: &L::Client,
     messages: &[ChatMessage],
@@ -152,34 +184,61 @@ async fn execute_llm_request_with_retry_inner<L, D, H>(
     delay: &D,
     cancellation: &CooperativeCancellation,
     after_completed_wait_check: H,
+    on_first_attempt_started: S,
 ) -> LlmRequestExecution<L::Error>
 where
     L: LlmRequestExecutor,
     D: AsyncDelay,
     H: Fn(),
+    S: FnOnce() + Send,
 {
     let mut evidence = AttemptEvidenceBuilder::new();
     let mut attempt = NonZeroUsize::MIN;
     let mut retry_delays = policy.retry_delays.iter().copied();
+    let mut on_first_attempt_started = Some(on_first_attempt_started);
 
     loop {
         if cancellation.is_requested() {
-            evidence.begin_attempt(attempt);
-            return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
+            return finish(LlmRequestExecutionOutcome::Cancelled, evidence);
         }
 
-        evidence.begin_attempt(attempt);
-        match llm.request(client, messages).await {
+        let mut attempt_reported = false;
+        let result = llm
+            .request_with_attempt_observer(
+                client,
+                messages,
+                Box::new(|| {
+                    attempt_reported = true;
+                    evidence.begin_attempt(attempt);
+                    if let Some(on_started) = on_first_attempt_started.take() {
+                        on_started();
+                    }
+                }),
+            )
+            .await;
+        match result {
             Ok(response) => {
+                if !attempt_reported {
+                    evidence.begin_attempt(attempt);
+                    if let Some(on_started) = on_first_attempt_started.take() {
+                        on_started();
+                    }
+                }
                 return finish(
                     LlmRequestExecutionOutcome::Response { response, attempt },
                     evidence,
                 );
             }
             Err(LlmRequestError::Fatal(source)) => {
+                if source.request_was_sent() && !attempt_reported {
+                    evidence.begin_attempt(attempt);
+                    if let Some(on_started) = on_first_attempt_started.take() {
+                        on_started();
+                    }
+                }
                 let cancelled = cancellation.is_requested() && source.is_cancelled_wait();
                 if cancelled {
-                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
+                    return finish(LlmRequestExecutionOutcome::Cancelled, evidence);
                 }
                 let diagnostic = {
                     DiagnosticReport::new(
@@ -192,24 +251,13 @@ where
                     llm.stop_admission(service_status, &diagnostic);
                 }
                 return finish(
-                    LlmRequestExecutionOutcome::Fatal {
-                        attempt,
-                        source,
-                        diagnostic,
-                    },
+                    LlmRequestExecutionOutcome::Fatal { source, diagnostic },
                     evidence,
                 );
             }
-            Err(LlmRequestError::AdmissionStopped {
-                service_status,
-                diagnostic,
-            }) => {
+            Err(LlmRequestError::AdmissionStopped { diagnostic, .. }) => {
                 return finish(
-                    LlmRequestExecutionOutcome::AdmissionStopped {
-                        attempt,
-                        diagnostic,
-                        service_status,
-                    },
+                    LlmRequestExecutionOutcome::AdmissionStopped { diagnostic },
                     evidence,
                 );
             }
@@ -217,8 +265,14 @@ where
                 source,
                 retry_after,
             }) => {
+                if source.request_was_sent() && !attempt_reported {
+                    evidence.begin_attempt(attempt);
+                    if let Some(on_started) = on_first_attempt_started.take() {
+                        on_started();
+                    }
+                }
                 if cancellation.is_requested() && source.is_cancelled_wait() {
-                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
+                    return finish(LlmRequestExecutionOutcome::Cancelled, evidence);
                 }
 
                 let diagnostic = DiagnosticReport::new(
@@ -268,20 +322,20 @@ where
                     biased;
                     () = &mut cancelled => {
                         return finish(
-                            LlmRequestExecutionOutcome::Cancelled { attempt },
+                            LlmRequestExecutionOutcome::Cancelled,
                             evidence,
                         );
                     }
                     () = &mut waiting => {}
                 }
                 if cancellation.is_requested() {
-                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
+                    return finish(LlmRequestExecutionOutcome::Cancelled, evidence);
                 }
                 // 这条同步观察只供竞态测试在“等待已完成、下一请求尚未准入”的
                 // 精确边界注入取消；生产调用传入零成本空闭包。
                 after_completed_wait_check();
                 if cancellation.is_requested() {
-                    return finish(LlmRequestExecutionOutcome::Cancelled { attempt }, evidence);
+                    return finish(LlmRequestExecutionOutcome::Cancelled, evidence);
                 }
                 attempt = attempt.saturating_add(1);
             }
@@ -294,6 +348,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::fmt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
     use crate::diagnostic::{Diagnostic, RuntimeComponent, RuntimeIssue, RuntimeOperation};
@@ -315,6 +370,10 @@ mod tests {
     impl LlmRequestFailure for FakeError {
         fn is_cancelled_wait(&self) -> bool {
             self.0 == "cancelled-wait"
+        }
+
+        fn request_was_sent(&self) -> bool {
+            !matches!(self.0, "cancelled-wait" | "not-sent")
         }
     }
 
@@ -341,6 +400,24 @@ mod tests {
                 .expect("响应队列锁不应中毒")
                 .pop_front()
                 .expect("测试必须准备足够响应")
+        }
+
+        async fn request_with_attempt_observer<'a>(
+            &'a self,
+            client: &'a Self::Client,
+            messages: &'a [ChatMessage],
+            on_attempt_started: Box<dyn FnOnce() + Send + 'a>,
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            let result = self.request(client, messages).await;
+            let was_sent = match &result {
+                Ok(_) | Err(LlmRequestError::Retryable { .. }) => true,
+                Err(LlmRequestError::Fatal(source)) => source.request_was_sent(),
+                Err(LlmRequestError::AdmissionStopped { .. }) => false,
+            };
+            if was_sent {
+                on_attempt_started();
+            }
+            result
         }
 
         fn request_diagnostic(
@@ -406,11 +483,7 @@ mod tests {
         .await;
         let (outcome, evidence) = execution.into_parts();
 
-        assert!(matches!(
-            outcome,
-            LlmRequestExecutionOutcome::Cancelled { attempt }
-                if attempt == NonZeroUsize::MIN
-        ));
+        assert!(matches!(outcome, LlmRequestExecutionOutcome::Cancelled));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 1);
         assert_eq!(
             evidence.attempt_count(),
@@ -453,16 +526,13 @@ mod tests {
                     std::thread::yield_now();
                 }
             },
+            || {},
         )
         .await;
         canceller.join().expect("取消线程不应 panic");
         let (outcome, evidence) = execution.into_parts();
 
-        assert!(matches!(
-            outcome,
-            LlmRequestExecutionOutcome::Cancelled { attempt }
-                if attempt == NonZeroUsize::MIN
-        ));
+        assert!(matches!(outcome, LlmRequestExecutionOutcome::Cancelled));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 1);
         assert_eq!(evidence.attempt_count(), 1);
     }
@@ -497,5 +567,67 @@ mod tests {
         ));
         assert_eq!(*calls.lock().expect("请求计数锁不应中毒"), 2);
         assert_eq!(evidence.attempt_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn admission_stop_without_http_has_zero_attempts() {
+        let started = Arc::new(AtomicBool::new(false));
+        let llm = FakeLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([Err(
+                LlmRequestError::AdmissionStopped {
+                    diagnostic: DiagnosticReport::new(
+                        StateEffect::ProgressPreserved,
+                        Diagnostic::runtime(RuntimeIssue::ExecutorClosed {
+                            component: RuntimeComponent::Process,
+                            operation: RuntimeOperation::ExecuteTask,
+                        }),
+                    ),
+                },
+            )]))),
+            calls: Arc::new(Mutex::new(0)),
+        };
+
+        let observed_started = Arc::clone(&started);
+        let execution = execute_llm_request_with_retry_observed(
+            &llm,
+            &(),
+            &[],
+            LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &CooperativeCancellation::default(),
+            move || observed_started.store(true, Ordering::Release),
+        )
+        .await;
+        let (outcome, evidence) = execution.into_parts();
+
+        assert!(matches!(
+            outcome,
+            LlmRequestExecutionOutcome::AdmissionStopped { .. }
+        ));
+        assert_eq!(evidence.attempt_count(), 0);
+        assert!(!started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn failure_before_http_has_zero_attempts() {
+        let llm = FakeLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([Err(LlmRequestError::Fatal(
+                FakeError("not-sent"),
+            ))]))),
+            calls: Arc::new(Mutex::new(0)),
+        };
+
+        let execution = execute_llm_request_with_retry(
+            &llm,
+            &(),
+            &[],
+            LlmRequestRetryPolicy::new(&[], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &CooperativeCancellation::default(),
+        )
+        .await;
+        let (_, evidence) = execution.into_parts();
+
+        assert_eq!(evidence.attempt_count(), 0);
     }
 }

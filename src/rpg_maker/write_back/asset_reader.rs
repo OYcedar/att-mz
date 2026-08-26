@@ -19,6 +19,7 @@ use crate::diagnostic::{
     TranslationPlanningResourceProblem,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::fingerprint::Sha256Fingerprint;
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::asset::{RpgMakerAssetOwner, RpgMakerTextSnapshotFingerprintBuilder};
@@ -103,6 +104,7 @@ fn read_rpg_maker_write_back_owner_units() -> String {
     format!(
         "SELECT\n    text_group.group_location,\n    \
          {RPG_MAKER_TEXT_UNIT_CONTENT_PROJECTION},\n    \
+         unit.translation_state,\n    \
          unit.rule_number,\n    \
          text_group.group_kind,\n    \
          text_group.projection_recipe_json,\n    \
@@ -350,6 +352,10 @@ where
     + use<Q, C> {
         let database_path = project.database_path().to_path_buf();
         let current_source = project.source_snapshot_fingerprint();
+        let source_language = project.source_language().as_str().to_owned();
+        let target_language = project.target_language().as_str().to_owned();
+        let applicability_source_language = source_language.clone();
+        let applicability_target_language = target_language.clone();
         let engine = project.layout().rpg_maker_layout().engine();
         let dialogue_definition = project.mv_dialogue_definition().clone();
         let sqlite = Arc::clone(&self.sqlite);
@@ -403,7 +409,9 @@ where
             }
 
             let decoded_records = cpu
-                .execute_ordered_map(prepared.records, decode_record)
+                .execute_ordered_map(prepared.records, move |record| {
+                    decode_record_for_language(record, &source_language, &target_language)
+                })
                 .await
                 .map_err(
                     |source| RpgMakerWriteBackAssetReadingError::ScheduleDecode {
@@ -462,9 +470,14 @@ where
                                 true,
                             ),
                         };
-                    let mut snapshot =
-                        assemble_snapshot(owner_states, decoded, &dialogue_definition_json)?
-                            .with_candidate_validation(candidate_validation);
+                    let mut snapshot = assemble_snapshot(
+                        owner_states,
+                        decoded,
+                        &dialogue_definition_json,
+                        &applicability_source_language,
+                        &applicability_target_language,
+                    )?
+                    .with_candidate_validation(candidate_validation);
                     snapshot
                         .apply_layout_rules(&layout_rules)
                         .map_err(|source| {
@@ -1621,8 +1634,9 @@ enum DecodedRecord {
         source_content: TextUnitContent,
         source_content_json: String,
         source_context_json: String,
-        translation_content: Option<TextUnitContent>,
-        manual: bool,
+        automatic_translation: Option<(TextUnitContent, Sha256Fingerprint)>,
+        manual_translation: Option<TextUnitContent>,
+        recipe_shape: String,
         readable_id: String,
         rule_number: Option<usize>,
     },
@@ -1635,12 +1649,16 @@ enum DecodedRecord {
     },
 }
 
-fn decode_record(
+fn decode_record_for_language(
     row: SnapshotAssetRow,
+    source_language: &str,
+    target_language: &str,
 ) -> Result<DecodedRecord, InvalidRpgMakerWriteBackAssetSnapshot> {
     match row {
         SnapshotAssetRow::Group(row) => decode_group(row),
-        SnapshotAssetRow::Unit(row) => decode_unit(row),
+        SnapshotAssetRow::Unit(row) => {
+            decode_unit_for_language(row, source_language, target_language)
+        }
         SnapshotAssetRow::Claim(row) => decode_claim(row),
     }
 }
@@ -1672,14 +1690,40 @@ fn decode_group(
     })
 }
 
-fn decode_unit(
+fn decode_unit_for_language(
     OwnerPartitionedSqliteRow { owner, row }: OwnerPartitionedSqliteRow,
+    source_language: &str,
+    target_language: &str,
 ) -> Result<DecodedRecord, InvalidRpgMakerWriteBackAssetSnapshot> {
-    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 11).map_err(map_storage_row_error)?;
+    let mut row = RpgMakerAssetStorageRowDecoder::new(row, 12).map_err(map_storage_row_error)?;
     let storage = RpgMakerTextUnitStorageRow::decode(&mut row).map_err(map_storage_row_error)?;
-    let automatic_translation = storage
+    let stored_automatic_translation = storage
         .decode_translation_content()
         .map_err(map_storage_row_error)?;
+    let automatic_state = row
+        .optional_blob("translation_state")
+        .map_err(map_storage_row_error)?;
+    let automatic_translation = match (stored_automatic_translation, automatic_state) {
+        (None, None) => None,
+        (Some(translation), Some(state)) => {
+            let state =
+                crate::fingerprint::Sha256Fingerprint::from_slice(&state).map_err(|error| {
+                    InvalidRpgMakerWriteBackAssetSnapshot::InvalidFingerprintLength {
+                        owner,
+                        column: "translation_state",
+                        actual: error.actual(),
+                    }
+                })?;
+            Some((translation, state))
+        }
+        _ => {
+            return Err(InvalidRpgMakerWriteBackAssetSnapshot::WrongColumnType {
+                column: "automatic_translation",
+                expected: "正文与状态同时存在或同时缺失",
+                actual: "不完整自动译文",
+            });
+        }
+    };
     let rule_number = row
         .optional_integer("rule_number")
         .map_err(map_storage_row_error)?;
@@ -1736,13 +1780,17 @@ fn decode_unit(
         RpgMakerProjectionCodec::encode_role_recipe_shape(&projection_recipe_json, &role)
             .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidProjection)?;
     let expected_manual_state = crate::manual::rpg_maker_manual_applicability(
-        owner.storage_name(),
-        &group_location_raw,
-        &group_kind_raw,
-        &role_raw,
-        &recipe_shape,
-        manual_type,
-        &source_lines,
+        crate::manual::RpgMakerManualApplicabilityFacts {
+            owner: owner.storage_name(),
+            group_location: &group_location_raw,
+            kind: &group_kind_raw,
+            role: &role_raw,
+            recipe_shape: &recipe_shape,
+            translation_type: manual_type,
+            source_language,
+            target_language,
+            source: &source_lines,
+        },
     );
     let manual_translation = match (manual_translation_json, manual_state) {
         (None, None) => None,
@@ -1786,8 +1834,6 @@ fn decode_unit(
             });
         }
     };
-    let manual = manual_translation.is_some();
-    let translation_content = manual_translation.or(automatic_translation);
     Ok(DecodedRecord::Unit {
         owner,
         group_location_raw,
@@ -1798,11 +1844,26 @@ fn decode_unit(
         source_content,
         source_content_json,
         source_context_json,
-        translation_content,
-        manual,
+        automatic_translation,
+        manual_translation,
+        recipe_shape,
         readable_id,
         rule_number,
     })
+}
+
+#[cfg(test)]
+fn decode_record(
+    row: SnapshotAssetRow,
+) -> Result<DecodedRecord, InvalidRpgMakerWriteBackAssetSnapshot> {
+    decode_record_for_language(row, "ja", "zh-Hans")
+}
+
+#[cfg(test)]
+fn decode_unit(
+    row: OwnerPartitionedSqliteRow,
+) -> Result<DecodedRecord, InvalidRpgMakerWriteBackAssetSnapshot> {
+    decode_unit_for_language(row, "ja", "zh-Hans")
 }
 
 fn decode_claim(
@@ -1834,10 +1895,70 @@ struct GroupBuilder {
     group_location_raw: String,
     semantic_order_key: RpgMakerSemanticOrderKey,
     kind: TextGroupKind,
+    group_kind_raw: String,
     location: RpgMakerLocation,
     recipes: Vec<TextProjectionRecipe>,
-    units: Vec<RpgMakerWriteBackUnit>,
+    units: Vec<PendingWriteBackUnit>,
     unit_order_keys: HashMap<RpgMakerSemanticOrderKey, TextUnitRole>,
+}
+
+struct PendingWriteBackUnit {
+    role: TextUnitRole,
+    role_raw: String,
+    semantic_order_key: RpgMakerSemanticOrderKey,
+    source_content: TextUnitContent,
+    source_content_json: String,
+    source_context_json: String,
+    automatic_translation: Option<(TextUnitContent, Sha256Fingerprint)>,
+    manual_translation: Option<TextUnitContent>,
+    recipe_shape: String,
+    rule_number: Option<usize>,
+}
+
+fn logical_group_source_contexts(groups: &[GroupBuilder]) -> HashMap<String, Sha256Fingerprint> {
+    let mut logical_group_indexes = HashMap::<String, Vec<usize>>::new();
+    for (index, group) in groups.iter().enumerate() {
+        logical_group_indexes
+            .entry(group.group_location_raw.clone())
+            .or_default()
+            .push(index);
+    }
+
+    logical_group_indexes
+        .into_iter()
+        .map(|(group_location, indexes)| {
+            let definition = &groups[indexes[0]];
+            debug_assert!(indexes.iter().all(|index| {
+                groups[*index].kind == definition.kind
+                    && groups[*index].semantic_order_key == definition.semantic_order_key
+            }));
+            let mut units = indexes
+                .iter()
+                .flat_map(|index| groups[*index].units.iter())
+                .collect::<Vec<_>>();
+            units.sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
+            let encoded_unit_orders = units
+                .iter()
+                .map(|unit| {
+                    unit.semantic_order_key
+                        .encode()
+                        .expect("已经从规范持久编码解出的 Unit 顺序键必须能重新编码")
+                })
+                .collect::<Vec<_>>();
+            let context = crate::translation::rpg_maker_group_source_context_v2(
+                &definition.group_kind_raw,
+                units.iter().zip(&encoded_unit_orders).map(|(unit, order)| {
+                    (
+                        unit.role_raw.as_str(),
+                        order.as_slice(),
+                        unit.source_content_json.as_str(),
+                        unit.source_context_json.as_str(),
+                    )
+                }),
+            );
+            (group_location, context)
+        })
+        .collect()
 }
 
 /// 校验侧对 `rpg_maker_asset` 唯一 framing 定义的薄包装。
@@ -1895,6 +2016,8 @@ fn assemble_snapshot(
     owner_states: HashMap<RpgMakerAssetOwner, OwnerState>,
     records: impl IntoIterator<Item = DecodedRecord>,
     dialogue_definition_json: &str,
+    source_language: &str,
+    target_language: &str,
 ) -> Result<RpgMakerWriteBackSnapshot, InvalidRpgMakerWriteBackAssetSnapshot> {
     let mut groups = Vec::<GroupBuilder>::new();
     let mut group_indexes = HashMap::<RpgMakerAssetOwner, HashMap<String, usize>>::new();
@@ -1971,6 +2094,7 @@ fn assemble_snapshot(
                     group_location_raw,
                     semantic_order_key,
                     kind,
+                    group_kind_raw,
                     location: group_location,
                     recipes,
                     units: Vec::new(),
@@ -1987,8 +2111,9 @@ fn assemble_snapshot(
                 source_content,
                 source_content_json,
                 source_context_json,
-                translation_content,
-                manual,
+                automatic_translation,
+                manual_translation,
+                recipe_shape,
                 readable_id: _,
                 rule_number,
             } => {
@@ -2013,7 +2138,7 @@ fn assemble_snapshot(
                 let group = &mut groups[index];
                 if group
                     .unit_order_keys
-                    .insert(semantic_order_key, role.clone())
+                    .insert(semantic_order_key.clone(), role.clone())
                     .is_some()
                 {
                     return Err(
@@ -2023,17 +2148,18 @@ fn assemble_snapshot(
                         },
                     );
                 }
-                let unit = if manual {
-                    RpgMakerWriteBackUnit::new_manual(
-                        role,
-                        source_content,
-                        translation_content.expect("当前人工译文必须包含正文"),
-                    )
-                } else {
-                    RpgMakerWriteBackUnit::new(role, source_content, translation_content)
-                }
-                .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
-                group.units.push(unit.with_rule_number(rule_number));
+                group.units.push(PendingWriteBackUnit {
+                    role,
+                    role_raw,
+                    semantic_order_key,
+                    source_content,
+                    source_content_json,
+                    source_context_json,
+                    automatic_translation,
+                    manual_translation,
+                    recipe_shape,
+                    rule_number,
+                });
             }
             DecodedRecord::Claim {
                 owner,
@@ -2064,17 +2190,55 @@ fn assemble_snapshot(
         }
     }
 
+    let group_source_contexts = logical_group_source_contexts(&groups);
     let mut logical_claims = HashMap::<RpgMakerAssetOwner, Vec<EncodedMutationClaim>>::new();
     let mut validated_groups = Vec::with_capacity(groups.len());
-    for group in groups {
+    for mut group in groups {
         let group_location_raw = group.group_location_raw;
         let semantic_order_key = group.semantic_order_key;
         let owner = group.owner;
+        group
+            .units
+            .sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
+        let group_source_context = *group_source_contexts
+            .get(&group_location_raw)
+            .expect("每个 owner Group 都必须属于一个完整逻辑 Group");
+        let units = group
+            .units
+            .into_iter()
+            .map(|unit| {
+                let expected = crate::translation::rpg_maker_automatic_applicability_v2(
+                    source_language,
+                    target_language,
+                    owner.storage_name(),
+                    &group.group_kind_raw,
+                    &group_location_raw,
+                    &unit.role_raw,
+                    &unit.recipe_shape,
+                    &unit.source_content_json,
+                    &unit.source_context_json,
+                    group_source_context,
+                );
+                let automatic = unit.automatic_translation.and_then(|(translation, state)| {
+                    crate::translation::rpg_maker_automatic_applicability_is_current(
+                        state, expected,
+                    )
+                    .then_some(translation)
+                });
+                let created = if let Some(manual) = unit.manual_translation {
+                    RpgMakerWriteBackUnit::new_manual(unit.role, unit.source_content, manual)
+                } else {
+                    RpgMakerWriteBackUnit::new(unit.role, unit.source_content, automatic)
+                }
+                .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
+                Ok(created.with_rule_number(unit.rule_number))
+            })
+            .collect::<Result<Vec<_>, InvalidRpgMakerWriteBackAssetSnapshot>>()?;
         let group = RpgMakerWriteBackGroup::from_recipes(
             owner,
             group.kind,
             group.location,
-            group.units,
+            units,
             group.recipes,
         )
         .map_err(InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel)?;
@@ -2748,7 +2912,7 @@ mod tests {
             ),
         ];
 
-        for (source, _legacy_expected_facts) in cases {
+        for (source, _discarded_expected_facts) in cases {
             let expected = write_back_model_violation(&source);
             let actual =
                 InvalidRpgMakerWriteBackAssetSnapshot::InvalidModel(source).diagnostic_violation();
@@ -2826,7 +2990,7 @@ mod tests {
         }
         .diagnostic_violation();
 
-        for (violation, _legacy_expected_facts) in [
+        for (violation, _discarded_expected_facts) in [
             (
                 dialogue,
                 &["rule_number=7", "engine=pcre2", "code=", "offset="][..],
@@ -2956,6 +3120,7 @@ mod tests {
                     SqliteValue::Text("{}".to_owned()),
                     SqliteValue::Null,
                     SqliteValue::Null,
+                    SqliteValue::Null,
                     SqliteValue::Text("database_entry".to_owned()),
                     SqliteValue::Text(recipes_raw.clone()),
                     SqliteValue::Null,
@@ -3033,7 +3198,13 @@ mod tests {
             .into_iter()
             .map(decode_record)
             .collect::<Result<Vec<_>, _>>()?;
-        assemble_snapshot(prepared.owner_states, records, "{\"rules\":[]}")
+        assemble_snapshot(
+            prepared.owner_states,
+            records,
+            "{\"rules\":[]}",
+            "ja",
+            "zh-Hans",
+        )
     }
 
     #[test]
@@ -3281,6 +3452,7 @@ mod tests {
             SqliteValue::Text(source_content_json),
             SqliteValue::Text(context),
             SqliteValue::Text(translation_content_json),
+            SqliteValue::Blob(vec![0x44; 32]),
             SqliteValue::Null,
             SqliteValue::Text("database_entry".to_owned()),
             SqliteValue::Text("[]".to_owned()),
@@ -3295,7 +3467,7 @@ mod tests {
             source_content,
             source_content_json,
             source_context_json,
-            translation_content: Some(translation_content),
+            automatic_translation: Some((translation_content, _)),
             ..
         } = decode_unit(row).expect("测试单元行应可解码")
         else {
@@ -3331,6 +3503,8 @@ mod tests {
                 prepared.owner_states,
                 Vec::new(),
                 DIALOGUE_DEFINITION,
+                "ja",
+                "zh-Hans",
             ),
             Err(InvalidRpgMakerWriteBackAssetSnapshot::AssetFingerprintMismatch {
                 owner
@@ -3347,8 +3521,14 @@ mod tests {
             SourceSnapshotFingerprint::from_bytes([1; 32]),
         )
         .expect("owner 行应可解码");
-        assemble_snapshot(prepared.owner_states, Vec::new(), DIALOGUE_DEFINITION)
-            .expect("Builtin 指纹应包含活动 MV 对话定义");
+        assemble_snapshot(
+            prepared.owner_states,
+            Vec::new(),
+            DIALOGUE_DEFINITION,
+            "ja",
+            "zh-Hans",
+        )
+        .expect("Builtin 指纹应包含活动 MV 对话定义");
     }
 
     #[test]

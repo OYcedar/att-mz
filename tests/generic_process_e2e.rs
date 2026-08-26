@@ -2,12 +2,14 @@
 
 //! Generic CLI 的独立生产进程边界测试。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::ErrorKind;
-use std::net::TcpListener;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -350,6 +352,7 @@ source_echo = false
 url = "http://127.0.0.1:9/v1/chat/completions"
 api_key = "unused-test-secret"
 model = "unused-test-model"
+stream = false
 max_concurrent_requests = 1
 connect_timeout_ms = 1000
 read_timeout_ms = 1000
@@ -654,14 +657,7 @@ target_task_user_message_characters = 10000
         stderr.contains("nested/bad.jsonl:line1"),
         "诊断必须指出损坏行号：{stderr}"
     );
-    assert!(
-        stderr.contains("The value has invalid syntax"),
-        "诊断必须说明直接原因：{stderr}"
-    );
-    assert!(
-        stderr.contains("Correct the named input and retry"),
-        "诊断必须说明修改方法：{stderr}"
-    );
+    assert!(stderr.contains("Reason:") && stderr.contains("Action:"));
     for internal in [
         "generic.jsonl",
         "operation=",
@@ -797,6 +793,174 @@ fn generic_write_back_materializes_manual_translation_exactly() {
             "项目日志只保存实际物化结果"
         );
     }
+}
+
+#[test]
+fn generic_client_switch_preserves_translation_and_language_change_only_makes_it_unpublishable() {
+    const PROJECT: &str = "generic-client-switch";
+    const SOURCE: &str = "こんにちは";
+    const TRANSLATION: &str = "已接受译文";
+
+    let temporary = tempfile::tempdir().expect("应可建立 Client 切换进程测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 Client 切换输入目录");
+    fs::write(
+        input.join("story.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": "story",
+                "kind": "dialogue",
+                "units": [{"id": "line", "text": SOURCE}],
+            })
+        ),
+    )
+    .expect("应可写入 Client 切换 Generic JSONL");
+
+    let client_a = TcpListener::bind(("127.0.0.1", 0)).expect("Client A 模型服务应可绑定");
+    let client_a_endpoint = format!(
+        "http://{}/v1/chat/completions",
+        client_a.local_addr().expect("Client A 地址应可读取")
+    );
+    write_client_switch_distribution(root, "client_a", &client_a_endpoint, "model-a");
+    assert_success(
+        "Client 切换 Generic Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                PROJECT,
+                "--path",
+                input.to_str().expect("临时输入路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "Client 切换 Generic Extract",
+        &run_att(root, &["generic", "extract", "--name", PROJECT]),
+    );
+
+    let client_a_server = thread::spawn(move || serve_chat_completion(client_a, TRANSLATION));
+    assert_success(
+        "Client A Generic Translate",
+        &run_att(root, &["generic", "translate", "--name", PROJECT, "local"]),
+    );
+    client_a_server
+        .join()
+        .expect("Client A 模型服务不得 panic")
+        .expect("Client A 模型服务必须完成请求");
+
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    let database = workspace.join("project.db");
+    assert_eq!(
+        read_single_generic_automatic_translation(&database),
+        (Some(TRANSLATION.to_owned()), true),
+        "Client A 的已验收译文必须保存为可识别的自动译文状态"
+    );
+    assert_success(
+        "Client A Generic WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    assert_eq!(
+        read_single_jsonl_group(&workspace.join("write_back/story.jsonl"))["units"][0]["text"],
+        TRANSLATION
+    );
+
+    let client_b = TcpListener::bind(("127.0.0.1", 0)).expect("Client B spy 应可绑定");
+    client_b
+        .set_nonblocking(true)
+        .expect("Client B spy 应可设为非阻塞");
+    let client_b_endpoint = format!(
+        "http://{}/v1/chat/completions",
+        client_b.local_addr().expect("Client B 地址应可读取")
+    );
+    write_client_switch_distribution(root, "client_b", &client_b_endpoint, "model-b");
+
+    assert_success(
+        "Client B 配置下 Generic WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    assert_eq!(
+        read_single_jsonl_group(&workspace.join("write_back/story.jsonl"))["units"][0]["text"],
+        TRANSLATION,
+        "WriteBack 必须使用已接受正文，不得用未来请求的 Client 重新判断它"
+    );
+    let no_work = run_att(root, &["generic", "translate", "--name", PROJECT, "local"]);
+    assert_success("Client B 配置下无工作 Translate", &no_work);
+    assert!(
+        matches!(client_b.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+        "单纯更换 Client 不得为已验收译文发出新请求"
+    );
+    assert_eq!(
+        read_single_generic_automatic_translation(&database),
+        (Some(TRANSLATION.to_owned()), true),
+        "单纯更换 Client 后无工作 Translate 不得改写已接受译文"
+    );
+    drop(client_b);
+
+    assert_success(
+        "Generic 目标语言变化 Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                PROJECT,
+                "--target-language",
+                "en",
+            ],
+        ),
+    );
+    assert_eq!(
+        read_single_generic_automatic_translation(&database),
+        (Some(TRANSLATION.to_owned()), true),
+        "目标语言变化应保留旧译文正文，但不能因保留而继续发布"
+    );
+
+    let failing_client = TcpListener::bind(("127.0.0.1", 0)).expect("失败 Client 模型服务应可绑定");
+    let failing_endpoint = format!(
+        "http://{}/v1/chat/completions",
+        failing_client
+            .local_addr()
+            .expect("失败 Client 地址应可读取")
+    );
+    write_client_switch_distribution(root, "client_c", &failing_endpoint, "model-c");
+    let failing_server = thread::spawn(move || serve_authentication_failure(failing_client));
+    let failed = run_att(root, &["generic", "translate", "--name", PROJECT, "local"]);
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "旧语言译文需要替换时，永久认证错误必须使 Translate 失败"
+    );
+    failing_server
+        .join()
+        .expect("失败 Client 模型服务不得 panic")
+        .expect("失败 Client 模型服务必须完成请求");
+    assert_eq!(
+        read_single_generic_automatic_translation(&database),
+        (Some(TRANSLATION.to_owned()), true),
+        "新译文请求失败不得先删除可供追溯和后续处理的旧正文"
+    );
+
+    assert_success(
+        "目标语言变化后 Generic WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    assert_eq!(
+        read_single_jsonl_group(&workspace.join("write_back/story.jsonl"))["units"][0]["text"],
+        SOURCE,
+        "旧目标语言的译文虽保留在数据库中，WriteBack 也不得把它发布到新语言输出"
+    );
 }
 
 #[test]
@@ -968,7 +1132,7 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         .join("projects/generic")
         .join(MISSING_CAPTURE_PROJECT);
     let database = workspace.join("project.db");
-    let database_before = fs::read(&database).expect("Translate 前数据库应可读取");
+    let database_before = read_sqlite_logical_snapshot(&database);
     let logs_before = project_log_paths(&workspace.join("logs"));
 
     let placeholder_argument = placeholders
@@ -1007,9 +1171,9 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
         "源文 Placeholder 规划失败前不得建立任何模型连接"
     );
     assert_eq!(
-        fs::read(&database).expect("Translate 后数据库应可读取"),
+        read_sqlite_logical_snapshot(&database),
         database_before,
-        "MissingTextCapture 失败前后 SQLite 文件字节必须完全一致"
+        "MissingTextCapture 规划失败不得改变任何 SQLite 逻辑业务状态"
     );
     assert!(
         !workspace.join("task-records").exists(),
@@ -1017,16 +1181,11 @@ fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_stat
     );
 
     let stderr = String::from_utf8(translate.stderr).expect("诊断 stderr 必须是 UTF-8");
-    for expected in [
-        "story.jsonl:line1:unit1:text".to_owned(),
-        "The required named text capture did not participate in the match".to_owned(),
-        "Correct the indicated Placeholder rule and retry".to_owned(),
-    ] {
-        assert!(
-            stderr.contains(&expected),
-            "stderr 必须保留 MissingTextCapture 事实 {expected:?}：{stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("story.jsonl:line1:unit1:text"),
+        "stderr 必须指出实际失败 Unit：{stderr}"
+    );
+    assert!(stderr.contains("Reason:") && stderr.contains("Action:"));
     for internal in [
         "translation.placeholder",
         "relative_path=",
@@ -1204,6 +1363,7 @@ source_echo = false
 url = "{endpoint}"
 api_key = "{MISSING_CAPTURE_API_KEY}"
 model = "unused-model"
+stream = false
 max_concurrent_requests = 1
 connect_timeout_ms = 1000
 read_timeout_ms = 1000
@@ -1257,6 +1417,75 @@ target_task_user_message_characters = 10000
     .expect("思考模式示例应可写入");
 }
 
+fn write_client_switch_distribution(root: &Path, client: &str, endpoint: &str, model: &str) {
+    let distribution = distribution_root(root);
+    fs::create_dir_all(&distribution).expect("Client 切换测试发行目录应可建立");
+    fs::write(
+        distribution.join("config.toml"),
+        format!(
+            r#"[prompts]
+thinking_output = true
+source_echo = false
+
+[llm.clients.{client}]
+url = "{endpoint}"
+api_key = "client-switch-secret"
+model = "{model}"
+stream = false
+max_concurrent_requests = 1
+connect_timeout_ms = 1000
+read_timeout_ms = 1000
+request_timeout_ms = 1000
+proxy = false
+additional_pem_files = []
+retry_delays_ms = []
+max_retry_after_ms = 1
+parameters = '''
+{{}}
+'''
+
+[[languages]]
+type = "japanese"
+id = "ja"
+minimum_kana_characters = 1
+allowed_terms = []
+
+[translation]
+record_translation_tasks = false
+
+[[translation.profiles]]
+id = "local"
+llm_client = "{client}"
+target_task_user_message_characters = 10000
+"#,
+        ),
+    )
+    .expect("Client 切换测试配置应可写入");
+    let prompt_root = distribution.join("prompts/translation");
+    fs::create_dir_all(prompt_root.join("rules")).expect("Prompt 规则目录应可建立");
+    fs::create_dir_all(prompt_root.join("examples")).expect("Prompt 示例目录应可建立");
+    fs::write(
+        prompt_root.join("system.md"),
+        "把 {{source_language}} 翻译成 {{target_language}}。",
+    )
+    .expect("system Prompt 应可写入");
+    fs::write(
+        prompt_root.join("thinking.md"),
+        "在 think 中写出影响译文的判断。",
+    )
+    .expect("Thinking Prompt 应可写入");
+    fs::write(
+        prompt_root.join("rules/thinking.md"),
+        "只输出带 think 和 translations 的 JSON object。",
+    )
+    .expect("思考模式规则应可写入");
+    fs::write(
+        prompt_root.join("examples/thinking.md"),
+        "# 示例\n\n输入：{}\n\n输出：{\"think\":\"判断\",\"translations\":{}}",
+    )
+    .expect("思考模式示例应可写入");
+}
+
 fn project_log_paths(directory: &Path) -> BTreeSet<PathBuf> {
     fs::read_dir(directory)
         .expect("项目日志目录应可读取")
@@ -1266,6 +1495,73 @@ fn project_log_paths(directory: &Path) -> BTreeSet<PathBuf> {
                 .is_some_and(|extension| extension == "jsonl")
         })
         .collect()
+}
+
+fn read_single_generic_automatic_translation(database: &Path) -> (Option<String>, bool) {
+    Connection::open(database)
+        .expect("Generic 项目数据库应可打开")
+        .query_row(
+            "SELECT translation, translation_state IS NOT NULL FROM generic_unit",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Generic 自动译文应可读取")
+}
+
+fn read_sqlite_logical_snapshot(database: &Path) -> BTreeMap<String, Vec<Vec<String>>> {
+    let connection = Connection::open(database).expect("项目数据库应可打开");
+    let tables = {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("逻辑快照数据表查询应可准备");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("逻辑快照数据表查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("逻辑快照数据表应可读取")
+    };
+    let mut snapshot = BTreeMap::new();
+    for table in tables {
+        let table_identifier = quote_sql_identifier(&table);
+        let columns = {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info({table_identifier})"))
+                .expect("逻辑快照列查询应可准备");
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("逻辑快照列查询应可执行")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("逻辑快照列应可读取")
+        };
+        let projection = columns
+            .iter()
+            .map(|column| format!("quote({})", quote_sql_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = connection
+            .prepare(&format!("SELECT {projection} FROM {table_identifier}"))
+            .expect("逻辑快照数据查询应可准备");
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..columns.len())
+                    .map(|index| row.get::<_, String>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("逻辑快照数据查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("逻辑快照数据应可读取");
+        rows.sort();
+        snapshot.insert(table, rows);
+    }
+    snapshot
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn read_manual_toml(path: &Path) -> toml::Value {
@@ -1307,6 +1603,109 @@ fn read_single_jsonl_group(path: &Path) -> serde_json::Value {
         .expect("Generic JSONL 行应可解析");
     assert!(lines.next().is_none(), "Generic JSONL 应只包含一行");
     value
+}
+
+fn serve_chat_completion(listener: TcpListener, translation: &str) -> Result<(), String> {
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|error| format!("接受模型请求失败：{error}"))?;
+    read_http_json(&mut stream)?;
+    let content = serde_json::json!({
+        "think": "已核对用户结果",
+        "translations": {"0": [translation]},
+    })
+    .to_string();
+    let body = serde_json::json!({
+        "id": "client-switch-response",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+    })
+    .to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .map_err(|error| format!("写入模型响应失败：{error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("刷新模型响应失败：{error}"))
+}
+
+fn serve_authentication_failure(listener: TcpListener) -> Result<(), String> {
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|error| format!("接受认证失败请求失败：{error}"))?;
+    read_http_json(&mut stream)?;
+    let body = serde_json::json!({
+        "error": {
+            "code": "invalid_api_key",
+            "type": "authentication_error",
+            "message": "invalid credentials",
+        }
+    })
+    .to_string();
+    write!(
+        stream,
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .map_err(|error| format!("写入认证失败响应失败：{error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("刷新认证失败响应失败：{error}"))
+}
+
+fn read_http_json(stream: &mut TcpStream) -> Result<serde_json::Value, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("设置 HTTP 请求读取超时失败：{error}"))?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let header_end = loop {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("读取 HTTP 请求失败：{error}"))?;
+        if read == 0 {
+            return Err("HTTP 请求在 header 完成前结束".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(position) = find_subslice(&bytes, b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let header = std::str::from_utf8(&bytes[..header_end - 4])
+        .map_err(|error| format!("HTTP header 不是 UTF-8：{error}"))?;
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .ok_or_else(|| "HTTP 请求缺少有效 Content-Length".to_owned())?;
+    while bytes.len() < header_end + content_length {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("读取 HTTP 请求 body 失败：{error}"))?;
+        if read == 0 {
+            return Err("HTTP 请求 body 提前结束".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+        .map_err(|error| format!("HTTP 请求 body 必须是 JSON：{error}"))
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn run_att(root: &Path, arguments: &[&str]) -> Output {

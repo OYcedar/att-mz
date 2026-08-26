@@ -92,6 +92,9 @@ code、数据库行、owner、group location、unit role、编码位置、SQLite
 每个实际开始的模型任务恰好写一条 `task.finished`。结果可以是 complete、partial、
 unavailable、failed、not committed after an earlier failure 或 cancelled；没有开始的任务不
 伪造完成事件。
+任务只在第一次真实外部 HTTP attempt 开始时写 `task.started`。请求构造失败、准入前取消
+或服务停发门拒绝仍是 not_started，不会产生伪造的 attempt、started 或 `task.finished`。
+`task.finished.attempts` 必须大于零，并只计算该任务真实开始的 HTTP attempt。
 
 每次 Translate 恰好写一条 `translation.finished`，保存完整任务计数和对应引擎的业务
 汇总。计数满足：
@@ -106,6 +109,12 @@ Maker 汇总保存接受、写入、剩余、协议和协调结果。Generic 另
 remaining_units；RPG Maker 分别保存 remaining_decisions 与 remaining_locations。两者都
 保存 recoverable_request_exhaustions 和 request_admission_stopped。不同引擎不共用含义
 不同的字段。
+
+Generic 的 `planned_units - remaining_units` 是模型计划中已经成功写入的 Unit；
+`written_units` 还可以包含既有译文复用写入，因此不能用 `written_units` 反推模型剩余量。
+模型写入不得多于 accepted Unit，总写入减去模型写入不得多于本次复用目标。RPG Maker 的
+accepted decisions 不能多于 written locations，remaining decisions 不能多于
+remaining locations。NoWork 和 Complete 的剩余必须为零。
 
 只要 Translate 已经形成计划事实，Complete、Incomplete、Failed 和 Cancelled 都保存当时
 的 Task 计数和引擎汇总。Failed 或 Cancelled 不得把已经开始、未开始、已写入和剩余工作

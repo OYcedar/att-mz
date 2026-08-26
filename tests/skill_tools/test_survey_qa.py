@@ -84,7 +84,13 @@ def survey_game(tmp_path: Path) -> Path:
                 "Visible Label": "Visible option",
                 "Protocol Key": "main-key",
                 "Image": "pictures/Hero.png",
-                "Decoded Controls": json.dumps({"Label": r"\V[1]"}),
+                "Decoded Controls": json.dumps({"Label": "Decoded visible"}),
+                "One Parse": json.dumps({"Label": "[1,2]"}),
+                "Schema Choices": json.dumps(
+                    [json.dumps({"Name": "Schema visible", "Key": "schema-key", "Literal": "[3,4]"})]
+                ),
+                "JSON Lookalike": json.dumps({"Label": "Not consumed"}),
+                "Broken Schema": '[{"Name":"Broken"}',
                 "Page Break Label": "\f",
             },
         },
@@ -100,10 +106,29 @@ def survey_game(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (scripts / "Options.js").write_text(
+        "/*:\n"
+        " * @param Schema Choices\n"
+        " * @type struct<SchemaChoice>[]\n"
+        " * @param Broken Schema\n"
+        " * @type struct<SchemaChoice>[]\n"
+        " */\n"
+        "/*~struct~SchemaChoice:\n"
+        " * @param Name\n"
+        " * @type string\n"
+        " * @param Key\n"
+        " * @type string\n"
+        " * @param Literal\n"
+        " * @type string\n"
+        " */\n"
         "const p = PluginManager.parameters('Options');\n"
         "const file = 'helpers/one.js';\n"
         "window.drawText(p.Categories, 0, 0);\n"
         "window.drawText(p['Visible Label'], 0, 0);\n"
+        "window.drawText(JSON.parse(p['Decoded Controls']).Label, 0, 0);\n"
+        "window.drawText(JSON.parse(p['One Parse']).Label, 0, 0);\n"
+        "function unrelatedConsumer(p) {\n"
+        "  window.drawText(JSON.parse(p['JSON Lookalike']).Label, 0, 0);\n"
+        "}\n"
         "if (p['Default Category'] === 'General') {}\n"
         "if (p['Protocol Key'] === 'main-key') {}\n"
         "window.drawText('Direct visible', 0, 0);\n"
@@ -231,10 +256,56 @@ def test_survey_keeps_every_fact_and_builds_relation_groups(survey_game: Path, t
     assert "Recursive visible" in by_text
     assert "Direct HTML visible" in by_text
     decoded_control = next(
-        item for item in by_text[r"\V[1]"] if item.get("source") == "plugin:Options:parameters"
+        item for item in by_text["Decoded visible"] if item.get("source") == "plugin:Options:parameters"
     )
-    assert decoded_control["decode_positions"]
-    assert decoded_control["source_text"] == r"\V[1]"
+    assert decoded_control["decode_positions"] == [3]
+    assert decoded_control["source_text"] == "Decoded visible"
+    assert any(
+        evidence.get("basis") == "json_parse"
+        for evidence in cast(list[dict[str, object]], decoded_control["consumer_evidence"])
+    )
+    one_parse_literal = next(
+        item
+        for item in by_text["[1,2]"]
+        if item.get("source") == "plugin:Options:parameters" and "One Parse" in str(item.get("location"))
+    )
+    assert one_parse_literal["decode_positions"] == [3]
+    schema_literal = next(
+        item for item in by_text["[3,4]"] if item.get("source") == "plugin:Options:parameters"
+    )
+    assert schema_literal["decode_positions"] == [3, 4]
+    schema_visible = next(
+        item for item in by_text["Schema visible"] if item.get("source") == "plugin:Options:parameters"
+    )
+    assert schema_visible["decode_positions"] == [3, 4]
+    assert schema_visible.get("expected_manual_id") is not None
+    assert any(
+        evidence.get("basis") == "plugin_schema"
+        for evidence in cast(list[dict[str, object]], schema_visible["consumer_evidence"])
+    )
+    json_lookalike = next(
+        item
+        for item in locations
+        if item.get("source") == "plugin:Options:parameters"
+        and item.get("source_text") == json.dumps({"Label": "Not consumed"})
+    )
+    assert json_lookalike["source_text"] == json.dumps({"Label": "Not consumed"})
+    assert json_lookalike["decode_positions"] == []
+    assert "rule" not in json_lookalike
+    assert "expected_manual_id" not in json_lookalike
+    assert "Not consumed" not in by_text
+    broken_schema = next(
+        item
+        for item in locations
+        if item.get("source") == "plugin:Options:parameters"
+        and item.get("source_text") == '[{"Name":"Broken"}'
+    )
+    assert "rule" not in broken_schema
+    assert "expected_manual_id" not in broken_schema
+    assert any(
+        evidence.get("kind") == "serialized_plugin_parameter_invalid"
+        for evidence in cast(list[dict[str, object]], broken_schema["consumer_evidence"])
+    )
     actor_damage = next(
         item for item in by_text["%1 takes %2 damage"] if item.get("expected_manual_id") is not None
     )
@@ -270,6 +341,16 @@ def test_survey_keeps_every_fact_and_builds_relation_groups(survey_game: Path, t
         item for item in by_text["main-key"] if item.get("source") == "plugin:Options:parameters"
     )
     assert visible_parameter["review_group_id"] != protocol_parameter["review_group_id"]
+    serialized_options = next(
+        item
+        for item in locations
+        if item.get("source") == "plugin:Options:parameters"
+        and str(item.get("location", "")).endswith("Options")
+    )
+    assert str(serialized_options["source_text"]).startswith('[{"Name": "[General] One"')
+    assert "rule" not in serialized_options
+    assert "expected_manual_id" not in serialized_options
+    assert "[General] One" not in by_text
     groups = read_jsonl(output / "review-groups.jsonl")
     assert [group["group_id"] for group in groups] == [
         f"group-{number:06d}" for number in range(1, len(groups) + 1)
@@ -280,7 +361,7 @@ def test_survey_keeps_every_fact_and_builds_relation_groups(survey_game: Path, t
     ]
     category_ids = {
         str(item["candidate_id"])
-        for text in ("General, Misc, Sound, Toggles", "General", "Misc")
+        for text in ("General, Misc, Sound, Toggles", "General")
         for item in by_text[text]
         if item["source"] == "plugin:Options:parameters"
     }
@@ -429,6 +510,13 @@ def test_finalize_uses_target_owner_and_audit_findings_are_nonfatal(
     wrapped_contract = cast(dict[str, object], wrapped["control_contract"])
     assert wrapped_contract["consumer"] == "plain_text"
     assert "text[0]" in str(wrapped["manual_id"])
+    decoded_control = next(item for item in projection if item["source_text"] == "Decoded visible")
+    assert decoded_control["owner"] == "rules"
+    schema_visible = next(item for item in projection if item["source_text"] == "Schema visible")
+    assert schema_visible["owner"] == "rules"
+    assert all(item["source_text"] != json.dumps({"Label": "Decoded visible"}) for item in projection)
+    serialized_schema = json.dumps([json.dumps({"Name": "Schema visible", "Key": "schema-key"})])
+    assert all(item["source_text"] != serialized_schema for item in projection)
     assert all("group_number" not in item for item in coverage["dispositions"])
     manifest = json.loads((plan / "rules-manifest.json").read_text(encoding="utf-8"))["rules"]
     assert "THIS_PREVIEW_MUST_NOT_BECOME_A_RULE" not in json.dumps(manifest)
@@ -594,18 +682,19 @@ def test_finalize_publishes_att_generic_input_and_qa_uses_the_exact_recipe(
             }
         ],
     )
-    write_back = tmp_path / "write-back.json"
-    write_json(
-        write_back,
-        {
-            "source_unchanged": True,
-            "output_json_valid": True,
-            "structural_differences": 0,
-            "non_text_value_changes": [],
-        },
+    write_back = tmp_path / "generic-write-back"
+    output_path = write_back / "js" / "direct-custom.js.jsonl"
+    output_path.parent.mkdir(parents=True)
+    write_jsonl(
+        output_path,
+        [
+            {
+                "id": f"candidate:{selected_id}",
+                "kind": "javascript_literal",
+                "units": [{"id": selected_id, "text": "直接显示的中文"}],
+            }
+        ],
     )
-    runtime = tmp_path / "runtime.json"
-    write_json(runtime, {"qa_status": "clean"})
     qa = tmp_path / "qa"
     run_script(
         QA,
@@ -615,18 +704,23 @@ def test_finalize_publishes_att_generic_input_and_qa_uses_the_exact_recipe(
             translations,
             "--survey",
             survey_root,
+            "--coverage",
+            plan / "coverage.json",
             "--generic-manifest",
             plan / "generic" / "manifest.json",
-            "--write-back-preview",
+            "--write-back",
             write_back,
-            "--runtime-report",
-            runtime,
             "--output",
             qa,
         ],
     )
     summary = json.loads((qa / "qa-summary.json").read_text(encoding="utf-8"))
-    assert summary["qa_status"] == "clean"
+    assert summary["qa_status"] == "unverified"
+    assert summary["unverified"] == [
+        "translation_language_pair_unbound",
+        "runtime_observation_missing",
+        "generic_external_consumption_unverified",
+    ]
 
 
 def test_mv_without_dialogue_group_finalizes_normally(survey_game: Path, tmp_path: Path) -> None:

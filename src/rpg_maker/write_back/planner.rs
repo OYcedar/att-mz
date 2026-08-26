@@ -48,7 +48,7 @@ use crate::translation::layout_rules::{
 use crate::translation::placeholder::PlaceholderRestoreError;
 use crate::translation::placeholder::placeholder_bindings_match_within_slot;
 use crate::translation::placeholder_projection::PlaceholderMultisetError;
-use crate::translation::text_layout::{LayoutTextSyntax, layout_text};
+use crate::translation::text_layout::layout_text;
 use crate::translation::write_back_text::{
     PunctuationRepairError, PunctuationRepairOutcome, repair_punctuation_with_cancellation,
 };
@@ -164,6 +164,16 @@ impl RpgMakerWriteBackUnit {
         self.translation_content
             .as_ref()
             .unwrap_or(&self.source_content)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_content(&self) -> &TextUnitContent {
+        &self.source_content
+    }
+
+    #[cfg(test)]
+    pub(crate) fn translation_content(&self) -> Option<&TextUnitContent> {
+        self.translation_content.as_ref()
     }
 }
 
@@ -373,7 +383,6 @@ fn layout_rpg_maker_text_with_cancellation(
         protected.text(),
         max_fullwidth_chars,
         complete_continuation_whitespace,
-        LayoutTextSyntax::RpgMaker,
     ) else {
         return Ok(OperationCompletion::Completed(None));
     };
@@ -1020,6 +1029,11 @@ impl RpgMakerWriteBackGroup {
     pub(crate) fn mutation_claims(&self) -> &MutationClaimSet {
         &self.mutation_claims
     }
+
+    #[cfg(test)]
+    pub(crate) fn units(&self) -> &[RpgMakerWriteBackUnit] {
+        &self.units
+    }
 }
 
 fn validate_line_references(
@@ -1049,11 +1063,7 @@ fn validate_line_references(
             }
             continue;
         };
-        let expected_uses = if matches!(unit.role, TextUnitRole::Choices) {
-            2
-        } else {
-            1
-        };
+        let expected_uses = 1;
         if actual.len() != lines.len()
             || (0..lines.len()).any(|index| actual.get(&index) != Some(&expected_uses))
         {
@@ -1298,6 +1308,11 @@ impl RpgMakerWriteBackSnapshot {
     ) -> Self {
         self.candidate_validation = Some(context);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn groups(&self) -> &[RpgMakerWriteBackGroup] {
+        &self.groups
     }
 
     /// 对当前 Extract 的全部 Unit 编译规则并把宽度附着到唯一逻辑位置。
@@ -1825,7 +1840,7 @@ impl ReplaceDialogueMutation {
     }
 }
 
-/// 一个选项头及其同层分支标签的唯一原子修改。
+/// 一个 102 选项头的唯一原子修改。402 只承载运行时分支索引，不复制显示文案。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplaceChoicesMutation {
     group_location: RpgMakerLocation,
@@ -1912,7 +1927,7 @@ impl ReplaceChoicesMutation {
             *references.entry(*source_line_index).or_default() += 1;
         }
         if references.len() != source_lines.len()
-            || (0..source_lines.len()).any(|index| references.get(&index) != Some(&2))
+            || (0..source_lines.len()).any(|index| references.get(&index) != Some(&1))
         {
             return Err(RpgMakerWriteBackMutationPlanError::InvalidChoices {
                 group_location: Box::new(group_location),
@@ -2159,7 +2174,7 @@ impl fmt::Display for WriteBackChoicesPlanViolation {
             Self::BlankSlotChanged => "选项空白槽必须物化为精确空字符串",
             Self::InvalidRecipeShape => "选项配方必须只包含一个 Choices 行槽",
             Self::RecipeSourceMismatch => "选项配方与冻结原文不一致",
-            Self::IncompleteCommandCoverage => "每个选项必须同时对应 102 列表项和同层 402 标签",
+            Self::IncompleteCommandCoverage => "每个选项必须恰好对应一个 102 列表项",
         })
     }
 }
@@ -3137,7 +3152,7 @@ mod tests {
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
         ScalarFieldKey,
     };
-    use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource};
+    use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
 
     #[derive(Clone, Default)]
     struct RecordingPlanningProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
@@ -3869,15 +3884,24 @@ mod tests {
 
     #[test]
     fn continuation_whitespace_switch_handles_existing_rpg_maker_hard_lines_without_layout_rule() {
-        let build_snapshot = || {
-            let group_location = location(50, None);
-            let target = location(51, Some(0));
+        let build_snapshot = |source: &str, translation: &str| {
+            let group_location = RpgMakerLocation::value(
+                RpgMakerSource::Data(StandardDataFile::Items),
+                vec![RpgMakerLocationStep::index(50)],
+            );
+            let target = RpgMakerLocation::value(
+                RpgMakerSource::Data(StandardDataFile::Items),
+                vec![
+                    RpgMakerLocationStep::index(50),
+                    RpgMakerLocationStep::key("description"),
+                ],
+            );
             let role =
                 TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("字段名必须有效"));
             let recipes = vec![TextProjectionRecipe::Direct(
                 DirectTextRecipe::new(
                     target,
-                    "原文",
+                    source,
                     vec![DirectTextPart::TextSlot { role: role.clone() }],
                 )
                 .expect("续行测试直接配方必须有效"),
@@ -3889,8 +3913,8 @@ mod tests {
                 vec![
                     RpgMakerWriteBackUnit::new(
                         role,
-                        TextUnitContent::Value("原文".to_owned()),
-                        Some(TextUnitContent::Value("「甲\n\\SE[2]乙」".to_owned())),
+                        TextUnitContent::Value(source.to_owned()),
+                        Some(TextUnitContent::Value(translation.to_owned())),
                     )
                     .expect("续行测试单元必须有效"),
                 ],
@@ -3903,11 +3927,39 @@ mod tests {
                 .with_candidate_validation(candidate_validation_context())
         };
 
-        let disabled = plan_rpg_maker_write_back_with_options(build_snapshot(), false, false);
-        assert_eq!(only_set_text_replacement(&disabled), "「甲\n\\SE[2]乙」");
+        let disabled = plan_rpg_maker_write_back_with_options(
+            build_snapshot("「原\n\\C[2]文」", "「甲\n\\C[2]乙」"),
+            false,
+            false,
+        );
+        assert_eq!(only_set_text_replacement(&disabled), "「甲\n\\C[2]乙」");
 
-        let enabled = plan_rpg_maker_write_back_with_options(build_snapshot(), false, true);
-        assert_eq!(only_set_text_replacement(&enabled), "「甲\n\\SE[2]　乙」");
+        let enabled = plan_rpg_maker_write_back_with_options(
+            build_snapshot("「原\n\\C[2]文」", "「甲\n\\C[2]乙」"),
+            false,
+            true,
+        );
+        assert_eq!(
+            only_set_text_replacement(&enabled),
+            "「甲\n\\C[2]　乙」",
+            "标准消费者确认的内建控制符应先由 Placeholder 保护，再在其后补续行空白"
+        );
+
+        for (source, unknown) in [
+            ("「原\n\\SE[2]文」", "「甲\n\\SE[2]乙」"),
+            ("「原\n\\N<姓名>文」", "「甲\n\\N<姓名>乙」"),
+        ] {
+            let enabled = plan_rpg_maker_write_back_with_options(
+                build_snapshot(source, unknown),
+                false,
+                true,
+            );
+            assert_eq!(
+                only_set_text_replacement(&enabled),
+                unknown.replacen('\n', "\n　", 1),
+                "未知形式和 inline 姓名框没有当前标准消费者，必须按可见文本排版"
+            );
+        }
     }
 
     #[test]
@@ -3999,9 +4051,6 @@ mod tests {
             (location(20, Some(0)), 0),
             (location(20, Some(1)), 1),
             (location(20, Some(2)), 2),
-            (location(21, Some(1)), 0),
-            (location(22, Some(1)), 1),
-            (location(23, Some(1)), 2),
         ];
         let mut recipes = physical_targets
             .clone()
@@ -4068,12 +4117,7 @@ mod tests {
         let group_location = location(25, None);
         let source_lines = vec!["保留".to_owned(), " ".to_owned()];
         let replacement_lines = vec!["保留".to_owned(), "错误文字".to_owned()];
-        let physical_targets = [
-            (location(25, Some(0)), 0),
-            (location(25, Some(1)), 1),
-            (location(26, Some(1)), 0),
-            (location(27, Some(1)), 1),
-        ];
+        let physical_targets = [(location(25, Some(0)), 0), (location(25, Some(1)), 1)];
         let recipes = physical_targets
             .into_iter()
             .map(|(target, source_line_index)| {
@@ -4183,7 +4227,7 @@ mod tests {
         ));
 
         let group_location = location(43, None);
-        let targets = [location(44, Some(0)), location(45, Some(0))];
+        let targets = [location(44, Some(0))];
         let mut recipes = targets
             .iter()
             .cloned()

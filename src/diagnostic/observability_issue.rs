@@ -264,6 +264,10 @@ pub(crate) enum ObservabilityContractViolation {
     InvalidTaskTransition {
         ordinal: u64,
     },
+    InvalidTaskAttempts {
+        ordinal: u64,
+        attempts: u64,
+    },
     InconsistentTaskTotal,
     DuplicateTranslationFinished,
     DuplicatePublication,
@@ -310,6 +314,7 @@ impl ObservabilityContractViolation {
             Self::InvalidRunPlanTransaction => "invalid_run_plan_transaction",
             Self::DuplicateTask { .. } => "duplicate_task",
             Self::InvalidTaskTransition { .. } => "invalid_task_transition",
+            Self::InvalidTaskAttempts { .. } => "invalid_task_attempts",
             Self::InconsistentTaskTotal => "inconsistent_task_total",
             Self::DuplicateTranslationFinished => "duplicate_translation_finished",
             Self::DuplicatePublication => "duplicate_publication",
@@ -971,6 +976,10 @@ impl ObservabilityIssue {
                     ObservabilityContractViolation::DuplicateTask { ordinal }
                     | ObservabilityContractViolation::InvalidTaskTransition { ordinal } => {
                         facts.push(("task_ordinal", ordinal.to_string()));
+                    }
+                    ObservabilityContractViolation::InvalidTaskAttempts { ordinal, attempts } => {
+                        facts.push(("task_ordinal", ordinal.to_string()));
+                        facts.push(("attempts", attempts.to_string()));
                     }
                     ObservabilityContractViolation::InvalidCancellationCount {
                         confirmed,

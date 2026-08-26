@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import time
 import tomllib
@@ -33,10 +32,6 @@ from att_skill_tools import (
     validate_object_keys,
     write_json,
 )
-from att_toolbox.rpg_control_codes import (
-    PLAIN_TEXT,
-    is_structural_blank,
-)
 from att_toolbox.survey import (
     GENERIC_EVIDENCE_FIELDS,
     json_lines,
@@ -45,6 +40,7 @@ from att_toolbox.survey import (
     scan_game,
     verify_source_baseline,
 )
+from att_toolbox.survey_projection import project_builtin_units, project_rule_units
 
 _OWNERS = {"rules", "generic", "exclude", "unresolved"}
 
@@ -432,157 +428,6 @@ def _generic_materials(
     return files, manifest
 
 
-def _projection_row(
-    manual_id: str,
-    source_text: str,
-    manual_type: str,
-    control_contract: Mapping[str, JsonValue],
-    location: Mapping[str, JsonValue],
-    *,
-    owner: str,
-    rule_number: int | None = None,
-) -> dict[str, JsonValue]:
-    row: dict[str, JsonValue] = {
-        "manual_id": manual_id,
-        "source_text": source_text,
-        "manual_type": manual_type,
-        "control_contract": dict(control_contract),
-        "source": cast(str, location["source"]),
-        "candidate_id": cast(str, location["candidate_id"]),
-        "owner": owner,
-    }
-    review_group_id = location.get("review_group_id")
-    if isinstance(review_group_id, str):
-        row["review_group_id"] = review_group_id
-    if rule_number is not None:
-        row["rule_number"] = rule_number
-    return row
-
-
-def _project_builtin_units(
-    locations: Sequence[Mapping[str, JsonValue]],
-) -> tuple[list[dict[str, JsonValue]], list[str]]:
-    projection: list[dict[str, JsonValue]] = []
-    for item in locations:
-        if item.get("classification") != "builtin":
-            continue
-        manual_id = item.get("expected_manual_id")
-        if not isinstance(manual_id, str):
-            continue
-        source_text = item.get("source_text")
-        manual_type = item.get("manual_type")
-        control_contract = item.get("control_contract")
-        source = item.get("source")
-        candidate_id = item.get("candidate_id")
-        if (
-            not isinstance(source_text, str)
-            or manual_type not in {"fixed", "free"}
-            or not isinstance(control_contract, dict)
-            or not isinstance(source, str)
-            or not isinstance(candidate_id, str)
-        ):
-            fail("locations.jsonl", f"{manual_id} 缺少 Builtin 投影事实", "使用当前工具重新执行 scan")
-
-        projection.append(
-            _projection_row(
-                manual_id,
-                source_text,
-                cast(str, manual_type),
-                control_contract,
-                item,
-                owner="builtin",
-            )
-        )
-    return projection, []
-
-
-def _rule_control_contract(
-    location: Mapping[str, JsonValue],
-) -> dict[str, JsonValue]:
-    explicit = location.get("control_contract")
-    if isinstance(explicit, dict):
-        return dict(explicit)
-    return PLAIN_TEXT.json()
-
-
-def _python_extract_pattern(pattern: str) -> re.Pattern[str]:
-    candidate = re.sub(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>", r"(?P<\1>", pattern).replace(r"\z", r"\Z")
-    try:
-        return re.compile(candidate)
-    except re.error as error:
-        fail("rules-manifest.json", f"Rules pattern 无法由调查器投影：{error}", "重新运行 scan/finalize")
-
-
-def _project_rule_units(
-    manifest: Sequence[Mapping[str, JsonValue]],
-    locations_by_id: Mapping[str, Mapping[str, JsonValue]],
-) -> list[dict[str, JsonValue]]:
-    projection: list[dict[str, JsonValue]] = []
-    for manifest_item in manifest:
-        rule = manifest_item.get("rule")
-        raw_candidate_ids = manifest_item.get("candidate_ids")
-        rule_number = manifest_item.get("rule_number")
-        if (
-            not isinstance(rule, dict)
-            or not isinstance(raw_candidate_ids, list)
-            or not isinstance(rule_number, int)
-        ):
-            fail("rules-manifest.json", "Rules manifest 缺少投影事实", "重新运行 scan/finalize")
-        pattern = rule.get("pattern")
-        compiled = _python_extract_pattern(pattern) if isinstance(pattern, str) else None
-        for raw_candidate_id in raw_candidate_ids:
-            if not isinstance(raw_candidate_id, str) or raw_candidate_id not in locations_by_id:
-                fail("rules-manifest.json", "Rules manifest 引用了未知位置", "重新运行 scan/finalize")
-            location = locations_by_id[raw_candidate_id]
-            manual_id = location.get("expected_manual_id")
-            source_text = location.get("source_text")
-            manual_type = location.get("manual_type")
-            if (
-                not isinstance(manual_id, str)
-                or not isinstance(source_text, str)
-                or manual_type not in {"fixed", "free"}
-            ):
-                fail("locations.jsonl", f"{raw_candidate_id} 缺少 Rules 投影事实", "重新运行 scan")
-            projected_texts: list[str]
-            if compiled is None:
-                projected_texts = [source_text]
-            else:
-                if "text" not in compiled.groupindex:
-                    fail(
-                        "rules-manifest.json",
-                        f"第 {rule_number} 条 pattern 缺少 text 捕获",
-                        "重新运行 finalize",
-                    )
-                projected_texts = [
-                    match.group("text")
-                    for match in compiled.finditer(source_text)
-                    if match.group("text") is not None and not is_structural_blank(match.group("text"))
-                ]
-                if not projected_texts:
-                    fail(
-                        "rules-manifest.json",
-                        f"第 {rule_number} 条不能投影 {manual_id}",
-                        "来源或规则已不一致；重新运行 scan/finalize",
-                    )
-            contract = _rule_control_contract(location)
-            for unit_index, projected_text in enumerate(projected_texts):
-                projected_id = re.sub(r"text\[0\]\Z", f"text[{unit_index}]", manual_id)
-                if projected_id == manual_id and unit_index != 0:
-                    fail("locations.jsonl", f"{manual_id} 不能表达多个 Rules Unit", "重新运行 scan")
-                projection.append(
-                    _projection_row(
-                        projected_id,
-                        projected_text,
-                        cast(str, manual_type),
-                        contract,
-                        location,
-                        owner="rules",
-                        rule_number=rule_number,
-                    )
-                )
-    return projection
-
-
 def _finalize(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     survey_root = require_directory(args.survey, "survey 作业目录")
@@ -758,8 +603,12 @@ def _finalize(args: argparse.Namespace) -> int:
     engine = survey.get("engine")
     if engine not in {"mv", "mz"}:
         fail(str(survey_root / "survey.json"), "engine 无效", "重新运行 scan")
-    builtin_projection, _dialogue_unverified = _project_builtin_units(locations)
-    rules_projection = _project_rule_units(manifest, locations_by_id)
+    builtin_projection = project_builtin_units(locations)
+    rules_projection = project_rule_units(
+        manifest,
+        locations_by_id,
+        validate_expected_manual_ids=False,
+    )
     projected_rule_ids: dict[int, list[str]] = {}
     for item in rules_projection:
         projected_rule_ids.setdefault(cast(int, item["rule_number"]), []).append(cast(str, item["manual_id"]))

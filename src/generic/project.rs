@@ -610,9 +610,10 @@ pub(crate) struct RejectedTranslationWrite {
     pub(crate) translation: Option<Vec<String>>,
     pub(crate) violation: ProvenInvariantViolation,
     pub(crate) planning_state: Sha256Fingerprint,
+    pub(crate) expected_translation: Option<GenericStoredTranslation>,
 }
 
-/// 一条已经由当前 Translate 语义确认失效、准备以 CAS 清除的旧译文。
+/// 一条已经证明违反当前强不变量、准备以 CAS 转入 Rejected 的旧译文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranslationClear {
     pub(crate) group_id: String,
@@ -621,7 +622,7 @@ pub(crate) struct TranslationClear {
     pub(crate) expected_source_text: String,
     pub(crate) expected_group_context: Sha256Fingerprint,
     pub(crate) expected_translation: GenericStoredTranslation,
-    pub(crate) violation: Option<ProvenInvariantViolation>,
+    pub(crate) violation: ProvenInvariantViolation,
     pub(crate) rejection_planning_state: Sha256Fingerprint,
 }
 
@@ -761,7 +762,6 @@ impl GenericProjectStore {
                 .target_language
                 .unwrap_or_else(|| current.language_pair.target().clone());
             validate_distinct_languages(&source_language, &target_language)?;
-            let source_changed = source_root != current.source_root;
             let language_changed = source_language != *current.language_pair.source()
                 || target_language != *current.language_pair.target();
 
@@ -787,29 +787,30 @@ impl GenericProjectStore {
                             operation: "更新 Generic 项目事实",
                             source,
                         })?;
-                    if source_changed || language_changed {
-                        clear_extracted_assets(transaction)?;
+                    if language_changed {
+                        transaction
+                            .execute(
+                                "UPDATE translation_resource
+                                 SET canonical_json = '[]'
+                                 WHERE resource_kind = ?1",
+                                [TERMINOLOGY_RESOURCE],
+                            )
+                            .map_err(|source| GenericProjectError::Sqlite {
+                                operation: "清空旧语言对的 Generic 术语",
+                                source,
+                            })?;
                     }
                     Ok(())
                 },
             )?;
-            let (extracted_raw_fingerprint, extracted_asset_fingerprint) =
-                if source_changed || language_changed {
-                    (None, None)
-                } else {
-                    (
-                        current.extracted_raw_fingerprint,
-                        current.extracted_asset_fingerprint,
-                    )
-                };
             Ok(GenericProject {
                 project_name: current.project_name,
                 workspace_root: self.workspace_root.clone(),
                 database_path: self.database_path.clone(),
                 source_root,
                 language_pair: LanguagePair::new(source_language, target_language),
-                extracted_raw_fingerprint,
-                extracted_asset_fingerprint,
+                extracted_raw_fingerprint: current.extracted_raw_fingerprint,
+                extracted_asset_fingerprint: current.extracted_asset_fingerprint,
                 last_profile_id: current.last_profile_id,
             })
         } else {
@@ -1312,6 +1313,15 @@ impl GenericProjectStore {
                 let mut rejected = 0_usize;
                 for rejection in rejections {
                     self.ensure_not_cancelled()?;
+                    let (expected_translation, expected_state) = rejection
+                        .expected_translation
+                        .as_ref()
+                        .map_or((None, None), |translation| {
+                            (
+                                Some(translation.translation.as_str()),
+                                Some(translation.state_fingerprint.as_bytes().as_slice()),
+                            )
+                        });
                     let current: i64 = transaction
                         .query_row(
                             "SELECT count(*)
@@ -1322,8 +1332,18 @@ impl GenericProjectStore {
                                AND unit.unit_id = ?2
                                AND unit.source_text = ?3
                                AND group_record.context_fingerprint = ?4
-                               AND unit.translation IS NULL
-                               AND unit.translation_state IS NULL
+                               AND (
+                                   (
+                                       ?6 IS NULL
+                                       AND unit.translation IS NULL
+                                       AND unit.translation_state IS NULL
+                                   )
+                                   OR
+                                   (
+                                       unit.translation = ?6
+                                       AND unit.translation_state = ?7
+                                   )
+                               )
                                AND NOT EXISTS (
                                    SELECT 1 FROM generic_manual_translation AS manual
                                    WHERE manual.group_id = unit.group_id
@@ -1339,6 +1359,8 @@ impl GenericProjectStore {
                                     .expected_manual_applicability
                                     .as_bytes()
                                     .as_slice(),
+                                expected_translation,
+                                expected_state,
                             ],
                             |row| row.get(0),
                         )
@@ -1745,31 +1767,29 @@ impl GenericProjectStore {
                         };
                         if changed == 1 {
                             committed += 1;
-                            if let Some(violation) = &invalidation.violation {
-                                let source = invalidation
-                                    .expected_source_text
-                                    .split('\n')
-                                    .map(str::to_owned)
-                                    .collect::<Vec<_>>();
-                                save_rejected
-                                    .execute(params![
-                                        invalidation.group_id,
-                                        invalidation.unit_id,
-                                        invalidation.readable_id,
-                                        invalidation.expected_translation.origin.storage_name(),
-                                        serde_json::to_string(&source)
-                                            .expect("Generic Rejected 原文必须可以编码"),
-                                        expected_translation_json,
-                                        invalidation.expected_group_context.as_bytes().as_slice(),
-                                        serde_json::to_string(violation)
-                                            .expect("Generic Rejected 原因必须可以编码"),
-                                        invalidation.rejection_planning_state.as_bytes().as_slice(),
-                                    ])
-                                    .map_err(|source| GenericProjectError::Sqlite {
-                                        operation: "保存失效 Generic 候选",
-                                        source,
-                                    })?;
-                            }
+                            let source = invalidation
+                                .expected_source_text
+                                .split('\n')
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>();
+                            save_rejected
+                                .execute(params![
+                                    invalidation.group_id,
+                                    invalidation.unit_id,
+                                    invalidation.readable_id,
+                                    invalidation.expected_translation.origin.storage_name(),
+                                    serde_json::to_string(&source)
+                                        .expect("Generic Rejected 原文必须可以编码"),
+                                    expected_translation_json,
+                                    invalidation.expected_group_context.as_bytes().as_slice(),
+                                    serde_json::to_string(&invalidation.violation)
+                                        .expect("Generic Rejected 原因必须可以编码"),
+                                    invalidation.rejection_planning_state.as_bytes().as_slice(),
+                                ])
+                                .map_err(|source| GenericProjectError::Sqlite {
+                                    operation: "保存失效 Generic 候选",
+                                    source,
+                                })?;
                         } else {
                             conflicts.push((
                                 clone_text_with_cancellation(
@@ -3177,23 +3197,28 @@ fn reconcile_snapshot(
             )?;
             let previous_group =
                 find_previous_group_with_cancellation(&previous_groups, group.id(), cancellation)?;
-            let preserve_units = match previous_group {
-                Some(old) => group_allows_unit_preservation(old, group, cancellation)?,
-                None => false,
-            };
-            let previous_units = previous_group
-                .filter(|_| preserve_units)
-                .map(|old| old.units.as_slice());
+            let mut previous_units = HashMap::<Sha256Fingerprint, Vec<&GenericStoredUnit>>::new();
+            if let Some(previous_group) = previous_group {
+                for previous_unit in &previous_group.units {
+                    ensure_generic_operation_not_cancelled(cancellation)?;
+                    let fingerprint = lookup_text_fingerprint_with_cancellation(
+                        previous_unit.id.as_str(),
+                        cancellation,
+                    )?;
+                    previous_units
+                        .entry(fingerprint)
+                        .or_default()
+                        .push(previous_unit);
+                }
+            }
             let mut units = Vec::with_capacity(group.units().len());
             for (unit_ordinal, unit) in group.units().iter().enumerate() {
                 ensure_generic_operation_not_cancelled(cancellation)?;
-                let translation = match previous_units.and_then(|units| units.get(unit_ordinal)) {
+                let previous_unit =
+                    find_previous_unit_with_cancellation(&previous_units, unit.id(), cancellation)?;
+                let translation = match previous_unit {
                     Some(old)
                         if bytes_equal_with_cancellation(
-                            old.id.as_bytes(),
-                            unit.id().as_bytes(),
-                            cancellation,
-                        )? && bytes_equal_with_cancellation(
                             old.source_text.as_bytes(),
                             unit.text().as_bytes(),
                             cancellation,
@@ -3211,13 +3236,9 @@ fn reconcile_snapshot(
                     }
                     _ => None,
                 };
-                let rejected = match previous_units.and_then(|units| units.get(unit_ordinal)) {
+                let rejected = match previous_unit {
                     Some(old)
                         if bytes_equal_with_cancellation(
-                            old.id.as_bytes(),
-                            unit.id().as_bytes(),
-                            cancellation,
-                        )? && bytes_equal_with_cancellation(
                             old.source_text.as_bytes(),
                             unit.text().as_bytes(),
                             cancellation,
@@ -3310,58 +3331,22 @@ fn clone_stored_rejected_translation_with_cancellation(
     })
 }
 
-fn group_allows_unit_preservation(
-    previous: &GenericStoredGroup,
-    current: &super::jsonl::GenericGroup,
+fn find_previous_unit_with_cancellation<'a>(
+    previous_units: &HashMap<Sha256Fingerprint, Vec<&'a GenericStoredUnit>>,
+    unit_id: &str,
     cancellation: &CooperativeCancellation,
-) -> Result<bool, GenericProjectError> {
-    if !bytes_equal_with_cancellation(
-        previous.kind.as_bytes(),
-        current.kind().as_bytes(),
-        cancellation,
-    )? || previous.units.len() != current.units().len()
-    {
-        return Ok(false);
-    }
-    for (left, right) in previous.units.iter().zip(current.units()) {
-        ensure_generic_operation_not_cancelled(cancellation)?;
-        if !bytes_equal_with_cancellation(
-            left.source_text.as_bytes(),
-            right.text().as_bytes(),
-            cancellation,
-        )? {
-            return Ok(false);
+) -> Result<Option<&'a GenericStoredUnit>, GenericProjectError> {
+    let fingerprint = lookup_text_fingerprint_with_cancellation(unit_id, cancellation)?;
+    let Some(candidates) = previous_units.get(&fingerprint) else {
+        return Ok(None);
+    };
+    for candidate in candidates {
+        if bytes_equal_with_cancellation(candidate.id.as_bytes(), unit_id.as_bytes(), cancellation)?
+        {
+            return Ok(Some(*candidate));
         }
     }
-    // 新 ID 表示原位置 Unit 改名；旧 ID 出现在新位置则说明稳定 Unit 确实发生了调序。
-    let mut previous_ordinals =
-        HashMap::<Sha256Fingerprint, Vec<(usize, &str)>>::with_capacity(previous.units.len());
-    for (ordinal, unit) in previous.units.iter().enumerate() {
-        ensure_generic_operation_not_cancelled(cancellation)?;
-        let fingerprint =
-            lookup_text_fingerprint_with_cancellation(unit.id.as_str(), cancellation)?;
-        previous_ordinals
-            .entry(fingerprint)
-            .or_default()
-            .push((ordinal, unit.id.as_str()));
-    }
-    for (ordinal, unit) in current.units().iter().enumerate() {
-        ensure_generic_operation_not_cancelled(cancellation)?;
-        let fingerprint = lookup_text_fingerprint_with_cancellation(unit.id(), cancellation)?;
-        if let Some(candidates) = previous_ordinals.get(&fingerprint) {
-            for (previous_ordinal, previous_id) in candidates {
-                if bytes_equal_with_cancellation(
-                    previous_id.as_bytes(),
-                    unit.id().as_bytes(),
-                    cancellation,
-                )? && *previous_ordinal != ordinal
-                {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    Ok(true)
+    Ok(None)
 }
 
 fn find_previous_group_with_cancellation<'a>(
@@ -3661,15 +3646,19 @@ fn replace_snapshot(
                     })?;
                 for unit in &group.units {
                     ensure_generic_operation_not_cancelled(cancellation)?;
-                    let (translation, state) =
-                        unit.translation
-                            .as_ref()
-                            .map_or((None, None), |translation| {
-                                (
-                                    Some(translation.translation.as_str()),
-                                    Some(translation.state_fingerprint.as_bytes().as_slice()),
-                                )
-                            });
+                    // 人工译文由独立表持有，并按当前位置重新计算适用性。把加载时覆盖在
+                    // Unit 上的人工正文写入自动列，会在文件移动等身份变化后把本应过期的
+                    // 人工译文伪装成 Current 自动译文。
+                    let (translation, state) = unit
+                        .translation
+                        .as_ref()
+                        .filter(|translation| translation.origin == TranslationOrigin::Automatic)
+                        .map_or((None, None), |translation| {
+                            (
+                                Some(translation.translation.as_str()),
+                                Some(translation.state_fingerprint.as_bytes().as_slice()),
+                            )
+                        });
                     unit_statement
                         .execute(params![
                             group.id,
@@ -4064,6 +4053,8 @@ fn load_snapshot_rows(
             &unit_id,
             &readable_path,
             group.kind(),
+            project.language_pair().source().as_str(),
+            project.language_pair().target().as_str(),
             &source_lines,
         );
         let manual_translation = match (manual_translation_json, manual_state) {
@@ -4552,25 +4543,6 @@ fn validate_schema_with_compiled_resources(
     }
     ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(compiled_resources)
-}
-
-fn clear_extracted_assets(transaction: &Transaction<'_>) -> Result<(), GenericProjectError> {
-    transaction
-        .execute("DELETE FROM generic_file", [])
-        .and_then(|_| {
-            transaction.execute(
-                "UPDATE generic_project
-                 SET extracted_raw_fingerprint = NULL,
-                     extracted_asset_fingerprint = NULL
-                 WHERE singleton = 1",
-                [],
-            )
-        })
-        .map_err(|source| GenericProjectError::Sqlite {
-            operation: "清理 Generic Extract 状态",
-            source,
-        })?;
-    Ok(())
 }
 
 fn resolve_source_root(path: &Path) -> Result<PathBuf, GenericProjectError> {
@@ -6392,7 +6364,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_preserves_moves_and_id_renames_but_clears_context_changes() {
+    fn extract_preserves_stable_units_and_retains_bodies_across_context_changes() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -6468,11 +6440,29 @@ mod tests {
         )
         .unwrap();
         store.extract().expect("kind 修改应成功");
-        assert!(
-            store.load_snapshot().unwrap().files()[0].groups()[0]
-                .units()
-                .iter()
-                .all(|unit| unit.translation().is_none())
+        let changed = store.load_snapshot().unwrap();
+        let changed_group = &changed.files()[0].groups()[0];
+        assert!(changed_group.units()[0].translation().is_none());
+        assert!(changed_group.units()[1].translation().is_none());
+        let retained = changed_group.units()[2]
+            .translation()
+            .expect("稳定 Unit 的正文不应因 kind 变化而删除");
+        assert_eq!(retained.translation(), "译丙");
+        assert_eq!(
+            retained.state_fingerprint(),
+            Sha256Fingerprint::from_bytes([7; 32]),
+            "Extract 只能保留正文和原状态，不能把无当前含义的状态升级成 V2"
+        );
+        assert_eq!(
+            crate::generic::current_translation_for_stored_with_cancellation(
+                changed.project(),
+                changed_group,
+                &changed_group.units()[2],
+                &CooperativeCancellation::default(),
+            )
+            .unwrap(),
+            None,
+            "旧 kind 语境的正文只保留为可逆旧值，不得继续作为 Current"
         );
     }
 
@@ -6705,12 +6695,15 @@ mod tests {
                 unit.id(),
                 "text.jsonl",
                 group.kind(),
+                "ja",
+                "zh-Hans",
                 &source_lines,
             ),
             candidate_json: "{\"wrong\":true}".to_owned(),
             translation: None,
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: state,
+            expected_translation: None,
         };
 
         let outcome = store
@@ -6777,6 +6770,135 @@ mod tests {
     }
 
     #[test]
+    fn rejected_candidate_cas_accepts_exact_stale_body_and_rejects_a_changed_body() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let workspace = temp.path().join("project");
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"k\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        );
+        let store = init(&workspace, &source);
+        store.extract().unwrap();
+        let snapshot = store.load_snapshot().unwrap();
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let old_state = crate::translation::generic_automatic_applicability_v2(
+            "ja",
+            "zh-Hans",
+            group.id(),
+            unit.id(),
+            unit.source_text(),
+            Sha256Fingerprint::from_bytes([91; 32]),
+        );
+        store
+            .commit_translations(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[TranslationWrite {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    expected_source_text: unit.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    translation: "旧语境译文".to_owned(),
+                    state_fingerprint: old_state,
+                    expected_translation: None,
+                }],
+            )
+            .unwrap();
+        let stale = store.load_snapshot().unwrap();
+        let group = &stale.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let previous = unit.translation().expect("旧正文必须保留").clone();
+        let source_lines = vec![unit.source_text().to_owned()];
+        let current_state = crate::translation::generic_automatic_applicability_v2(
+            "ja",
+            "zh-Hans",
+            group.id(),
+            unit.id(),
+            unit.source_text(),
+            group.context_fingerprint(),
+        );
+        let rejection = RejectedTranslationWrite {
+            group_id: group.id().to_owned(),
+            unit_id: unit.id().to_owned(),
+            readable_id: "text.jsonl:line1:unit1:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            expected_source_text: unit.source_text().to_owned(),
+            source: source_lines.clone(),
+            expected_group_context: group.context_fingerprint(),
+            expected_manual_applicability: crate::manual::generic_manual_applicability(
+                group.id(),
+                unit.id(),
+                "text.jsonl",
+                group.kind(),
+                "ja",
+                "zh-Hans",
+                &source_lines,
+            ),
+            candidate_json: "true".to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: current_state,
+            expected_translation: Some(previous.clone()),
+        };
+
+        let saved = store
+            .commit_translation_results_for_profile(
+                stale.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                std::slice::from_ref(&rejection),
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(saved.rejected, 1);
+        assert!(saved.conflicts.is_empty());
+        let retained = store.load_snapshot().unwrap();
+        let retained_unit = &retained.files()[0].groups()[0].units()[0];
+        assert_eq!(retained_unit.translation(), Some(&previous));
+        assert!(retained_unit.rejected().is_some());
+
+        let replacement = TranslationWrite {
+            group_id: rejection.group_id.clone(),
+            unit_id: rejection.unit_id.clone(),
+            expected_source_text: rejection.expected_source_text.clone(),
+            expected_group_context: rejection.expected_group_context,
+            translation: "新语境译文".to_owned(),
+            state_fingerprint: current_state,
+            expected_translation: Some(previous),
+        };
+        assert_eq!(
+            store
+                .commit_translations(
+                    retained.project().extracted_raw_fingerprint().unwrap(),
+                    &[replacement],
+                )
+                .unwrap()
+                .committed,
+            1
+        );
+        let conflict = store
+            .commit_translation_results_for_profile(
+                retained.project().extracted_raw_fingerprint().unwrap(),
+                &[],
+                &[rejection],
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(conflict.rejected, 0);
+        assert_eq!(conflict.conflicts, [("g".to_owned(), "u".to_owned())]);
+        let final_snapshot = store.load_snapshot().unwrap();
+        let final_unit = &final_snapshot.files()[0].groups()[0].units()[0];
+        assert_eq!(
+            final_unit
+                .translation()
+                .map(GenericStoredTranslation::translation),
+            Some("新语境译文")
+        );
+        assert!(final_unit.rejected().is_none());
+    }
+
+    #[test]
     fn stale_manual_translation_does_not_block_current_rejected_candidate() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
@@ -6797,6 +6919,8 @@ mod tests {
             unit.id(),
             "text.jsonl",
             group.kind(),
+            "ja",
+            "zh-Hans",
             &old_source,
         );
         let connection = Connection::open(&store.database_path).unwrap();
@@ -6830,6 +6954,7 @@ mod tests {
             translation: None,
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: Sha256Fingerprint::from_bytes([41; 32]),
+            expected_translation: None,
         };
         let current_outcome = store
             .commit_translation_results_for_profile(
@@ -6869,12 +6994,15 @@ mod tests {
                 unit.id(),
                 "text.jsonl",
                 group.kind(),
+                "ja",
+                "zh-Hans",
                 &source_lines,
             ),
             candidate_json: "{\"wrong\":true}".to_owned(),
             translation: None,
             violation: ProvenInvariantViolation::InvalidCandidateShape,
             planning_state: Sha256Fingerprint::from_bytes([42; 32]),
+            expected_translation: None,
         };
 
         let outcome = store
@@ -6983,6 +7111,8 @@ mod tests {
         let workspace = temp.path().join("project");
         let store = init(&workspace, &first_source);
         store.remember_profile("primary").unwrap();
+        store.extract().expect("空输入也应建立 Extract 快照");
+        let extracted_before_move = store.open().unwrap().extracted_raw_fingerprint();
 
         GenericProjectStore::initialize(GenericInitRequest {
             project_name: "game".parse().unwrap(),
@@ -6994,7 +7124,11 @@ mod tests {
         .expect("改变输入根应成功");
         let after_source_change = store.open().unwrap();
         assert_eq!(after_source_change.last_profile_id(), Some("primary"));
-        assert_eq!(after_source_change.extracted_raw_fingerprint(), None);
+        assert_eq!(
+            after_source_change.extracted_raw_fingerprint(),
+            extracted_before_move,
+            "只改变绑定路径不应删除最近一次成功 Extract 的事实"
+        );
 
         GenericProjectStore::initialize(GenericInitRequest {
             project_name: "game".parse().unwrap(),
@@ -7008,7 +7142,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_either_language_invalidates_extract_and_translations() {
+    fn changing_either_language_preserves_extract_and_translation_bodies() {
         for (source_language, target_language) in [(Some("en"), None), (None, Some("zh-Hant"))] {
             let temp = tempdir().unwrap();
             let source = temp.path().join("source");
@@ -7023,6 +7157,14 @@ mod tests {
             let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
             let group = &snapshot.files()[0].groups()[0];
             let unit = &group.units()[0];
+            let current_state = crate::translation::generic_automatic_applicability_v2(
+                snapshot.project().language_pair().source().as_str(),
+                snapshot.project().language_pair().target().as_str(),
+                group.id(),
+                unit.id(),
+                unit.source_text(),
+                group.context_fingerprint(),
+            );
             store
                 .commit_translations(
                     snapshot.project().extracted_raw_fingerprint().unwrap(),
@@ -7032,7 +7174,7 @@ mod tests {
                         expected_source_text: unit.source_text().to_owned(),
                         expected_group_context: group.context_fingerprint(),
                         translation: "译文".to_owned(),
-                        state_fingerprint: Sha256Fingerprint::from_bytes([31; 32]),
+                        state_fingerprint: current_state,
                         expected_translation: None,
                     }],
                 )
@@ -7048,12 +7190,14 @@ mod tests {
             .expect("改变语言应成功");
 
             let project = store.open().unwrap();
-            assert_eq!(project.extracted_raw_fingerprint(), None);
-            assert_eq!(project.extracted_asset_fingerprint(), None);
-            assert!(matches!(
-                store.load_snapshot(),
-                Err(GenericProjectError::ExtractRequired)
-            ));
+            assert_eq!(
+                project.extracted_raw_fingerprint(),
+                snapshot.project().extracted_raw_fingerprint()
+            );
+            assert_eq!(
+                project.extracted_asset_fingerprint(),
+                snapshot.project().extracted_asset_fingerprint()
+            );
             let connection = store.open_connection(false).unwrap();
             let asset_rows: i64 = connection
                 .query_row(
@@ -7065,8 +7209,404 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(asset_rows, 0, "语言变化必须同时删除 Extract 资产和译文");
+            assert_eq!(asset_rows, 3, "语言变化不应销毁仍可核对的 Extract 事实");
+            let retained_translation: Option<String> = connection
+                .query_row(
+                    "SELECT translation FROM generic_unit WHERE group_id = 'g' AND unit_id = 'u'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained_translation.as_deref(), Some("译文"));
+            drop(connection);
+            let changed = store.load_snapshot().unwrap();
+            let changed_group = &changed.files()[0].groups()[0];
+            let changed_unit = &changed_group.units()[0];
+            assert_eq!(
+                changed_unit.translation().unwrap().state_fingerprint(),
+                current_state,
+                "语言变化只能改变当前适用性，不能重写已有 V2 状态"
+            );
+            assert_eq!(
+                crate::generic::current_translation_for_stored_with_cancellation(
+                    changed.project(),
+                    changed_group,
+                    changed_unit,
+                    &CooperativeCancellation::default(),
+                )
+                .unwrap(),
+                None
+            );
+            let connection = store.open_connection(false).unwrap();
+            let terminology_json: String = connection
+                .query_row(
+                    "SELECT canonical_json FROM translation_resource
+                     WHERE resource_kind = 'terminology'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(terminology_json, "[]");
         }
+    }
+
+    #[test]
+    fn untagged_automatic_body_is_retained_but_never_upgraded_or_current() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        );
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &source);
+        store.extract().expect("首次 Extract 应成功");
+        let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let untagged = Sha256Fingerprint::from_bytes([31; 32]);
+        store
+            .commit_translations(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[TranslationWrite {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    expected_source_text: unit.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    translation: "译文".to_owned(),
+                    state_fingerprint: untagged,
+                    expected_translation: None,
+                }],
+            )
+            .expect("未标记状态的测试译文应该可提交");
+
+        GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "game".parse().unwrap(),
+            workspace_root: workspace.clone(),
+            source_root: None,
+            source_language: None,
+            target_language: Some(language("zh-Hant")),
+        })
+        .expect("改变目标语言应成功");
+        let changed = store
+            .load_snapshot()
+            .expect("语言变化后应保留 Extract 快照");
+        let changed_group = &changed.files()[0].groups()[0];
+        let changed_unit = &changed_group.units()[0];
+        assert_eq!(
+            changed_unit.translation().unwrap().state_fingerprint(),
+            untagged,
+            "语言变化不得重写无当前含义的旧状态"
+        );
+        assert_eq!(changed_unit.translation().unwrap().translation(), "译文");
+        assert_eq!(
+            crate::generic::current_translation_for_stored_with_cancellation(
+                changed.project(),
+                changed_group,
+                changed_unit,
+                &CooperativeCancellation::default(),
+            )
+            .unwrap(),
+            None,
+            "旧语言正文在新语言对下不得作为 Current"
+        );
+
+        GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "game".parse().unwrap(),
+            workspace_root: workspace,
+            source_root: None,
+            source_language: None,
+            target_language: Some(language("zh-Hans")),
+        })
+        .expect("恢复目标语言应成功");
+        let restored = store
+            .load_snapshot()
+            .expect("恢复语言后应保留 Extract 快照");
+        let restored_group = &restored.files()[0].groups()[0];
+        let restored_unit = &restored_group.units()[0];
+        assert_eq!(
+            restored_unit.translation().unwrap().state_fingerprint(),
+            untagged,
+            "往返语言变化也不得把旧状态升级成当前 V2"
+        );
+        assert_eq!(
+            crate::generic::current_translation_for_stored_with_cancellation(
+                restored.project(),
+                restored_group,
+                restored_unit,
+                &CooperativeCancellation::default(),
+            )
+            .unwrap(),
+            None,
+            "无当前 V2 身份的正文在语言事实恢复后仍不得成为 Current"
+        );
+    }
+
+    #[test]
+    fn untagged_rejected_is_retained_but_never_upgraded_or_current() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
+        );
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &source);
+        store.extract().expect("首次 Extract 应成功");
+        let snapshot = store.load_snapshot().unwrap();
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let source_lines = vec![unit.source_text().to_owned()];
+        let untagged = Sha256Fingerprint::from_bytes([63; 32]);
+        let rejected = RejectedTranslationWrite {
+            group_id: group.id().to_owned(),
+            unit_id: unit.id().to_owned(),
+            readable_id: "old/path.jsonl:line9:unit9:text".to_owned(),
+            origin: TranslationOrigin::Automatic,
+            expected_source_text: unit.source_text().to_owned(),
+            source: source_lines.clone(),
+            expected_group_context: group.context_fingerprint(),
+            expected_manual_applicability: crate::manual::generic_manual_applicability(
+                group.id(),
+                unit.id(),
+                "text.jsonl",
+                group.kind(),
+                "ja",
+                "zh-Hans",
+                &source_lines,
+            ),
+            candidate_json: "true".to_owned(),
+            translation: None,
+            violation: ProvenInvariantViolation::InvalidCandidateShape,
+            planning_state: untagged,
+            expected_translation: None,
+        };
+        assert_eq!(
+            store
+                .commit_translation_results_for_profile(
+                    snapshot.project().extracted_raw_fingerprint().unwrap(),
+                    &[],
+                    &[rejected],
+                    "primary",
+                )
+                .unwrap()
+                .rejected,
+            1
+        );
+
+        GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "game".parse().unwrap(),
+            workspace_root: workspace.clone(),
+            source_root: None,
+            source_language: None,
+            target_language: Some(language("en")),
+        })
+        .expect("改变目标语言应成功");
+        let changed = store.load_snapshot().unwrap();
+        let changed_group = &changed.files()[0].groups()[0];
+        let changed_rejected = changed_group.units()[0]
+            .rejected()
+            .expect("Rejected 候选正文应保留");
+        assert_eq!(changed_rejected.planning_state, untagged);
+        let changed_applicability = crate::translation::generic_automatic_applicability_v2(
+            "ja",
+            "en",
+            changed_group.id(),
+            changed_group.units()[0].id(),
+            changed_group.units()[0].source_text(),
+            changed_group.context_fingerprint(),
+        );
+        assert!(
+            !crate::translation::generic_automatic_applicability_is_current(
+                changed_rejected.planning_state,
+                changed_applicability,
+            )
+        );
+
+        GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "game".parse().unwrap(),
+            workspace_root: workspace,
+            source_root: None,
+            source_language: None,
+            target_language: Some(language("zh-Hans")),
+        })
+        .expect("恢复目标语言应成功");
+        let restored = store.load_snapshot().unwrap();
+        let restored_group = &restored.files()[0].groups()[0];
+        let restored_rejected = restored_group.units()[0].rejected().unwrap();
+        assert_eq!(restored_rejected.planning_state, untagged);
+        assert!(
+            !crate::translation::generic_automatic_applicability_is_current(
+                restored_rejected.planning_state,
+                crate::translation::generic_automatic_applicability_v2(
+                    "ja",
+                    "zh-Hans",
+                    restored_group.id(),
+                    restored_group.units()[0].id(),
+                    restored_group.units()[0].source_text(),
+                    restored_group.context_fingerprint(),
+                ),
+            ),
+            "恢复语言事实不能让未标记 Rejected 阻止新的当前候选"
+        );
+    }
+
+    #[test]
+    fn sibling_context_change_preserves_untagged_body_without_upgrading_or_reactivating_it() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let original = "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u1\",\"text\":\"原文一\"},{\"id\":\"u2\",\"text\":\"原文二\"}]}\n";
+        write_source(&source, original);
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &source);
+        store.extract().expect("首次 Extract 应成功");
+        let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        let untagged = Sha256Fingerprint::from_bytes([17; 32]);
+        store
+            .commit_translations(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[TranslationWrite {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    expected_source_text: unit.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    translation: "译文一".to_owned(),
+                    state_fingerprint: untagged,
+                    expected_translation: None,
+                }],
+            )
+            .expect("未标记状态的测试译文应该可提交");
+
+        write_source(
+            &source,
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u1\",\"text\":\"原文一\"},{\"id\":\"u2\",\"text\":\"变化后的兄弟\"}]}\n",
+        );
+        store.extract().expect("兄弟正文变化应可重新 Extract");
+        let changed = store.load_snapshot().unwrap();
+        let changed_group = &changed.files()[0].groups()[0];
+        let changed_unit = &changed_group.units()[0];
+        let retained = changed_unit.translation().expect("目标 Unit 正文应该保留");
+        assert_eq!(retained.translation(), "译文一");
+        assert_eq!(retained.state_fingerprint(), untagged);
+        assert_eq!(
+            crate::generic::current_translation_for_stored_with_cancellation(
+                changed.project(),
+                changed_group,
+                changed_unit,
+                &CooperativeCancellation::default(),
+            )
+            .unwrap(),
+            None,
+            "旧 Group 语境的正文不得在新语境成为 Current"
+        );
+        let conflict = store
+            .commit_translations(
+                changed.project().extracted_raw_fingerprint().unwrap(),
+                &[TranslationWrite {
+                    group_id: changed_group.id().to_owned(),
+                    unit_id: changed_unit.id().to_owned(),
+                    expected_source_text: changed_unit.source_text().to_owned(),
+                    expected_group_context: changed_group.context_fingerprint(),
+                    translation: "不应写入".to_owned(),
+                    state_fingerprint: crate::translation::generic_automatic_applicability_v2(
+                        "ja",
+                        "zh-Hans",
+                        changed_group.id(),
+                        changed_unit.id(),
+                        changed_unit.source_text(),
+                        changed_group.context_fingerprint(),
+                    ),
+                    expected_translation: None,
+                }],
+            )
+            .expect("CAS 冲突应作为可观察提交结果返回");
+        assert_eq!(conflict.committed, 0);
+        assert_eq!(conflict.conflicts, [("g".to_owned(), "u1".to_owned())]);
+        assert_eq!(
+            store.load_snapshot().unwrap().files()[0].groups()[0].units()[0]
+                .translation()
+                .unwrap()
+                .translation(),
+            "译文一",
+            "没有精确携带旧正文与状态的替换不得覆盖保留值"
+        );
+
+        write_source(&source, original);
+        store.extract().expect("恢复兄弟正文应可重新 Extract");
+        let restored = store.load_snapshot().unwrap();
+        let restored_group = &restored.files()[0].groups()[0];
+        let restored_unit = &restored_group.units()[0];
+        let restored_translation = restored_unit.translation().expect("保留正文不得被删除");
+        assert_eq!(restored_translation.translation(), "译文一");
+        assert_eq!(restored_translation.state_fingerprint(), untagged);
+        assert_eq!(
+            crate::generic::current_translation_for_stored_with_cancellation(
+                restored.project(),
+                restored_group,
+                restored_unit,
+                &CooperativeCancellation::default(),
+            )
+            .unwrap(),
+            None,
+            "旧 Group 事实恢复后，未标记状态仍不得升级或重新成为 Current"
+        );
+    }
+
+    #[test]
+    fn moving_to_an_identical_source_root_preserves_the_current_snapshot_and_translation() {
+        let temp = tempdir().unwrap();
+        let first_source = temp.path().join("source-a");
+        let second_source = temp.path().join("source-b");
+        fs::create_dir(&first_source).unwrap();
+        fs::create_dir(&second_source).unwrap();
+        let input =
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n";
+        write_source(&first_source, input);
+        write_source(&second_source, input);
+        let workspace = temp.path().join("project");
+        let store = init(&workspace, &first_source);
+        store.extract().expect("首次 Extract 应成功");
+        let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
+        let group = &snapshot.files()[0].groups()[0];
+        let unit = &group.units()[0];
+        store
+            .commit_translations(
+                snapshot.project().extracted_raw_fingerprint().unwrap(),
+                &[TranslationWrite {
+                    group_id: group.id().to_owned(),
+                    unit_id: unit.id().to_owned(),
+                    expected_source_text: unit.source_text().to_owned(),
+                    expected_group_context: group.context_fingerprint(),
+                    translation: "译文".to_owned(),
+                    state_fingerprint: Sha256Fingerprint::from_bytes([31; 32]),
+                    expected_translation: None,
+                }],
+            )
+            .expect("测试译文应该可提交");
+
+        GenericProjectStore::initialize(GenericInitRequest {
+            project_name: "game".parse().unwrap(),
+            workspace_root: workspace,
+            source_root: Some(second_source),
+            source_language: None,
+            target_language: None,
+        })
+        .expect("移动到相同内容的输入根应成功");
+
+        let (moved, _) = store
+            .ensure_input_current()
+            .expect("相同内容的新根应继续匹配既有 Extract 快照");
+        assert_eq!(
+            moved.files()[0].groups()[0].units()[0]
+                .translation()
+                .map(GenericStoredTranslation::translation),
+            Some("译文")
+        );
     }
 
     #[test]
@@ -7531,7 +8071,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_treats_reordered_equal_text_units_as_a_group_change() {
+    fn extract_preserves_logical_units_when_equal_text_siblings_reorder() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -7570,17 +8110,17 @@ mod tests {
         );
         store.extract().expect("重排后的输入应该可重新提取");
 
-        assert!(
-            store.load_snapshot().unwrap().files()[0].groups()[0]
-                .units()
-                .iter()
-                .all(|unit| unit.translation().is_none()),
-            "即使原文相同，Unit 顺序改变也必须清除整个 Group 的译文"
-        );
+        let moved = store.load_snapshot().unwrap();
+        let units = moved.files()[0].groups()[0].units();
+        assert_eq!(units[0].id(), "b");
+        assert_eq!(units[0].translation().unwrap().translation(), "译文-b");
+        assert_eq!(units[1].id(), "a");
+        assert_eq!(units[1].translation().unwrap().translation(), "译文-a");
+        assert_eq!(units[2].translation().unwrap().translation(), "译文-c");
     }
 
     #[test]
-    fn applying_resources_rejects_invalid_terminology_without_changing_snapshot() {
+    fn applying_resources_rejects_invalid_terminology_and_preserves_valid_raw_text() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
@@ -7608,11 +8148,6 @@ mod tests {
                 r#"[{"term":"同名","translation":"译文一","triggers":["触发一"]},{"term":"同名","translation":"译文二","triggers":["触发二"]}]"#,
                 "translation.terminology.duplicate_term",
             ),
-            (
-                "术语含首尾空白",
-                r#"[{"term":" 原文","translation":"译文","triggers":["原文"]}]"#,
-                "translation.terminology.surrounding_whitespace",
-            ),
         ] {
             let error = store
                 .apply_translation_resources(expected_raw_fingerprint, terminology_json, "[]", &[])
@@ -7632,74 +8167,21 @@ mod tests {
             assert_eq!(resources.terminology_json(), "[]");
             assert_eq!(resources.placeholder_rules_json(), "[]");
         }
-    }
 
-    #[test]
-    fn applying_new_resources_clears_confirmed_stale_translations_in_the_same_transaction() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        fs::create_dir(&source).unwrap();
-        let workspace = temp.path().join("project");
-        write_source(
-            &source,
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
-        );
-        let store = init(&workspace, &source);
-        store.extract().expect("首次 Extract 应成功");
-        let snapshot = store.load_snapshot().expect("应该可读取首次快照");
-        let group = &snapshot.files()[0].groups()[0];
-        let unit = &group.units()[0];
-        let previous = GenericStoredTranslation {
-            translation: "旧译文".to_owned(),
-            origin: TranslationOrigin::Automatic,
-            state_fingerprint: Sha256Fingerprint::from_bytes([7; 32]),
-        };
+        let terminology_with_whitespace =
+            r#"[{"term":" 原文 ","translation":" 译文 ","triggers":[" 原文 "]}]"#;
         store
-            .commit_translations(
-                snapshot.project().extracted_raw_fingerprint().unwrap(),
-                &[TranslationWrite {
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    expected_source_text: unit.source_text().to_owned(),
-                    expected_group_context: group.context_fingerprint(),
-                    translation: previous.translation.clone(),
-                    state_fingerprint: previous.state_fingerprint,
-                    expected_translation: None,
-                }],
-            )
-            .expect("旧译文应该可提交");
-
-        let outcome = store
             .apply_translation_resources(
-                snapshot.project().extracted_raw_fingerprint().unwrap(),
-                r#"[{"term":"原文","translation":"新术语","triggers":["原文"]}]"#,
+                expected_raw_fingerprint,
+                terminology_with_whitespace,
                 "[]",
-                &[TranslationClear {
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    readable_id: "source.jsonl:line1:unit1:text".to_owned(),
-                    expected_source_text: unit.source_text().to_owned(),
-                    expected_group_context: group.context_fingerprint(),
-                    rejection_planning_state: previous.state_fingerprint,
-                    expected_translation: previous,
-                    violation: None,
-                }],
+                &[],
             )
-            .expect("资源和失效译文应该可原子更新");
-
-        assert_eq!(outcome.committed, 1);
-        assert!(outcome.conflicts.is_empty());
-        assert!(
-            store.load_snapshot().unwrap().files()[0].groups()[0].units()[0]
-                .translation()
-                .is_none(),
-            "失效旧译文不得继续被 WriteBack 当成 Current"
-        );
+            .expect("术语原值中的首尾空白应由项目资源边界原样接受");
         let resources = store
             .load_translation_resources()
-            .expect("应该可读取新资源");
-        assert!(resources.terminology_json().contains("新术语"));
-        assert_eq!(resources.placeholder_rules_json(), "[]");
+            .expect("合法术语应保存到当前项目");
+        assert_eq!(resources.terminology_json(), terminology_with_whitespace);
     }
 
     #[test]
@@ -7723,6 +8205,8 @@ mod tests {
             unit.id(),
             "text.jsonl",
             group.kind(),
+            "ja",
+            "zh-Hans",
             &source_lines,
         );
         let connection = Connection::open(&store.database_path).expect("应该可打开项目数据库");
@@ -7760,7 +8244,7 @@ mod tests {
                     expected_source_text: unit.source_text().to_owned(),
                     expected_group_context: group.context_fingerprint(),
                     expected_translation: previous,
-                    violation: Some(ProvenInvariantViolation::PlaceholderMismatch),
+                    violation: ProvenInvariantViolation::PlaceholderMismatch,
                     rejection_planning_state: Sha256Fingerprint::from_bytes([8; 32]),
                 }],
             )

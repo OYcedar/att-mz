@@ -34,8 +34,9 @@ ATT 不替代游戏调查和最终验收。非标准插件数据、图片文字�
 从 [GitHub Releases](https://github.com/yexi-by/att/releases/latest) 下载 Windows x64
 发行包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压到可写目录。不要只复制 `att.exe`，
 运行时还需要同目录的配置、文档、Prompt、Skill 和工具。更新已有安装时，不要把新 ZIP 直接
-解压覆盖旧目录；先解压到新目录，再把旧目录根部和 `tools\formic` 中已经填写的两份
-`config.toml` 复制到新目录。仓库资源同步脚本会自动执行同样的保留规则。
+解压覆盖旧目录，也不要把旧 `config.toml` 整份复制给新版本。先解压到新目录，以当前
+`config.example.toml` 为字段权威，再把旧配置中的实际服务取值逐项填入；项目数据需要转换时
+使用该版本明确提供的一次性转换步骤。仓库资源同步脚本只保留活动配置，不证明旧字段仍有效。
 
 打开 `config.toml`，填写模型服务：
 
@@ -45,13 +46,17 @@ protocol = "chat_completions"
 url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
+stream = false
 ```
 
-`protocol` 省略时同样使用 `chat_completions`；需要 Responses 时改为 `responses`。`url` 可以
-填写基础地址或完整端点，ATT 会按协议补全路径。
+`stream` 是必填项。`protocol` 省略时使用 `chat_completions`；需要 Responses 时改为
+`responses`。`url` 可以
+填写基础地址或完整端点，ATT 会按协议补全路径。`stream = true` 时以流式 HTTP 响应接收
+模型结果，`false` 时等待完整 JSON；两种方式都会在响应完整结束后再验收和保存译文。
 
-`config.example.toml` 保存当前不含真实凭据的发行默认，供查看新字段和新默认；它不是已有活动配置
-的替代品。服务明确限制上下文、输出、并发或请求频率时，再按实际限制降低相应配置。
+`config.example.toml` 保存当前不含真实凭据的完整字段和发行默认。旧活动配置只能作为实际取值
+参考，不能反向定义当前字段。服务明确限制上下文、输出、并发或请求频率时，再按实际限制降低
+相应配置。
 制作术语表时还要填写 `tools\formic\config.toml`；普通更新同样不会覆盖这份活动配置。
 
 ### 2. 把翻译目标交给 Agent

@@ -20,7 +20,8 @@ use crate::translation::planning_resource::TerminologyEntry;
 use super::{
     ProjectLuaCallError, ProjectLuaEngineAdapter, ProjectLuaOutdatedTranslation,
     ProjectLuaTerminologyEntry, ProjectLuaTranslationContext, ProjectLuaTranslationFilter,
-    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, rollback_translation_api_savepoint,
+    ProjectLuaTranslationRecord, ProjectLuaTranslationStatus, current_translation_status,
+    with_translation_api_savepoint,
 };
 
 pub(crate) fn rpg_maker_project_lua_adapter(
@@ -177,15 +178,12 @@ impl RpgMakerProjectLuaAdapter {
 }
 
 fn record_from_current(entry: &ManualTranslationEntry) -> ProjectLuaTranslationRecord {
-    let status = if entry.outdated_manual.is_some() {
-        ProjectLuaTranslationStatus::Outdated
-    } else if entry.current_translation.is_some() {
-        ProjectLuaTranslationStatus::Translated
-    } else if entry.needs_translation {
-        ProjectLuaTranslationStatus::Unfinished
-    } else {
-        ProjectLuaTranslationStatus::NotNeeded
-    };
+    let status = current_translation_status(
+        entry.current_translation.is_some(),
+        entry.rejected.is_some(),
+        entry.needs_translation,
+        entry.outdated_manual.is_some(),
+    );
     ProjectLuaTranslationRecord {
         id: entry.id.clone(),
         kind: entry.kind.as_str().to_owned(),
@@ -289,30 +287,7 @@ fn with_savepoint<T>(
     cancellation: &super::ProjectLuaCancellation,
     operation: impl FnOnce() -> Result<T, ProjectLuaCallError>,
 ) -> Result<T, ProjectLuaCallError> {
-    cancellation.ensure_running()?;
-    connection
-        .execute_batch("SAVEPOINT att_translation_api")
-        .map_err(|error| sqlite_error(error, engine))?;
-    match operation() {
-        Ok(value) => {
-            if let Err(error) = cancellation.ensure_running() {
-                return Err(rollback_translation_api_savepoint(
-                    connection,
-                    lua_engine(engine),
-                    error,
-                ));
-            }
-            connection
-                .execute_batch("RELEASE att_translation_api")
-                .map_err(|error| sqlite_error(error, engine))?;
-            Ok(value)
-        }
-        Err(error) => Err(rollback_translation_api_savepoint(
-            connection,
-            lua_engine(engine),
-            error,
-        )),
-    }
+    with_translation_api_savepoint(connection, lua_engine(engine), cancellation, operation)
 }
 
 fn map_manual_error(error: ManualDatabaseError, engine: RpgMakerEngine) -> ProjectLuaCallError {

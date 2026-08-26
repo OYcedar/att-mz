@@ -1,96 +1,81 @@
-# ATT 每次运行都会读取 att.exe 同目录下的 config.toml。
-# 本发行模板默认使用高吞吐配置。API 地址、密钥和模型名称必须替换为实际值；
-# 供应商确有更低并发、更小上下文或其他服务限制时，按实际限制调整对应字段。
-# 未声明的字段、重复字段和错误类型会使使用该配置的命令失败。
-# 除特别说明外，所有以 _ms 结尾的时间值都使用毫秒。
+# ATT 每次运行都读取 att.exe 同目录的 config.toml。
+# 请填写实际的 API 地址、密钥和模型。服务有限制时再调整并发、超时等值。
+# 未知字段、重复字段或错误类型会导致命令失败。所有 *_ms 值均为毫秒。
 
+# WriteBack 可以修正自动译文中与原文一一对应的标点，并为未闭合成对符号内的续行补一个全角空格。
+# 两项都只处理正文形式，不改变翻译状态。
 [write_back]
-# true 表示 WriteBack 会替换自动译文中已经存在且能与原文唯一对应的标点；不增删标点或空白。
 repair_punctuation = true
-# true 表示 WriteBack 会为未闭合成对符号内需要缩进的续行补一个全角空格。
 complete_continuation_whitespace = true
 
+# Prompt 可以要求模型返回可读判断和逐项原文。两个开关互不依赖。
 [prompts]
-# true 表示要求模型返回可读的翻译判断；false 表示省略这部分内容。
 thinking_output = true
-# true 表示要求模型在每项结果中同时返回本次原文；false 表示省略原文字段。
 source_echo = false
 
-# primary 是这个模型服务配置的 ID，翻译方案通过该 ID 使用它。
+# primary 是模型服务 ID。协议决定请求格式，地址可以是基础地址或完整端点；stream 必填，
+# true 使用流式响应，false 等待完整 JSON。API key 按字面读取，不解析环境变量。
 [llm.clients.primary]
-# 请求协议；省略时默认 chat_completions，使用 Responses 时显式改为 responses。
 protocol = "chat_completions"
-# 模型服务基础地址。ATT 会按 protocol 补全 /chat/completions 或 /responses；完整端点也可使用。
 url = "https://api.example.com/v1"
-# API key 会按原样读取，不会展开环境变量或 ${...}。
 api_key = "replace-with-api-key"
-# 发给模型服务的模型 ID。
 model = "replace-with-model-id"
-# 这个模型服务同时进行的 HTTP 请求数上限。
+stream = false
+
+# 这一组控制单个 Client 的活动 HTTP 请求数及超时。所有 *_ms 值均为毫秒；本地排队时间
+# 不计入 request_timeout_ms。
 max_concurrent_requests = 16
-# 建立网络连接允许等待的最长时间。
 connect_timeout_ms = 5000
-# 两次连续读取响应数据之间允许等待的最长时间。
 read_timeout_ms = 120000
-# 一次完整 HTTP 请求允许占用的最长时间，不包括本地等待请求许可的时间。
 request_timeout_ms = 120000
-# false 表示不使用代理；使用代理时改成不含账号和密码的 URL 字符串。
+
+# proxy 填 false 或不含账号密码的 URL。额外 PEM 的相对路径从 att.exe 所在目录计算。
 proxy = false
-# 需要额外信任的 PEM 证书文件。相对路径从 att.exe 所在目录开始计算。
 additional_pem_files = []
-# 可重试错误发生后，各次重试前依次等待的时间；数组长度就是最多重试次数。
+
+# retry_delays_ms 的元素个数就是最多重试次数；max_retry_after_ms 限制接受服务端
+# Retry-After 的最长时间。空数组表示不重试。
 retry_delays_ms = []
-# 接受服务端 Retry-After 指定等待时间的最大值。
 max_retry_after_ms = 1000
-# 合并到请求正文中的额外 JSON object，不能覆盖所选协议的 model、messages/input、stream，
-# Responses 也不能覆盖固定为 false 的 background。
-# 供应商私有字段只在该服务明确要求时添加。
+
+# parameters 必须是 JSON object，只填写供应商明确要求的扩展；不能覆盖 model、stream、
+# messages/input 或 Responses 的 background。
 parameters = '''
 {}
 '''
 
-# 可选：模型服务限制每分钟请求数时，取消下面配置的注释并填写实际限制。
+# 服务明确限制每分钟请求数时，取消整个区块的注释；burst 是可以立即发出的请求数。
 # [llm.clients.primary.rate_limit]
-# 长时间运行时每分钟允许开始的请求数。
 # requests_per_minute = 60
-# 短时间内允许立即开始的最大请求数。
 # burst = 8
 
-# 日语源文判断和译文残留检查。
+# 日语规则用 id 参与 Init；minimum_kana_characters 决定残留阈值，allowed_terms 是译文中
+# 已确认可以保留的日语。
 [[languages]]
 type = "japanese"
-# 项目 Init 时使用的语言 ID。
 id = "ja"
-# 译文中连续出现至少这么多个假名时，报告日语残留；allowed_terms 中的内容除外。
 minimum_kana_characters = 1
-# 已确认可以原样保留在译文中的日语片段。
 allowed_terms = []
 
-# 英语源文判断和译文残留检查。
+# 英语规则分别控制译前准入和译后残留。ignored_terms 只影响原文判断；allowed_terms 只表示
+# 译文中可以保留的英文。
 [[languages]]
 type = "english"
-# 项目 Init 时使用的语言 ID。
 id = "en"
-# 同一连续英文片段必须同时达到下面两个值，原文才会进入翻译。
 minimum_word_count = 1
 minimum_letter_count = 2
-# 判断原文是否需要翻译前排除的英文片段。不要用它表示译文中允许保留的词。
 ignored_terms = []
-# 译文从同一条原文复制的连续英文片段同时达到下面两个值时，报告英文残留。
 minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
-# 已确认可以原样保留在译文中的英文片段，例如专名、按键名或协议字段。
 allowed_terms = []
 
+# 任务记录保存实际模型任务的 Markdown；省略 record_translation_tasks 时默认为 true。
 [translation]
-# true 表示为每个实际发给模型的任务保存可读 Markdown 记录；省略时也是 true。
 record_translation_tasks = true
 
-# primary 是翻译方案 ID，也是 Translate 命令选择这个方案时使用的名称。
+# primary 是 Translate 选择的方案 ID，引用上面的模型服务。字符目标用于 TaskBlock 装箱，
+# 完整分组不会拆开，因此它不是最终 user message 的硬上限。
 [[translation.profiles]]
 id = "primary"
-# 使用上面 ID 为 primary 的模型服务配置。
 llm_client = "primary"
-# 用于确定每个模型任务大小的字符目标，按完整原文及其分组结构计算。
-# 完整分组不会拆开，JSON 围栏、缩进、术语和已有译文不计入，因此这不是最终 user message 的长度上限。
 target_task_user_message_characters = 24000

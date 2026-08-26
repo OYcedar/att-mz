@@ -264,6 +264,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] No se pudo serializar la solicitud al modelo
     [response_parsing_failed] La respuesta del modelo no es JSON válido
     [invalid_response_contract] La respuesta del modelo no cumple el contrato requerido
+    [model_stream_incomplete] El flujo del modelo terminó antes de un resultado terminal explícito
     [transport_failed] El transporte HTTP falló antes de recibir una respuesta válida
     [lua_compilation_failed] No se pudo compilar el programa Lua principal
     [lua_execution_failed] El programa Lua principal falló durante la ejecución

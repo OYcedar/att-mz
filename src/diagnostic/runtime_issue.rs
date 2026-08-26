@@ -2275,6 +2275,15 @@ pub(crate) enum HttpEnvelopeViolation {
     MissingContent,
     MissingOutput,
     MissingOutputText,
+    MissingFinishReason,
+    InvalidStreamEncoding,
+    InvalidStreamEvent,
+    StreamErrorEvent,
+    DuplicateChoice,
+    ChoiceAfterFinish,
+    InvalidFieldType,
+    EventTypeMismatch,
+    StreamEndedBeforeTerminal,
     InvalidContract,
 }
 
@@ -2287,6 +2296,15 @@ impl HttpEnvelopeViolation {
             Self::MissingContent => "missing_content",
             Self::MissingOutput => "missing_output",
             Self::MissingOutputText => "missing_output_text",
+            Self::MissingFinishReason => "missing_finish_reason",
+            Self::InvalidStreamEncoding => "invalid_stream_encoding",
+            Self::InvalidStreamEvent => "invalid_stream_event",
+            Self::StreamErrorEvent => "stream_error_event",
+            Self::DuplicateChoice => "duplicate_choice",
+            Self::ChoiceAfterFinish => "choice_after_finish",
+            Self::InvalidFieldType => "invalid_field_type",
+            Self::EventTypeMismatch => "event_type_mismatch",
+            Self::StreamEndedBeforeTerminal => "stream_ended_before_terminal",
             Self::InvalidContract => "invalid_contract",
         }
     }
@@ -2410,6 +2428,18 @@ impl HttpIssue {
             Self::Transport { .. } => "transport_failed",
             Self::Status { .. } => "external_service_rejected",
             Self::ResponseJson { .. } => "response_parsing_failed",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::InvalidStreamEvent,
+                ..
+            } => "response_parsing_failed",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::StreamErrorEvent,
+                ..
+            } => "external_service_rejected",
+            Self::InvalidEnvelope {
+                violation: HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                ..
+            } => "model_stream_incomplete",
             Self::InvalidEnvelope { .. } => "invalid_response_contract",
         }
     }
@@ -2661,6 +2691,40 @@ mod http_tests {
                 "resolution": "check_model_service"
             })
         );
+    }
+
+    #[test]
+    fn stream_envelope_failures_keep_actionable_public_categories_and_exact_facts() {
+        let endpoint = HttpEndpoint::new(HttpScheme::Https, "api.example.test", None);
+        for (violation, expected_summary) in [
+            (
+                HttpEnvelopeViolation::InvalidStreamEvent,
+                "response_parsing_failed",
+            ),
+            (
+                HttpEnvelopeViolation::StreamErrorEvent,
+                "external_service_rejected",
+            ),
+            (
+                HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                "model_stream_incomplete",
+            ),
+            (
+                HttpEnvelopeViolation::MissingFinishReason,
+                "invalid_response_contract",
+            ),
+        ] {
+            let issue = HttpIssue::InvalidEnvelope {
+                endpoint: endpoint.clone(),
+                violation,
+            };
+            assert_eq!(issue.summary_code(), expected_summary);
+            assert!(
+                issue
+                    .facts()
+                    .contains(&("violation", violation.as_str().to_owned()))
+            );
+        }
     }
 
     #[test]

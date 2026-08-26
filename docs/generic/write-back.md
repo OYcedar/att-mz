@@ -11,18 +11,23 @@ att generic write-back --name NAME [--layout-rules FILE]
 ```
 
 命令永远不修改外部输入目录。
+命令不构造模型 Client，不读取 Prompt、Profile、Endpoint、Model 或语言检查配置，也不会发出
+模型请求。这些未来请求选择不能决定数据库中的既有正文是否可写回。
 
 ## 1. 输出内容
 
 - 保留输入 `.jsonl` 的相对路径；
 - 保留 Group 顺序、Unit 顺序、ID 和 kind；
-- 当前 Unit 优先用人工译文，其次用自动译文替换 `text`；
+- 当前 Unit 优先用当前语言对的人工译文，其次用对当前源文、完整 Group 语境、
+  语言对和强不变量仍适用的自动译文替换 `text`；
 - 其他 Unit 保留当前原文；
 - 每条 Group 使用紧凑 JSON 占一行；
 - 文件使用 LF，非空文件末尾有 LF；
 - 输出只包含输入根内的 JSONL 文件，其他文件不复制。
 
 Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留原文的 Unit 数。
+保留但已不适用于当前语言对或 Group 语境的正文不会写回，对应 Unit 保留当前原文；
+WriteBack 不删除这些正文，也不把保留原文伪装成已翻译。
 
 WriteBack 重新执行当前 Placeholder 与结构强校验；源语言残留仍只是一项 Review，不会拒绝
 候选。随后按[配置规格](../runtime/configuration.md#4-writeback-正文开关)执行独立标点修复和

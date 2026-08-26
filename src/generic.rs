@@ -28,12 +28,11 @@ pub(crate) use project::{
 };
 pub(crate) use task_record::{GenericTaskRecordDocument, GenericTaskRecordState};
 pub(crate) use translate::{
-    AutomaticStateResources, GenericPlanningError, GenericPlanningUnitLocator, GenericUnitKey,
-    GenericUnitMap, PlannedTask, PlanningUnit, ResponseProblem, TranslationAcceptance,
-    TranslationPlan, TranslationReview, ValidatedReuse, accept_parsed_response_with_cancellation,
+    GenericPlanningError, GenericPlanningUnitLocator, GenericUnitKey, GenericUnitMap, PlannedTask,
+    PlanningUnit, ResponseProblem, TranslationAcceptance, TranslationPlan, TranslationReview,
+    ValidatedReuse, accept_parsed_response_with_cancellation,
     current_translation_for_stored_with_cancellation,
     plan_translation_with_validator_and_cancellation, readable_generic_unit_id,
-    terminology_hit_fingerprint_with_cancellation,
 };
 pub(crate) use write_back::{
     GenericCurrentTranslation, GenericWriteBackCandidate, GenericWriteBackError,

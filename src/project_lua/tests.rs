@@ -7,8 +7,24 @@ use super::{
     ProjectLuaOutdatedTranslation, ProjectLuaProgram, ProjectLuaProject, ProjectLuaRunError,
     ProjectLuaRunRequest, ProjectLuaTerminologyEntry, ProjectLuaTranslationContext,
     ProjectLuaTranslationFilter, ProjectLuaTranslationRecord, ProjectLuaTranslationStatus,
-    run_project_lua,
+    current_translation_status, run_project_lua,
 };
+
+#[test]
+fn current_status_uses_current_translation_before_outdated_manual() {
+    assert_eq!(
+        current_translation_status(true, false, false, true),
+        ProjectLuaTranslationStatus::Translated
+    );
+}
+
+#[test]
+fn rejected_candidate_is_unfinished_instead_of_not_needed() {
+    assert_eq!(
+        current_translation_status(false, true, false, false),
+        ProjectLuaTranslationStatus::Unfinished
+    );
+}
 
 #[derive(Default)]
 struct TestAdapter {
@@ -82,6 +98,108 @@ impl ProjectLuaEngineAdapter for TestAdapter {
             term: "攻撃".to_owned(),
             translation: "攻击".to_owned(),
         }])
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SavepointFailureMode {
+    CommitOutcomeUnknown,
+    CleanupFailed,
+}
+
+struct SavepointFailureAdapter {
+    mode: SavepointFailureMode,
+}
+
+impl ProjectLuaEngineAdapter for SavepointFailureAdapter {
+    fn list_translations(
+        &self,
+        _connection: &Connection,
+        _filter: ProjectLuaTranslationFilter,
+    ) -> Result<Vec<ProjectLuaTranslationRecord>, ProjectLuaCallError> {
+        unreachable!("故障注入脚本不读取译文")
+    }
+
+    fn translation_context(
+        &self,
+        _connection: &Connection,
+        _ids: Vec<String>,
+    ) -> Result<Vec<ProjectLuaTranslationContext>, ProjectLuaCallError> {
+        unreachable!("故障注入脚本不读取语境")
+    }
+
+    fn set_translation(
+        &self,
+        connection: &Connection,
+        _id: String,
+        _translation: Vec<String>,
+        cancellation: &super::ProjectLuaCancellation,
+    ) -> Result<u64, ProjectLuaCallError> {
+        match self.mode {
+            SavepointFailureMode::CommitOutcomeUnknown => {
+                connection
+                    .execute_batch(
+                        "SAVEPOINT att_translation_api;
+                         UPDATE generic_unit SET value = 'poisoned' WHERE id = 'entry';
+                         RELEASE att_translation_api;",
+                    )
+                    .map_err(ProjectLuaCallError::sqlite)?;
+                return Err(super::handle_translation_api_release_failure(
+                    connection,
+                    crate::diagnostic::LuaEngine::Generic,
+                    cancellation,
+                    rusqlite::Error::InvalidQuery,
+                ));
+            }
+            SavepointFailureMode::CleanupFailed => {
+                connection
+                    .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+                        if matches!(
+                            context.action,
+                            rusqlite::hooks::AuthAction::Savepoint {
+                                operation: rusqlite::hooks::TransactionOperation::Release
+                                    | rusqlite::hooks::TransactionOperation::Rollback,
+                                savepoint_name: "att_translation_api",
+                            }
+                        ) {
+                            rusqlite::hooks::Authorization::Deny
+                        } else {
+                            rusqlite::hooks::Authorization::Allow
+                        }
+                    }))
+                    .map_err(ProjectLuaCallError::sqlite)?;
+            }
+        }
+        super::with_translation_api_savepoint(
+            connection,
+            crate::diagnostic::LuaEngine::Generic,
+            cancellation,
+            || {
+                connection
+                    .execute(
+                        "UPDATE generic_unit SET value = 'poisoned' WHERE id = 'entry'",
+                        [],
+                    )
+                    .map_err(ProjectLuaCallError::sqlite)?;
+                Ok(1)
+            },
+        )
+    }
+
+    fn clear_translation(
+        &self,
+        _connection: &Connection,
+        _id: String,
+        _cancellation: &super::ProjectLuaCancellation,
+    ) -> Result<u64, ProjectLuaCallError> {
+        unreachable!("故障注入脚本不清除译文")
+    }
+
+    fn list_terminology(
+        &self,
+        _connection: &Connection,
+    ) -> Result<Vec<ProjectLuaTerminologyEntry>, ProjectLuaCallError> {
+        unreachable!("故障注入脚本不读取术语")
     }
 }
 
@@ -348,4 +466,82 @@ fn ordinary_sqlite_error_is_not_a_typed_cancellation() {
             .into_typed_cancellation();
 
     assert!(matches!(failure, ProjectLuaFailure::Host(_)));
+}
+
+#[test]
+fn outermost_release_failure_is_outcome_unknown_even_when_lua_catches_the_call() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("project.db");
+    let source = r#"
+local ok = pcall(ctx.translation.set, "entry", { "译文" })
+assert(not ok)
+pcall(ctx.db.execute, "UPDATE generic_unit SET value = 'after-catch' WHERE id = 'entry'")
+"#;
+
+    let error = run_project_lua(
+        database(&path),
+        request(
+            source,
+            Arc::new(SavepointFailureAdapter {
+                mode: SavepointFailureMode::CommitOutcomeUnknown,
+            }),
+        ),
+    )
+    .expect_err("最外层 RELEASE 报错必须终止脚本并报告结果未知");
+
+    assert!(
+        matches!(
+            &error,
+            ProjectLuaRunError::SavepointOutcomeUnknown(ProjectLuaFailure::Host(_))
+        ),
+        "应报告 savepoint 提交结果未知，实际为 {error:?}"
+    );
+    let value: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM generic_unit WHERE id = 'entry'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, "poisoned", "结果未知回归必须覆盖实际已经提交的分支");
+}
+
+#[test]
+fn savepoint_cleanup_failure_cannot_be_caught_and_committed_by_lua() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("project.db");
+    let source = r#"
+ctx.db.execute("BEGIN IMMEDIATE")
+local ok = pcall(ctx.translation.set, "entry", { "译文" })
+assert(not ok)
+pcall(ctx.db.execute, "COMMIT")
+"#;
+
+    let error = run_project_lua(
+        database(&path),
+        request(
+            source,
+            Arc::new(SavepointFailureAdapter {
+                mode: SavepointFailureMode::CleanupFailed,
+            }),
+        ),
+    )
+    .expect_err("savepoint 清理失败必须毒化脚本并回滚外层事务");
+
+    match error {
+        ProjectLuaRunError::RolledBack(ProjectLuaFailure::Host(failure)) => {
+            assert_eq!(failure.kind(), "cleanup_failed");
+        }
+        other => panic!("应报告已回滚的 Host cleanup failure，实际为 {other:?}"),
+    }
+    let value: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM generic_unit WHERE id = 'entry'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, "original");
 }

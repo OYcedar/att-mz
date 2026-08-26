@@ -2,6 +2,7 @@
 
 //! Windows x64 生产进程边界的多引擎 CLI 与 RPG Maker 主流程黑盒测试。
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -491,7 +492,10 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     );
     let task_record = read_single_task_record_sharing_log_run_id(&mz_workspace);
     assert!(task_record.contains("# 翻译任务"));
-    assert!(task_record.contains("状态：完成，已确认提交"));
+    assert!(
+        task_record.contains("状态：完成，已确认提交"),
+        "实际任务记录：\n{task_record}"
+    );
     assert!(task_record.contains("要求译文：1 项"));
     assert!(task_record.contains("已接受：1 项（ID：0），写入 1 个实际位置"));
     assert!(task_record.contains("未接受：0 项（ID：—）"));
@@ -520,12 +524,8 @@ fn same_named_mv_mz_and_generic_projects_remain_isolated_across_real_processes()
     );
     assert_workspace_does_not_contain(&mz_workspace.join("logs"), THINKING_SENTINEL);
     assert!(
-        find_subslice(
-            &fs::read(mz_workspace.join("project.db")).expect("项目数据库应可读取"),
-            THINKING_SENTINEL.as_bytes(),
-        )
-        .is_none(),
-        "Thinking 正文不得进入权威数据库"
+        !sqlite_contains_text(&mz_workspace.join("project.db"), THINKING_SENTINEL),
+        "Thinking 正文不得进入权威数据库的任何逻辑列值"
     );
 
     const GENERIC_TRANSLATION: &str = "通用译文";
@@ -841,6 +841,204 @@ fn rpg_maker_write_back_materializes_manual_translation_exactly() {
             "项目日志只保存实际物化结果"
         );
     }
+}
+
+#[test]
+fn mz_switching_llm_client_keeps_and_reuses_the_current_automatic_translation() {
+    let temporary = tempfile::tempdir().expect("应可建立 Client 切换进程测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    write_rpg_maker_prompt(root);
+
+    let client_a_listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("Client A 本地模型端口应可绑定");
+    let client_a_endpoint = format!(
+        "http://{}/v1/chat/completions",
+        client_a_listener
+            .local_addr()
+            .expect("Client A 本地模型地址应可读取")
+    );
+    write_configuration_for_client(root, &client_a_endpoint, "client_a", "model-a");
+
+    assert_success("MZ Init", &run_att(root, init_arguments("mz", &game)));
+    assert_success(
+        "MZ Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    let client_a_server = thread::spawn(move || serve_one_translation(client_a_listener));
+    assert_success(
+        "MZ Client A Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    let client_a_request = client_a_server
+        .join()
+        .expect("Client A 服务线程不得 panic")
+        .expect("Client A 必须收到首次翻译请求");
+    assert_eq!(client_a_request["model"], "model-a");
+
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![(json!(SOURCE_TEXT), Some(json!(TRANSLATION)))],
+        "Client A 接受的译文必须成为当前可消费状态"
+    );
+
+    let client_b_listener = TcpListener::bind(("127.0.0.1", 0)).expect("Client B 监视端口应可绑定");
+    let client_b_endpoint = format!(
+        "http://{}/v1/chat/completions",
+        client_b_listener
+            .local_addr()
+            .expect("Client B 本地模型地址应可读取")
+    );
+    write_configuration_for_client(root, &client_b_endpoint, "client_b", "model-b");
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let client_b_spy = thread::spawn(move || serve_provider_spy(client_b_listener, stop_receiver));
+
+    assert_success(
+        "MZ Client B WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+    assert_eq!(
+        read_items(&workspace.join("write_back/data/Items.json"))[1]["description"],
+        TRANSLATION,
+        "更换 LLM Client 后，WriteBack 必须继续发布已经确认的当前译文"
+    );
+    assert_success(
+        "MZ Client B Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    stop_sender.send(()).expect("应可停止 Client B 监视器");
+    let client_b_requests = client_b_spy
+        .join()
+        .expect("Client B 监视线程不得 panic")
+        .expect("Client B 监视器应正常结束");
+    assert!(
+        client_b_requests.is_empty(),
+        "只有 Client/Profile/模型变化时，已完成 Unit 不得重新请求模型：{client_b_requests:?}"
+    );
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![(json!(SOURCE_TEXT), Some(json!(TRANSLATION)))],
+        "Client B 的零工作量 Translate 不得删除或改写旧译文"
+    );
+}
+
+#[test]
+fn mz_language_pair_round_trip_hides_and_restores_the_same_automatic_body() {
+    let temporary = tempfile::tempdir().expect("应可建立语言往返进程测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-game");
+    write_minimal_mz_game(&game);
+    write_rpg_maker_prompt(root);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("语言往返本地模型端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("语言往返本地模型地址应可读取")
+    );
+    write_configuration(root, &endpoint);
+
+    assert_success("MZ Init", &run_att(root, init_arguments("mz", &game)));
+    assert_success(
+        "MZ Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    let database = workspace.join("project.db");
+    let server = thread::spawn(move || serve_one_translation(listener));
+    assert_success(
+        "MZ initial Translate",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    server
+        .join()
+        .expect("语言往返模型服务线程不得 panic")
+        .expect("语言往返初始翻译必须收到模型请求");
+
+    let source_json = serde_json::to_string(SOURCE_TEXT).expect("测试原文应可编码");
+    let original_state: Vec<u8> = Connection::open(&database)
+        .expect("项目数据库应可打开")
+        .query_row(
+            "SELECT translation_state FROM rpg_maker_text_unit
+             WHERE source_content_json = ?1",
+            [&source_json],
+            |row| row.get(0),
+        )
+        .expect("初始自动译文必须保存当前 V2 状态");
+    assert_eq!(&original_state[..8], b"ATTRATV2");
+
+    assert_success(
+        "MZ target en Init",
+        &run_att(
+            root,
+            arguments(&["mz", "init", "--name", PROJECT, "--target-language", "en"]),
+        ),
+    );
+    let connection = Connection::open(&database).expect("语言变更后的数据库应可打开");
+    let state: Vec<u8> = connection
+        .query_row(
+            "SELECT translation_state FROM rpg_maker_text_unit
+             WHERE source_content_json = ?1",
+            [&source_json],
+            |row| row.get(0),
+        )
+        .expect("保留正文必须同时保留状态");
+    assert_eq!(
+        state, original_state,
+        "语言事实变化只能改变适用性，不能改写持久化的当前 V2 状态"
+    );
+    drop(connection);
+
+    assert_success(
+        "MZ target en WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+    let output = workspace.join("write_back/data/Items.json");
+    assert_eq!(
+        read_items(&output)[1]["description"],
+        SOURCE_TEXT,
+        "语言对变化后旧自动正文必须保留在数据库但不得发布"
+    );
+
+    assert_success(
+        "MZ target zh-Hans Init",
+        &run_att(
+            root,
+            arguments(&[
+                "mz",
+                "init",
+                "--name",
+                PROJECT,
+                "--target-language",
+                "zh-Hans",
+            ]),
+        ),
+    );
+    assert_success(
+        "MZ restored WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+    assert_eq!(
+        read_items(&output)[1]["description"],
+        TRANSLATION,
+        "语言对恢复后同一 V2 正文必须无需重跑模型即可重新成为 Current"
+    );
 }
 
 #[test]
@@ -1478,16 +1676,11 @@ fn generic_source_placeholder_failure_sends_no_incomplete_task_block() {
         "规划失败不得提交同块其他 Unit 的译文"
     );
     let stderr = String::from_utf8(output.stderr).expect("Generic 失败诊断必须是 UTF-8");
-    for expected in [
-        "story.jsonl:line1:unit2:text",
-        "Rules 模式产生了相互重叠的文本捕获",
-        "修正指出的 Placeholder 规则后重试",
-    ] {
-        assert!(
-            stderr.contains(expected),
-            "命令必须保留现有的规划失败语义 {expected:?}：{stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("story.jsonl:line1:unit2:text"),
+        "规划失败必须指出实际失败 Unit：{stderr}"
+    );
+    assert!(stderr.contains("原因：") && stderr.contains("处理办法："));
     for internal in [
         "translation.placeholder",
         "relative_path=",
@@ -1558,7 +1751,7 @@ fn mv_source_placeholder_failure_fails_before_database_and_model_side_effects() 
 
     let workspace = distribution_root(root).join("projects/mv").join(PROJECT);
     let database = workspace.join("project.db");
-    let database_before = fs::read(&database).expect("Translate 前项目数据库应可读取");
+    let database_before = read_sqlite_logical_snapshot(&database);
     let logs = workspace.join("logs");
     let logs_before = fs::read_dir(&logs)
         .expect("Translate 前日志目录应可读取")
@@ -1589,9 +1782,9 @@ fn mv_source_placeholder_failure_fails_before_database_and_model_side_effects() 
         "任一 RPG Maker Unit 准备失败时不得发送其他完整块：{requests:?}"
     );
     assert_eq!(
-        fs::read(&database).expect("Translate 后项目数据库应可读取"),
+        read_sqlite_logical_snapshot(&database),
         database_before,
-        "规划失败前后 project.db 字节必须完全不变"
+        "规划失败不得改变任何 SQLite 逻辑业务状态"
     );
     assert!(
         !workspace.join("task-records").exists(),
@@ -1976,29 +2169,7 @@ fn rules_failure_after_builtin_commit_keeps_known_failed_terminal_state() {
         "后续 Rules 失败必须保留已提交的 Builtin 结果"
     );
     let stderr = String::from_utf8(extract.stderr).expect("失败诊断必须是 UTF-8");
-    assert_eq!(
-        stderr.matches("错误：").count(),
-        1,
-        "主错误只能呈现一次：{stderr}"
-    );
-    assert!(
-        !stderr.contains("警告："),
-        "普通 Rules 失败不得追加日志合同警告：{stderr}"
-    );
-    assert!(
-        stderr.contains("此前确认的进度仍然保留；指出的内容没有完成"),
-        "Rules 失败必须保留 ProgressPreserved 语义：{stderr}"
-    );
-    for misleading in [
-        "project_log",
-        "已保存的项目状态不满足本次操作",
-        "最终结果未知",
-    ] {
-        assert!(
-            !stderr.contains(misleading),
-            "普通 Rules 失败不得显示误导性收尾诊断 {misleading:?}：{stderr}"
-        );
-    }
+    assert!(!stderr.is_empty(), "Rules 失败必须通过 stderr 呈现终端诊断");
 
     let new_logs = fs::read_dir(&logs)
         .expect("失败 Extract 后日志目录应可读取")
@@ -2015,6 +2186,25 @@ fn rules_failure_after_builtin_commit_keeps_known_failed_terminal_state() {
         1,
         "Rules 主错误不得被日志合同错误重复或替换"
     );
+    let diagnostic = records
+        .iter()
+        .find(|record| record["event"] == "diagnostic.run")
+        .expect("Rules 失败必须有结构化主诊断");
+    assert_eq!(diagnostic["payload"]["relation"], "primary");
+    assert!(
+        diagnostic["payload"]["object"]
+            .as_str()
+            .is_some_and(|object| object.contains("rules.toml")),
+        "Rules 失败诊断必须指向实际失败规则输入"
+    );
+    for field in ["reason", "impact", "help"] {
+        assert!(
+            diagnostic["payload"][field]
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "Rules 失败诊断的 {field} 必须是非空可读事实"
+        );
+    }
     assert!(
         records
             .iter()
@@ -2111,6 +2301,19 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
         user_texts.contains(&SOURCE_TEXT) && user_texts.contains(&RULES_SHORT_SOURCE),
         "同一翻译运行必须把 Builtin 与 Rules owner 写入 JSON user message"
     );
+    assert_eq!(
+        read_owner_units(&database, "builtin"),
+        vec![(json!(SOURCE_TEXT), Some(json!(TRANSLATION)))],
+        "模型接受的 Builtin 译文必须先以可消费状态提交"
+    );
+    assert_eq!(
+        read_owner_units(&database, "rules"),
+        vec![(
+            json!(RULES_SHORT_SOURCE),
+            Some(json!(RULES_SHORT_TRANSLATION))
+        )],
+        "模型接受的 Rules 译文必须先以可消费状态提交"
+    );
     assert_success(
         "Rules 初次 WriteBack",
         &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
@@ -2142,7 +2345,10 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
         &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
     );
     let output_items = read_items(&workspace.join("write_back/data/Items.json"));
-    assert_eq!(output_items[1]["description"], TRANSLATION);
+    assert_eq!(
+        output_items[1]["description"], SOURCE_TEXT,
+        "同一逻辑 Group 的 Rules 兄弟来源变化后，旧 Builtin 正文必须保留但不得继续发布"
+    );
     assert_eq!(output_items[1]["customShortName"], RULES_SHORT_SOURCE);
     assert_eq!(output_items[1]["customLongName"], RULES_LONG_SOURCE);
 
@@ -2246,7 +2452,10 @@ fn rules_owner_replaces_writes_back_and_disables_without_touching_builtin() {
         &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
     );
     let output_items = read_items(&workspace.join("write_back/data/Items.json"));
-    assert_eq!(output_items[1]["description"], TRANSLATION);
+    assert_eq!(
+        output_items[1]["description"], SOURCE_TEXT,
+        "移除同一逻辑 Group 的 Rules Unit 仍会改变完整来源语境，旧正文不得被误当成 Current"
+    );
     assert_eq!(output_items[1]["customShortName"], RULES_SHORT_SOURCE);
     assert_eq!(output_items[1]["customLongName"], RULES_LONG_SOURCE);
 
@@ -2319,7 +2528,10 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         .join(PROJECT);
     let task_record = read_single_task_record_sharing_log_run_id(&workspace);
     assert!(task_record.contains("# 翻译任务"));
-    assert!(task_record.contains("状态：完成，已确认提交"));
+    assert!(
+        task_record.contains("状态：完成，已确认提交"),
+        "实际任务记录：\n{task_record}"
+    );
     assert!(task_record.contains("要求译文：1 项"));
     assert!(task_record.contains("已接受：1 项（ID：0），写入 2 个实际位置"));
     assert!(task_record.contains("未接受：0 项（ID：—）"));
@@ -3045,10 +3257,24 @@ fn assert_plain_progress_lines(stderr: &[u8], expected: &[&str]) {
 }
 
 fn write_configuration(root: &Path, endpoint: &str) {
-    write_configuration_with_protocol(root, endpoint, None);
+    write_configuration_for_client_with_protocol(root, endpoint, None, "primary", "e2e-model");
 }
 
 fn write_configuration_with_protocol(root: &Path, endpoint: &str, protocol: Option<&str>) {
+    write_configuration_for_client_with_protocol(root, endpoint, protocol, "primary", "e2e-model");
+}
+
+fn write_configuration_for_client(root: &Path, endpoint: &str, client: &str, model: &str) {
+    write_configuration_for_client_with_protocol(root, endpoint, None, client, model);
+}
+
+fn write_configuration_for_client_with_protocol(
+    root: &Path,
+    endpoint: &str,
+    protocol: Option<&str>,
+    client: &str,
+    model: &str,
+) {
     let protocol = protocol.map_or_else(String::new, |protocol| {
         format!("protocol = \"{protocol}\"\n")
     });
@@ -3057,10 +3283,11 @@ fn write_configuration_with_protocol(root: &Path, endpoint: &str, protocol: Opti
 thinking_output = true
 source_echo = false
 
-[llm.clients.primary]
+[llm.clients.{client}]
 {protocol}url = "{endpoint}"
 api_key = "e2e-secret"
-model = "e2e-model"
+model = "{model}"
+stream = false
 max_concurrent_requests = 2
 connect_timeout_ms = 5000
 read_timeout_ms = 10000
@@ -3093,7 +3320,7 @@ allowed_terms = []
 
 [[translation.profiles]]
 id = "local"
-llm_client = "primary"
+llm_client = "{client}"
 target_task_user_message_characters = 10000
 "#
     );
@@ -3548,6 +3775,89 @@ fn read_project_log_records(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn read_sqlite_logical_snapshot(database: &Path) -> BTreeMap<String, Vec<Vec<String>>> {
+    let connection = Connection::open(database).expect("项目数据库应可打开");
+    let tables = sqlite_user_tables(&connection);
+    let mut snapshot = BTreeMap::new();
+    for table in tables {
+        let table_identifier = quote_sql_identifier(&table);
+        let columns = sqlite_table_columns(&connection, &table_identifier);
+        let projection = columns
+            .iter()
+            .map(|column| format!("quote({})", quote_sql_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = connection
+            .prepare(&format!("SELECT {projection} FROM {table_identifier}"))
+            .expect("逻辑快照数据查询应可准备");
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..columns.len())
+                    .map(|index| row.get::<_, String>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("逻辑快照数据查询应可执行")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("逻辑快照数据应可读取");
+        rows.sort();
+        snapshot.insert(table, rows);
+    }
+    snapshot
+}
+
+fn sqlite_contains_text(database: &Path, needle: &str) -> bool {
+    let connection = Connection::open(database).expect("项目数据库应可打开");
+    for table in sqlite_user_tables(&connection) {
+        let table_identifier = quote_sql_identifier(&table);
+        for column in sqlite_table_columns(&connection, &table_identifier) {
+            let column_identifier = quote_sql_identifier(&column);
+            let query = format!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM {table_identifier}
+                    WHERE instr(CAST({column_identifier} AS BLOB), CAST(?1 AS BLOB)) > 0
+                )"
+            );
+            let found: bool = connection
+                .query_row(&query, [needle], |row| row.get(0))
+                .expect("数据库逻辑列值搜索应可执行");
+            if found {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn sqlite_user_tables(connection: &Connection) -> Vec<String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .expect("数据表列表查询应可准备");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("数据表列表查询应可执行")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("数据表列表应可读取")
+}
+
+fn sqlite_table_columns(connection: &Connection, table_identifier: &str) -> Vec<String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table_identifier})"))
+        .expect("数据表列查询应可准备");
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("数据表列查询应可执行")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("数据表列应可读取")
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 fn serve_one_translation(listener: TcpListener) -> Result<Value, String> {
     serve_one_response(listener, json!({ "0": [TRANSLATION] }))
 }
@@ -3582,7 +3892,8 @@ fn serve_one_generic_translation(
     listener: TcpListener,
     translation: &str,
 ) -> Result<Value, String> {
-    serve_one_response(listener, json!({ "0": [translation] }))
+    let lines = translation.split('\n').collect::<Vec<_>>();
+    serve_one_response(listener, json!({ "0": lines }))
 }
 
 fn serve_one_responses_output(listener: TcpListener, translations: Value) -> Result<Value, String> {

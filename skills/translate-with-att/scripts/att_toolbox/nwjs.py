@@ -551,7 +551,9 @@ OBSERVER_SCRIPT = r"""
   if (window.__ATT_NW_OBSERVER__) return {installed: true, reused: true};
   const state = {
     events: [], runtimeErrors: [], runtimeErrorKeys: Object.create(null),
-    sequence: 0, installedAt: Date.now(), installed: {}
+    sequence: 0, installedAt: Date.now(), installed: {},
+    pageLoadFinished: document.readyState === "complete", pollTicks: 0,
+    installFinished: false, installTimer: null
   };
   const clean = value => String(value == null ? "" : value).replace(/[\u0000-\u001f\u007f]/g, " ");
   const sceneName = () => {
@@ -621,6 +623,31 @@ OBSERVER_SCRIPT = r"""
     Object.defineProperty(wrapped, "__attObserverWrapped", {value: true});
     prototype[name] = wrapped;
     return true;
+  };
+  const hookRequirements = () => ({
+    bitmapDrawText: state.installed.bitmapDrawText === true,
+    windowDrawText: state.installed.windowDrawText === true,
+    windowDrawTextEx: state.installed.windowDrawTextEx === true,
+    addCommand: state.installed.addCommand === true,
+    loadFont: !window.Graphics || typeof Graphics.loadFont !== "function" || state.installed.loadFont === true,
+    fontManagerLoad: !window.FontManager || typeof FontManager.load !== "function" || state.installed.fontManagerLoad === true,
+    graphicsPrintError: !window.Graphics || typeof Graphics.printError !== "function" || state.installed.graphicsPrintError === true,
+    graphicsPrintLoadingError: !window.Graphics || typeof Graphics.printLoadingError !== "function" || state.installed.graphicsPrintLoadingError === true
+  });
+  const snapshot = () => {
+    const requirements = hookRequirements();
+    return {
+      installed: true,
+      hooks: Object.assign({}, state.installed),
+      hookRequirements: requirements,
+      requiredHooksInstalled: Object.keys(requirements).every(name => requirements[name] === true),
+      pageLoadFinished: state.pageLoadFinished === true,
+      pollingObserved: state.pollTicks > 0,
+      pollingActive: state.installTimer !== null,
+      installationFinished: state.installFinished === true,
+      sequence: state.sequence,
+      scene: sceneName()
+    };
   };
   const installHooks = () => {
   const installed = state.installed;
@@ -711,12 +738,10 @@ OBSERVER_SCRIPT = r"""
     recordRuntimeError("graphics_loading_error", "Failed to load " + clean(url), clean(url), 0, 0, "");
     return original.apply(this, arguments);
   });
-  const coreReady = installed.bitmapDrawText && installed.windowDrawText && installed.windowDrawTextEx && installed.addCommand;
-  const graphicsFontReady = !window.Graphics || typeof Graphics.loadFont !== "function" || installed.loadFont;
-  const managerFontReady = !window.FontManager || typeof FontManager.load !== "function" || installed.fontManagerLoad;
-  const printErrorReady = !window.Graphics || typeof Graphics.printError !== "function" || installed.graphicsPrintError;
-  const loadingErrorReady = !window.Graphics || typeof Graphics.printLoadingError !== "function" || installed.graphicsPrintLoadingError;
-  if (coreReady && graphicsFontReady && managerFontReady && printErrorReady && loadingErrorReady && state.installTimer) {
+  const requirements = hookRequirements();
+  const ready = Object.keys(requirements).every(name => requirements[name] === true);
+  state.installFinished = ready && state.pageLoadFinished && state.pollTicks > 0;
+  if (state.installFinished && state.installTimer) {
     clearInterval(state.installTimer);
     state.installTimer = null;
   }
@@ -727,23 +752,23 @@ OBSERVER_SCRIPT = r"""
     return state.runtimeErrors.splice(0, state.runtimeErrors.length);
   };
   state.scene = sceneName;
+  state.snapshot = snapshot;
   window.__ATT_NW_OBSERVER__ = state;
   installHooks();
-  state.installTimer = setInterval(installHooks, 10);
-  const finishInstall = () => {
+  state.installTimer = setInterval(() => {
+    state.pollTicks += 1;
     installHooks();
-    if (state.installTimer) {
-      clearInterval(state.installTimer);
-      state.installTimer = null;
-    }
-    state.installFinished = true;
+  }, 10);
+  const finishInstall = () => {
+    state.pageLoadFinished = true;
+    installHooks();
   };
   if (document.readyState === "complete") {
     setTimeout(finishInstall, 0);
   } else {
     window.addEventListener("load", () => setTimeout(finishInstall, 0), {once: true});
   }
-  return {installed: true, reused: false, hooks: state.installed};
+  return Object.assign({reused: false}, snapshot());
 })()
 """
 

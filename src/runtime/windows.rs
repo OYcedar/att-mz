@@ -756,6 +756,22 @@ pub(crate) fn create_new_atomic_replace_candidate(path: &Path) -> Result<File, W
         .map_err(|source| io_error("建立原子替换候选", path, source))
 }
 
+/// 为需要由其他句柄继续读写的新数据库原子占有路径，并固定其物理身份。
+///
+/// 返回句柄允许 SQLite 另开读写句柄，但不共享删除权限。调用方只要同时继续持有
+/// 已固定的父目录链和本句柄，目标路径就不能在初始化或 online backup 期间被删除、
+/// 重命名或替换。该句柄必须一直保留到最终路径身份复核完成。
+pub(crate) fn create_new_pinned_database_file(path: &Path) -> Result<File, WindowsFsError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| io_error("建立身份固定的数据库文件", path, source))
+}
+
 /// 通过调用方仍持有的精确文件句柄删除新建候选，不再按路径选择删除对象。
 pub(crate) fn delete_open_atomic_replace_candidate(
     file: &File,

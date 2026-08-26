@@ -86,11 +86,15 @@ ATT 当前没有独立 `status` 命令。需要完整枚举当前 Unit、有效�
 使用高级 `ctx.translation.list()`；需要 Group 语境时，把全部待查可读 ID 合并到一次
 `ctx.translation.context(ids)`。普通验收不读取 raw schema，也不使用内部位置字段。
 
-数据库中译文非空也不能单独证明它对本次预期 Prompt、Profile、Client、术语和 Placeholder
-仍是 Current。要验证自动状态，必须用本次预期资源执行 Translate 的准备与状态重判；
-这可能按当前配置发出模型请求，完成或修复翻译的任务已包含该操作。当前配置缺少必需的
-外部值，或用户明确排除模型调用时，把 Current 标为未验证，不能从不透明
-`translation_state` 或旧任务记录自行推导。
+数据库中译文非空不能单独证明它可以发布。自动正文先要求 V2 状态与当前源文、完整实际
+Group 来源语境、项目语言对、位置、角色和写回结构精确匹配，再由消费入口独立执行当前
+Placeholder 与结构强验收；人工正文另绑定写入时的语言对，但不绑定兄弟语境。Prompt、
+Profile、Client、术语和语言检查阈值只影响后续请求或质量审查，不能用来否定或删除既有
+V2 身份。
+
+验收当前状态时使用 `translation export`、当前 Extract 事实和实际 WriteBack 输出交叉核对，
+不为“重判”构造新 Client 或发出模型请求。来源、语言对、项目或实际输出之间缺少可核对
+绑定时，结果必须为 `unverified`，不能从不透明 `translation_state`、旧任务记录或手工报告推导。
 
 数据库中没有译文的 Unit 是“待人工分类候选”，不必然等于应该翻译：空白、没有源语
 自然文本或完全受 Placeholder 保护的内容也可以没有译文。对每个候选按当前语言、
@@ -144,17 +148,31 @@ Manual 不检查语言质量、术语、文风、语境或源语残留，这些�
 - 目标语自然度、UI 长度和可读性；
 - 源语言残留、拒绝语、模型说明、JSON 痕迹和异常转义。
 
-标准流程使用 `translation_qa.py scan` 一次读取 `translation export`、survey、术语和可选
-WriteBack 预览或 NW.js 运行记录，生成 `qa-summary.json`、完整机器明细 `findings.jsonl` 和
+标准流程使用 `translation_qa.py scan` 一次读取 `translation export`、survey、coverage、coverage
+同目录的逐规则 manifest、术语、
+可选的 ATT 当前实际 `write_back` 目录以及 NW.js 运行记录，生成 `qa-summary.json`、完整机器明细 `findings.jsonl` 和
 紧凑的 `review-groups.jsonl`。Agent 先读 Review 组及少量样例，只有决定处理某组时才按
 `review_group_id` 查看对应明细；不得把数千条启发式命中逐项读完后再分类。`manual` 默认只
 输出确定问题的自然 ID，使用一个或多个 `--review-group` 才加入已审核的启发式组。状态只取
 `clean`、`needs_review` 或 `unverified`；问题数量不会使该工具非零退出，也不会把结构合法
 译文改成 Rejected。
+不存在独立的 WriteBack preview 报告契约；QA 必须读取真实输出并核对其与 survey、coverage、
+translation export 和运行观察的来源关系。任一必要关系无法证明时，没有静态 finding 也只能是
+`unverified`。
+Coverage 不能自行证明 Rules Unit。QA 必须从 Survey 位置、实际 Rule recipe 和 pattern 重新投影
+`manual_id`、原文、类型、控制契约与所有权，并核对 Rules disposition 的全部候选都有唯一实际
+Rule 消费；空投影或只改 coverage 的伪所有权属于输入不一致。
+NW.js 场景证据还必须包含完整观察 hooks 和安装轮询、严格递增的完整事件与可重算子集、每个场景
+独立的序列边界和语义匹配绘制，以及足以审核文本的可解码截图；同时核对隔离副本中未写回的 Survey
+基线字节与实际 WriteBack 部署字节。PID、布尔标签、空事件、空 hooks 或极小图片本身都不是运行
+证据。结构和字节一致性也不能证明报告无法伪造，因此执行记录不得声称工具无法提供的绝对来源。
 
 源语残留扫描必须覆盖数据库当前译文、全部 WriteBack 输出和外部转换后的最终文件。扫描
 命中逐项分类，不能因某些合法专名或协议片段存在就整体忽略。扫描无命中也不能替代语义
 审校。
+Generic 有精确 recipe 时按实际 Unit 输出核对原文序列，并区分译文已有残留与 WriteBack 新引入
+残留。RPG Maker 尚无完整 Unit 写回 recipe 时，只能把同一输出文件内出现的源文精确文字序列列为
+启发式 Review，并继续保留 Unit 映射未验证；不得把文件级命中冒充精确 Unit 结论。
 
 ## 8. WriteBack、实际消费者与组合项目
 
@@ -197,7 +215,8 @@ WriteBack 成功不表示 Translate 完成；Partial 输出可能合法保留源
 | 最早改变的事实 | 必须重新执行 |
 | --- | --- |
 | 来源、项目归属、Rules、JSONL 分组或稳定身份 | Extract 及其后全部验收 |
-| 语言、术语、Placeholder、Prompt、Profile 或 Client | Translate 状态重判、全部译文与下游验收 |
+| 项目语言对、源文、Group 语境或 Placeholder 强不变量 | 重新确认译文适用性；非 Current 正文不发布，新结果原子替换后再做全部下游验收 |
+| 术语、Prompt、Profile、Client 或语言检查阈值 | 不改变既有 Current；重新审查受影响的质量要求，并将新选择用于后续实际模型请求 |
 | Manual、Lua 或其他译文修订 | 受影响 Group、全量语言/Placeholder/质量扫描、WriteBack 与实际加载 |
 | WriteBack recipe、布局或外部转换 | 完整输出、残留、转换和实际消费者验收 |
 | 部署方式或消费者版本 | 全部实际消费与组合检查 |

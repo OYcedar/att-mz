@@ -6821,7 +6821,8 @@ impl ProductionCommandError {
             ),
             ProjectLuaExecutionError::Run { path, source } => {
                 let class = match source {
-                    ProjectLuaRunError::RollbackOutcomeUnknown { .. } => 1,
+                    ProjectLuaRunError::RollbackOutcomeUnknown { .. }
+                    | ProjectLuaRunError::SavepointOutcomeUnknown(_) => 1,
                     ProjectLuaRunError::NotStarted(failure)
                     | ProjectLuaRunError::Failed(failure)
                     | ProjectLuaRunError::RolledBack(failure) => match failure {

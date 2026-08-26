@@ -261,6 +261,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] Không thể tuần tự hóa yêu cầu mô hình
     [response_parsing_failed] Phản hồi mô hình không phải JSON hợp lệ
     [invalid_response_contract] Phản hồi mô hình không đáp ứng hợp đồng phản hồi bắt buộc
+    [model_stream_incomplete] Luồng mô hình kết thúc trước khi có kết quả cuối rõ ràng
     [transport_failed] Truyền tải HTTP thất bại trước khi nhận được phản hồi hợp lệ
     [lua_compilation_failed] Không thể biên dịch chương trình Lua chính
     [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy

@@ -104,8 +104,14 @@ impl TranslationTaskExecutionEvidence {
 /// Executor 的正常结果及其旁路证据。
 #[derive(Debug)]
 pub(crate) struct TranslationTaskExecution {
-    outcome: TranslationTaskOutcome,
+    state: TranslationTaskExecutionState,
     evidence: TranslationTaskExecutionEvidence,
+}
+
+#[derive(Debug)]
+pub(crate) enum TranslationTaskExecutionState {
+    Started(TranslationTaskOutcome),
+    AdmissionStopped,
 }
 
 impl TranslationTaskExecution {
@@ -113,21 +119,56 @@ impl TranslationTaskExecution {
         outcome: TranslationTaskOutcome,
         evidence: TranslationTaskExecutionEvidence,
     ) -> Self {
-        Self { outcome, evidence }
+        assert_ne!(
+            evidence.attempt_count(),
+            0,
+            "模型任务结果必须对应至少一次真实外部 attempt"
+        );
+        Self {
+            state: TranslationTaskExecutionState::Started(outcome),
+            evidence,
+        }
+    }
+
+    pub(crate) fn admission_stopped(evidence: TranslationTaskExecutionEvidence) -> Self {
+        assert_eq!(
+            evidence.attempt_count(),
+            0,
+            "请求准入停止不得携带模型 attempt"
+        );
+        Self {
+            state: TranslationTaskExecutionState::AdmissionStopped,
+            evidence,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn synthetic(outcome: TranslationTaskOutcome) -> Self {
         let evidence = TranslationTaskExecutionEvidence::synthetic(outcome.attempts());
-        Self { outcome, evidence }
+        Self {
+            state: TranslationTaskExecutionState::Started(outcome),
+            evidence,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (TranslationTaskOutcome, TranslationTaskExecutionEvidence) {
-        (self.outcome, self.evidence)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TranslationTaskExecutionState,
+        TranslationTaskExecutionEvidence,
+    ) {
+        (self.state, self.evidence)
     }
 
-    pub(crate) fn outcome(&self) -> &TranslationTaskOutcome {
-        &self.outcome
+    pub(crate) fn outcome(&self) -> Option<&TranslationTaskOutcome> {
+        match &self.state {
+            TranslationTaskExecutionState::Started(outcome) => Some(outcome),
+            TranslationTaskExecutionState::AdmissionStopped => None,
+        }
+    }
+
+    pub(crate) const fn admission_was_stopped(&self) -> bool {
+        matches!(&self.state, TranslationTaskExecutionState::AdmissionStopped)
     }
 }
 

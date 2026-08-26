@@ -261,6 +261,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] 无法序列化模型请求
     [response_parsing_failed] 模型响应不是有效 JSON
     [invalid_response_contract] 模型响应不符合所需响应契约
+    [model_stream_incomplete] 模型流在明确终态前结束
     [transport_failed] 收到有效响应前 HTTP 传输失败
     [lua_compilation_failed] Lua 主程序编译失败
     [lua_execution_failed] Lua 主程序运行失败

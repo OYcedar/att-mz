@@ -1,4 +1,4 @@
-//! 跨引擎共享的非流式 LLM 请求契约。
+//! 跨引擎共享的 LLM 请求契约。
 //!
 //! 本模块只表达调用方与模型请求根之间共同拥有的消息、响应和单次请求失败
 //! 语义。具体协议、认证、资源治理和重试策略分别由根适配器与调用方拥有。
@@ -18,7 +18,6 @@ use serde_json::Value;
 use url::{Url, form_urlencoded};
 
 use crate::diagnostic::{Diagnostic, DiagnosticReport};
-use crate::fingerprint::Sha256Fingerprint;
 
 /// 发送给 LLM 的消息角色。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +50,7 @@ impl ChatMessage {
     }
 }
 
-/// 单次非流式 LLM 请求的结束原因。
+/// 单次 LLM 请求的结束原因。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LlmFinishReason {
     Stop,
@@ -117,10 +116,7 @@ pub(crate) enum LlmRequestError<E> {
     /// 认证、无效请求等继续重试无意义的失败。
     Fatal(E),
     /// 同一运行已经确认必须停止后续模型请求；本工作没有再次调用供应商。
-    AdmissionStopped {
-        service_status: LlmServiceStatus,
-        diagnostic: DiagnosticReport,
-    },
+    AdmissionStopped { diagnostic: DiagnosticReport },
 }
 
 impl<E> fmt::Display for LlmRequestError<E>
@@ -159,7 +155,7 @@ where
     }
 }
 
-/// 执行一次非流式 LLM 请求的根能力。
+/// 执行一次 LLM 请求的根能力。
 ///
 /// 根适配器不自动重试。`Client` 由统一配置边界建立，根适配器只执行客户端
 /// 已经确定的协议、认证、模型、资源上限和请求正文事实。
@@ -172,6 +168,22 @@ pub(crate) trait LlmRequestExecutor: Send + Sync {
         client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a;
+
+    /// 在本地准入完成、一次外部请求即将实际执行时同步报告该事实。
+    ///
+    /// 默认实现适用于没有独立本地准入阶段的执行器；拥有许可、限速或关闭门的运行根
+    /// 必须在这些门之后覆盖该方法。回调不得在序列化失败或准入拒绝时执行。
+    fn request_with_attempt_observer<'a>(
+        &'a self,
+        client: &'a Self::Client,
+        messages: &'a [ChatMessage],
+        on_attempt_started: Box<dyn FnOnce() + Send + 'a>,
+    ) -> impl Future<Output = Result<LlmResponse, LlmRequestError<Self::Error>>> + Send + 'a {
+        async move {
+            on_attempt_started();
+            self.request(client, messages).await
+        }
+    }
 
     /// 在执行器仍同时持有 Client 协议事实与根错误类型时建立唯一安全诊断。
     fn request_diagnostic(
@@ -188,15 +200,6 @@ pub(crate) trait LlmRequestExecutor: Send + Sync {
     fn continue_after_retryable(&self, _service_status: LlmServiceStatus) {}
 }
 
-/// 一个受信 LLM Client 对译文结果有影响的稳定语义身份。
-///
-/// 实现只纳入会改变模型输出语义的协议事实；密钥、TLS、代理、
-/// 超时、限速与并发等运行资源事实不得进入身份。这是公共 LLM
-/// Client 对会消费已接受译文的上层提供的能力，不携带 MZ 特有规则。
-pub(crate) trait LlmClientSemanticIdentity: Send + Sync {
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint;
-}
-
 /// LLM 根错误只公开合作取消判断；诊断投影由仍持有 Client 协议事实的执行器负责。
 pub(crate) trait LlmRequestFailure {
     /// 该根错误是否明确表示请求仍在等待本地入场资源时被合作取消。
@@ -205,6 +208,14 @@ pub(crate) trait LlmRequestFailure {
     /// 误归类为用户取消。
     fn is_cancelled_wait(&self) -> bool {
         false
+    }
+
+    /// 该失败是否发生在一次 HTTP 请求已经实际发出之后。
+    ///
+    /// 本地准入等待、请求序列化和已经关闭的执行器都不得被上层计为模型 attempt；
+    /// 传输、HTTP 状态和响应验收失败则已经消费了一次真实请求。
+    fn request_was_sent(&self) -> bool {
+        true
     }
 
     /// 返回外部服务已经以结构化状态确认的失败类别。

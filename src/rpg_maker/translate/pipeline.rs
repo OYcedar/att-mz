@@ -27,7 +27,7 @@ use crate::execution::ordered::{
     OrderedFinalizationDisposition, OrderedTaskResult, execute_ordered,
 };
 use crate::execution::{CooperativeCancellation, OperationCompletion};
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::fingerprint::Sha256Fingerprint;
 use crate::language::{LanguageAnalysis, LanguagePair};
 use crate::llm::{ChatMessage, LlmClientConcurrency, LlmServiceStatus};
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
@@ -56,7 +56,8 @@ use super::task_record::{
     NoOpTranslationTaskRecordSink, TranslationAssistantValueError, TranslationTaskCommitFailure,
     TranslationTaskCommitFailureImpact, TranslationTaskCommitPhase, TranslationTaskExecution,
     TranslationTaskExecutionEvidence, TranslationTaskExecutionFailure,
-    TranslationTaskRecordDocument, TranslationTaskRecordFinalState, TranslationTaskRecordSink,
+    TranslationTaskExecutionState, TranslationTaskRecordDocument, TranslationTaskRecordFinalState,
+    TranslationTaskRecordSink,
 };
 
 /// 模型响应返回后仍要执行验收、传播准备和顺序提交；这些本地完成项可以在内存中
@@ -210,35 +211,12 @@ impl TranslationUnitIdentity {
     }
 }
 
-/// 一条已经实际影响某个译文的术语事实。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TerminologyDependency {
-    term: String,
-    translation: String,
-}
-
-impl TerminologyDependency {
-    pub(crate) fn new(term: impl Into<String>, translation: impl Into<String>) -> Self {
-        Self {
-            term: term.into(),
-            translation: translation.into(),
-        }
-    }
-
-    pub(crate) fn term(&self) -> &str {
-        &self.term
-    }
-
-    pub(crate) fn translation(&self) -> &str {
-        &self.translation
-    }
-}
-
 /// 从 RPG Maker 资产表读出的一个语义单元。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerTranslationAsset {
     identity: TranslationUnitIdentity,
     semantic_order_key: RpgMakerSemanticOrderKey,
+    recipe_shape: String,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     manual: bool,
@@ -305,23 +283,7 @@ impl RpgMakerTranslationAsset {
         Self {
             identity,
             semantic_order_key: RpgMakerSemanticOrderKey::new(Vec::new(), 0),
-            translation,
-            translation_state,
-            manual: false,
-            rejected: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_semantic_order_key(
-        identity: TranslationUnitIdentity,
-        semantic_order_key: RpgMakerSemanticOrderKey,
-        translation: Option<TextUnitContent>,
-        translation_state: Option<Sha256Fingerprint>,
-    ) -> Self {
-        Self {
-            identity,
-            semantic_order_key,
+            recipe_shape: "[]".to_owned(),
             translation,
             translation_state,
             manual: false,
@@ -332,6 +294,7 @@ impl RpgMakerTranslationAsset {
     pub(crate) fn with_rejected_semantic_order_key(
         identity: TranslationUnitIdentity,
         semantic_order_key: RpgMakerSemanticOrderKey,
+        recipe_shape: String,
         translation: Option<TextUnitContent>,
         translation_state: Option<Sha256Fingerprint>,
         rejected: Option<RpgMakerStoredRejectedTranslation>,
@@ -339,6 +302,7 @@ impl RpgMakerTranslationAsset {
         Self {
             identity,
             semantic_order_key,
+            recipe_shape,
             translation,
             translation_state,
             manual: false,
@@ -349,12 +313,14 @@ impl RpgMakerTranslationAsset {
     pub(crate) fn with_manual_semantic_order_key(
         identity: TranslationUnitIdentity,
         semantic_order_key: RpgMakerSemanticOrderKey,
+        recipe_shape: String,
         translation: TextUnitContent,
         translation_state: Sha256Fingerprint,
     ) -> Self {
         Self {
             identity,
             semantic_order_key,
+            recipe_shape,
             translation: Some(translation),
             translation_state: Some(translation_state),
             manual: true,
@@ -376,6 +342,7 @@ impl RpgMakerTranslationAsset {
     ) -> (
         TranslationUnitIdentity,
         RpgMakerSemanticOrderKey,
+        String,
         Option<TextUnitContent>,
         Option<Sha256Fingerprint>,
         bool,
@@ -384,6 +351,7 @@ impl RpgMakerTranslationAsset {
         (
             self.identity,
             self.semantic_order_key,
+            self.recipe_shape,
             self.translation,
             self.translation_state,
             self.manual,
@@ -437,10 +405,6 @@ impl RpgMakerTranslationGroup {
     #[cfg(test)]
     pub(crate) fn group_location(&self) -> &RpgMakerLocation {
         &self.group_location
-    }
-
-    pub(crate) fn semantic_order_key(&self) -> &RpgMakerSemanticOrderKey {
-        &self.semantic_order_key
     }
 
     #[cfg(test)]
@@ -811,21 +775,6 @@ impl TranslationInvalidation {
                 origin,
             }),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn identity(&self) -> &TranslationUnitIdentity {
-        &self.identity
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expected_translation(&self) -> &TextUnitContent {
-        &self.expected_translation
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn expected_translation_state(&self) -> Sha256Fingerprint {
-        self.expected_translation_state
     }
 
     pub(crate) fn into_parts(
@@ -1396,9 +1345,9 @@ impl fmt::Display for RpgMakerTranslationTaskIndex {
     }
 }
 
-pub(crate) use crate::translation::placeholder::{
-    AppliedPlaceholder, PlaceholderRuleOrigin, PlaceholderSegment,
-};
+#[cfg(test)]
+pub(crate) use crate::translation::placeholder::PlaceholderSegment;
+pub(crate) use crate::translation::placeholder::{AppliedPlaceholder, PlaceholderRuleOrigin};
 
 /// 一个完整 Group 的身份、完整原文、来源语境与 Unit 自然顺序指纹。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1414,21 +1363,45 @@ impl GroupContextFingerprint {
     }
 }
 
-/// 一个语义单元除最终译文以外的全部当前翻译语义。
+/// 一个语义单元的请求规划状态与自动正文适用性。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationStateContext(Sha256Fingerprint);
+pub(crate) struct TranslationStateContext {
+    rejected_applicability: Sha256Fingerprint,
+    automatic_applicability: Sha256Fingerprint,
+}
 
 impl TranslationStateContext {
+    #[cfg(test)]
     pub(crate) const fn new(fingerprint: Sha256Fingerprint) -> Self {
-        Self(fingerprint)
+        Self {
+            rejected_applicability: fingerprint,
+            automatic_applicability: fingerprint,
+        }
+    }
+
+    pub(crate) const fn from_applicabilities(
+        rejected_applicability: Sha256Fingerprint,
+        automatic_applicability: Sha256Fingerprint,
+    ) -> Self {
+        Self {
+            rejected_applicability,
+            automatic_applicability,
+        }
     }
 
     pub(crate) fn finish(self, _translation: &TextUnitContent) -> Sha256Fingerprint {
-        let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-unit-state");
-        hasher.frame(1, self.0.as_bytes());
-        // 译文正文与产生它的语义上下文分别参与并发比较。这样，可信的项目数据库
-        // 修订只改变译文时不会伪装成原文、Prompt 或 Placeholder 已经变化。
-        hasher.finish()
+        self.automatic_applicability
+    }
+
+    pub(crate) fn rejection_planning_state(self, _source: &TextUnitContent) -> Sha256Fingerprint {
+        self.rejected_applicability
+    }
+
+    pub(crate) fn rejected_applicability_is_current(self, stored: Sha256Fingerprint) -> bool {
+        crate::translation::rpg_maker_rejected_applicability_is_current(
+            stored,
+            self.rejected_applicability,
+        )
     }
 }
 
@@ -1437,9 +1410,11 @@ impl TranslationStateContext {
 pub(crate) struct TranslationPropagationTarget {
     identity: TranslationUnitIdentity,
     state_context: TranslationStateContext,
+    expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
 }
 
 impl TranslationPropagationTarget {
+    #[cfg(test)]
     pub(crate) const fn new(
         identity: TranslationUnitIdentity,
         state_context: TranslationStateContext,
@@ -1447,6 +1422,25 @@ impl TranslationPropagationTarget {
         Self {
             identity,
             state_context,
+            expected_previous: None,
+        }
+    }
+
+    pub(crate) fn with_previous(
+        identity: TranslationUnitIdentity,
+        state_context: TranslationStateContext,
+        expected_translation: Option<TextUnitContent>,
+        expected_translation_state: Option<Sha256Fingerprint>,
+    ) -> Self {
+        assert_eq!(
+            expected_translation.is_some(),
+            expected_translation_state.is_some(),
+            "传播目标读取时的译文和状态必须同时存在或同时缺失"
+        );
+        Self {
+            identity,
+            state_context,
+            expected_previous: expected_translation.zip(expected_translation_state),
         }
     }
 
@@ -1456,6 +1450,12 @@ impl TranslationPropagationTarget {
 
     pub(crate) const fn state_context(&self) -> TranslationStateContext {
         self.state_context
+    }
+
+    pub(crate) fn expected_previous(&self) -> Option<(&TextUnitContent, Sha256Fingerprint)> {
+        self.expected_previous
+            .as_ref()
+            .map(|(translation, state)| (translation, *state))
     }
 }
 
@@ -1750,6 +1750,8 @@ pub(crate) struct ExpectedTranslationOutput {
     placeholder_bindings: Arc<PlaceholderBindingIndex>,
     state_context: TranslationStateContext,
     propagation_state_contexts: Vec<TranslationStateContext>,
+    expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    propagation_expected_previous: Vec<Option<(TextUnitContent, Sha256Fingerprint)>>,
 }
 
 impl ExpectedTranslationOutput {
@@ -1776,6 +1778,7 @@ impl ExpectedTranslationOutput {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_new_with_cancellation<E>(
         id: TaskId,
         identity: TranslationUnitIdentity,
@@ -1783,9 +1786,37 @@ impl ExpectedTranslationOutput {
         validation: ExpectedTranslationValidation,
         state_context: TranslationStateContext,
         propagation_state_contexts: Vec<TranslationStateContext>,
+        ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, ExpectedTranslationOutputContractError>, E> {
+        Self::try_new_with_previous_and_cancellation(
+            id,
+            identity,
+            propagation_targets,
+            validation,
+            state_context,
+            propagation_state_contexts,
+            None,
+            Vec::new(),
+            ensure_running,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_previous_and_cancellation<E>(
+        id: TaskId,
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationUnitIdentity>,
+        validation: ExpectedTranslationValidation,
+        state_context: TranslationStateContext,
+        propagation_state_contexts: Vec<TranslationStateContext>,
+        expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+        mut propagation_expected_previous: Vec<Option<(TextUnitContent, Sha256Fingerprint)>>,
         mut ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<Self, ExpectedTranslationOutputContractError>, E> {
         ensure_running()?;
+        if propagation_expected_previous.is_empty() {
+            propagation_expected_previous.resize(propagation_targets.len(), None);
+        }
         if propagation_targets.len() != propagation_state_contexts.len() {
             return Ok(Err(
                 ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
@@ -1795,6 +1826,18 @@ impl ExpectedTranslationOutput {
                     )),
                     target_count: propagation_targets.len(),
                     context_count: propagation_state_contexts.len(),
+                },
+            ));
+        }
+        if propagation_targets.len() != propagation_expected_previous.len() {
+            return Ok(Err(
+                ExpectedTranslationOutputContractError::PropagationContextCountMismatch {
+                    unit_id: id,
+                    target: Box::new(ExpectedTranslationOutputContractTarget::from_identity(
+                        &identity,
+                    )),
+                    target_count: propagation_targets.len(),
+                    context_count: propagation_expected_previous.len(),
                 },
             ));
         }
@@ -1829,6 +1872,8 @@ impl ExpectedTranslationOutput {
             placeholder_bindings,
             state_context,
             propagation_state_contexts,
+            expected_previous,
+            propagation_expected_previous,
         }))
     }
 
@@ -1854,6 +1899,18 @@ impl ExpectedTranslationOutput {
 
     pub(crate) const fn id(&self) -> TaskId {
         self.id
+    }
+
+    pub(crate) fn expected_previous(&self) -> Option<(&TextUnitContent, Sha256Fingerprint)> {
+        self.expected_previous
+            .as_ref()
+            .map(|(translation, state)| (translation, *state))
+    }
+
+    pub(crate) fn propagation_expected_previous(
+        &self,
+    ) -> &[Option<(TextUnitContent, Sha256Fingerprint)>] {
+        &self.propagation_expected_previous
     }
 
     pub(crate) const fn line_shape(&self) -> ExpectedLineShape {
@@ -2136,9 +2193,11 @@ pub(crate) struct TranslationPatch {
     propagation_targets: Vec<TranslationPropagationTarget>,
     translation: TextUnitContent,
     translation_state: Sha256Fingerprint,
+    expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
 }
 
 impl TranslationPatch {
+    #[cfg(test)]
     pub(crate) fn new(
         identity: TranslationUnitIdentity,
         propagation_targets: Vec<TranslationPropagationTarget>,
@@ -2150,6 +2209,23 @@ impl TranslationPatch {
             propagation_targets,
             translation,
             translation_state,
+            expected_previous: None,
+        }
+    }
+
+    pub(crate) fn with_previous(
+        identity: TranslationUnitIdentity,
+        propagation_targets: Vec<TranslationPropagationTarget>,
+        translation: TextUnitContent,
+        translation_state: Sha256Fingerprint,
+        expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
+    ) -> Self {
+        Self {
+            identity,
+            propagation_targets,
+            translation,
+            translation_state,
+            expected_previous,
         }
     }
 
@@ -2167,6 +2243,12 @@ impl TranslationPatch {
 
     pub(crate) const fn translation_state(&self) -> Sha256Fingerprint {
         self.translation_state
+    }
+
+    pub(crate) fn expected_previous(&self) -> Option<(&TextUnitContent, Sha256Fingerprint)> {
+        self.expected_previous
+            .as_ref()
+            .map(|(translation, state)| (translation, *state))
     }
 }
 
@@ -2208,16 +2290,19 @@ impl AcceptedTranslationDecision {
 pub(crate) struct RejectedTranslationTarget {
     identity: TranslationUnitIdentity,
     planning_state: Sha256Fingerprint,
+    expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
 }
 
 impl RejectedTranslationTarget {
     pub(crate) fn new(
         identity: TranslationUnitIdentity,
         planning_state: Sha256Fingerprint,
+        expected_previous: Option<(TextUnitContent, Sha256Fingerprint)>,
     ) -> Self {
         Self {
             identity,
             planning_state,
+            expected_previous,
         }
     }
 
@@ -2227,6 +2312,12 @@ impl RejectedTranslationTarget {
 
     pub(crate) const fn planning_state(&self) -> Sha256Fingerprint {
         self.planning_state
+    }
+
+    pub(crate) fn expected_previous(&self) -> Option<(&TextUnitContent, Sha256Fingerprint)> {
+        self.expected_previous
+            .as_ref()
+            .map(|(translation, state)| (translation, *state))
     }
 }
 
@@ -2424,18 +2515,13 @@ pub(crate) enum TranslationTaskUnavailableReason {
         diagnostic: DiagnosticReport,
         service_status: LlmServiceStatus,
     },
-    RequestAdmissionStopped {
-        diagnostic: DiagnosticReport,
-        service_status: LlmServiceStatus,
-    },
 }
 
 impl TranslationTaskUnavailableReason {
     fn stops_admission(&self) -> bool {
         match self {
             Self::RecoverableRequestExhausted { service_status, .. }
-            | Self::RetryAfterExceedsConfiguredMaximum { service_status, .. }
-            | Self::RequestAdmissionStopped { service_status, .. } => {
+            | Self::RetryAfterExceedsConfiguredMaximum { service_status, .. } => {
                 service_status.stops_admission_after_unavailable() || service_status.is_permanent()
             }
             Self::ModelResponseUnusable | Self::AllOutputsRejected => false,
@@ -2832,8 +2918,7 @@ fn task_outcome_diagnostics(
             | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
                 diagnostic,
                 ..
-            }
-            | TranslationTaskUnavailableReason::RequestAdmissionStopped { diagnostic, .. } => {
+            } => {
                 vec![diagnostic.clone()]
             }
             TranslationTaskUnavailableReason::ModelResponseUnusable => {
@@ -3064,18 +3149,20 @@ pub(crate) trait RpgMakerTranslationTaskExecutor: Send + Sync {
     type Profile: RpgMakerTranslationExecutionProfile;
     type Error: Error + Send + Sync + 'static;
 
-    /// 永久服务状态已经停止新请求时，是否仍应提交其他已准入任务的验收结果。
+    /// 外部请求失败已经停止新任务准入时，是否仍应提交其他已准入任务的验收结果。
     fn failure_preserves_admitted_results(_error: &Self::Error) -> bool {
         false
     }
 
-    fn execute(
-        &self,
-        profile: &Self::Profile,
-        task: &RpgMakerExecutableTask,
+    fn execute<'a>(
+        &'a self,
+        profile: &'a Self::Profile,
+        task: &'a RpgMakerExecutableTask,
+        on_task_started: Box<dyn FnOnce() + Send + 'a>,
     ) -> impl Future<
         Output = Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>>,
-    > + Send;
+    > + Send
+    + 'a;
 }
 
 /// 拥有 RPG Maker 译文准备与单任务提交事务的存储边界。
@@ -3237,10 +3324,13 @@ pub(crate) trait RpgMakerTranslationLog: Send + Sync {
     fn emit(&self, event: RpgMakerTranslationLogEvent);
 }
 
-struct PreparedTranslationTask<C> {
-    outcome: Arc<TranslationTaskOutcome>,
-    evidence: TranslationTaskExecutionEvidence,
-    prepared_commit: Option<C>,
+enum PreparedTranslationTask<C> {
+    Started {
+        outcome: Arc<TranslationTaskOutcome>,
+        evidence: TranslationTaskExecutionEvidence,
+        prepared_commit: Option<C>,
+    },
+    AdmissionStopped,
 }
 
 enum TranslationTaskStageError<E, S> {
@@ -3446,14 +3536,23 @@ where
         task: &RpgMakerExecutableTask,
     ) -> Result<Self::Executed, Self::StageError> {
         let task_index = task.index();
-        self.service
-            .event_log
-            .emit(RpgMakerTranslationLogEvent::TaskStarted {
-                task_index,
-                total_tasks: self.total_tasks,
-            });
-
-        match self.service.task_executor.execute(self.profile, task).await {
+        let event_log = &self.service.event_log;
+        let total_tasks = self.total_tasks;
+        match self
+            .service
+            .task_executor
+            .execute(
+                self.profile,
+                task,
+                Box::new(move || {
+                    event_log.emit(RpgMakerTranslationLogEvent::TaskStarted {
+                        task_index,
+                        total_tasks,
+                    });
+                }),
+            )
+            .await
+        {
             Ok(execution) => Ok(execution),
             Err(TranslationTaskExecutionFailure::Failed {
                 source,
@@ -3481,7 +3580,13 @@ where
         execution: Self::Executed,
     ) -> Result<Self::Prepared, Self::StageError> {
         let task_index = task.index();
-        let (outcome, evidence) = execution.into_parts();
+        let (state, evidence) = execution.into_parts();
+        let outcome = match state {
+            TranslationTaskExecutionState::Started(outcome) => outcome,
+            TranslationTaskExecutionState::AdmissionStopped => {
+                return Ok(PreparedTranslationTask::AdmissionStopped);
+            }
+        };
         let outcome = Arc::new(outcome);
         if outcome.task_index() != task_index {
             return Err(TranslationTaskStageError::InvalidResult {
@@ -3510,7 +3615,7 @@ where
                     }
                 }
             };
-        Ok(PreparedTranslationTask {
+        Ok(PreparedTranslationTask::Started {
             outcome,
             evidence,
             prepared_commit,
@@ -3518,10 +3623,11 @@ where
     }
 
     fn executed_stops_admission(&self, _ordinal: usize, executed: &Self::Executed) -> bool {
-        matches!(
-            executed.outcome(),
-            TranslationTaskOutcome::Unavailable { reason, .. } if reason.stops_admission()
-        )
+        executed.admission_was_stopped()
+            || matches!(
+                executed.outcome(),
+                Some(TranslationTaskOutcome::Unavailable { reason, .. }) if reason.stops_admission()
+            )
     }
 
     async fn finalize(
@@ -3545,26 +3651,28 @@ where
                     report.mark_request_admission_stopped();
                 }
                 self.remember_failure_diagnostic(&diagnostic);
-                self.service
-                    .event_log
-                    .emit(RpgMakerTranslationLogEvent::TaskFinished {
-                        task_index: scheduled_task_index,
-                        outcome: RpgMakerTranslationLogTaskOutcome::ExecutionFailed {
-                            diagnostic: diagnostic.clone(),
-                        },
-                        attempts,
-                        retry_exhausted: false,
-                        report: report.clone(),
+                if attempts.is_some() {
+                    self.service
+                        .event_log
+                        .emit(RpgMakerTranslationLogEvent::TaskFinished {
+                            task_index: scheduled_task_index,
+                            outcome: RpgMakerTranslationLogTaskOutcome::ExecutionFailed {
+                                diagnostic: diagnostic.clone(),
+                            },
+                            attempts,
+                            retry_exhausted: false,
+                            report: report.clone(),
+                        });
+                    self.service.record_task(|| {
+                        TranslationTaskRecordDocument::new(
+                            task,
+                            evidence,
+                            TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                                diagnostic: diagnostic.clone(),
+                            },
+                        )
                     });
-                self.service.record_task(|| {
-                    TranslationTaskRecordDocument::new(
-                        task,
-                        evidence,
-                        TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
-                            diagnostic: diagnostic.clone(),
-                        },
-                    )
-                });
+                }
                 Err(TranslationTaskPipelineError::ExecuteTask {
                     task_index: scheduled_task_index,
                     source,
@@ -3576,22 +3684,25 @@ where
                 source,
                 evidence,
             }) => {
-                self.service
-                    .event_log
-                    .emit(RpgMakerTranslationLogEvent::TaskFinished {
-                        task_index: scheduled_task_index,
-                        outcome: RpgMakerTranslationLogTaskOutcome::Cancelled,
-                        attempts: NonZeroUsize::new(evidence.attempt_count()),
-                        retry_exhausted: false,
-                        report: report.clone(),
+                let attempts = NonZeroUsize::new(evidence.attempt_count());
+                if attempts.is_some() {
+                    self.service
+                        .event_log
+                        .emit(RpgMakerTranslationLogEvent::TaskFinished {
+                            task_index: scheduled_task_index,
+                            outcome: RpgMakerTranslationLogTaskOutcome::Cancelled,
+                            attempts,
+                            retry_exhausted: false,
+                            report: report.clone(),
+                        });
+                    self.service.record_task(|| {
+                        TranslationTaskRecordDocument::new(
+                            task,
+                            evidence,
+                            TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
+                        )
                     });
-                self.service.record_task(|| {
-                    TranslationTaskRecordDocument::new(
-                        task,
-                        evidence,
-                        TranslationTaskRecordFinalState::CancelledNoChanges { outcome: None },
-                    )
-                });
+                }
                 drop(source);
                 Ok(())
             }
@@ -3603,27 +3714,29 @@ where
                 let diagnostic =
                     task_result_sequence_report(scheduled_task_index, Some(actual_task_index));
                 self.remember_failure_diagnostic(&diagnostic);
-                self.service
-                    .event_log
-                    .emit(RpgMakerTranslationLogEvent::TaskFinished {
-                        task_index: scheduled_task_index,
-                        outcome: RpgMakerTranslationLogTaskOutcome::InvalidResult {
-                            diagnostic: diagnostic.clone(),
-                        },
-                        attempts: Some(outcome.attempts()),
-                        retry_exhausted: false,
-                        report: report.clone(),
+                if evidence.attempt_count() > 0 {
+                    self.service
+                        .event_log
+                        .emit(RpgMakerTranslationLogEvent::TaskFinished {
+                            task_index: scheduled_task_index,
+                            outcome: RpgMakerTranslationLogTaskOutcome::InvalidResult {
+                                diagnostic: diagnostic.clone(),
+                            },
+                            attempts: NonZeroUsize::new(evidence.attempt_count()),
+                            retry_exhausted: false,
+                            report: report.clone(),
+                        });
+                    self.service.record_task(|| {
+                        TranslationTaskRecordDocument::new(
+                            task,
+                            evidence,
+                            TranslationTaskRecordFinalState::InvalidResultNoChanges {
+                                outcome: Arc::clone(&outcome),
+                                diagnostic: diagnostic.clone(),
+                            },
+                        )
                     });
-                self.service.record_task(|| {
-                    TranslationTaskRecordDocument::new(
-                        task,
-                        evidence,
-                        TranslationTaskRecordFinalState::InvalidResultNoChanges {
-                            outcome: Arc::clone(&outcome),
-                            diagnostic: diagnostic.clone(),
-                        },
-                    )
-                });
+                }
                 Err(TranslationTaskPipelineError::InvalidTaskResultSequence {
                     expected_task_index: scheduled_task_index,
                     actual_task_index: Some(actual_task_index),
@@ -3644,12 +3757,15 @@ where
                 failure,
                 report,
             ),
-            OrderedTaskResult::Prepared(prepared) => {
-                let PreparedTranslationTask {
-                    outcome,
-                    evidence,
-                    prepared_commit,
-                } = prepared;
+            OrderedTaskResult::Prepared(PreparedTranslationTask::AdmissionStopped) => {
+                report.mark_request_admission_stopped();
+                Ok(())
+            }
+            OrderedTaskResult::Prepared(PreparedTranslationTask::Started {
+                outcome,
+                evidence,
+                prepared_commit,
+            }) => {
                 // Unavailable 等没有任何已验收译文的结果不需要提交。它们已经形成自己的
                 // 业务终态，不能仅因同时收到取消或更早任务失败而伪装成“未提交”。
                 if prepared_commit.is_none() {
@@ -3710,10 +3826,13 @@ where
     }
 
     fn prepared_stops_admission(&self, _ordinal: usize, prepared: &Self::Prepared) -> bool {
-        matches!(
-            prepared.outcome.as_ref(),
-            TranslationTaskOutcome::Unavailable { reason, .. } if reason.stops_admission()
-        )
+        match prepared {
+            PreparedTranslationTask::AdmissionStopped => true,
+            PreparedTranslationTask::Started { outcome, .. } => matches!(
+                outcome.as_ref(),
+                TranslationTaskOutcome::Unavailable { reason, .. } if reason.stops_admission()
+            ),
+        }
     }
 
     fn finalization_failure_preserves_admitted_results(
@@ -3879,6 +3998,11 @@ where
         report: &mut RpgMakerTranslationRunReport,
     ) {
         let task_index = task.index();
+        assert_ne!(
+            evidence.attempt_count(),
+            0,
+            "已开始任务的正常结果必须携带真实模型 attempt"
+        );
         report.record(&outcome);
         let retry_exhausted = matches!(
             outcome.as_ref(),
@@ -4617,6 +4741,8 @@ mod tests {
         max_active: Arc<AtomicUsize>,
         yields_by_task: Arc<Vec<usize>>,
         fail_at: Arc<Vec<usize>>,
+        preserve_failure_at: Arc<Vec<usize>>,
+        admission_stopped_at: Arc<Vec<usize>>,
         outcome_kinds: Arc<Vec<FakeOutcomeKind>>,
         cancel_on_start: Option<(usize, CooperativeCancellation)>,
         block_at: Option<(usize, Arc<Semaphore>)>,
@@ -4627,15 +4753,26 @@ mod tests {
         type Profile = FakeProfile;
         type Error = FakeError;
 
-        async fn execute(
-            &self,
-            _profile: &Self::Profile,
-            task: &RpgMakerExecutableTask,
+        fn failure_preserves_admitted_results(error: &Self::Error) -> bool {
+            error.0 == "external"
+        }
+
+        async fn execute<'a>(
+            &'a self,
+            _profile: &'a Self::Profile,
+            task: &'a RpgMakerExecutableTask,
+            on_task_started: Box<dyn FnOnce() + Send + 'a>,
         ) -> Result<TranslationTaskExecution, TranslationTaskExecutionFailure<Self::Error>>
         {
             let task_index = task.index();
             let index = task_index.get();
             record(&self.events, Event::Execute(index));
+            if self.admission_stopped_at.contains(&index) {
+                return Ok(TranslationTaskExecution::admission_stopped(
+                    TranslationTaskExecutionEvidence::from_execution(0, None),
+                ));
+            }
+            on_task_started();
             if let Some((cancel_index, cancellation)) = &self.cancel_on_start
                 && *cancel_index == index
             {
@@ -4668,8 +4805,13 @@ mod tests {
                         evidence,
                     ))
                 } else {
+                    let source = if self.preserve_failure_at.contains(&index) {
+                        FakeError("external")
+                    } else {
+                        FakeError("execute")
+                    };
                     Err(TranslationTaskExecutionFailure::failed(
-                        FakeError("execute"),
+                        source,
                         evidence,
                         test_retry_exhausted_report(),
                     ))
@@ -4963,6 +5105,8 @@ mod tests {
                     max_active: Arc::clone(&max_active),
                     yields_by_task: Arc::new(yields_by_task),
                     fail_at: Arc::new(execute_failure_at.into_iter().collect()),
+                    preserve_failure_at: Arc::new(Vec::new()),
+                    admission_stopped_at: Arc::new(Vec::new()),
                     outcome_kinds: Arc::new(outcome_kinds),
                     cancel_on_start: None,
                     block_at: None,
@@ -5675,6 +5819,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_request_failure_commits_other_already_admitted_results() {
+        let mut harness = harness(4, vec![4, 1, 1, 1], false, false, false, Some(1), None);
+        harness.service.task_executor.preserve_failure_at = Arc::new(vec![1]);
+
+        let error = harness
+            .service
+            .run(&project(), &profile(4), input())
+            .await
+            .expect_err("第二个外部请求失败仍必须成为 Translate 主错误");
+
+        assert!(matches!(
+            error,
+            RpgMakerTranslationServiceError::ExecuteTask {
+                task_index,
+                source: FakeError("external"),
+                ..
+            } if task_index == RpgMakerTranslationTaskIndex::new(1)
+        ));
+        let events = events(&harness.events);
+        assert_eq!(
+            committed(&events),
+            vec![0, 2, 3],
+            "外部请求失败只能跳过自身，不能丢弃其他已验收的并发结果"
+        );
+        assert!(!events.contains(&Event::LogNotCommitted(2)));
+        assert!(!events.contains(&Event::LogNotCommitted(3)));
+        assert_all_started_tasks_observed(&harness.log_records, &harness.task_records);
+        assert_eq!(
+            *harness.task_records.lock().expect("任务记录锁不应中毒"),
+            vec![
+                (0, RecordedTaskState::CompleteCommitted),
+                (1, RecordedTaskState::ExecutionFailedNoChanges),
+                (2, RecordedTaskState::CompleteCommitted),
+                (3, RecordedTaskState::CompleteCommitted),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn earlier_failure_keeps_a_later_unavailable_task_as_unavailable() {
         let harness = harness_with_behavior(
             3,
@@ -6124,6 +6307,54 @@ mod tests {
         assert!(report.request_admission_stopped());
         assert_eq!(report.unresolved_decisions(), 14);
         assert_eq!(report.unresolved_locations(), 21);
+    }
+
+    #[tokio::test]
+    async fn local_admission_stop_remains_a_zero_attempt_unstarted_task() {
+        let mut harness = harness(4, vec![1; 4], false, false, false, None, None);
+        harness.service.task_executor.admission_stopped_at = Arc::new(vec![0]);
+
+        let report = expect_completed(
+            harness
+                .service
+                .run(&project(), &profile(1), input())
+                .await
+                .expect("本地准入停止应保留项目进度并形成未完整结果"),
+        );
+
+        assert_eq!(
+            events(&harness.events)
+                .into_iter()
+                .filter(|event| matches!(event, Event::Execute(_)))
+                .collect::<Vec<_>>(),
+            [Event::Execute(0)]
+        );
+        assert_eq!(report.total_tasks(), 4);
+        assert_eq!(report.started_tasks(), 0);
+        assert_eq!(report.not_started_tasks(), 4);
+        assert_eq!(report.unavailable_tasks(), 0);
+        assert!(report.request_admission_stopped());
+        assert!(
+            harness
+                .log_records
+                .lock()
+                .expect("日志事件记录锁不应中毒")
+                .iter()
+                .all(|event| !matches!(
+                    event,
+                    RpgMakerTranslationLogEvent::TaskStarted { .. }
+                        | RpgMakerTranslationLogEvent::TaskFinished { .. }
+                )),
+            "未准入任务不得产生 started 或 finished 事件"
+        );
+        assert!(
+            harness
+                .task_records
+                .lock()
+                .expect("任务记录锁不应中毒")
+                .is_empty(),
+            "未准入任务不得建立模型任务记录"
+        );
     }
 
     #[tokio::test]

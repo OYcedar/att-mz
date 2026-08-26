@@ -60,26 +60,25 @@ use crate::diagnostic::{
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::llm_request::{
-    AsyncDelay, LlmRequestExecutionOutcome, LlmRequestRetryPolicy, execute_llm_request_with_retry,
+    AsyncDelay, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
+    execute_llm_request_with_retry_observed,
 };
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
+use crate::fingerprint::Sha256Fingerprint;
 #[cfg(test)]
 use crate::generic::build_write_back_candidate;
 use crate::generic::{
-    AutomaticStateResources, CancellableTextMap, CommitTranslationResultsOutcome,
-    CommitTranslationsOutcome, ExtractOutcome, GenericCompiledPlaceholderRules,
-    GenericCurrentTranslation, GenericInitRequest, GenericPlaceholderService, GenericPlanningError,
-    GenericPlanningUnitLocator, GenericProject, GenericProjectError, GenericProjectStore,
-    GenericProtectedText, GenericStoredSnapshot, GenericTaskRecordDocument, GenericTaskRecordState,
-    GenericUnitKey, GenericUnitMap, GenericWriteBackCandidate, GenericWriteBackError,
-    GenericWriteBackTextOptions, PlannedTask, PlanningUnit, RejectedTranslationWrite,
-    ResponseProblem, TranslationAcceptance, TranslationOrigin, TranslationPlan, TranslationReview,
-    TranslationWrite, ValidatedReuse, accept_parsed_response_with_cancellation,
-    build_write_back_candidate_with_cancellation, compile_generic_layout_rules,
-    current_translation_for_stored_with_cancellation,
+    CancellableTextMap, CommitTranslationResultsOutcome, CommitTranslationsOutcome, ExtractOutcome,
+    GenericCompiledPlaceholderRules, GenericCurrentTranslation, GenericInitRequest,
+    GenericPlaceholderService, GenericPlanningError, GenericPlanningUnitLocator, GenericProject,
+    GenericProjectError, GenericProjectStore, GenericProtectedText, GenericStoredSnapshot,
+    GenericTaskRecordDocument, GenericTaskRecordState, GenericUnitKey, GenericUnitMap,
+    GenericWriteBackCandidate, GenericWriteBackError, GenericWriteBackTextOptions, PlannedTask,
+    PlanningUnit, RejectedTranslationWrite, ResponseProblem, TranslationAcceptance,
+    TranslationOrigin, TranslationPlan, TranslationReview, TranslationWrite, ValidatedReuse,
+    accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
+    compile_generic_layout_rules, current_translation_for_stored_with_cancellation,
     ensure_input_fingerprints_current_with_cancellation,
     plan_translation_with_validator_and_cancellation,
-    terminology_hit_fingerprint_with_cancellation,
     validate_materialized_write_back_file_with_cancellation,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
@@ -89,8 +88,7 @@ use crate::language::{
 };
 use crate::llm::ApiKeyRedactor;
 use crate::llm::{
-    ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity, LlmFinishReason,
-    LlmRequestFailure,
+    ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmFinishReason, LlmRequestFailure,
 };
 use crate::manual::{ManualCommandError, ManualCommandSummary, execute_generic_manual_command};
 #[cfg(not(test))]
@@ -1680,8 +1678,6 @@ impl ProductionGenericCommandRunner {
             let planning_rules = placeholder_rules.clone();
             let planning_rule_source = placeholder_rule_source.clone();
             let planning_language = Arc::clone(&source_language);
-            let planning_prompt = prompt.fingerprint;
-            let planning_client = Arc::clone(configuration.client());
             let planning_cancellation = operation_cancellation.clone();
             let target_characters = configuration
                 .profile()
@@ -1690,26 +1686,12 @@ impl ProductionGenericCommandRunner {
             let prepared = operation_cpu
                 .execute(move || {
                     ensure_generic_cpu_running(&planning_cancellation)?;
-                    let planning_client_fingerprint = planning_client.semantic_fingerprint();
-                    ensure_generic_cpu_running(&planning_cancellation)?;
-                    let planning_language_fingerprint = planning_language
-                        .semantic_fingerprint_with_cancellation(&mut || {
-                            ensure_generic_language_running(&planning_cancellation)
-                        })
-                        .map_err(|LanguageOperationCancelled| GenericPreparationError::Cancelled)?;
-                    ensure_generic_cpu_running(&planning_cancellation)?;
                     prepare_generic_translation(
                         &planning_snapshot,
                         planning_terms,
                         &planning_rules,
                         &planning_rule_source,
                         planning_language,
-                        AutomaticStateResources {
-                            prompt: planning_prompt,
-                            client_semantics: planning_client_fingerprint,
-                            language_module: planning_language_fingerprint,
-                            terminology_hits: empty_terminology_fingerprint(),
-                        },
                         target_characters,
                         retry_rejected,
                         &planning_cancellation,
@@ -2182,8 +2164,6 @@ impl ProductionGenericCommandRunner {
                 )
                 .await?;
             }
-            let project = snapshot.project().clone();
-            let terminology = current_resources.terminology();
             let valid_placeholder_ids = snapshot.natural_unit_ids();
             let placeholder_json = current_resources.placeholder_rules_json().to_owned();
             let placeholder_compile_cancellation = operation_cancellation.clone();
@@ -2213,95 +2193,7 @@ impl ProductionGenericCommandRunner {
                 .map_err(generic_cpu_execution_failure)?
                 .map_err(generic_write_back_preparation_failure)?;
 
-            let automatic_scan_cancellation = operation_cancellation.clone();
-            let (snapshot, has_automatic_translation) = operation_cpu
-                .execute(move || {
-                    let mut has_automatic = false;
-                    'files: for file in snapshot.files() {
-                        ensure_generic_cpu_running(&automatic_scan_cancellation)?;
-                        for group in file.groups() {
-                            ensure_generic_cpu_running(&automatic_scan_cancellation)?;
-                            for unit in group.units() {
-                                ensure_generic_cpu_running(&automatic_scan_cancellation)?;
-                                if unit.translation().is_some_and(|translation| {
-                                    matches!(
-                                        translation.origin(),
-                                        crate::generic::TranslationOrigin::Automatic
-                                    )
-                                }) {
-                                    has_automatic = true;
-                                    break 'files;
-                                }
-                            }
-                        }
-                    }
-                    Ok::<_, GenericPreparationError>((snapshot, has_automatic))
-                })
-                .await
-                .map_err(generic_cpu_execution_failure)?
-                .map_err(generic_write_back_preparation_failure)?;
-            let automatic_resources = if has_automatic_translation {
-                match project.last_profile_id().map(str::to_owned) {
-                    Some(profile_id) => {
-                        let configuration = command
-                            .resolve_translation(&profile_id)
-                            .map_err(GenericCommandError::configuration)?;
-                        let source_language = configuration
-                            .language_modules()
-                            .resolve(project.language_pair().source())
-                            .map_err(|source| {
-                                GenericCommandError::language_module(
-                                    source,
-                                    project.language_pair().target(),
-                                )
-                            })?;
-                        let prompt = load_generic_prompt(
-                            &operation_file_system,
-                            &operation_cpu,
-                            &configuration,
-                            project.language_pair(),
-                            &operation_cancellation,
-                        )
-                        .await?;
-                        let fingerprint_client = Arc::clone(configuration.client());
-                        let fingerprint_cancellation = operation_cancellation.clone();
-                        Some(
-                            operation_cpu
-                                .execute(move || {
-                                    ensure_generic_cpu_running(&fingerprint_cancellation)?;
-                                    let client_semantics =
-                                        fingerprint_client.semantic_fingerprint();
-                                    ensure_generic_cpu_running(&fingerprint_cancellation)?;
-                                    let language_module = source_language
-                                        .semantic_fingerprint_with_cancellation(&mut || {
-                                            ensure_generic_language_running(
-                                                &fingerprint_cancellation,
-                                            )
-                                        })
-                                        .map_err(|LanguageOperationCancelled| {
-                                            GenericPreparationError::Cancelled
-                                        })?;
-                                    ensure_generic_cpu_running(&fingerprint_cancellation)?;
-                                    Ok::<_, GenericPreparationError>(AutomaticStateResources {
-                                        prompt: prompt.fingerprint,
-                                        client_semantics,
-                                        language_module,
-                                        terminology_hits: empty_terminology_fingerprint(),
-                                    })
-                                })
-                                .await
-                                .map_err(generic_cpu_execution_failure)?
-                                .map_err(generic_write_back_preparation_failure)?,
-                        )
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
             let current_snapshot = snapshot;
-            let current_terms = Arc::clone(&terminology);
-            let current_rules = placeholder_rules.clone();
             let write_back_rules = placeholder_rules;
             let write_back_layout_rules = compiled_layout_rules;
             let current_cancellation = operation_cancellation.clone();
@@ -2309,9 +2201,6 @@ impl ProductionGenericCommandRunner {
                 .execute(move || {
                     let current_translations = collect_generic_current_translations(
                         &current_snapshot,
-                        current_terms.as_ref(),
-                        &current_rules,
-                        automatic_resources,
                         &current_cancellation,
                     )?;
                     Ok::<_, GenericPreparationError>((current_snapshot, current_translations))
@@ -2476,7 +2365,6 @@ impl Error for GenericLuaExecutionError {
 struct LoadedGenericPrompt {
     system_prompt: String,
     response_mode: TranslationResponseMode,
-    fingerprint: Sha256Fingerprint,
 }
 
 #[derive(Debug)]
@@ -2576,14 +2464,9 @@ async fn load_generic_prompt(
             || ensure_generic_prompt_preparation_running(&prompt_cancellation),
         )?;
 
-        let fingerprint =
-            generic_prompt_fingerprint_with_cancellation(&system_prompt, response_mode, || {
-                ensure_generic_prompt_preparation_running(&prompt_cancellation)
-            })?;
         Ok::<_, GenericPromptPreparationError>(LoadedGenericPrompt {
             system_prompt,
             response_mode,
-            fingerprint,
         })
     })
     .await
@@ -2636,36 +2519,6 @@ fn ensure_generic_prompt_preparation_running(
     } else {
         Ok(())
     }
-}
-
-fn generic_prompt_fingerprint_with_cancellation<E>(
-    system_prompt: &str,
-    response_mode: TranslationResponseMode,
-    mut ensure_running: impl FnMut() -> Result<(), E>,
-) -> Result<Sha256Fingerprint, E> {
-    let chunk_size =
-        std::num::NonZeroUsize::new(64 * 1024).expect("Prompt 指纹取消检查块大小必须非零");
-    let mut hasher = Sha256FramedHasher::new(b"att.translation.system-prompt");
-    hasher
-        .try_frame_chunks(1, system_prompt.as_bytes(), chunk_size, &mut ensure_running)?
-        .frame(
-            2,
-            if response_mode.thinking() {
-                b"thinking=true"
-            } else {
-                b"thinking=false"
-            },
-        )
-        .frame(
-            3,
-            if response_mode.source_echo() {
-                b"source-echo=true"
-            } else {
-                b"source-echo=false"
-            },
-        );
-    ensure_running()?;
-    Ok(hasher.finish())
 }
 
 #[derive(Clone)]
@@ -3549,7 +3402,6 @@ fn prepare_generic_translation(
     placeholder_rules: &GenericCompiledPlaceholderRules,
     placeholder_rule_source: &GenericPlaceholderRuleSource,
     source_language: Arc<dyn LanguageModule>,
-    base_resources: AutomaticStateResources,
     target_task_characters: std::num::NonZeroUsize,
     retry_rejected: bool,
     cancellation: &CooperativeCancellation,
@@ -3616,19 +3468,10 @@ fn prepare_generic_translation(
                     .flat_map(|(_, _, _, language_text, _)| natural_segments(language_text)),
                 || ensure_generic_cpu_running(cancellation),
             )?;
-            let terminology_hits = terminology_hit_fingerprint_with_cancellation(
-                terminology.as_ref(),
-                &term_indices,
-                || ensure_generic_cpu_running(cancellation),
-            )?;
             let mut planning_units = Vec::with_capacity(prepared_units.len());
             let mut facts = Vec::with_capacity(prepared_units.len());
             for (unit, locator, protected, language_text, analysis) in prepared_units {
                 ensure_generic_cpu_running(cancellation)?;
-                let resources = AutomaticStateResources {
-                    terminology_hits,
-                    ..base_resources
-                };
                 let mut planning = PlanningUnit::from_stored_with_cancellation(
                     relative_path,
                     snapshot.project(),
@@ -3640,7 +3483,6 @@ fn prepare_generic_translation(
                         &language_text,
                         cancellation,
                     )? && analysis.needs_translation(),
-                    resources,
                     retry_rejected,
                     cancellation,
                 )
@@ -3742,149 +3584,39 @@ fn prepare_generic_translation(
 
 fn collect_generic_current_translations(
     snapshot: &GenericStoredSnapshot,
-    terminology: &CompiledTerminology,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    automatic_resources: Option<AutomaticStateResources>,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericUnitMap<GenericCurrentTranslation>, GenericPreparationError> {
     ensure_generic_cpu_running(cancellation)?;
-    let mut groups = Vec::new();
+    let mut current = GenericUnitMap::new();
     for file in snapshot.files() {
         ensure_generic_cpu_running(cancellation)?;
-        for (group_ordinal, group) in file.groups().iter().enumerate() {
+        for group in file.groups() {
             ensure_generic_cpu_running(cancellation)?;
-            groups.push((file.relative_path(), group_ordinal, group));
-        }
-    }
-    let prepared_groups = groups
-        .par_iter()
-        .map(|(relative_path, group_ordinal, group)| {
-            ensure_generic_cpu_running(cancellation)?;
-            let has_automatic = group.units().iter().any(|unit| {
-                unit.translation()
-                    .is_some_and(|translation| translation.origin() == TranslationOrigin::Automatic)
-            });
-            if !has_automatic {
-                let mut current = Vec::new();
-                for unit in group.units() {
-                    if let Some(translation) = unit
-                        .translation()
-                        .filter(|translation| translation.origin() == TranslationOrigin::Manual)
-                    {
-                        current.push((
-                            GenericUnitKey::new(
-                                clone_generic_cpu_text(group.id(), cancellation)?,
-                                clone_generic_cpu_text(unit.id(), cancellation)?,
-                            ),
-                            GenericCurrentTranslation::new(
-                                clone_generic_cpu_text(translation.translation(), cancellation)?,
-                                true,
-                            ),
-                        ));
-                    }
-                }
-                return Ok::<_, GenericPreparationError>(current);
-            }
-            let service = GenericPlaceholderService::default();
-            let mut protected_units = Vec::with_capacity(group.units().len());
-            for (unit_ordinal, unit) in group.units().iter().enumerate() {
-                ensure_generic_cpu_running(cancellation)?;
-                let locator = GenericUnitLocator {
-                    relative_path: relative_path.to_path_buf(),
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    role: group.kind().to_owned(),
-                    line: group_ordinal + 1,
-                    unit: unit_ordinal + 1,
-                };
-                let target_id = locator.readable_id();
-                let protected = service
-                    .protect_target_with_cancellation(
-                        &target_id,
-                        group.kind(),
-                        unit.source_text(),
-                        placeholder_rules,
-                        || ensure_generic_cpu_running(cancellation),
-                    )?
-                    .map_err(|source| {
-                        generic_placeholder_protection_failure(
-                            source,
-                            &GenericPlaceholderRuleSource::ProjectSnapshot,
-                            &locator,
-                        )
-                    })?;
-                let language_text = protected
-                    .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
-                    .map_err(|source| GenericPreparationError::LanguageProjection {
-                        locator,
-                        source,
-                    })?;
-                ensure_generic_cpu_running(cancellation)?;
-                protected_units.push((unit, protected, language_text));
-            }
-            ensure_generic_cpu_running(cancellation)?;
-            let term_indices = match automatic_resources {
-                Some(_) => Some(
-                    terminology.triggered_indices_with_cancellation(
-                        protected_units
-                            .iter()
-                            .flat_map(|(_, _, language_text)| natural_segments(language_text)),
-                        || ensure_generic_cpu_running(cancellation),
-                    )?,
-                ),
-                None => None,
-            };
-            let group_resources = match automatic_resources {
-                Some(resources) => Some(AutomaticStateResources {
-                    terminology_hits: terminology_hit_fingerprint_with_cancellation(
-                        terminology,
-                        term_indices.as_deref().unwrap_or_default(),
-                        || ensure_generic_cpu_running(cancellation),
-                    )?,
-                    ..resources
-                }),
-                None => None,
-            };
-            let mut current = Vec::new();
-            for (unit, protected, _) in protected_units {
+            for unit in group.units() {
                 ensure_generic_cpu_running(cancellation)?;
                 if let Some(translation) = current_translation_for_stored_with_cancellation(
                     snapshot.project(),
                     group,
                     unit,
-                    protected.binding_fingerprint(),
-                    group_resources,
                     cancellation,
                 )
                 .map_err(GenericPreparationError::Planning)?
                 {
-                    current.push((
-                        GenericUnitKey::new(
-                            clone_generic_cpu_text(group.id(), cancellation)?,
-                            clone_generic_cpu_text(unit.id(), cancellation)?,
-                        ),
-                        GenericCurrentTranslation::new(
-                            translation,
-                            unit.translation()
-                                .is_some_and(|stored| stored.origin() == TranslationOrigin::Manual),
-                        ),
-                    ));
+                    let key = GenericUnitKey::new(
+                        clone_generic_cpu_text(group.id(), cancellation)?,
+                        clone_generic_cpu_text(unit.id(), cancellation)?,
+                    );
+                    let translation = GenericCurrentTranslation::new(
+                        translation,
+                        unit.translation()
+                            .is_some_and(|stored| stored.origin() == TranslationOrigin::Manual),
+                    );
+                    let previous = current.insert_with_cancellation(key, translation, || {
+                        ensure_generic_cpu_running(cancellation)
+                    })?;
+                    debug_assert!(previous.is_none());
                 }
             }
-            ensure_generic_cpu_running(cancellation)?;
-            Ok::<_, GenericPreparationError>(current)
-        })
-        .collect::<Vec<_>>();
-
-    let mut current = GenericUnitMap::new();
-    for prepared_group in prepared_groups {
-        ensure_generic_cpu_running(cancellation)?;
-        for (key, translation) in prepared_group? {
-            ensure_generic_cpu_running(cancellation)?;
-            let previous = current.insert_with_cancellation(key, translation, || {
-                ensure_generic_cpu_running(cancellation)
-            })?;
-            debug_assert!(previous.is_none());
         }
     }
     ensure_generic_cpu_running(cancellation)?;
@@ -4148,21 +3880,6 @@ fn generic_task_execution_error_report(
     }
 }
 
-fn empty_terminology_fingerprint() -> Sha256Fingerprint {
-    Sha256FramedHasher::new(b"att.generic.terminology-hits").finish()
-}
-
-#[cfg(test)]
-fn terminology_hit_fingerprint(
-    terminology: &CompiledTerminology,
-    indices: &[usize],
-) -> Sha256Fingerprint {
-    terminology_hit_fingerprint_with_cancellation(terminology, indices, || {
-        Ok::<_, std::convert::Infallible>(())
-    })
-    .unwrap_or_else(|never| match never {})
-}
-
 struct GenericTaskExecution {
     store: GenericProjectStore,
     expected_raw_fingerprint: Sha256Fingerprint,
@@ -4266,6 +3983,9 @@ impl GenericTaskProjectLog {
         terminal: GenericTaskTerminal,
         diagnostics: impl IntoIterator<Item = DiagnosticReport>,
     ) {
+        if attempts == 0 {
+            return;
+        }
         let task = self.position(task_index);
         let earlier_failure = {
             let mut state = self
@@ -4388,7 +4108,7 @@ impl GenericTaskProjectLog {
             .collect::<Vec<_>>();
         in_flight.sort_unstable();
         for task_index in in_flight {
-            self.finished(task_index, 0, GenericTaskTerminal::Failed, [report.clone()]);
+            self.finished(task_index, 1, GenericTaskTerminal::Failed, [report.clone()]);
         }
     }
 
@@ -4434,7 +4154,7 @@ struct GenericTaskRecordDraft {
     task_index: usize,
     requested_outputs: usize,
     user_message: String,
-    raw_assistant: Option<String>,
+    raw_assistant: Option<Arc<String>>,
 }
 
 struct GenericTaskRecordInFlight {
@@ -4444,7 +4164,7 @@ struct GenericTaskRecordInFlight {
 }
 
 impl GenericTaskRecordInFlight {
-    fn finish(self, raw_assistant: Option<String>) -> GenericTaskRecordDraft {
+    fn finish(self, raw_assistant: Option<Arc<String>>) -> GenericTaskRecordDraft {
         GenericTaskRecordDraft {
             task_index: self.task_index,
             requested_outputs: self.requested_outputs,
@@ -4460,7 +4180,9 @@ impl GenericTaskRecordDraft {
             self.task_index,
             self.requested_outputs,
             self.user_message,
-            self.raw_assistant,
+            self.raw_assistant.map(|assistant| {
+                Arc::try_unwrap(assistant).unwrap_or_else(|value| (*value).clone())
+            }),
             state,
         )
     }
@@ -4488,6 +4210,20 @@ enum GenericPreparedTaskOutcome {
     Cancelled,
 }
 
+impl GenericPreparedTaskOutcome {
+    /// 一旦后续任务暴露内部失败或合作取消，先前外部失败授予的“继续提交已准入结果”
+    /// 只能收紧，不能被更晚的外部失败重新放宽。
+    fn blocks_later_commits_after_prior_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                preserve_admitted_results: false,
+                ..
+            } | Self::Cancelled
+        )
+    }
+}
+
 struct GenericPreparedTask {
     task_index: usize,
     outcome: GenericPreparedTaskOutcome,
@@ -4498,12 +4234,13 @@ struct GenericPreparedTask {
 fn cancelled_generic_prepared_task(
     task_index: usize,
     record: Option<GenericTaskRecordInFlight>,
+    raw_assistant: Option<Arc<String>>,
     attempt_count: usize,
 ) -> GenericPreparedTask {
     GenericPreparedTask {
         task_index,
         outcome: GenericPreparedTaskOutcome::Cancelled,
-        record: record.map(|record| record.finish(None)),
+        record: record.map(|record| record.finish(raw_assistant)),
         attempt_count,
     }
 }
@@ -4526,6 +4263,7 @@ struct GenericTaskRequestContext {
     cancellation: CooperativeCancellation,
     record_evidence: bool,
     admission_stopped: Arc<AtomicBool>,
+    project_log: GenericTaskProjectLog,
 }
 
 async fn execute_owned_generic_task(
@@ -4577,6 +4315,7 @@ async fn execute_owned_generic_task(
         context.cancellation.clone(),
         context.record_evidence,
         Arc::clone(&context.admission_stopped),
+        context.project_log.clone(),
     )
     .await
 }
@@ -4636,6 +4375,7 @@ async fn execute_generic_tasks(
         cancellation: cancellation.clone(),
         record_evidence,
         admission_stopped: Arc::new(AtomicBool::new(false)),
+        project_log: project_log.clone(),
     };
     let mut remaining = tasks.into_iter().enumerate();
     let mut tasks = FuturesOrdered::new();
@@ -4643,7 +4383,6 @@ async fn execute_generic_tasks(
         let Some((task_index, task)) = remaining.next() else {
             break;
         };
-        project_log.started(task_index);
         tasks.push_back(execute_indexed_generic_task(
             request_context.clone(),
             task_index,
@@ -4687,6 +4426,10 @@ async fn execute_generic_tasks(
             && !(preserve_admitted_results_after_error
                 && matches!(&outcome, GenericPreparedTaskOutcome::Accepted { .. }))
         {
+            if outcome.blocks_later_commits_after_prior_failure() {
+                preserve_admitted_results_after_error = false;
+                cancellation.request();
+            }
             let prior_was_cancelled = terminal_error
                 .as_ref()
                 .is_some_and(GenericCommandError::is_cancelled);
@@ -4892,13 +4635,17 @@ async fn execute_generic_tasks(
                     task_records
                         .submit(record.finish(GenericTaskRecordState::unavailable(diagnostic)));
                 }
-                summary.unavailable_tasks += 1;
-                summary.recoverable_request_exhaustions += usize::from(request_exhausted);
+                if attempt_count > 0 {
+                    summary.unavailable_tasks += 1;
+                    summary.recoverable_request_exhaustions += usize::from(request_exhausted);
+                }
                 summary.request_admission_stopped |= stop_admission;
                 admission_stopped |= stop_admission;
                 update_generic_translate_summary(&translate_project_log, |stored| {
-                    stored.unavailable_tasks += 1;
-                    stored.recoverable_request_exhaustions += usize::from(request_exhausted);
+                    if attempt_count > 0 {
+                        stored.unavailable_tasks += 1;
+                        stored.recoverable_request_exhaustions += usize::from(request_exhausted);
+                    }
                     stored.request_admission_stopped |= stop_admission;
                 });
             }
@@ -4957,7 +4704,6 @@ async fn execute_generic_tasks(
             && !request_context.admission_stopped.load(Ordering::Acquire)
             && let Some((task_index, task)) = remaining.next()
         {
-            project_log.started(task_index);
             tasks.push_back(execute_indexed_generic_task(
                 request_context.clone(),
                 task_index,
@@ -4996,6 +4742,7 @@ async fn execute_generic_task(
     cancellation: CooperativeCancellation,
     record_evidence: bool,
     admission_stopped: Arc<AtomicBool>,
+    project_log: GenericTaskProjectLog,
 ) -> Result<GenericPreparedTask, GenericCommandError> {
     let requested_outputs = task.expected_output_count();
     let recorded_user_message = record_evidence.then(|| user_message.clone());
@@ -5003,13 +4750,14 @@ async fn execute_generic_task(
         ChatMessage::new(ChatMessageRole::System, system_prompt),
         ChatMessage::new(ChatMessageRole::User, user_message),
     ];
-    let execution = execute_llm_request_with_retry(
+    let execution = execute_llm_request_with_retry_observed(
         llm,
         client,
         &messages,
         LlmRequestRetryPolicy::new(retry_delays, max_retry_after),
         &TokioDelay,
         &cancellation,
+        move || project_log.started(task_index),
     )
     .await;
     let (outcome, evidence) = execution.into_parts();
@@ -5020,29 +4768,33 @@ async fn execute_generic_task(
         }
         LlmRequestExecutionOutcome::Fatal { source, .. } => source.service_status().is_permanent(),
         LlmRequestExecutionOutcome::AdmissionStopped { .. } => true,
-        LlmRequestExecutionOutcome::Response { .. }
-        | LlmRequestExecutionOutcome::Cancelled { .. } => false,
+        LlmRequestExecutionOutcome::Response { .. } | LlmRequestExecutionOutcome::Cancelled => {
+            false
+        }
     };
     if stops_admission {
         admission_stopped.store(true, Ordering::Release);
     }
     let attempt_count = evidence.attempt_count();
-    let record = recorded_user_message.map(|user_message| GenericTaskRecordInFlight {
-        task_index,
-        requested_outputs,
-        user_message,
+    let record = (attempt_count > 0)
+        .then_some(recorded_user_message)
+        .flatten()
+        .map(|user_message| GenericTaskRecordInFlight {
+            task_index,
+            requested_outputs,
+            user_message,
+        });
+    let response_record = record.as_ref().and_then(|_| match &outcome {
+        LlmRequestExecutionOutcome::Response { response, .. } => Some(response.shared_content()),
+        _ => None,
     });
     let response_cancellation = cancellation.clone();
     let processing = cpu
         .execute(move || {
             ensure_generic_response_processing_running(&response_cancellation)?;
-            let mut response_record = None;
             let outcome = match outcome {
                 LlmRequestExecutionOutcome::Response { response, .. } => {
                     let (content, finish_reason) = response.into_content_and_finish_reason();
-                    if record_evidence {
-                        response_record = Some(content.clone());
-                    }
                     ensure_generic_response_processing_running(&response_cancellation)?;
                     let finish_review =
                         (!matches!(finish_reason, LlmFinishReason::Stop)).then(|| {
@@ -5155,32 +4907,28 @@ async fn execute_generic_task(
                 },
                 LlmRequestExecutionOutcome::Fatal {
                     source, diagnostic, ..
-                } => {
-                    let preserve_admitted_results = source.service_status().is_permanent();
-                    GenericPreparedTaskOutcome::Failed {
-                        error: GenericCommandError::reported(source, diagnostic),
-                        preserve_admitted_results,
-                    }
-                }
-                LlmRequestExecutionOutcome::AdmissionStopped { diagnostic, .. } => {
+                } => GenericPreparedTaskOutcome::Failed {
+                    error: GenericCommandError::reported(source, diagnostic),
+                    preserve_admitted_results: true,
+                },
+                LlmRequestExecutionOutcome::AdmissionStopped { diagnostic } => {
                     GenericPreparedTaskOutcome::Unavailable {
                         diagnostic,
                         request_exhausted: false,
                         stop_admission: true,
                     }
                 }
-                LlmRequestExecutionOutcome::Cancelled { .. } => {
-                    GenericPreparedTaskOutcome::Cancelled
-                }
+                LlmRequestExecutionOutcome::Cancelled => GenericPreparedTaskOutcome::Cancelled,
             };
-            Ok::<_, GenericPreparationError>((outcome, response_record))
+            Ok::<_, GenericPreparationError>(outcome)
         })
         .await;
-    let (outcome, response_record) = match processing {
+    let outcome = match processing {
         Err(CpuTaskExecutionError::Cancelled) => {
             return Ok(cancelled_generic_prepared_task(
                 task_index,
                 record,
+                response_record,
                 attempt_count,
             ));
         }
@@ -5192,7 +4940,7 @@ async fn execute_generic_task(
                     error,
                     preserve_admitted_results: false,
                 },
-                record: record.map(|record| record.finish(None)),
+                record: record.map(|record| record.finish(response_record)),
                 attempt_count,
             });
         }
@@ -5200,6 +4948,7 @@ async fn execute_generic_task(
             return Ok(cancelled_generic_prepared_task(
                 task_index,
                 record,
+                response_record,
                 attempt_count,
             ));
         }
@@ -5211,7 +4960,7 @@ async fn execute_generic_task(
                     error,
                     preserve_admitted_results: false,
                 },
-                record: record.map(|record| record.finish(None)),
+                record: record.map(|record| record.finish(response_record)),
                 attempt_count,
             });
         }
@@ -7746,8 +7495,30 @@ mod tests {
 
     use super::*;
 
-    fn fingerprint(byte: u8) -> Sha256Fingerprint {
-        Sha256Fingerprint::from_bytes([byte; 32])
+    #[test]
+    fn admitted_result_preservation_only_narrows_after_a_later_failure() {
+        let accepted = GenericPreparedTaskOutcome::Accepted {
+            writes: Vec::new(),
+            rejections: Vec::new(),
+            diagnostics: Vec::new(),
+            accepted_units: 0,
+            response_problems: 0,
+            response_complete: true,
+            accepted_output_ids: Vec::new(),
+        };
+        let preserving_external_failure = GenericPreparedTaskOutcome::Failed {
+            error: generic_manual_failure(manual_read_failure()),
+            preserve_admitted_results: true,
+        };
+        let blocking_internal_failure = GenericPreparedTaskOutcome::Failed {
+            error: generic_manual_failure(manual_read_failure()),
+            preserve_admitted_results: false,
+        };
+
+        assert!(!accepted.blocks_later_commits_after_prior_failure());
+        assert!(!preserving_external_failure.blocks_later_commits_after_prior_failure());
+        assert!(blocking_internal_failure.blocks_later_commits_after_prior_failure());
+        assert!(GenericPreparedTaskOutcome::Cancelled.blocks_later_commits_after_prior_failure());
     }
 
     fn manual_read_failure() -> ManualCommandError {
@@ -7822,6 +7593,7 @@ mod tests {
             .split('\n')
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let project = store.open().expect("应该可读取测试项目语言对");
         let write = crate::manual::ValidatedManualTranslation {
             id: entry.id.to_owned(),
             kind: crate::manual::ManualTranslationType::Free,
@@ -7836,6 +7608,8 @@ mod tests {
                 entry.unit_id,
                 entry.relative_path,
                 entry.kind,
+                project.language_pair().source().as_str(),
+                project.language_pair().target().as_str(),
                 &source,
             ),
         };
@@ -7858,30 +7632,6 @@ mod tests {
                 .expect("模型 user message 必须是有效 JSON"),
         )
         .expect("模型 user message 应该可以重新序列化")
-    }
-
-    #[test]
-    fn generic_prompt_fingerprint_includes_both_response_switches() {
-        let modes = [
-            TranslationResponseMode::new(false, false),
-            TranslationResponseMode::new(true, false),
-            TranslationResponseMode::new(false, true),
-            TranslationResponseMode::new(true, true),
-        ];
-        let fingerprints = modes.map(|mode| {
-            generic_prompt_fingerprint_with_cancellation("相同 Prompt 正文", mode, || {
-                Ok::<_, ()>(())
-            })
-            .expect("未取消的 Prompt 指纹应建立")
-        });
-        for left in 0..fingerprints.len() {
-            for right in left + 1..fingerprints.len() {
-                assert_ne!(
-                    fingerprints[left], fingerprints[right],
-                    "不同响应开关组合必须产生不同自动译文语义指纹"
-                );
-            }
-        }
     }
 
     #[tokio::test]
@@ -8039,10 +7789,14 @@ mod tests {
             None,
         );
         let tasks = install_generic_translate_task_log(&project_log, &state, 2);
+        // 复用写入先于模型 Task；随后两个模型 Task 都在完成前 panic，所以模型 Unit 仍全部剩余。
         set_generic_translate_summary(
             &state,
             GenericTranslationSummary {
                 total_tasks: 2,
+                planned_units: 2,
+                remaining_units: 2,
+                reused_units: 1,
                 written_units: 1,
                 ..GenericTranslationSummary::default()
             },
@@ -8349,6 +8103,7 @@ mod tests {
                 requested_outputs: 1,
                 user_message: "request".to_owned(),
             }),
+            None,
             1,
         );
 
@@ -8364,6 +8119,26 @@ mod tests {
         assert!(record.raw_assistant.is_none());
     }
 
+    #[test]
+    fn cancellation_during_response_processing_keeps_received_assistant() {
+        let prepared = cancelled_generic_prepared_task(
+            1,
+            Some(GenericTaskRecordInFlight {
+                task_index: 1,
+                requested_outputs: 1,
+                user_message: "request".to_owned(),
+            }),
+            Some(Arc::new(r#"{"0":["译文"]}"#.to_owned())),
+            1,
+        );
+
+        let record = prepared.record.expect("收到响应后的取消必须保留任务记录");
+        assert_eq!(
+            record.raw_assistant.as_deref().map(String::as_str),
+            Some(r#"{"0":["译文"]}"#)
+        );
+    }
+
     struct BlockingLanguageModule {
         inner: JapaneseLanguageModule,
         started: Mutex<Option<mpsc::SyncSender<()>>>,
@@ -8372,10 +8147,6 @@ mod tests {
     }
 
     impl LanguageModule for BlockingLanguageModule {
-        fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-            self.inner.semantic_fingerprint()
-        }
-
         fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
             self.analysis_count.fetch_add(1, Ordering::AcqRel);
             if let Some(started) = self.started.lock().expect("开始信号锁不应中毒").take()
@@ -8530,12 +8301,6 @@ mod tests {
                 &rules,
                 &GenericPlaceholderRuleSource::ProjectSnapshot,
                 language_module,
-                AutomaticStateResources {
-                    prompt: fingerprint(1),
-                    client_semantics: fingerprint(2),
-                    language_module: fingerprint(3),
-                    terminology_hits: empty_terminology_fingerprint(),
-                },
                 NonZeroUsize::new(10_000).expect("常量应该非零"),
                 false,
                 &operation_cancellation,
@@ -8625,12 +8390,6 @@ mod tests {
                 &rules,
                 &expected_rule_source,
                 Arc::clone(&language_module),
-                AutomaticStateResources {
-                    prompt: fingerprint(91),
-                    client_semantics: fingerprint(92),
-                    language_module: fingerprint(93),
-                    terminology_hits: empty_terminology_fingerprint(),
-                },
                 NonZeroUsize::new(10_000).expect("常量应该非零"),
                 false,
                 &CooperativeCancellation::default(),
@@ -9499,41 +9258,16 @@ mod tests {
                 r"\{[^}]+\}",
             )])
             .expect("Placeholder 规则应该合法");
-        let resources = AutomaticStateResources {
-            prompt: fingerprint(2),
-            client_semantics: fingerprint(3),
-            language_module: fingerprint(4),
-            terminology_hits: empty_terminology_fingerprint(),
-        };
         let current_group = snapshot.files()[0].groups()[0].clone();
         let current_unit = current_group.units()[0].clone();
-        let current_protected = GenericPlaceholderService::default()
-            .protect(
-                current_group.kind(),
-                current_unit.source_text(),
-                &placeholder_rules,
-            )
-            .expect("原文应该可保护");
         let current_state = automatic_translation_state_fingerprint(
             snapshot.project().language_pair(),
             &GenericUnitKey::new(current_group.id().to_owned(), current_unit.id().to_owned()),
             current_unit.source_text(),
             current_group.context_fingerprint(),
-            current_protected.binding_fingerprint(),
-            AutomaticStateResources {
-                terminology_hits: terminology_hit_fingerprint(terminology.as_ref(), &[0]),
-                ..resources
-            },
         );
         let invalid_current_group = snapshot.files()[0].groups()[1].clone();
         let invalid_current_unit = invalid_current_group.units()[0].clone();
-        let invalid_current_protected = GenericPlaceholderService::default()
-            .protect(
-                invalid_current_group.kind(),
-                invalid_current_unit.source_text(),
-                &placeholder_rules,
-            )
-            .expect("原文应该可保护");
         let invalid_current_state = automatic_translation_state_fingerprint(
             snapshot.project().language_pair(),
             &GenericUnitKey::new(
@@ -9542,8 +9276,6 @@ mod tests {
             ),
             invalid_current_unit.source_text(),
             invalid_current_group.context_fingerprint(),
-            invalid_current_protected.binding_fingerprint(),
-            resources,
         );
         store
             .commit_translations(
@@ -9587,7 +9319,6 @@ mod tests {
             &placeholder_rules,
             &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
-            resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
             false,
             &CooperativeCancellation::default(),
@@ -9692,12 +9423,6 @@ mod tests {
             &placeholder_rules,
             &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
-            AutomaticStateResources {
-                prompt: fingerprint(21),
-                client_semantics: fingerprint(22),
-                language_module: fingerprint(23),
-                terminology_hits: empty_terminology_fingerprint(),
-            },
             NonZeroUsize::new(10_000).expect("常量应该非零"),
             false,
             &CooperativeCancellation::default(),
@@ -9797,12 +9522,6 @@ mod tests {
             &placeholder_rules,
             &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
-            AutomaticStateResources {
-                prompt: fingerprint(31),
-                client_semantics: fingerprint(32),
-                language_module: fingerprint(33),
-                terminology_hits: empty_terminology_fingerprint(),
-            },
             target,
             false,
             &CooperativeCancellation::default(),
@@ -9832,7 +9551,7 @@ mod tests {
     }
 
     #[test]
-    fn write_back_current_keeps_manual_without_profile_and_omits_unprovable_automatic() {
+    fn write_back_uses_applicable_translations_without_a_model_profile() {
         let temporary = tempfile::tempdir().expect("应该可建立临时目录");
         let source_root = temporary.path().join("source");
         fs::create_dir_all(&source_root).expect("应该可建立输入目录");
@@ -9858,9 +9577,6 @@ mod tests {
         let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
         assert!(snapshot.project().last_profile_id().is_none());
         let group = &snapshot.files()[0].groups()[0];
-        let rules = GenericPlaceholderService::default()
-            .compile(Vec::new())
-            .expect("空 Placeholder 规则应该合法");
         let manual = &group.units()[0];
         apply_test_manual_translation(
             &store,
@@ -9875,6 +9591,12 @@ mod tests {
             },
         );
         let automatic = &group.units()[1];
+        let automatic_state = automatic_translation_state_fingerprint(
+            snapshot.project().language_pair(),
+            &GenericUnitKey::new(group.id().to_owned(), automatic.id().to_owned()),
+            automatic.source_text(),
+            group.context_fingerprint(),
+        );
         store
             .commit_translations(
                 snapshot
@@ -9886,22 +9608,16 @@ mod tests {
                     unit_id: automatic.id().to_owned(),
                     expected_source_text: automatic.source_text().to_owned(),
                     expected_group_context: group.context_fingerprint(),
-                    translation: "无法证明语义的自动译文".to_owned(),
-                    state_fingerprint: fingerprint(70),
+                    translation: "自动译文".to_owned(),
+                    state_fingerprint: automatic_state,
                     expected_translation: None,
                 }],
             )
             .expect("应该可保存测试译文");
         let (stored, live) = store.ensure_input_current().expect("输入应该仍为 Current");
-        let terminology = CompiledTerminology::empty();
-        let current = collect_generic_current_translations(
-            &stored,
-            &terminology,
-            &rules,
-            None,
-            &CooperativeCancellation::default(),
-        )
-        .expect("人工 Current 应可独立计算");
+        let current =
+            collect_generic_current_translations(&stored, &CooperativeCancellation::default())
+                .expect("人工 Current 应可独立计算");
         let manual_key = GenericUnitKey::new("group".to_owned(), "manual".to_owned());
         assert_eq!(
             current
@@ -9911,17 +9627,17 @@ mod tests {
             Some("人工译文")
         );
         let automatic_key = GenericUnitKey::new("group".to_owned(), "automatic".to_owned());
-        assert!(
-            !current
-                .contains_with_cancellation(&automatic_key, || {
-                    Ok::<_, std::convert::Infallible>(())
-                })
+        assert_eq!(
+            current
+                .get_with_cancellation(&automatic_key, || { Ok::<_, std::convert::Infallible>(()) })
                 .unwrap_or_else(|never| match never {})
+                .map(GenericCurrentTranslation::text),
+            Some("自动译文")
         );
         let candidate =
             build_write_back_candidate(&stored, &live, &current).expect("Partial 应允许写回");
-        assert_eq!(candidate.translated_units(), 1);
-        assert_eq!(candidate.retained_source_units(), 1);
+        assert_eq!(candidate.translated_units(), 2);
+        assert_eq!(candidate.retained_source_units(), 0);
     }
 
     #[test]
@@ -9971,14 +9687,9 @@ mod tests {
         let (stored, live) = store
             .ensure_input_current()
             .expect("应该可重新读取当前 Generic 输入");
-        let current = collect_generic_current_translations(
-            &stored,
-            &CompiledTerminology::empty(),
-            &rules,
-            None,
-            &CooperativeCancellation::default(),
-        )
-        .expect("应该可读取数据库中的人工译文");
+        let current =
+            collect_generic_current_translations(&stored, &CooperativeCancellation::default())
+                .expect("应该可读取数据库中的人工译文");
         let key = GenericUnitKey::new("group".to_owned(), "unit".to_owned());
         current
             .get_with_cancellation(&key, || Ok::<_, std::convert::Infallible>(()))
@@ -10294,13 +10005,6 @@ mod tests {
             JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
                 .expect("日文残留策略应该合法"),
         ));
-        let resources = AutomaticStateResources {
-            prompt: fingerprint(81),
-            client_semantics: fingerprint(82),
-            language_module: fingerprint(83),
-            terminology_hits: empty_terminology_fingerprint(),
-        };
-
         let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
         let prepared = prepare_generic_translation(
             &snapshot,
@@ -10308,7 +10012,6 @@ mod tests {
             &rules,
             &GenericPlaceholderRuleSource::ProjectSnapshot,
             Arc::clone(&language_module),
-            resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
             false,
             &CooperativeCancellation::default(),
@@ -10384,7 +10087,6 @@ mod tests {
             &rules,
             &GenericPlaceholderRuleSource::ProjectSnapshot,
             language_module,
-            resources,
             NonZeroUsize::new(10_000).expect("常量应该非零"),
             false,
             &CooperativeCancellation::default(),

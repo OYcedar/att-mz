@@ -480,6 +480,7 @@ source_echo = false
 url = "http://127.0.0.1:$ProviderPort/v1/chat/completions"
 api_key = "att-performance-$ScenarioLabel"
 model = "att-local-performance"
+stream = false
 max_concurrent_requests = 16
 connect_timeout_ms = 5000
 read_timeout_ms = 120000

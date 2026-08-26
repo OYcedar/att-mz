@@ -786,15 +786,9 @@ impl ConfiguredGenericCommand {
                     project_name: project.name,
                     layout_rules_path: layout_rules,
                     write_back: WriteBackTextConfiguration::from_raw(raw.write_back),
-                    prompt_root: distribution.prompts_root().to_path_buf(),
                     common,
                     cpu: build_cpu_configuration(),
                     publisher,
-                    source: Arc::new(DeferredConfigurationSource::new(
-                        configuration_path,
-                        source,
-                        Arc::clone(&toml_index),
-                    )),
                 }))
             }
             GenericCommand::Manual { command } => Ok(Self::Manual(ConfiguredManualCommand::build(
@@ -841,16 +835,14 @@ impl ConfiguredGenericCommand {
     }
 }
 
-/// Generic WriteBack 的基础配置；仅在存在自动译文时才解析翻译 Profile。
+/// Generic WriteBack 只解析正文处理和发布所需配置，不读取模型、Prompt 或语言模块。
 pub(crate) struct ConfiguredGenericWriteBackCommand {
     project_name: ProjectName,
     layout_rules_path: Option<PathBuf>,
     write_back: WriteBackTextConfiguration,
-    prompt_root: PathBuf,
     common: CommonCommandConfiguration,
     cpu: CpuExecutorConfig,
     publisher: DirectoryPublisherConfig,
-    source: Arc<DeferredConfigurationSource>,
 }
 
 impl ConfiguredGenericWriteBackCommand {
@@ -876,27 +868,6 @@ impl ConfiguredGenericWriteBackCommand {
 
     pub(crate) const fn publisher(&self) -> &DirectoryPublisherConfig {
         &self.publisher
-    }
-
-    pub(crate) fn resolve_translation(
-        &self,
-        profile_id: &str,
-    ) -> Result<TranslateConfiguration, ConfigurationLoadError> {
-        let raw: RawTranslateSelection = parse_selected(
-            self.source.source(),
-            self.source.path(),
-            self.source.toml_index(),
-            ConfigurationSelection::Translate,
-        )?;
-        PendingTranslateConfiguration::build(
-            &self.prompt_root,
-            raw.prompts,
-            raw.languages,
-            raw.translation,
-        )
-        .map_err(ConfigurationLoadError::InvalidValue)
-        .map_err(|error| error.with_configuration_path(self.source.path()))?
-        .resolve(self.source.as_ref(), profile_id)
     }
 }
 
@@ -1806,7 +1777,7 @@ fn build_llm_client(
         Duration::from_millis(raw.max_retry_after_ms),
     );
     let client = OpenAiCompatibleClient::new_with_endpoint(
-        OpenAiEndpoint::new(url, protocol),
+        OpenAiEndpoint::new(url, protocol, raw.stream),
         raw.api_key,
         raw.model,
         max_concurrent_requests,
@@ -2975,6 +2946,7 @@ impl ConfigurationFieldContract {
         "url",
         "api_key",
         "model",
+        "stream",
         "max_concurrent_requests",
         "connect_timeout_ms",
         "read_timeout_ms",
@@ -3062,6 +3034,11 @@ impl ConfigurationFieldContract {
                     ) =>
             {
                 ConfigurationTomlValueKind::String
+            }
+            [llm, clients, _, stream]
+                if llm == "llm" && clients == "clients" && stream == "stream" =>
+            {
+                ConfigurationTomlValueKind::Boolean
             }
             [llm, clients, _, field]
                 if llm == "llm"
@@ -4472,6 +4449,7 @@ struct RawLlmClientConfiguration {
     #[serde(deserialize_with = "deserialize_api_key")]
     api_key: SecretString,
     model: String,
+    stream: bool,
     max_concurrent_requests: u64,
     connect_timeout_ms: u64,
     read_timeout_ms: u64,
@@ -4518,11 +4496,11 @@ mod tests {
 
     use super::*;
     use crate::application::arguments::{AttArguments, ProductCommand};
-    use crate::llm::LlmClientSemanticIdentity;
     use crate::rpg_maker::RpgMakerEngine;
 
     const EXAMPLE_TASK_RECORDING: &str = "record_translation_tasks = true";
     const EXAMPLE_TARGET_CHARACTERS: &str = "target_task_user_message_characters = 24000";
+    const EXAMPLE_CLIENT_STREAM: &str = "stream = false";
     const EXAMPLE_CLIENT_PARAMETERS: &str = "parameters = '''\n{}\n'''";
 
     #[test]
@@ -4602,12 +4580,35 @@ mod tests {
     }
 
     #[test]
+    fn llm_stream_accepts_both_explicit_boolean_values() {
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        for expected in [false, true] {
+            let source = example.replacen(
+                EXAMPLE_CLIENT_STREAM,
+                format!("stream = {expected}").as_str(),
+                1,
+            );
+            let path = directory.write(format!("stream-{expected}.toml").as_str(), &source);
+            let ConfiguredRpgMakerCommand::Translate(configured) =
+                load_configuration(&path, translate_command("primary"))
+                    .expect("显式流式开关应建立 Translate 配置")
+            else {
+                panic!("应建立 Translate 配置");
+            };
+            assert_eq!(configured.client().stream(), expected);
+        }
+    }
+
+    #[test]
     fn llm_parameters_reserve_only_the_selected_protocol_fields() {
         let directory = TestDirectory::new();
         let example = include_str!("../../config.example.toml");
         for (name, protocol, reserved, allowed) in [
             ("chat-messages", "chat_completions", "messages", "input"),
+            ("chat-stream", "chat_completions", "stream", "input"),
             ("responses-input", "responses", "input", "messages"),
+            ("responses-stream", "responses", "stream", "messages"),
             (
                 "responses-background",
                 "responses",
@@ -4955,6 +4956,7 @@ url = []
 protocol = []
 api_key = []
 model = []
+stream = []
 max_concurrent_requests = []
 connect_timeout_ms = []
 read_timeout_ms = []
@@ -5139,7 +5141,6 @@ id = "unused"
             ("true", example.to_owned(), true),
         ];
 
-        let mut semantic_fingerprints = Vec::new();
         for (name, source, expected) in cases {
             let path = directory.write(
                 format!("record-translation-tasks-{name}.toml").as_str(),
@@ -5153,13 +5154,7 @@ id = "unused"
             };
 
             assert_eq!(configured.record_translation_tasks(), expected);
-            semantic_fingerprints.push(configured.client().semantic_fingerprint());
         }
-        assert!(
-            semantic_fingerprints
-                .windows(2)
-                .all(|pair| pair[0] == pair[1])
-        );
     }
 
     #[test]
@@ -5228,6 +5223,10 @@ id = "unused"
                 source.replacen("retry_delays_ms = []\n", "", 1),
             ),
             (
+                "client-stream",
+                source.replacen(format!("{EXAMPLE_CLIENT_STREAM}\n").as_str(), "", 1),
+            ),
+            (
                 "client-max-retry-after",
                 source.replacen("max_retry_after_ms = 1000\n", "", 1),
             ),
@@ -5251,6 +5250,14 @@ id = "unused"
                 "selected-profile-missing",
                 source.replacen("llm_client = \"primary\"\n", "", 1),
                 "translation.profiles.llm_client",
+                "缺少必填字段",
+                ConfigurationTomlFailureKind::MissingField,
+                None,
+            ),
+            (
+                "client-stream-missing",
+                source.replacen(format!("{EXAMPLE_CLIENT_STREAM}\n").as_str(), "", 1),
+                "llm.clients.primary.stream",
                 "缺少必填字段",
                 ConfigurationTomlFailureKind::MissingField,
                 None,
@@ -5326,6 +5333,20 @@ id = "unused"
                     expected: ConfigurationTomlValueKind::Integer,
                 },
                 Some("TYPE_VALUE_SENTINEL"),
+            ),
+            (
+                "stream-type",
+                source.replacen(
+                    EXAMPLE_CLIENT_STREAM,
+                    "stream = [\"STREAM_TYPE_SENTINEL\"]",
+                    1,
+                ),
+                "llm.clients.primary.stream",
+                "字段类型不符合当前配置契约",
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::Boolean,
+                },
+                Some("STREAM_TYPE_SENTINEL"),
             ),
             (
                 "api-key-type",
@@ -5700,7 +5721,7 @@ api_key = "{API_KEY}" "invalid"
     fn unselected_client_api_key_never_enters_configuration_diagnostics() {
         let directory = TestDirectory::new();
         let source = format!(
-            "{}\n[llm.clients.unused]\nurl = []\nprotocol = []\napi_key = \"UNSELECTED_API_KEY_SENTINEL\"\nmodel = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
+            "{}\n[llm.clients.unused]\nurl = []\nprotocol = []\napi_key = \"UNSELECTED_API_KEY_SENTINEL\"\nmodel = []\nstream = []\nmax_concurrent_requests = []\nconnect_timeout_ms = []\nread_timeout_ms = []\nrequest_timeout_ms = []\nproxy = []\nadditional_pem_files = []\nretry_delays_ms = []\nmax_retry_after_ms = []\nparameters = []\n",
             include_str!("../../config.example.toml")
         );
         let source = replace_thinking_output(&source, "thinking_output = []");

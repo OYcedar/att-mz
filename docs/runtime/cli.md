@@ -103,11 +103,18 @@ Windows 路径统一显示自然盘符或 UNC 形式，不公开 `\\?\` 扩展�
 从状态读取、业务执行、必要收尾到最终保存，项目租约全程在场，两条并发命令不能拼出一份
 不存在的选择。
 
+Profile、Client、Prompt、术语和语言检查阈值是后续 Translate 请求的选择，不是已有正文
+的所有权或适用性条件。更换这些选择不会使既有译文失去 Current。项目语言对不属于
+这类请求选择；它改变后，旧语言对正文保留但不发布。
+
 ## 4. 启动、取消与资源
 
 程序只按命令的实际需要建立配置、项目、Prompt、Client、文件系统、SQLite 和 Lua 能力。
 Manual、Lua、Init、Extract 与 WriteBack 不构造模型 Client；Manual check/apply 和 Lua 高级
 译文 API 也不会请求模型。
+
+模型 Task 只在第一次真实外部 HTTP attempt 开始时计为 started。请求构造失败、准入前
+取消或服务停发门拒绝都不得伪造 started、attempt 或任务记录。
 
 文件解析与相互独立的工作默认并行；要求确定顺序的结果仍按自然顺序合并和提交。处理窗口
 装满时上游等待，不把合法项目总量变成容量错误。
@@ -149,6 +156,10 @@ RPG Maker 另含 owner 和 Rules 的 `rule_number`。`state` 为 `pending`、`cu
 已经接受的 string array；pending 和 rejected 都是 `null`。Rejected 另含
 `rejected_candidate_json` string，逐字保存原候选 JSON 文本；该文本是诊断材料，不作为外层
 JSONL 的嵌套 JSON 解析。输出始终一行一条完整 JSON，不含数据库 ID、hash 或编码位置。
+
+`current` 表示译文对当前源文、实际 Group 语境、项目语言对和强不变量仍可发布；它不表示
+译文由当前 Client、Profile 或 Prompt 生成。保留但不适用于当前事实的正文不作为
+`current` 导出或发布。
 
 ## 6. 运行文件
 

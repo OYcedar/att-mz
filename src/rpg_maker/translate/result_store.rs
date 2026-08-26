@@ -861,6 +861,8 @@ struct EncodedCommitUnit {
     decision_index: usize,
     identity: EncodedIdentity,
     translation_state: Sha256Fingerprint,
+    expected_translation: Option<String>,
+    expected_translation_state: Option<Sha256Fingerprint>,
 }
 
 struct EncodedRejectedUnit {
@@ -871,6 +873,8 @@ struct EncodedRejectedUnit {
     translation_json: Option<String>,
     violation_json: String,
     planning_state: Sha256Fingerprint,
+    expected_translation: Option<String>,
+    expected_translation_state: Option<Sha256Fingerprint>,
 }
 
 fn preparation_work(
@@ -1056,6 +1060,8 @@ fn encode_invalidated_rejection(
         violation_json: serde_json::to_string(&violation)
             .map_err(ResultStoragePlanError::Content)?,
         planning_state,
+        expected_translation: None,
+        expected_translation_state: None,
     })
 }
 
@@ -1250,8 +1256,12 @@ fn encode_commit_unit(work: CommitUnitWork) -> Result<EncodedCommitUnit, ResultS
         .get(work.decision_index)
         .expect("提交工作必须引用已验收的 decision");
     let patch = decision.patch();
-    let (identity, translation_state) = match work.position {
-        CommitUnitPosition::Representative => (patch.identity(), patch.translation_state()),
+    let (identity, translation_state, expected_previous) = match work.position {
+        CommitUnitPosition::Representative => (
+            patch.identity(),
+            patch.translation_state(),
+            patch.expected_previous(),
+        ),
         CommitUnitPosition::PropagationTarget(target_index) => {
             let target = patch
                 .propagation_targets()
@@ -1266,13 +1276,20 @@ fn encode_commit_unit(work: CommitUnitWork) -> Result<EncodedCommitUnit, ResultS
             (
                 target.identity(),
                 target.state_context().finish(patch.translation()),
+                target.expected_previous(),
             )
         }
+    };
+    let (expected_translation, expected_translation_state) = match expected_previous {
+        Some((translation, state)) => (Some(encode_content(translation)?), Some(state)),
+        None => (None, None),
     };
     Ok(EncodedCommitUnit {
         decision_index: work.decision_index,
         identity: encode_identity(identity)?,
         translation_state,
+        expected_translation,
+        expected_translation_state,
     })
 }
 
@@ -1301,6 +1318,10 @@ fn encode_rejected_unit(
     let violation_json =
         serde_json::to_string(candidate.violation()).map_err(ResultStoragePlanError::Content)?;
     let identity = target.identity();
+    let (expected_translation, expected_translation_state) = match target.expected_previous() {
+        Some((translation, state)) => (Some(encode_content(translation)?), Some(state)),
+        None => (None, None),
+    };
     let readable_id = crate::manual::readable_rpg_maker_id(
         identity.group_location(),
         identity.kind(),
@@ -1314,6 +1335,8 @@ fn encode_rejected_unit(
         translation_json,
         violation_json,
         planning_state: target.planning_state(),
+        expected_translation,
+        expected_translation_state,
     })
 }
 
@@ -1466,7 +1489,7 @@ const CLEAR_MANUAL_TRANSLATION_FROM_SNAPSHOT: &str = "DELETE FROM rpg_maker_manu
 
 const WRITE_TRANSLATION_FROM_SNAPSHOT: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?3 AND text_group.group_location = ?4) AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND (translation_content_json = ?8 OR (translation_content_json IS NULL AND ?8 IS NULL)) AND (translation_state = ?9 OR (translation_state IS NULL AND ?9 IS NULL))";
 
-const COMMIT_TRANSLATION: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?3 AND text_group.group_location = ?4) AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND translation_content_json IS NULL AND translation_state IS NULL";
+const COMMIT_TRANSLATION: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = ?1, translation_state = ?2 WHERE owner = ?3 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?3 AND text_group.group_location = ?4) AND unit_role = ?5 AND source_content_json = ?6 AND source_context_json = ?7 AND ((?8 IS NULL AND translation_content_json IS NULL AND translation_state IS NULL) OR (translation_content_json = ?8 AND translation_state = ?9))";
 
 const DELETE_REJECTED_TRANSLATION: &str = "DELETE FROM rpg_maker_rejected_translation WHERE owner = ?1 AND group_id = (SELECT text_group.group_id FROM rpg_maker_text_group AS text_group WHERE text_group.owner = ?1 AND text_group.group_location = ?2) AND unit_role = ?3";
 
@@ -1483,8 +1506,10 @@ WHERE unit.owner = ?9
   AND unit.unit_role = ?11
   AND unit.source_content_json = ?3
   AND unit.source_context_json = ?4
-  AND unit.translation_content_json IS NULL
-  AND unit.translation_state IS NULL
+  AND (
+      (?12 IS NULL AND unit.translation_content_json IS NULL AND unit.translation_state IS NULL)
+      OR (unit.translation_content_json = ?12 AND unit.translation_state = ?13)
+  )
 ON CONFLICT (owner, group_id, unit_role) DO UPDATE SET
     readable_id = excluded.readable_id,
     origin = excluded.origin,
@@ -1576,6 +1601,9 @@ fn commit_translation_parameters(unit: EncodedCommitUnit) -> Vec<SqliteValue> {
         text(unit.identity.unit_role),
         text(unit.identity.source_content_json),
         text(unit.identity.source_context_json),
+        unit.expected_translation.map_or(SqliteValue::Null, text),
+        unit.expected_translation_state
+            .map_or(SqliteValue::Null, blob),
     ]
 }
 
@@ -1600,6 +1628,12 @@ fn rejected_translation_parameters(rejection: EncodedRejectedUnit) -> Vec<Sqlite
         text(rejection.identity.owner),
         text(rejection.identity.group_location),
         text(rejection.identity.unit_role),
+        rejection
+            .expected_translation
+            .map_or(SqliteValue::Null, text),
+        rejection
+            .expected_translation_state
+            .map_or(SqliteValue::Null, blob),
     ]
 }
 
@@ -1708,11 +1742,12 @@ mod tests {
 
     use super::*;
     use crate::rpg_maker::translate::pipeline::{
-        AcceptedTranslationDecision, NonEmptyTaskItems, RpgMakerTranslationTaskIndex,
-        TranslationInvalidation, TranslationOwnerSnapshot, TranslationPatch,
-        TranslationPropagationTarget, TranslationReuse, TranslationReuseSeed,
-        TranslationReuseTarget, TranslationSnapshotBaseline, TranslationStateContext,
-        TranslationTaskOutcomeContext,
+        AcceptedTranslationDecision, NonEmptyTaskItems, RejectedTranslationCandidate,
+        RejectedTranslationTarget, RpgMakerTranslationTaskIndex, TranslationInvalidation,
+        TranslationOwnerSnapshot, TranslationPatch, TranslationPropagationTarget, TranslationReuse,
+        TranslationReuseSeed, TranslationReuseTarget, TranslationSnapshotBaseline,
+        TranslationStateContext, TranslationTaskOutcomeContext, TranslationTaskUnavailableReason,
+        TranslationUnitRejectionReason, UnresolvedTranslationUnit, rpg_maker_diagnostic_unit,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -2219,6 +2254,67 @@ mod tests {
         assert_eq!(rejected_clear.parameter_set_count(), 1);
     }
 
+    #[tokio::test]
+    async fn rejected_commit_uses_the_exact_retained_stale_body_as_its_cas_baseline() {
+        let sqlite = RecordingSqlite::default();
+        let plans = Arc::clone(&sqlite.plans);
+        let service = RpgMakerTranslationResultStorageService::new(sqlite, InlineCpu);
+        let identity = scalar_identity(1, "name", "原文", "{}");
+        let previous = value("旧语境译文");
+        let previous_state = Sha256Fingerprint::from_bytes([0x61; 32]);
+        let target = RejectedTranslationTarget::new(
+            identity.clone(),
+            Sha256Fingerprint::from_bytes([0x62; 32]),
+            Some((previous.clone(), previous_state)),
+        );
+        let candidate = RejectedTranslationCandidate::new(
+            r#"[""]"#.to_owned(),
+            Some(vec![String::new()]),
+            ProvenInvariantViolation::BlankTranslation,
+            vec![target],
+        );
+        let unresolved = UnresolvedTranslationUnit::with_rejected_candidate(
+            task_id(0),
+            rpg_maker_diagnostic_unit(&identity),
+            TranslationUnitRejectionReason::BlankTranslation,
+            candidate,
+        );
+        let outcome = Arc::new(TranslationTaskOutcome::Unavailable {
+            context: TranslationTaskOutcomeContext::new(
+                RpgMakerTranslationTaskIndex::new(0),
+                NonZeroUsize::MIN,
+                Vec::new(),
+            ),
+            reason: TranslationTaskUnavailableReason::AllOutputsRejected,
+            unresolved: NonEmptyTaskItems::new(unresolved, Vec::new()),
+        });
+
+        let prepared = service
+            .prepare_commit(outcome)
+            .await
+            .expect("Rejected 应可编码");
+        service
+            .commit_prepared(&project(), prepared)
+            .await
+            .expect("精确旧正文应允许保存 Rejected");
+
+        let plans = plans.lock().expect("事务锁");
+        let [SqliteTransactionStep::ExecuteManyExactlyOne(write)] = plans[0].1.steps() else {
+            panic!("纯 Rejected 任务应只有一批条件写入")
+        };
+        assert_eq!(write.statement(), UPSERT_REJECTED_TRANSLATION);
+        let parameters = write
+            .parameter_rows()
+            .next()
+            .expect("应有一组 Rejected 参数");
+        assert_eq!(parameters.len(), 13);
+        assert_eq!(
+            parameters[11],
+            SqliteValue::Text(r#""旧语境译文""#.to_owned())
+        );
+        assert_eq!(parameters[12], SqliteValue::Blob(vec![0x61; 32]));
+    }
+
     #[test]
     fn unit_writes_resolve_internal_group_id_from_the_domain_location() {
         for (statement, owner_parameter, location_parameter) in [
@@ -2437,7 +2533,7 @@ mod tests {
         );
         assert_eq!(batch.parameter_set_count(), TARGETS + 1);
         assert!(batch.parameter_rows().all(|parameters| {
-            parameters.len() == 6 && !parameters.contains(&encoded_translation)
+            parameters.len() == 8 && !parameters.contains(&encoded_translation)
         }));
         let SqliteTransactionStep::ExecuteMany(rejected_clear) = &plan.steps()[1] else {
             panic!("全部传播目标必须批量清除旧 Rejected 候选");
@@ -2700,6 +2796,163 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn real_sqlite_rejected_commit_preserves_the_exact_retained_stale_body() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let database_path = directory
+            .path()
+            .join("retained-rejected")
+            .join("project.db");
+        let identity = scalar_identity(1, "name", "翻訳対象", "{}");
+        let previous = value("旧语境译文");
+        let previous_state = Sha256Fingerprint::from_bytes([0x61; 32]);
+        create_unit_database(
+            &database_path,
+            &[StoredUnit::new(
+                &identity,
+                "翻訳対象",
+                "{}",
+                Some("旧语境译文"),
+                Some(previous_state.as_bytes()),
+            )],
+        );
+        let storage = runtime_storage();
+        let service = RpgMakerTranslationResultStorageService::new(storage.clone(), InlineCpu);
+        let target = RejectedTranslationTarget::new(
+            identity.clone(),
+            Sha256Fingerprint::from_bytes([0x62; 32]),
+            Some((previous.clone(), previous_state)),
+        );
+        let candidate = RejectedTranslationCandidate::new(
+            r#"[""]"#.to_owned(),
+            Some(vec![String::new()]),
+            ProvenInvariantViolation::BlankTranslation,
+            vec![target],
+        );
+        let outcome = Arc::new(TranslationTaskOutcome::Unavailable {
+            context: TranslationTaskOutcomeContext::new(
+                RpgMakerTranslationTaskIndex::new(0),
+                NonZeroUsize::MIN,
+                Vec::new(),
+            ),
+            reason: TranslationTaskUnavailableReason::AllOutputsRejected,
+            unresolved: NonEmptyTaskItems::new(
+                UnresolvedTranslationUnit::with_rejected_candidate(
+                    task_id(0),
+                    rpg_maker_diagnostic_unit(&identity),
+                    TranslationUnitRejectionReason::BlankTranslation,
+                    candidate,
+                ),
+                Vec::new(),
+            ),
+        });
+
+        let prepared = service
+            .prepare_commit(outcome)
+            .await
+            .expect("Rejected 应可编码");
+        service
+            .commit_prepared(&project_at(database_path.clone()), prepared)
+            .await
+            .expect("数据库仍是精确旧正文时，应保存 Rejected");
+
+        assert_eq!(
+            stored_translation(&database_path, 1),
+            (Some(previous), Some(previous_state.as_bytes().to_vec()),),
+            "保存模型 Rejected 不得清除仍可恢复的旧正文"
+        );
+        assert_eq!(stored_rejection_count(&database_path), 1);
+
+        service.finalize().await.expect("测试数据库会话应正常终结");
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_rejected_commit_rolls_back_when_the_retained_body_changed() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let database_path = directory
+            .path()
+            .join("retained-rejected-race")
+            .join("project.db");
+        let identity = scalar_identity(1, "name", "翻訳対象", "{}");
+        let expected_previous = value("规划时旧译文");
+        let expected_previous_state = Sha256Fingerprint::from_bytes([0x71; 32]);
+        create_unit_database(
+            &database_path,
+            &[StoredUnit::new(
+                &identity,
+                "翻訳対象",
+                "{}",
+                Some("规划时旧译文"),
+                Some(expected_previous_state.as_bytes()),
+            )],
+        );
+        let storage = runtime_storage();
+        let service = RpgMakerTranslationResultStorageService::new(storage.clone(), InlineCpu);
+        let target = RejectedTranslationTarget::new(
+            identity.clone(),
+            Sha256Fingerprint::from_bytes([0x72; 32]),
+            Some((expected_previous, expected_previous_state)),
+        );
+        let candidate = RejectedTranslationCandidate::new(
+            r#"[""]"#.to_owned(),
+            Some(vec![String::new()]),
+            ProvenInvariantViolation::BlankTranslation,
+            vec![target],
+        );
+        let outcome = Arc::new(TranslationTaskOutcome::Unavailable {
+            context: TranslationTaskOutcomeContext::new(
+                RpgMakerTranslationTaskIndex::new(0),
+                NonZeroUsize::MIN,
+                Vec::new(),
+            ),
+            reason: TranslationTaskUnavailableReason::AllOutputsRejected,
+            unresolved: NonEmptyTaskItems::new(
+                UnresolvedTranslationUnit::with_rejected_candidate(
+                    task_id(0),
+                    rpg_maker_diagnostic_unit(&identity),
+                    TranslationUnitRejectionReason::BlankTranslation,
+                    candidate,
+                ),
+                Vec::new(),
+            ),
+        });
+        let prepared = service
+            .prepare_commit(outcome)
+            .await
+            .expect("Rejected 应可编码");
+        Connection::open(&database_path)
+            .expect("数据库应可并发重开")
+            .execute(
+                "UPDATE rpg_maker_text_unit
+                 SET translation_content_json = ?, translation_state = ?
+                 WHERE rowid = 1",
+                params![r#""并发新译文""#, vec![0x7f_u8; 32]],
+            )
+            .expect("应可模拟规划后到达的新译文");
+
+        let error = service
+            .commit_prepared(&project_at(database_path.clone()), prepared)
+            .await
+            .expect_err("旧正文或状态已变化时，Rejected 不得覆盖并发结果");
+        assert!(matches!(
+            error.source(),
+            RpgMakerTranslationResultStorageError::StalePlan { .. }
+        ));
+        assert_eq!(
+            stored_translation(&database_path, 1),
+            (Some(value("并发新译文")), Some(vec![0x7f; 32]))
+        );
+        assert_eq!(
+            stored_rejection_count(&database_path),
+            0,
+            "CAS 失败必须回滚 Rejected 写入"
+        );
+
+        service.finalize().await.expect("测试数据库会话应正常终结");
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
     #[test]
     fn duplicate_logical_unit_is_rejected_before_a_commit_plan_is_created() {
         let identity = scalar_identity(1, "name", "原文", "{}");
@@ -2729,6 +2982,274 @@ mod tests {
         let error = finish_commit_plan(decisions, encoded, Vec::new())
             .expect_err("重复逻辑单元不得进入事务");
         assert!(matches!(error, ResultStoragePlanError::DuplicateUnit));
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_commits_retried_strong_rejections_from_the_post_preparation_baseline() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let database_path = directory.path().join("retry-rejected").join("project.db");
+        let representative = scalar_identity(1, "name", r"翻訳対象 \V[1]", "{}");
+        let propagation = scalar_identity(2, "name", r"翻訳対象 \V[1]", "{}");
+        let representative_state = Sha256Fingerprint::from_bytes([0x31; 32]);
+        let propagation_state = Sha256Fingerprint::from_bytes([0x32; 32]);
+        create_unit_database(
+            &database_path,
+            &[
+                StoredUnit::new(
+                    &representative,
+                    r"翻訳対象 \V[1]",
+                    "{}",
+                    Some("缺少占位符的旧译文"),
+                    Some(representative_state.as_bytes()),
+                ),
+                StoredUnit::new(
+                    &propagation,
+                    r"翻訳対象 \V[1]",
+                    "{}",
+                    Some("另一条缺少占位符的旧译文"),
+                    Some(propagation_state.as_bytes()),
+                ),
+            ],
+        );
+        let storage = runtime_storage();
+        let service = RpgMakerTranslationResultStorageService::new(storage.clone(), InlineCpu);
+        let preparation = TranslationPlanPreparation::new(
+            vec![
+                TranslationInvalidation::rejected(
+                    representative.clone(),
+                    value("缺少占位符的旧译文"),
+                    representative_state,
+                    ProvenInvariantViolation::PlaceholderMismatch,
+                    Sha256Fingerprint::from_bytes([0x41; 32]),
+                    TranslationOrigin::Automatic,
+                ),
+                TranslationInvalidation::rejected(
+                    propagation.clone(),
+                    value("另一条缺少占位符的旧译文"),
+                    propagation_state,
+                    ProvenInvariantViolation::PlaceholderMismatch,
+                    Sha256Fingerprint::from_bytes([0x42; 32]),
+                    TranslationOrigin::Automatic,
+                ),
+            ],
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            0,
+            2,
+            0,
+        );
+
+        service
+            .apply_preparation(&project_at(database_path.clone()), preparation)
+            .await
+            .expect("强不变量旧译文应先原子转入 Rejected");
+        assert_eq!(stored_translation(&database_path, 1), (None, None));
+        assert_eq!(stored_translation(&database_path, 2), (None, None));
+        assert_eq!(stored_rejection_count(&database_path), 2);
+
+        let translation = value(r"已修复的译文 \V[1]");
+        let representative_context = state_context(0x51);
+        let propagation_context = state_context(0x52);
+        let committed_representative_state = representative_context.finish(&translation);
+        let committed_propagation_state = propagation_context.finish(&translation);
+        let outcome = complete_outcome(vec![TranslationPatch::new(
+            representative,
+            vec![TranslationPropagationTarget::new(
+                propagation,
+                propagation_context,
+            )],
+            translation.clone(),
+            committed_representative_state,
+        )]);
+        let prepared = service
+            .prepare_commit(outcome)
+            .await
+            .expect("修复结果应可编码");
+        service
+            .commit_prepared(&project_at(database_path.clone()), prepared)
+            .await
+            .expect("Preparation 后的空 Current 基线必须允许代表和传播目标原子提交");
+
+        assert_eq!(
+            stored_translation(&database_path, 1),
+            (
+                Some(translation.clone()),
+                Some(committed_representative_state.as_bytes().to_vec()),
+            )
+        );
+        assert_eq!(
+            stored_translation(&database_path, 2),
+            (
+                Some(translation),
+                Some(committed_propagation_state.as_bytes().to_vec()),
+            )
+        );
+        assert_eq!(
+            stored_rejection_count(&database_path),
+            0,
+            "合法替换提交后应清除两项旧 Rejected"
+        );
+
+        service.finalize().await.expect("测试数据库会话应正常终结");
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_retry_rejected_commit_rolls_back_when_a_target_changes_after_preparation()
+    {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let database_path = directory.path().join("retry-race").join("project.db");
+        let representative = scalar_identity(1, "name", r"翻訳対象 \V[1]", "{}");
+        let propagation = scalar_identity(2, "name", r"翻訳対象 \V[1]", "{}");
+        let representative_state = Sha256Fingerprint::from_bytes([0x61; 32]);
+        let propagation_state = Sha256Fingerprint::from_bytes([0x62; 32]);
+        create_unit_database(
+            &database_path,
+            &[
+                StoredUnit::new(
+                    &representative,
+                    r"翻訳対象 \V[1]",
+                    "{}",
+                    Some("缺少占位符的旧译文"),
+                    Some(representative_state.as_bytes()),
+                ),
+                StoredUnit::new(
+                    &propagation,
+                    r"翻訳対象 \V[1]",
+                    "{}",
+                    Some("另一条缺少占位符的旧译文"),
+                    Some(propagation_state.as_bytes()),
+                ),
+            ],
+        );
+        let storage = runtime_storage();
+        let service = RpgMakerTranslationResultStorageService::new(storage.clone(), InlineCpu);
+        let preparation = TranslationPlanPreparation::new(
+            vec![
+                TranslationInvalidation::rejected(
+                    representative.clone(),
+                    value("缺少占位符的旧译文"),
+                    representative_state,
+                    ProvenInvariantViolation::PlaceholderMismatch,
+                    Sha256Fingerprint::from_bytes([0x71; 32]),
+                    TranslationOrigin::Automatic,
+                ),
+                TranslationInvalidation::rejected(
+                    propagation.clone(),
+                    value("另一条缺少占位符的旧译文"),
+                    propagation_state,
+                    ProvenInvariantViolation::PlaceholderMismatch,
+                    Sha256Fingerprint::from_bytes([0x72; 32]),
+                    TranslationOrigin::Automatic,
+                ),
+            ],
+            Vec::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            0,
+            2,
+            0,
+        );
+        service
+            .apply_preparation(&project_at(database_path.clone()), preparation)
+            .await
+            .expect("强不变量旧译文应先原子转入 Rejected");
+
+        Connection::open(&database_path)
+            .expect("数据库应可并发重开")
+            .execute(
+                "UPDATE rpg_maker_text_unit SET translation_content_json = ?, translation_state = ? WHERE rowid = 2",
+                params![r#""并发译文""#, vec![0x7f_u8; 32]],
+            )
+            .expect("应可模拟 Preparation 后到达的并发译文");
+        let translation = value(r"已修复的译文 \V[1]");
+        let outcome = complete_outcome(vec![TranslationPatch::new(
+            representative,
+            vec![TranslationPropagationTarget::new(
+                propagation,
+                state_context(0x82),
+            )],
+            translation.clone(),
+            state_context(0x81).finish(&translation),
+        )]);
+        let prepared = service
+            .prepare_commit(outcome)
+            .await
+            .expect("修复结果应可编码");
+        let error = service
+            .commit_prepared(&project_at(database_path.clone()), prepared)
+            .await
+            .expect_err("任一传播目标在 Preparation 后变化时，整项决定必须拒绝");
+        assert!(matches!(
+            error.source(),
+            RpgMakerTranslationResultStorageError::StalePlan { .. }
+        ));
+        assert_eq!(
+            stored_translation(&database_path, 1),
+            (None, None),
+            "后一个目标 CAS 失败必须回滚先写入的代表"
+        );
+        assert_eq!(
+            stored_translation(&database_path, 2),
+            (Some(value("并发译文")), Some(vec![0x7f; 32]))
+        );
+        assert_eq!(
+            stored_rejection_count(&database_path),
+            2,
+            "失败事务不得提前清除 Rejected 恢复证据"
+        );
+
+        service.finalize().await.expect("测试数据库会话应正常终结");
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_request_failure_path_preserves_a_non_strong_outdated_translation() {
+        let directory = tempfile::tempdir().expect("临时目录应可创建");
+        let database_path = directory.path().join("request-failed").join("project.db");
+        let identity = scalar_identity(1, "name", "翻訳対象", "{}");
+        let previous_state =
+            crate::translation::unrelated_rpg_maker_automatic_applicability_for_test();
+        create_unit_database(
+            &database_path,
+            &[StoredUnit::new(
+                &identity,
+                "翻訳対象",
+                "{}",
+                Some("仍可恢复的旧译文"),
+                Some(previous_state.as_bytes()),
+            )],
+        );
+        let storage = runtime_storage();
+        let service = RpgMakerTranslationResultStorageService::new(storage.clone(), InlineCpu);
+        service
+            .apply_preparation(
+                &project_at(database_path.clone()),
+                TranslationPlanPreparation::new(
+                    Vec::new(),
+                    Vec::new(),
+                    "[]".to_owned(),
+                    "[]".to_owned(),
+                    0,
+                    1,
+                    0,
+                ),
+            )
+            .await
+            .expect("没有强不变量违反时，Preparation 应只核对快照");
+
+        // 模型请求失败时不会产生任务提交；Preparation 必须已经保留可恢复正文。
+        assert_eq!(
+            stored_translation(&database_path, 1),
+            (
+                Some(value("仍可恢复的旧译文")),
+                Some(previous_state.as_bytes().to_vec()),
+            )
+        );
+
+        service.finalize().await.expect("测试数据库会话应正常终结");
+        storage.shutdown().await.expect("SQLite 根应正常关闭");
     }
 
     #[tokio::test]
@@ -2960,7 +3481,24 @@ mod tests {
         let connection = Connection::open(path).expect("测试数据库应可创建");
         connection
             .execute_batch(
-                "CREATE TABLE rpg_maker_text_group (
+                "CREATE TABLE metadata (
+                    source_snapshot_fingerprint BLOB NOT NULL
+                );
+                INSERT INTO metadata (source_snapshot_fingerprint) VALUES (zeroblob(32));
+                CREATE TABLE rpg_maker_asset_owner_state (
+                    owner TEXT NOT NULL,
+                    source_snapshot_fingerprint BLOB NOT NULL,
+                    asset_snapshot_fingerprint BLOB NOT NULL
+                );
+                CREATE TABLE rpg_maker_translation_resource (
+                    resource_kind TEXT PRIMARY KEY,
+                    canonical_json TEXT NOT NULL
+                );
+                INSERT INTO rpg_maker_translation_resource (resource_kind, canonical_json) VALUES
+                    ('terminology', '[]'),
+                    ('placeholder_rules', '[]'),
+                    ('write_back_layout_rules', '[]');
+                CREATE TABLE rpg_maker_text_group (
                     owner TEXT NOT NULL,
                     group_id INTEGER NOT NULL CHECK (group_id > 0),
                     group_location TEXT NOT NULL,
@@ -3060,6 +3598,18 @@ mod tests {
                 },
             )
             .expect("测试单元应仍存在")
+    }
+
+    fn stored_rejection_count(path: &std::path::Path) -> usize {
+        let count = Connection::open(path)
+            .expect("数据库应可重开")
+            .query_row(
+                "SELECT COUNT(*) FROM rpg_maker_rejected_translation",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应可统计 Rejected");
+        usize::try_from(count).expect("Rejected 数量应可表示为 usize")
     }
 
     fn translation_patch(

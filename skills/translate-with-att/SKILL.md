@@ -58,6 +58,12 @@ python <Skill>\scripts\rpg_maker_survey.py scan --game <完整游戏安装根> -
 所有权决定前，用隔离副本上的 `inspect_nwjs_runtime.py observe` 确认实际消费；无法访问时保持
 `unresolved`，不得先分配所有者再补调查。用户禁止运行游戏、运行场景无法到达或静态证据不足时，
 直接保留 `unresolved`；不要只为消除未确认项反复扫描或逐个展开大型关系组。
+字符串仅仅长得像 JSON 不能证明消费者会解析它。Survey 只在活动插件源码建立了当前插件参数对象、
+精确参数名到 `JSON.parse` 参数的直接数据流，或插件 schema 明确声明对应层是 `struct` / array 容器时，
+展开这一层；一次 `JSON.parse` 只证明顶层一次解码，容器里的 JSON 外形字符串仍需自己的嵌套 schema
+或下一次实际解析数据流。其他 JSON 外形保留完整外层字符串。已证明的序列化参数损坏时保留结构错误供
+审核，不把损坏外层当玩家正文，也不让一个参数中止整个游戏调查。采用的 Rules 或外部往返方案
+必须沿 Survey 记录的精确路径与解码层级写回。
 
 `scan` 同时生成 `ownership-decisions.jsonl`：每个关系组只有一行，默认状态是
 `unresolved`。把它复制到 `artifacts/decisions/ownership.jsonl`，只修改已经取得证据的组；
@@ -94,6 +100,8 @@ python <Skill>\scripts\rpg_maker_survey.py finalize --survey <工作目录>\surv
 `coverage.json` 的 `complete=false` 是正常结果，表示仍有未确认范围，不是命令失败。能够取得新证据时可对
 同一来源重新 finalize；证据暂时不可得时，记录精确未确认项并继续处理已确认范围，不让少量未知项卡住整次翻译。
 完成的计划提供 `dialogue-rules.toml`、`rules.toml`、逐规则 manifest、Unit 投影和预期所有权。
+`coverage.json` 与同目录 `rules-manifest.json` 是不可拆分的同次 finalize 证据；译后 QA 会从 Survey
+和逐规则 recipe 重新投影 Unit，并拒绝由 coverage 自己声明、却没有真实 Rule 产生的所有权或 Unit。
 MV 姓名 wrapper 不因外形建立全局规则；未证明的 wrapper 由译前检查按精确自然 ID 审核。
 
 已批准 Generic 来源的 ATT 输入在 `plan/generic/input/`，精确来源映射在
@@ -148,11 +156,12 @@ ATT 的 MV/MZ 内建控制符由 ATT 默认规则负责。普通未知外形、�
 
 ```powershell
 att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations.jsonl
-python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations.jsonl --survey <工作目录>\survey --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations.jsonl --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa
 ```
 
-Generic 项目另传 `--generic-manifest <工作目录>\plan\generic\manifest.json`。首次静态 QA 不传 WriteBack 和
-NW.js 报告；它们只在最终合并 QA 时传入。`qa_status` 只取 `clean`、`needs_review`、
+Generic 项目另传 `--generic-manifest <工作目录>\plan\generic\manifest.json`。首次静态 QA 不传实际
+`write_back` 和 NW.js 报告，因此没有静态问题时也只能是 `unverified`；它们只在最终合并 QA 时传入。
+`qa_status` 只取 `clean`、`needs_review`、
 `unverified`；发现多少 Review 都不会拒绝已有结构合法译文。
 
 先读 `qa/review-groups.jsonl` 的分类、数量和少量样例，不默认打开完整
@@ -175,7 +184,7 @@ apply 成功后重新导出当前译文并再做一次静态 QA；确认本轮�
 
 ```powershell
 att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations-after-manual.jsonl
-python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations-after-manual.jsonl --survey <工作目录>\survey --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa-after-manual
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations-after-manual.jsonl --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --terminology <任务根>\artifacts\rules\terminology.toml --output <工作目录>\qa-after-manual
 ```
 
 ## WriteBack、最终运行观察和 QA
@@ -194,12 +203,17 @@ python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\tran
 只在需要修改前比较或只读调查时先 inspect。每次修改都有事务记录，可按记录 restore：
 
 ```powershell
-python <Skill>\scripts\manage_rpg_maker_fonts.py apply --game <隔离副本> --font noto-sans-sc --state <工作目录>\font-state --output <任务根>\artifacts\qa\font-apply.json
+python <Skill>\scripts\manage_rpg_maker_fonts.py apply --game <隔离副本> --font noto-sans-sc --translations <工作目录>\translations-after-manual.jsonl --state <工作目录>\font-state --output <任务根>\artifacts\qa\font-apply.json
 python <Skill>\scripts\manage_rpg_maker_fonts.py restore --game <隔离副本> --state <工作目录>\font-state --output <任务根>\artifacts\qa\font-restore.json
 ```
 
 字体工具递归处理已确认的完整字体引用，不只修改 MV `gamefont.css` 或 MZ 的单个标准字段；
 `@font-face` 和字体加载 API 已注册的运行时别名必须保留，只替换别名指向的字体资源。
+项目字符投影只读取严格校验后的当前 ATT `translation export`，并按 WriteBack 的 current 译文或
+未接受条目的原文计算；这份导出没有同时绑定 Survey、finalize coverage、实际 WriteBack 和运行
+副本，不能证明项目全部字体消费者范围。`--coverage-text` 只用于另有真实消费者的补充玩家文本。
+因此字体工具没有发现问题时仍报告 scoped `unverified`；缺字属于 `needs_review`，并必须检查
+`review_required`，不能把“静态引用 Review 为空”误读成字体覆盖通过。
 
 ```powershell
 python <Skill>\scripts\inspect_nwjs_runtime.py smoke --game <隔离副本> --output <任务根>\artifacts\qa\nwjs-smoke --confirm-isolated-copy
@@ -207,11 +221,36 @@ python <Skill>\scripts\inspect_nwjs_runtime.py observe --game <隔离副本> --o
 ```
 
 smoke 必须等游戏离开启动场景，并把未捕获异常、引擎错误画面和启动超时记为 `needs_review`。
-单个后续场景无法安全进入时记为 `unsupported` 并继续；未访问场景是 `unverified`。窗口宽度、
+场景只有在观察器必需 hooks 完整并完成安装轮询、动作明确受支持、本场景原子序列边界内存在
+语义匹配的非空文本绘制，且截图是至少 64×64、可完整解码的 PNG 时才能标为 `verified`；不能沿用
+启动期、切换期或前序场景累计的绘制。单个后续场景无法安全进入时记为 `unverified` 并继续；未访问
+场景也是 `unverified`。窗口宽度、
 溢出、字体回退和英文命中只生成 Review。
 
-完成 WriteBack、字体和 NW.js 观察后，使用 Manual 后已经重新导出的 `translation export`、WriteBack 验证报告和运行报告合并
-最终 QA。运行报告、用户实机检查或返修后新出现的可观察事实可以触发下一轮 Manual、WriteBack 和受影响场景复查；
+完成 WriteBack、字体和 NW.js 观察后，使用 Manual 后已经重新导出的 `translation export`、同次
+finalize 的 coverage、ATT 当前项目的实际 `write_back` 目录和一次完整 NW.js 观察证据目录中的
+`report.json` 合并最终 QA。QA 会核对 Survey、coverage、导出自然 ID 与原文、完整 hooks/轮询、
+事件字段与精确子集、场景序列边界与绘制语义、截图尺寸、写回文件，以及隔离副本中 Survey 基线
+与 WriteBack 的部署字节；手写 PID、布尔值、空 hooks、空事件或 1×1 图片都不能形成通过证据。
+这些一致性检查不构成无法取得的报告来源证明；执行者仍必须实际运行随包工具并保留完整目录：
+
+```powershell
+python <Skill>\scripts\translation_qa.py scan --translations <工作目录>\translations-after-manual.jsonl --survey <工作目录>\survey --coverage <工作目录>\plan\coverage.json --write-back <ATT项目目录>\write_back --runtime-report <任务根>\artifacts\qa\nwjs-smoke\report.json --terminology <任务根>\artifacts\rules\terminology.toml --output <任务根>\artifacts\qa\final
+```
+
+现行 `translation export` 不携带项目目标语言，工具不能自行证明所传导出确属本轮语言方向；即使
+其余材料一致也保留 `translation_language_pair_unbound`，由任务清单中的项目身份、实际 Translate
+运行和语言验收另行闭合，不能删掉该未验证项来换取 clean。
+RPG Maker 的现有 Survey/coverage 也没有完整 WriteBack recipe，工具能够核对输出树、JSON、应有文件
+及隔离副本部署字节，并只用同一输出文件中源文的精确文字序列提出残留 Review；这种文件级命中
+不能证明每个自然 ID 的精确写回位置，因此保留
+`rpg_write_back_unit_mapping_unverified`；按验收指南检查真实差异和场景，不能把该项改写成已验证。
+
+Generic 项目另传 `--generic-manifest` 和实际 Generic `write_back`。当前没有通用的外部反向转换或游戏
+消费者报告格式，因此 Generic 最终 QA 保持 `unverified`，直到任务按已确认的外部消费过程另行取得并
+记录实际结果；不要为让工具显示 clean 手造报告。
+
+运行报告、用户实机检查或返修后新出现的可观察事实可以触发下一轮 Manual、WriteBack 和受影响场景复查；
 不得为了避免第二轮而在译前穷举无法确认的内容，也不得因同一静态问题重复返工。
 
 部分 NW.js 包装器不接受 smoke 使用的调试端口。此时不能跳过启动：改用 Windows 界面按玩家方式

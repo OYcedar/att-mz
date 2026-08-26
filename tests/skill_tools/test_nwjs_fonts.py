@@ -43,7 +43,8 @@ from att_toolbox.nwjs import (
     summarize_draws,
     unique_content_target,
 )
-from inspect_nwjs_runtime import scenario_action, wait_for_runtime_start
+from att_toolbox.png import decode_png_size
+from inspect_nwjs_runtime import scenario_action, scenario_status, wait_for_runtime_start
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "skills" / "translate-with-att" / "scripts"
@@ -79,6 +80,25 @@ def _run_script(
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_translation_export(path: Path, translation: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "manual_id": "System.json:gameTitle",
+                "source": ["Original title"],
+                "translation": [translation],
+                "state": "current",
+                "origin": "automatic",
+                "type": "fixed",
+                "owner": "builtin",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture
@@ -523,7 +543,7 @@ def test_font_cli_named_bundle_noop_is_success(tmp_path: Path) -> None:
     assert not state.exists()
 
 
-def test_font_cli_already_selected_reference_is_clean(tmp_path: Path) -> None:
+def test_font_cli_keeps_selected_reference_scoped_without_full_consumer_binding(tmp_path: Path) -> None:
     selected = FONT_ROOT / "NotoSansCJKsc-Regular.otf"
     game = tmp_path / "selected-font-game"
     (game / "data").mkdir(parents=True)
@@ -546,7 +566,99 @@ def test_font_cli_already_selected_reference_is_clean(tmp_path: Path) -> None:
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["confirmed_reference_count"] == 1
     assert report["mutation_count"] == 0
-    assert report["qa_status"] == "clean"
+    assert report["qa_status"] == "unverified"
+    assert report["coverage"]["translation_projection_available"] is False
+
+    empty_coverage = tmp_path / "empty-coverage.txt"
+    empty_coverage.write_text("\n", encoding="utf-8")
+    empty_output = tmp_path / "empty-coverage.json"
+    _run_script(
+        SCRIPTS / "manage_rpg_maker_fonts.py",
+        [
+            "inspect",
+            "--game",
+            game,
+            "--font",
+            "noto-sans-sc",
+            "--coverage-text",
+            empty_coverage,
+            "--output",
+            empty_output,
+        ],
+    )
+    empty_report = json.loads(empty_output.read_text(encoding="utf-8"))
+    assert empty_report["qa_status"] == "unverified"
+    assert empty_report["coverage"]["translation_projection_available"] is False
+
+    project_text = tmp_path / "project-text.txt"
+    project_text.write_text("A", encoding="utf-8")
+    covered_output = tmp_path / "covered.json"
+    _run_script(
+        SCRIPTS / "manage_rpg_maker_fonts.py",
+        [
+            "inspect",
+            "--game",
+            game,
+            "--font",
+            "noto-sans-sc",
+            "--coverage-text",
+            project_text,
+            "--output",
+            covered_output,
+        ],
+    )
+    covered = json.loads(covered_output.read_text(encoding="utf-8"))
+    assert covered["qa_status"] == "unverified"
+    assert covered["coverage"]["translation_projection_available"] is False
+    assert covered["coverage"]["additional_checked_characters"] == "A"
+
+    translations = tmp_path / "translations.jsonl"
+    _write_translation_export(translations, "实际译文")
+    bound_output = tmp_path / "bound.json"
+    _run_script(
+        SCRIPTS / "manage_rpg_maker_fonts.py",
+        [
+            "inspect",
+            "--game",
+            game,
+            "--font",
+            "noto-sans-sc",
+            "--translations",
+            translations,
+            "--coverage-text",
+            project_text,
+            "--output",
+            bound_output,
+        ],
+    )
+    bound = json.loads(bound_output.read_text(encoding="utf-8"))
+    assert bound["qa_status"] == "unverified"
+    assert bound["coverage"]["translation_projection_available"] is True
+    assert bound["coverage"]["scope"] == "translation_export_and_explicit_additions"
+    assert bound["coverage"]["project_checked_characters"] == "实文译际"
+    assert bound["coverage"]["translation_export"]["unit_count"] == 1
+
+    missing_translations = tmp_path / "missing-translations.jsonl"
+    _write_translation_export(missing_translations, "\U0010fffd")
+    missing_output = tmp_path / "missing.json"
+    _run_script(
+        SCRIPTS / "manage_rpg_maker_fonts.py",
+        [
+            "inspect",
+            "--game",
+            game,
+            "--font",
+            "noto-sans-sc",
+            "--translations",
+            missing_translations,
+            "--output",
+            missing_output,
+        ],
+    )
+    missing_report = json.loads(missing_output.read_text(encoding="utf-8"))
+    assert missing_report["qa_status"] == "needs_review"
+    assert missing_report["review_required"] is True
+    assert missing_report["coverage"]["project_missing_characters"] == "\U0010fffd"
 
 
 def test_bundled_fonts_match_official_manifest_and_cover_common_chinese() -> None:
@@ -758,6 +870,10 @@ def test_nwjs_public_contract_and_observer_memory_behavior(tmp_path: Path) -> No
     assert 'window.addEventListener("unhandledrejection"' in OBSERVER_SCRIPT
     assert 'patch(window.Graphics, "printError"' in OBSERVER_SCRIPT
     assert "state.takeErrors" in OBSERVER_SCRIPT
+    assert "hookRequirements" in OBSERVER_SCRIPT
+    assert "pollTicks" in OBSERVER_SCRIPT
+    assert "installationFinished" in OBSERVER_SCRIPT
+    assert "state.snapshot" in OBSERVER_SCRIPT
     assert "Math.min(width, px + allowed)" in OBSERVER_SCRIPT
     assert "px + measuredWidth > contentsWidth" in OBSERVER_SCRIPT
     assert 'measurementStatus = "unverified_control_or_multiline"' in OBSERVER_SCRIPT
@@ -842,6 +958,48 @@ def test_smoke_keeps_running_after_one_scene_script_exception() -> None:
         {"supported": True, "reason": "opened"},
     ]
     assert connection.calls == 2
+
+    status, _evidence = scenario_status(
+        "title",
+        {"supported": True},
+        [{"scene": "Scene_Map", "context": "Window_Map", "text": "先前以外的绘制"}],
+    )
+    assert status == "unverified"
+    status, _evidence = scenario_status(
+        "title",
+        {"supported": True},
+        [{"scene": "Scene_Title", "context": "Window_Title", "text": "标题"}],
+    )
+    assert status == "verified"
+    status, _evidence = scenario_status(
+        "title",
+        {"supported": True},
+        [{"scene": "Scene_Title", "context": "Window_Title", "text": "标题"}],
+        observer_start={},
+        observer_end={},
+        screenshot_size=(80, 80),
+    )
+    assert status == "unverified"
+    status, _evidence = scenario_status(
+        "title",
+        {"supported": True},
+        [{"scene": "Scene_Title", "context": "Window_Title", "text": "标题"}],
+        screenshot_size=(1, 1),
+    )
+    assert status == "unverified"
+    status, _evidence = scenario_status(
+        "title",
+        {"supported": True},
+        [{"scene": "Scene_Title", "context": "Window_Title", "text": ""}],
+    )
+    assert status == "unverified"
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    assert decode_png_size(png) == (1, 1)
+    with pytest.raises(ValueError):
+        decode_png_size(b"\x89PNG\r\n\x1a\n")
 
     help_result = _run_script(SCRIPTS / "inspect_nwjs_runtime.py", ["--help"])
     assert "smoke" in help_result.stdout and "observe" in help_result.stdout

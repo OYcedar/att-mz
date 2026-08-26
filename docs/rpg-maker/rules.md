@@ -633,6 +633,8 @@ MV/MZ 的标准控制语法和标准字段消费者是 ATT 的默认领域事实
 speaker 是事件命令 101 的独立字段；MV 没有原生姓名框。当前游戏确实使用 inline wrapper
 时，使用带精确 `ids` 和 `text` 捕获的 Custom Placeholder Rule 保护前后壳，姓名正文仍是
 NaturalText。裸 `<`、`>` 以及没有消费者证据的反斜杠形式同样只进入 Review。
+排版层也不会因它们“看起来像控制符”就当作零宽字符；只有上游语义所有者已建立的 ATT
+Placeholder token 按受保护内容处理，其他反斜杠形式按可见文本计量。
 
 ### 6.9 匹配、NaturalText 与重叠
 
@@ -683,7 +685,8 @@ label 或 state。插入、删除、重排一条对该单元不命中的规则�
 Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反向扫描候选正文，正文中的
 同字节内容保持 NaturalText。
 
-已存译文的 state 与当前事实精确匹配时直接判定 Current，不把恢复后的旧译文再次反向
+已存译文对当前源文、完整 Group 语境、项目语言对和强不变量仍适用时直接判定
+Current，不把恢复后的旧译文再次反向
 正规化。因此重复相同占位符的已验收译文在第二次运行不会再次请求 LLM；严格歧义检查
 只用于验收新的模型候选。
 
@@ -694,7 +697,8 @@ Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反�
 ## 7. Terminology 与协议壳的边界
 
 术语只在 Placeholder 投影后的每段 NaturalText 内逐段匹配，不扫描 opaque 协议壳，也
-不跨两个 `OpaqueBoundary` 拼接。模型 Prompt 和翻译状态复用同一次有序命中结果。
+不跨两个 `OpaqueBoundary` 拼接。模型 Prompt 复用同一次有序命中结果；术语不参与既有译文的
+Current 身份。
 
 假设术语 trigger 是 `勇者`：
 

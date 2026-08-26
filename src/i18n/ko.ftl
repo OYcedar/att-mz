@@ -261,6 +261,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] 모델 요청을 직렬화할 수 없습니다
     [response_parsing_failed] 모델 응답이 유효한 JSON이 아닙니다
     [invalid_response_contract] 모델 응답이 필수 응답 계약을 충족하지 않습니다
+    [model_stream_incomplete] 모델 스트림이 명시적인 최종 결과 전에 종료되었습니다
     [transport_failed] 유효한 응답을 받기 전에 HTTP 전송이 실패했습니다
     [lua_compilation_failed] Lua 주 프로그램을 컴파일할 수 없습니다
     [lua_execution_failed] Lua 주 프로그램 실행 중 오류가 발생했습니다

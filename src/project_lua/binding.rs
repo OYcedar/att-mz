@@ -60,7 +60,7 @@ pub(super) fn prepare_lua(
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(cancel_check_instruction_interval.get()),
         move |lua, _debug| {
-            if !hook_cancellation.is_cancelled() {
+            if !hook_cancellation.should_abort() {
                 return Ok(VmState::Continue);
             }
             hook_cancelled_observer.store(true, Ordering::Release);
@@ -225,7 +225,7 @@ fn lua_value_is_cancellation(value: &Value) -> bool {
 }
 
 fn ensure_lua_not_cancelled(cancellation: &ProjectLuaCancellation) -> mlua::Result<()> {
-    if cancellation.is_cancelled() {
+    if cancellation.should_abort() {
         Err(mlua::Error::external(ProjectLuaCancellationTrap))
     } else {
         Ok(())
@@ -247,7 +247,7 @@ unsafe extern "C-unwind" fn read_lua_source_chunk(
     // SAFETY: `compile_program` 在同步 `lua_load` 调用期间传入唯一的 reader 指针，
     // reader 及其借用的 program source 在整个回调期内都保持存活。
     let reader = unsafe { &mut *data.cast::<CancellableLuaSourceReader<'_>>() };
-    if reader.cancellation.is_cancelled() {
+    if reader.cancellation.should_abort() {
         reader.cancelled = true;
         // SAFETY: Lua 按 lua_Reader 契约传入有效的 size 输出指针。
         unsafe { *size = 0 };
@@ -329,7 +329,7 @@ fn complete_compilation(
                 line: lua_compilation_line(load_status, &error),
             },
         }),
-        Ok(_) if reader_cancelled || cancellation.is_cancelled() => {
+        Ok(_) if reader_cancelled || cancellation.should_abort() => {
             Err(ProjectLuaFailure::Cancelled)
         }
         Ok(function) => Ok(function),
@@ -341,13 +341,13 @@ fn validate_lua_source_utf8(
     cancellation: &ProjectLuaCancellation,
 ) -> Result<(), ProjectLuaFailure> {
     let source = program.source();
-    if cancellation.is_cancelled() {
+    if cancellation.should_abort() {
         return Err(ProjectLuaFailure::Cancelled);
     }
 
     let mut pending = Vec::with_capacity(PROJECT_LUA_SOURCE_CHUNK_BYTES.get() + 3);
     for chunk in source.chunks(PROJECT_LUA_SOURCE_CHUNK_BYTES.get()) {
-        if cancellation.is_cancelled() {
+        if cancellation.should_abort() {
             return Err(ProjectLuaFailure::Cancelled);
         }
         pending.extend_from_slice(chunk);
@@ -367,7 +367,7 @@ fn validate_lua_source_utf8(
         }
     }
     if pending.is_empty() {
-        if cancellation.is_cancelled() {
+        if cancellation.should_abort() {
             Err(ProjectLuaFailure::Cancelled)
         } else {
             Ok(())
@@ -1274,7 +1274,7 @@ fn dense_table_values(
 fn ensure_project_lua_call_running(
     cancellation: &ProjectLuaCancellation,
 ) -> Result<(), ProjectLuaCallError> {
-    if cancellation.is_cancelled() {
+    if cancellation.should_abort() {
         Err(ProjectLuaCallError::cancelled())
     } else {
         Ok(())

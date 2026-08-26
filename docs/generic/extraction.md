@@ -33,13 +33,16 @@ Extract 同时建立供 Translate 使用的稳定文本层次：一个 JSONL 文
 | Group 在文件内移动到其他行、文件改名或移到其他 JSONL | 保留译文 |
 | Group ID 改变 | 删除旧 Group；新 Group 未翻译 |
 | 只改变一个 Unit ID，kind、文本和顺序不变 | 该 Unit 作为新 Unit；其余 Unit 保留 |
-| kind、Unit 数量、Unit 顺序或任一 text 改变 | 清除该 Group 全部译文 |
+| 只改变 kind、Unit 数量、Unit 顺序或兄弟 Unit text | 仍能唯一识别且自身原文不变的 Unit 保留正文，但因 Group 语境改变而不再是 Current |
+| 某 Unit 的自身 text 改变 | 新原文没有 Current 译文 |
 | 删除 Group | 删除该 Group 及其译文 |
-| 删除 Unit | 删除该 Unit；Unit 数量改变，因此清除该 Group 其余译文 |
+| 删除 Unit | 删除该 Unit；其余 Unit 正文保留但因 Group 语境改变而不再是 Current |
 | 新增 Group | 新 Group 未翻译 |
-| 新增 Unit | Unit 数量改变，因此该 Group 全部未翻译 |
+| 新增 Unit | 新 Unit 未翻译；其余 Unit 正文保留但因 Group 语境改变而不再是 Current |
 
-ATT 只清除实际受影响的 Group 自动状态，其他文件或 Group 的自动译文原样保留。
+Extract 不把“语境已改变”等同于“正文已删除”。保留但过期的自动正文不参与 WriteBack
+或后续模型语境；新候选通过验收后才以该旧正文为 CAS 预期值原子覆盖。其他文件或
+Group 的自动译文原样保留。
 
 ## 3. 人工译文状态
 
@@ -50,7 +53,8 @@ Extract 不删除 `generic_manual_translation`。人工记录按当前位置重�
   记录成为过期；
 - 删除当前位置时，旧原文和人工译文继续保存在人工表中；
 - 以后同一内部位置、文件、kind、正文形状和原文重新匹配时，记录可以再次成为当前；
-- 术语、Prompt、Profile、Client、语言判断和 Placeholder 配置不参与这个判断。
+- 术语、Prompt、Profile、Client、语言判断和 Placeholder 配置不参与这个判断；
+- 人工译文另外绑定填写时的项目语言对，语言对不同时保留正文但不作为当前译文。
 
 过期人工记录不参与 WriteBack，也不阻止后续自动 Translate。高级 Lua 的
 `ctx.translation.list({ status = "outdated" })` 可以查看保存的旧快照。

@@ -776,10 +776,6 @@ pub(crate) enum TranslationPlanningResourceProblem {
         entry_number: usize,
         field: TerminologyField,
     },
-    SurroundingWhitespace {
-        entry_number: usize,
-        field: TerminologyField,
-    },
     ControlCharacter {
         entry_number: usize,
         field: TerminologyField,
@@ -803,7 +799,6 @@ impl TranslationPlanningResourceProblem {
             Self::InvalidSnapshotJson { .. } => "invalid_snapshot_json",
             Self::SnapshotEncodingJson { .. } => "snapshot_encoding_json",
             Self::BlankField { .. } => "blank_field",
-            Self::SurroundingWhitespace { .. } => "surrounding_whitespace",
             Self::ControlCharacter { .. } => "control_character",
             Self::EmptyTriggers { .. } => "empty_triggers",
             Self::DuplicateTerm => "duplicate_term",
@@ -852,10 +847,6 @@ impl TranslationPlanningResourceProblem {
                 ("column", column.to_string()),
             ],
             Self::BlankField {
-                entry_number,
-                field,
-            }
-            | Self::SurroundingWhitespace {
                 entry_number,
                 field,
             } => vec![
@@ -1282,10 +1273,6 @@ fn translation_planning_resource_code(
             TranslationPlanningResourceKind::Terminology,
             TranslationPlanningResourceProblem::BlankField { .. },
         ) => "translation.terminology.blank_field",
-        (
-            TranslationPlanningResourceKind::Terminology,
-            TranslationPlanningResourceProblem::SurroundingWhitespace { .. },
-        ) => "translation.terminology.surrounding_whitespace",
         (
             TranslationPlanningResourceKind::Terminology,
             TranslationPlanningResourceProblem::ControlCharacter { .. },

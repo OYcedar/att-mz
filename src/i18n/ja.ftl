@@ -261,6 +261,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] モデルリクエストをシリアル化できませんでした
     [response_parsing_failed] モデル応答が有効な JSON ではありません
     [invalid_response_contract] モデル応答が必要な応答契約を満たしていません
+    [model_stream_incomplete] モデルストリームが明確な終端結果の前に終了しました
     [transport_failed] 有効な応答を受け取る前に HTTP 転送が失敗しました
     [lua_compilation_failed] Lua メインプログラムをコンパイルできませんでした
     [lua_execution_failed] Lua メインプログラムの実行中に失敗しました

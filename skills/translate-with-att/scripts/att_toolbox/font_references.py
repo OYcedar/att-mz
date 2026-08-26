@@ -1662,13 +1662,18 @@ def build_font_plan(
     content_root: Path,
     selected_font: Path,
     coverage_texts: Sequence[Path] = (),
+    coverage_characters: str = "",
 ) -> FontPlan:
     selected_body = selected_font.read_bytes()
     selected_name = selected_font.name
     if selected_font.suffix.casefold() not in {".otf", ".ttf"}:
         fail(str(selected_font), "替换字体必须是单个 OTF 或 TTF", "选择随包提供的未修改单字体文件")
     try:
-        coverage = check_font_coverage(selected_font, coverage_texts)
+        coverage = check_font_coverage(
+            selected_font,
+            coverage_texts,
+            extra_characters=coverage_characters,
+        )
     except (OSError, UnicodeError, ValueError) as error:
         fail(
             str(selected_font),

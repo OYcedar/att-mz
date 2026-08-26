@@ -4,16 +4,12 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageAnalysis, LanguageModule, LanguagePair, LanguageTextSegment};
 use crate::rpg_maker::RpgMakerEngine;
-use crate::rpg_maker::location_codec::{
-    RpgMakerLocationCodec, RpgMakerLocationCodecError, RpgMakerProjectionCodec,
-    RpgMakerProjectionCodecError,
-};
+use crate::rpg_maker::location_codec::{RpgMakerProjectionCodec, RpgMakerProjectionCodecError};
 use crate::rpg_maker::model::TextUnitContent;
 use crate::rpg_maker::semantic_order::{
     RpgMakerSemanticOrderKey, RpgMakerSemanticOrderKeyEncodeError,
@@ -29,9 +25,7 @@ use crate::translation::placeholder_projection::{
 use super::executor::accept_prepared_translation_candidate;
 #[cfg(test)]
 use super::pipeline::TranslationUnitRejectionReason;
-use super::pipeline::{
-    AppliedPlaceholder, GroupContextFingerprint, TerminologyDependency, TranslationUnitIdentity,
-};
+use super::pipeline::{AppliedPlaceholder, GroupContextFingerprint, TranslationUnitIdentity};
 use super::placeholder::{
     CompiledPlaceholderRules, Pcre2PlaceholderService, PlaceholderProtectionError,
     RpgMakerBuiltinPlaceholderProfile,
@@ -46,7 +40,6 @@ pub(crate) struct ResolvedTranslationSemantics {
     placeholder_service: Pcre2PlaceholderService,
     custom_placeholders: CompiledPlaceholderRules,
     source_language: Arc<dyn LanguageModule>,
-    global_fingerprint: Sha256Fingerprint,
 }
 
 impl fmt::Debug for ResolvedTranslationSemantics {
@@ -56,7 +49,6 @@ impl fmt::Debug for ResolvedTranslationSemantics {
             .field("engine", &self.engine)
             .field("language_pair", &self.language_pair)
             .field("term_count", &self.terminology.entries().len())
-            .field("global_fingerprint", &self.global_fingerprint)
             .finish_non_exhaustive()
     }
 }
@@ -70,7 +62,6 @@ impl PartialEq for ResolvedTranslationSemantics {
 impl Eq for ResolvedTranslationSemantics {}
 
 impl ResolvedTranslationSemantics {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         engine: RpgMakerEngine,
         language_pair: LanguagePair,
@@ -78,7 +69,6 @@ impl ResolvedTranslationSemantics {
         placeholder_service: Pcre2PlaceholderService,
         custom_placeholders: CompiledPlaceholderRules,
         source_language: Arc<dyn LanguageModule>,
-        global_fingerprint: Sha256Fingerprint,
     ) -> Self {
         Self {
             engine,
@@ -87,7 +77,6 @@ impl ResolvedTranslationSemantics {
             placeholder_service,
             custom_placeholders,
             source_language,
-            global_fingerprint,
         }
     }
 
@@ -124,12 +113,11 @@ impl ResolvedTranslationSemantics {
             placeholder_service,
             custom_placeholders,
             source_language,
-            Sha256Fingerprint::from_bytes([0x5a; 32]),
         )
     }
 
-    pub(crate) const fn global_fingerprint(&self) -> Sha256Fingerprint {
-        self.global_fingerprint
+    pub(crate) const fn language_pair(&self) -> &LanguagePair {
+        &self.language_pair
     }
 
     /// 当前 Unit 的完整候选校验契约身份；源文零命中时也不同。
@@ -316,7 +304,6 @@ impl ResolvedTranslationSemantics {
     ) -> Result<PreparedTranslationText, ResolvedTranslationSemanticError> {
         let TranslationResourceFacts {
             model_text,
-            terms,
             term_indices,
             placeholders,
             language_text,
@@ -332,7 +319,6 @@ impl ResolvedTranslationSemantics {
         Ok(PreparedTranslationText {
             status,
             model_text,
-            terms,
             term_indices,
             placeholders,
             language_analysis,
@@ -402,7 +388,6 @@ fn test_profile(engine: RpgMakerEngine, kind: TextGroupKind) -> RpgMakerBuiltinP
 /// 字段保持私有，调用方不能用原始 JSON 假装已经完成规则编译和实际命中计算。
 pub(crate) struct TranslationResourceFacts {
     model_text: String,
-    terms: Vec<TerminologyDependency>,
     term_indices: Vec<usize>,
     placeholders: Vec<AppliedPlaceholder>,
     language_text: crate::language::LanguageText,
@@ -583,19 +568,9 @@ fn prepare_translation_resource_text_with_cancellation<E>(
         indices
     };
 
-    let mut terms = Vec::with_capacity(term_indices.len());
-    for &index in &term_indices {
-        ensure_running()?;
-        let entry = &terminology.entries()[index];
-        terms.push(TerminologyDependency::new(
-            clone_text_with_cancellation(entry.term(), ensure_running)?,
-            clone_text_with_cancellation(entry.translation(), ensure_running)?,
-        ));
-    }
     ensure_running()?;
     Ok(Ok(TranslationResourceFacts {
         model_text,
-        terms,
         term_indices,
         placeholders,
         language_text,
@@ -605,29 +580,14 @@ fn prepare_translation_resource_text_with_cancellation<E>(
 /// 建立一个完整 Group 的稳定来源语境指纹。
 ///
 /// 调用方必须按完整自然顺序提供 Group 的全部 Unit。译文、Current、模型责任、
-/// TaskBlock 邻居和临时 ID 都不进入该指纹。
+/// TaskBlock 邻居、Group 在外部 Scope 中的顺序和临时 ID 都不进入该指纹。
 pub(crate) fn group_context_fingerprint_with_cancellation<'a, E>(
     kind: TextGroupKind,
-    semantic_order_key: &RpgMakerSemanticOrderKey,
     units: impl ExactSizeIterator<Item = (&'a RpgMakerSemanticOrderKey, &'a TranslationUnitIdentity)>,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<GroupContextFingerprint, GroupContextFingerprintError>, E> {
     ensure_running()?;
-    let group_order = match semantic_order_key.encode() {
-        Ok(group_order) => group_order,
-        Err(source) => {
-            return Ok(Err(GroupContextFingerprintError::SemanticOrder(source)));
-        }
-    };
-    let unit_count = u64::try_from(units.len())
-        .expect("当前平台的 Group Unit 数量必须可表示为 u64")
-        .to_be_bytes();
-    let chunk_size = semantic_hash_chunk_size();
-    let mut hasher = Sha256FramedHasher::new(b"att.rpg_maker.translation-group-context");
-    hasher
-        .frame(1, kind.storage_name().as_bytes())
-        .frame(2, &group_order)
-        .frame(3, &unit_count);
+    let mut encoded_units = Vec::with_capacity(units.len());
     for (unit_order_key, identity) in units {
         ensure_running()?;
         let unit_order = match unit_order_key.encode() {
@@ -636,61 +596,38 @@ pub(crate) fn group_context_fingerprint_with_cancellation<'a, E>(
                 return Ok(Err(GroupContextFingerprintError::SemanticOrder(source)));
             }
         };
-        let location = match RpgMakerLocationCodec::encode(identity.group_location()) {
-            Ok(location) => location,
-            Err(source) => {
-                return Ok(Err(GroupContextFingerprintError::Location(source)));
-            }
-        };
         let role = match RpgMakerProjectionCodec::encode_role(identity.role()) {
             Ok(role) => role,
             Err(source) => return Ok(Err(GroupContextFingerprintError::Role(source))),
         };
-        hasher
-            .frame(10, identity.owner().storage_name().as_bytes())
-            .frame(11, identity.kind().storage_name().as_bytes())
-            .frame(12, &unit_order);
-        hasher.try_frame_chunks(13, location.as_bytes(), chunk_size, &mut ensure_running)?;
-        hasher.try_frame_chunks(14, role.as_bytes(), chunk_size, &mut ensure_running)?;
-        hasher.try_frame_chunks(
-            15,
-            identity.source_context_json().as_bytes(),
-            chunk_size,
-            &mut ensure_running,
-        )?;
-        match identity.source_content() {
-            TextUnitContent::Value(value) => {
-                hasher.frame(16, b"value");
-                hasher.try_frame_chunks(17, value.as_bytes(), chunk_size, &mut ensure_running)?;
-            }
-            TextUnitContent::Lines(lines) => {
-                hasher.frame(16, b"lines").frame(
-                    17,
-                    &u64::try_from(lines.len())
-                        .expect("当前平台的源行数必须可表示为 u64")
-                        .to_be_bytes(),
-                );
-                for line in lines {
-                    ensure_running()?;
-                    hasher.try_frame_chunks(
-                        18,
-                        line.as_bytes(),
-                        chunk_size,
-                        &mut ensure_running,
-                    )?;
-                }
-            }
-        }
+        let source_content_json = serde_json::to_string(identity.source_content())
+            .expect("受信 TextUnitContent 必须可序列化为规范 JSON");
+        encoded_units.push((
+            role,
+            unit_order,
+            source_content_json,
+            identity.source_context_json().to_owned(),
+        ));
     }
-    ensure_running()?;
-    Ok(Ok(GroupContextFingerprint::new(hasher.finish())))
+    let fingerprint = crate::translation::rpg_maker_group_source_context_v2_with_cancellation(
+        kind.storage_name(),
+        encoded_units.iter().map(|(role, order, source, context)| {
+            (
+                role.as_str(),
+                order.as_slice(),
+                source.as_str(),
+                context.as_str(),
+            )
+        }),
+        ensure_running,
+    )?;
+    Ok(Ok(GroupContextFingerprint::new(fingerprint)))
 }
 
 /// 完整 Group 语境指纹无法编码受信的顺序或 Unit 身份。
 #[derive(Debug)]
 pub(crate) enum GroupContextFingerprintError {
     SemanticOrder(RpgMakerSemanticOrderKeyEncodeError),
-    Location(RpgMakerLocationCodecError),
     Role(RpgMakerProjectionCodecError),
 }
 
@@ -698,7 +635,6 @@ impl fmt::Display for GroupContextFingerprintError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SemanticOrder(source) => write!(formatter, "无法编码语义顺序：{source}"),
-            Self::Location(source) => write!(formatter, "无法编码 Group 位置：{source}"),
             Self::Role(source) => write!(formatter, "无法编码 Unit 角色：{source}"),
         }
     }
@@ -708,14 +644,9 @@ impl Error for GroupContextFingerprintError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SemanticOrder(source) => Some(source),
-            Self::Location(source) => Some(source),
             Self::Role(source) => Some(source),
         }
     }
-}
-
-fn semantic_hash_chunk_size() -> NonZeroUsize {
-    NonZeroUsize::new(64 * 1024).expect("语义状态哈希取消检查块大小必须非零")
 }
 
 fn natural_segments(language_text: &crate::language::LanguageText) -> impl Iterator<Item = &str> {
@@ -981,7 +912,6 @@ impl PreparedTranslationStatus {
 pub(crate) struct PreparedTranslationText {
     status: PreparedTranslationStatus,
     model_text: String,
-    terms: Vec<TerminologyDependency>,
     term_indices: Vec<usize>,
     placeholders: Vec<AppliedPlaceholder>,
     language_analysis: LanguageAnalysis,
@@ -996,10 +926,6 @@ impl PreparedTranslationText {
 
     pub(crate) fn model_text(&self) -> &str {
         &self.model_text
-    }
-
-    pub(crate) fn terms(&self) -> &[TerminologyDependency] {
-        &self.terms
     }
 
     pub(crate) fn term_indices(&self) -> &[usize] {
@@ -1100,13 +1026,7 @@ mod tests {
     use crate::language::{
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguagePair,
     };
-    use crate::rpg_maker::asset::RpgMakerAssetOwner;
-    use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
-    use crate::rpg_maker::text::{
-        RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
-    };
     use crate::rpg_maker::translate::placeholder::PlaceholderRuleDefinition;
-    use crate::rpg_maker::translate::planner::translation_state_context;
     use crate::translation::planning_resource::{TerminologyEntry, compile_terminology};
 
     fn semantics_with(
@@ -1131,7 +1051,6 @@ mod tests {
             placeholder_service,
             custom_placeholders,
             source_language,
-            Sha256Fingerprint::from_bytes([0x3c; 32]),
         )
     }
 
@@ -1149,24 +1068,16 @@ mod tests {
         let hidden = semantics
             .prepare(TextGroupKind::PluginParameter, r"<code:勇者>前\C[2]後翻訳")
             .expect("混合协议文本应可准备");
-        assert!(hidden.terms().is_empty());
+        assert!(hidden.term_indices().is_empty());
 
         let visible = semantics
             .prepare(TextGroupKind::PluginParameter, r"<code:x>勇者")
             .expect("自然正文应可准备");
-        assert_eq!(
-            visible
-                .terms()
-                .iter()
-                .map(TerminologyDependency::term)
-                .collect::<Vec<_>>(),
-            ["勇者"]
-        );
         assert_eq!(visible.term_indices(), [0]);
     }
 
     #[test]
-    fn suppressed_overlapping_term_is_absent_from_translation_state_fingerprint() {
+    fn overlapping_terminology_keeps_only_the_longest_trigger() {
         let semantics = semantics_with(
             RpgMakerEngine::Mz,
             vec![
@@ -1175,104 +1086,10 @@ mod tests {
             ],
             Vec::new(),
         );
-        let identity = TranslationUnitIdentity::new(
-            RpgMakerAssetOwner::Builtin,
-            TextGroupKind::DatabaseEntry,
-            RpgMakerLocation::value(
-                RpgMakerSource::data(StandardDataFile::Actors),
-                vec![RpgMakerLocationStep::index(1)],
-            ),
-            TextUnitRole::Scalar(ScalarFieldKey::new("name").expect("字段键应有效")),
-            TextUnitContent::Value("プフクスッは笑った".to_owned()),
-            "{}",
-        );
         let prepared = semantics
-            .prepare_content(identity.kind(), identity.source_content())
+            .prepare(TextGroupKind::DatabaseEntry, "プフクスッは笑った")
             .expect("重叠术语原文应可准备");
         assert_eq!(prepared.term_indices(), [1]);
-        assert_eq!(
-            prepared
-                .terms()
-                .iter()
-                .map(TerminologyDependency::term)
-                .collect::<Vec<_>>(),
-            ["プフクスッ"]
-        );
-
-        let translation = TextUnitContent::Value("噗呼咯笑了".to_owned());
-        let actual = translation_state_context(
-            semantics.global_fingerprint(),
-            &identity,
-            prepared.model_text(),
-            prepared.placeholders(),
-            prepared.terms(),
-        )
-        .expect("实际状态上下文应可建立")
-        .finish(&translation);
-        let longest_only = [TerminologyDependency::new("プフクスッ", "噗呼咯")];
-        let expected = translation_state_context(
-            semantics.global_fingerprint(),
-            &identity,
-            prepared.model_text(),
-            prepared.placeholders(),
-            &longest_only,
-        )
-        .expect("最长术语状态上下文应可建立")
-        .finish(&translation);
-        let both = [
-            TerminologyDependency::new("プフクス", "普芙库丝"),
-            TerminologyDependency::new("プフクスッ", "噗呼咯"),
-        ];
-        let obsolete_overlap = translation_state_context(
-            semantics.global_fingerprint(),
-            &identity,
-            prepared.model_text(),
-            prepared.placeholders(),
-            &both,
-        )
-        .expect("旧重叠状态上下文应可建立")
-        .finish(&translation);
-
-        assert_eq!(actual, expected);
-        assert_ne!(actual, obsolete_overlap);
-    }
-
-    #[test]
-    fn terminology_keeps_lines_elements_separate_and_value_can_match_lf() {
-        let semantics = semantics_with(
-            RpgMakerEngine::Mz,
-            vec![
-                TerminologyEntry::new("跨元素", "不应命中", vec!["海へ\n出よう".to_owned()]),
-                TerminologyEntry::new("标量换行", "应命中", vec!["鐘が\n鳴る".to_owned()]),
-            ],
-            Vec::new(),
-        );
-
-        let lines = semantics
-            .prepare_content(
-                TextGroupKind::EventDialogue,
-                &TextUnitContent::Lines(vec![
-                    "海へ".to_owned(),
-                    "出よう".to_owned(),
-                    "別の翻訳".to_owned(),
-                ]),
-            )
-            .expect("Lines 术语边界应可准备");
-        assert!(lines.terms().is_empty());
-        assert!(lines.term_indices().is_empty());
-
-        let value = semantics
-            .prepare(TextGroupKind::DatabaseEntry, "鐘が\n鳴る翻訳")
-            .expect("Value 内部 LF 是可达的标量内容");
-        assert_eq!(
-            value
-                .terms()
-                .iter()
-                .map(TerminologyDependency::term)
-                .collect::<Vec<_>>(),
-            ["标量换行"]
-        );
-        assert_eq!(value.term_indices(), [1]);
     }
 
     #[test]

@@ -21,11 +21,9 @@ use crate::diagnostic::{
     HttpResponseReadFailure, HttpTransportKind, HttpTransportPhase, SafeIdentifier, SafeText,
     StateEffect,
 };
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
 use crate::llm::{
-    ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmClientSemanticIdentity,
-    LlmFinishReason, LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse,
-    LlmServiceStatus,
+    ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmFinishReason,
+    LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse, LlmServiceStatus,
 };
 use crate::user_text::sanitize_user_text;
 
@@ -74,26 +72,20 @@ impl OpenAiProtocol {
         drop(path);
         url
     }
-
-    const fn semantic_domain(self) -> &'static [u8] {
-        match self {
-            // 保持现有 Chat Completions 语义指纹，使仅升级程序不会让当前译文失效。
-            Self::ChatCompletions => b"att.llm.chat-completions.semantics",
-            Self::Responses => b"att.llm.responses.semantics",
-        }
-    }
 }
 
 pub(crate) struct OpenAiEndpoint {
     url: Url,
     protocol: OpenAiProtocol,
+    stream: bool,
 }
 
 impl OpenAiEndpoint {
-    pub(crate) fn new(url: Url, protocol: OpenAiProtocol) -> Self {
+    pub(crate) fn new(url: Url, protocol: OpenAiProtocol, stream: bool) -> Self {
         Self {
             url: protocol.complete_endpoint(url),
             protocol,
+            stream,
         }
     }
 }
@@ -104,7 +96,7 @@ pub(crate) struct OpenAiCompatibleClient {
     protocol: OpenAiProtocol,
     api_key: SecretString,
     model: Arc<str>,
-    semantic_fingerprint: Sha256Fingerprint,
+    stream: bool,
     max_concurrent_requests: NonZeroUsize,
     request_timeout: Duration,
     parameters: Arc<Map<String, Value>>,
@@ -113,27 +105,6 @@ pub(crate) struct OpenAiCompatibleClient {
 }
 
 impl OpenAiCompatibleClient {
-    #[cfg(test)]
-    pub(crate) fn new(
-        url: Url,
-        api_key: SecretString,
-        model: impl Into<String>,
-        max_concurrent_requests: NonZeroUsize,
-        request_timeout: Duration,
-        rate_limit: Option<(NonZeroU32, NonZeroU32)>,
-        parameters: Map<String, Value>,
-    ) -> Self {
-        Self::new_with_endpoint(
-            OpenAiEndpoint::new(url, OpenAiProtocol::ChatCompletions),
-            api_key,
-            model,
-            max_concurrent_requests,
-            request_timeout,
-            rate_limit,
-            parameters,
-        )
-    }
-
     pub(crate) fn new_with_endpoint(
         endpoint: OpenAiEndpoint,
         api_key: SecretString,
@@ -151,20 +122,18 @@ impl OpenAiCompatibleClient {
         let model: String = model.into();
         let model: Arc<str> = Arc::from(model);
         let parameters = Arc::new(parameters);
-        let OpenAiEndpoint { url, protocol } = endpoint;
-        let semantic_fingerprint = openai_compatible_semantic_fingerprint(
+        let OpenAiEndpoint {
+            url,
             protocol,
-            &url,
-            model.as_ref(),
-            parameters.as_ref(),
-        );
+            stream,
+        } = endpoint;
         let api_key_redactor = Arc::new(ApiKeyRedactor::new(api_key.clone()));
         Self {
             url,
             protocol,
             api_key,
             model,
-            semantic_fingerprint,
+            stream,
             max_concurrent_requests,
             request_timeout,
             parameters,
@@ -189,6 +158,11 @@ impl OpenAiCompatibleClient {
     }
 
     #[cfg(test)]
+    pub(crate) const fn stream(&self) -> bool {
+        self.stream
+    }
+
+    #[cfg(test)]
     pub(crate) const fn endpoint(&self) -> &Url {
         &self.url
     }
@@ -196,280 +170,6 @@ impl OpenAiCompatibleClient {
     pub(crate) fn api_key_redactor(&self) -> Arc<ApiKeyRedactor> {
         Arc::clone(&self.api_key_redactor)
     }
-}
-
-impl LlmClientSemanticIdentity for OpenAiCompatibleClient {
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-        self.semantic_fingerprint
-    }
-}
-
-fn openai_compatible_semantic_fingerprint(
-    protocol: OpenAiProtocol,
-    url: &Url,
-    model: &str,
-    parameters: &Map<String, Value>,
-) -> Sha256Fingerprint {
-    let canonical_parameters = canonical_json_object_semantic_bytes(parameters);
-    let mut hasher = Sha256FramedHasher::new(protocol.semantic_domain());
-    hasher
-        .frame(1, url.as_str().as_bytes())
-        .frame(2, model.as_bytes())
-        .frame(3, &canonical_parameters);
-    hasher.finish()
-}
-
-/// 为翻译语义指纹建立与配置书写形式无关的 JSON object 编码。
-///
-/// 对象键递归排序，数组顺序保持不变；数字按任意精度十进制值规范化，因此
-/// `0.2`、`2e-1` 与 `0.20` 具有同一个语义身份。显式工作栈避免自定义参数的
-/// 合法嵌套深度进入 Rust 调用栈。
-fn canonical_json_object_semantic_bytes(object: &Map<String, Value>) -> Vec<u8> {
-    enum Work<'a> {
-        Value(&'a Value),
-        ObjectEntry(&'a str, &'a Value),
-    }
-
-    fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
-        output.extend_from_slice(
-            &u64::try_from(bytes.len())
-                .expect("x86_64 usize 必须可表示为 u64")
-                .to_be_bytes(),
-        );
-        output.extend_from_slice(bytes);
-    }
-
-    fn push_object<'a>(
-        object: &'a Map<String, Value>,
-        output: &mut Vec<u8>,
-        work: &mut Vec<Work<'a>>,
-    ) {
-        output.push(6);
-        output.extend_from_slice(
-            &u64::try_from(object.len())
-                .expect("x86_64 usize 必须可表示为 u64")
-                .to_be_bytes(),
-        );
-        let mut entries = object.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-        work.extend(
-            entries
-                .into_iter()
-                .rev()
-                .map(|(key, value)| Work::ObjectEntry(key, value)),
-        );
-    }
-
-    let mut output = Vec::new();
-    let mut work = Vec::new();
-    push_object(object, &mut output, &mut work);
-    while let Some(item) = work.pop() {
-        match item {
-            Work::ObjectEntry(key, value) => {
-                push_bytes(&mut output, key.as_bytes());
-                work.push(Work::Value(value));
-            }
-            Work::Value(Value::Null) => output.push(0),
-            Work::Value(Value::Bool(false)) => output.push(1),
-            Work::Value(Value::Bool(true)) => output.push(2),
-            Work::Value(Value::Number(number)) => {
-                output.push(3);
-                let number = CanonicalJsonNumber::parse(&number.to_string());
-                output.push(u8::from(number.negative));
-                push_bytes(&mut output, number.coefficient.as_bytes());
-                output.push(u8::from(number.exponent.negative));
-                push_bytes(&mut output, &number.exponent.magnitude);
-            }
-            Work::Value(Value::String(value)) => {
-                output.push(4);
-                push_bytes(&mut output, value.as_bytes());
-            }
-            Work::Value(Value::Array(values)) => {
-                output.push(5);
-                output.extend_from_slice(
-                    &u64::try_from(values.len())
-                        .expect("x86_64 usize 必须可表示为 u64")
-                        .to_be_bytes(),
-                );
-                work.extend(values.iter().rev().map(Work::Value));
-            }
-            Work::Value(Value::Object(object)) => {
-                push_object(object, &mut output, &mut work);
-            }
-        }
-    }
-    output
-}
-
-struct CanonicalJsonNumber {
-    negative: bool,
-    coefficient: String,
-    exponent: SignedDecimal,
-}
-
-impl CanonicalJsonNumber {
-    fn parse(value: &str) -> Self {
-        let (negative, unsigned) = value
-            .strip_prefix('-')
-            .map_or((false, value), |value| (true, value));
-        let (mantissa, exponent) = unsigned
-            .split_once(['e', 'E'])
-            .map_or((unsigned, "0"), |(mantissa, exponent)| (mantissa, exponent));
-        let (integer, fraction) = mantissa
-            .split_once('.')
-            .map_or((mantissa, ""), |(integer, fraction)| (integer, fraction));
-        let mut digits = String::with_capacity(integer.len() + fraction.len());
-        digits.push_str(integer);
-        digits.push_str(fraction);
-        let digits = digits.trim_start_matches('0');
-        if digits.is_empty() {
-            return Self {
-                negative: false,
-                coefficient: "0".to_owned(),
-                exponent: SignedDecimal::zero(),
-            };
-        }
-
-        let trailing_zeroes = digits
-            .bytes()
-            .rev()
-            .take_while(|byte| *byte == b'0')
-            .count();
-        let coefficient = digits[..digits.len() - trailing_zeroes].to_owned();
-        let mut exponent = SignedDecimal::parse(exponent);
-        exponent.add_unsigned(fraction.len(), true);
-        exponent.add_unsigned(trailing_zeroes, false);
-        Self {
-            negative,
-            coefficient,
-            exponent,
-        }
-    }
-}
-
-struct SignedDecimal {
-    negative: bool,
-    /// 无前导零的 ASCII 十进制绝对值；零固定为单个 `0`。
-    magnitude: Vec<u8>,
-}
-
-impl SignedDecimal {
-    fn zero() -> Self {
-        Self {
-            negative: false,
-            magnitude: vec![b'0'],
-        }
-    }
-
-    fn parse(value: &str) -> Self {
-        let (negative, digits) = value.strip_prefix('-').map_or_else(
-            || (false, value.strip_prefix('+').unwrap_or(value)),
-            |digits| (true, digits),
-        );
-        let digits = digits.trim_start_matches('0');
-        if digits.is_empty() {
-            Self::zero()
-        } else {
-            Self {
-                negative,
-                magnitude: digits.as_bytes().to_vec(),
-            }
-        }
-    }
-
-    fn add_unsigned(&mut self, value: usize, negative: bool) {
-        if value == 0 {
-            return;
-        }
-        let right = value.to_string().into_bytes();
-        if self.is_zero() {
-            self.negative = negative;
-            self.magnitude = right;
-        } else if self.negative == negative {
-            self.magnitude = add_decimal_magnitudes(&self.magnitude, &right);
-        } else {
-            match compare_decimal_magnitudes(&self.magnitude, &right) {
-                std::cmp::Ordering::Greater => {
-                    self.magnitude = subtract_decimal_magnitudes(&self.magnitude, &right);
-                }
-                std::cmp::Ordering::Less => {
-                    self.magnitude = subtract_decimal_magnitudes(&right, &self.magnitude);
-                    self.negative = negative;
-                }
-                std::cmp::Ordering::Equal => *self = Self::zero(),
-            }
-        }
-        if self.is_zero() {
-            self.negative = false;
-        }
-    }
-
-    fn is_zero(&self) -> bool {
-        self.magnitude == b"0"
-    }
-}
-
-fn compare_decimal_magnitudes(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
-    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
-}
-
-fn add_decimal_magnitudes(left: &[u8], right: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(left.len().max(right.len()) + 1);
-    let mut left = left.iter().rev();
-    let mut right = right.iter().rev();
-    let mut carry = 0_u8;
-    loop {
-        let left = left.next().map(|digit| digit - b'0');
-        let right = right.next().map(|digit| digit - b'0');
-        if left.is_none() && right.is_none() {
-            break;
-        }
-        let sum = left.unwrap_or(0) + right.unwrap_or(0) + carry;
-        output.push(b'0' + sum % 10);
-        carry = sum / 10;
-    }
-    if carry != 0 {
-        output.push(b'0' + carry);
-    }
-    output.reverse();
-    output
-}
-
-/// `left` 必须大于 `right`。
-fn subtract_decimal_magnitudes(left: &[u8], right: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(left.len());
-    let mut right = right.iter().rev();
-    let mut borrow = 0_i8;
-    for left_digit in left.iter().rev() {
-        let mut value = i8::try_from(left_digit - b'0').expect("十进制位必须小于 10") - borrow;
-        let right_digit = right.next().map_or(0, |digit| {
-            i8::try_from(digit - b'0').expect("十进制位必须小于 10")
-        });
-        if value < right_digit {
-            value += 10;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        output.push(b'0' + u8::try_from(value - right_digit).expect("十进制差必须非负"));
-    }
-    debug_assert_eq!(borrow, 0);
-    while output.len() > 1 && output.last() == Some(&b'0') {
-        output.pop();
-    }
-    output.reverse();
-    output
-}
-
-#[cfg(test)]
-fn canonical_json_number(value: &str) -> (bool, String, bool, String) {
-    let value = CanonicalJsonNumber::parse(value);
-    (
-        value.negative,
-        value.coefficient,
-        value.exponent.negative,
-        String::from_utf8(value.exponent.magnitude).expect("指数必须保持 ASCII"),
-    )
 }
 
 impl fmt::Debug for OpenAiCompatibleClient {
@@ -485,6 +185,7 @@ impl fmt::Debug for OpenAiCompatibleClient {
             .field("protocol", &self.protocol)
             .field("endpoint", &endpoint)
             .field("model", &model)
+            .field("stream", &self.stream)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("request_timeout", &self.request_timeout)
             .field("rate_limited", &self.rate_limiter.is_some())
@@ -661,6 +362,7 @@ impl OpenAiCompatibleExecutor {
         &self,
         client: &OpenAiCompatibleClient,
         messages: &[ChatMessage],
+        on_attempt_started: Box<dyn FnOnce() + Send + '_>,
     ) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
         let request_body = serialize_request(client, messages).map_err(LlmRequestError::Fatal)?;
 
@@ -681,6 +383,7 @@ impl OpenAiCompatibleExecutor {
             .bearer_auth(client.api_key.expose_secret())
             .body(request_body);
 
+        on_attempt_started();
         let response = match request.send().await {
             Ok(response) => response,
             Err(source) => {
@@ -774,20 +477,29 @@ impl OpenAiCompatibleExecutor {
             return result;
         }
 
-        let response_body = match response.bytes().await {
-            Ok(body) => body,
-            Err(source) => {
-                drop(active_permit);
-                drop(job);
-                return Err(classify_transport_error(
+        let result = if client.stream {
+            match parse_streaming_success_response(client.protocol, response).await {
+                Err(LlmRequestError::Fatal(source @ OpenAiCompatibleError::ParseResponse(_)))
+                | Err(LlmRequestError::Fatal(
+                    source @ OpenAiCompatibleError::InvalidResponseWire { .. },
+                )) => Err(LlmRequestError::Retryable {
+                    source,
+                    retry_after: None,
+                }),
+                result => result,
+            }
+        } else {
+            match response.bytes().await {
+                Ok(body) => parse_success_response(client.protocol, &body),
+                Err(source) => Err(classify_transport_error(
                     HttpTransportPhase::ReadSuccessResponse,
                     source,
-                ));
+                )),
             }
         };
         drop(active_permit);
         drop(job);
-        parse_success_response(client.protocol, &response_body)
+        result
     }
 }
 
@@ -808,7 +520,18 @@ impl LlmRequestExecutor for OpenAiCompatibleExecutor {
         client: &'a Self::Client,
         messages: &'a [ChatMessage],
     ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
-        self.execute_request(client, messages).await
+        self.execute_request(client, messages, Box::new(|| {}))
+            .await
+    }
+
+    async fn request_with_attempt_observer<'a>(
+        &'a self,
+        client: &'a Self::Client,
+        messages: &'a [ChatMessage],
+        on_attempt_started: Box<dyn FnOnce() + Send + 'a>,
+    ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+        self.execute_request(client, messages, on_attempt_started)
+            .await
     }
 
     fn request_diagnostic(
@@ -972,6 +695,16 @@ impl LlmRequestFailure for OpenAiCompatibleError {
         matches!(self, Self::WaitCancelled)
     }
 
+    fn request_was_sent(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport { .. }
+                | Self::HttpStatus { .. }
+                | Self::ParseResponse(_)
+                | Self::InvalidResponseWire { .. }
+        )
+    }
+
     fn service_status(&self) -> LlmServiceStatus {
         match self {
             Self::HttpStatus { service_status, .. } => *service_status,
@@ -1060,18 +793,384 @@ fn serialize_request(
         OpenAiProtocol::ChatCompletions => serde_json::to_vec(&ChatCompletionRequestWire {
             model: client.model.as_ref(),
             messages,
-            stream: false,
+            stream: client.stream,
             parameters: client.parameters.as_ref(),
         }),
         OpenAiProtocol::Responses => serde_json::to_vec(&ResponsesRequestWire {
             model: client.model.as_ref(),
             input: messages,
-            stream: false,
+            stream: client.stream,
             background: false,
             parameters: client.parameters.as_ref(),
         }),
     }
     .map_err(OpenAiCompatibleError::SerializeRequest)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SseEvent {
+    event_type: Option<Vec<u8>>,
+    data: Vec<u8>,
+}
+
+/// 只负责 SSE 字节 framing；协议事件和 JSON 语义由所选 OpenAI 协议解析器拥有。
+struct SseDecoder {
+    pending: Vec<u8>,
+    data: Vec<u8>,
+    event_type: Option<Vec<u8>>,
+    has_data: bool,
+    first_line: bool,
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            data: Vec::new(),
+            event_type: None,
+            has_data: false,
+            first_line: true,
+        }
+    }
+}
+
+impl SseDecoder {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<SseEvent>, LlmRequestError<OpenAiCompatibleError>> {
+        self.pending.extend_from_slice(chunk);
+
+        let mut line_ranges = Vec::new();
+        let mut line_start = 0usize;
+        let mut cursor = 0usize;
+        let mut consumed = 0usize;
+        while cursor < self.pending.len() {
+            match self.pending[cursor] {
+                b'\n' => {
+                    line_ranges.push(line_start..cursor);
+                    cursor += 1;
+                    line_start = cursor;
+                    consumed = cursor;
+                }
+                b'\r' => {
+                    if cursor + 1 == self.pending.len() {
+                        break;
+                    }
+                    line_ranges.push(line_start..cursor);
+                    cursor += if self.pending[cursor + 1] == b'\n' {
+                        2
+                    } else {
+                        1
+                    };
+                    line_start = cursor;
+                    consumed = cursor;
+                }
+                _ => cursor += 1,
+            }
+        }
+
+        if line_ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tail = self.pending.split_off(consumed);
+        let complete = std::mem::replace(&mut self.pending, tail);
+        let mut events = Vec::new();
+        for range in line_ranges {
+            let line = &complete[range];
+            std::str::from_utf8(line)
+                .map_err(|_| invalid_response(HttpEnvelopeViolation::InvalidStreamEncoding))?;
+            self.push_line(line, &mut events);
+        }
+        Ok(events)
+    }
+
+    /// EOF 只确认最后一个裸 CR 是行结束；没有空行终止的 data 仍不分派。
+    fn finish(&mut self) -> Result<Vec<SseEvent>, LlmRequestError<OpenAiCompatibleError>> {
+        if self.pending.last() != Some(&b'\r') {
+            return Ok(Vec::new());
+        }
+        self.pending.pop();
+        let line = std::mem::take(&mut self.pending);
+        std::str::from_utf8(&line)
+            .map_err(|_| invalid_response(HttpEnvelopeViolation::InvalidStreamEncoding))?;
+        let mut events = Vec::new();
+        self.push_line(&line, &mut events);
+        Ok(events)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && !self.has_data && self.event_type.is_none()
+    }
+
+    fn push_line(&mut self, mut line: &[u8], events: &mut Vec<SseEvent>) {
+        if self.first_line {
+            self.first_line = false;
+            line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
+        }
+        if line.is_empty() {
+            let event_type = self.event_type.take();
+            if self.has_data {
+                debug_assert_eq!(self.data.last(), Some(&b'\n'));
+                self.data.pop();
+                events.push(SseEvent {
+                    event_type,
+                    data: std::mem::take(&mut self.data),
+                });
+            }
+            self.has_data = false;
+            return;
+        }
+        if line.first() == Some(&b':') {
+            return;
+        }
+
+        let (field, mut value) = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .map_or((line, [].as_slice()), |colon| {
+                (&line[..colon], &line[colon + 1..])
+            });
+        if value.first() == Some(&b' ') {
+            value = &value[1..];
+        }
+        match field {
+            b"data" => {
+                self.data.extend_from_slice(value);
+                self.data.push(b'\n');
+                self.has_data = true;
+            }
+            b"event" => self.event_type = Some(value.to_vec()),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChatCompletionsStream {
+    content: String,
+    refusal: String,
+    saw_content: bool,
+    saw_refusal: bool,
+    saw_index_zero: bool,
+    finish_reason: Option<LlmFinishReason>,
+}
+
+impl ChatCompletionsStream {
+    fn complete(
+        &mut self,
+        missing_finish: HttpEnvelopeViolation,
+    ) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
+        let finish_reason = self
+            .finish_reason
+            .take()
+            .ok_or_else(|| invalid_response(missing_finish))?;
+        if !self.saw_index_zero {
+            return Err(invalid_response(HttpEnvelopeViolation::EmptyChoices));
+        }
+        if self.saw_content {
+            return Ok(LlmResponse::new(
+                std::mem::take(&mut self.content),
+                finish_reason,
+            ));
+        }
+        if self.saw_refusal {
+            return Ok(LlmResponse::new(
+                std::mem::take(&mut self.refusal),
+                LlmFinishReason::ContentFilter,
+            ));
+        }
+        Err(invalid_response(HttpEnvelopeViolation::MissingContent))
+    }
+
+    fn accept(
+        &mut self,
+        event: SseEvent,
+    ) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
+        if trim_ascii_whitespace(&event.data) == b"[DONE]" {
+            return self
+                .complete(HttpEnvelopeViolation::MissingFinishReason)
+                .map(Some);
+        }
+
+        let wire = parse_stream_json(&event.data)?;
+        let object = wire
+            .as_object()
+            .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
+        if object.contains_key("error")
+            || object.get("type").and_then(Value::as_str) == Some("error")
+        {
+            return Err(invalid_response(HttpEnvelopeViolation::StreamErrorEvent));
+        }
+        let choices = object
+            .get("choices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingChoices))?;
+        if choices.is_empty() {
+            return Ok(None);
+        }
+
+        let mut matching_choices = choices.iter().filter(|choice| {
+            choice
+                .as_object()
+                .and_then(|choice| choice.get("index"))
+                .and_then(Value::as_u64)
+                == Some(0)
+        });
+        let Some(choice) = matching_choices.next() else {
+            return Ok(None);
+        };
+        if matching_choices.next().is_some() {
+            return Err(invalid_response(HttpEnvelopeViolation::DuplicateChoice));
+        }
+        if self.finish_reason.is_some() {
+            return Err(invalid_response(HttpEnvelopeViolation::ChoiceAfterFinish));
+        }
+        self.saw_index_zero = true;
+        let choice = choice
+            .as_object()
+            .expect("index 0 choice 已经确认是 JSON 对象");
+        let delta = choice
+            .get("delta")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingMessage))?;
+        let content = optional_wire_string(delta, "content")?;
+        let refusal = optional_wire_string(delta, "refusal")?;
+        if let Some(content) = content {
+            self.content.push_str(content);
+            self.saw_content = true;
+        }
+        if let Some(refusal) = refusal {
+            self.refusal.push_str(refusal);
+            self.saw_refusal = true;
+        }
+        match choice.get("finish_reason") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(reason)) => {
+                self.finish_reason = Some(llm_finish_reason(reason));
+            }
+            Some(_) => return Err(invalid_response(HttpEnvelopeViolation::InvalidFieldType)),
+        }
+        Ok(None)
+    }
+}
+
+async fn parse_streaming_success_response(
+    protocol: OpenAiProtocol,
+    mut response: reqwest::Response,
+) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
+    let mut sse = SseDecoder::default();
+    let mut chat = ChatCompletionsStream::default();
+    loop {
+        let Some(chunk) = response.chunk().await.map_err(|source| {
+            classify_transport_error(HttpTransportPhase::ReadSuccessResponse, source)
+        })?
+        else {
+            for event in sse.finish()? {
+                let completed = match protocol {
+                    OpenAiProtocol::ChatCompletions => chat.accept(event)?,
+                    OpenAiProtocol::Responses => parse_responses_stream_event(event)?,
+                };
+                if let Some(response) = completed {
+                    return Ok(response);
+                }
+            }
+            if !sse.is_idle() {
+                return Err(invalid_response(
+                    HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                ));
+            }
+            return match protocol {
+                OpenAiProtocol::ChatCompletions => {
+                    chat.complete(HttpEnvelopeViolation::StreamEndedBeforeTerminal)
+                }
+                OpenAiProtocol::Responses => Err(invalid_response(
+                    HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                )),
+            };
+        };
+        for event in sse.push(&chunk)? {
+            let completed = match protocol {
+                OpenAiProtocol::ChatCompletions => chat.accept(event)?,
+                OpenAiProtocol::Responses => parse_responses_stream_event(event)?,
+            };
+            if let Some(response) = completed {
+                return Ok(response);
+            }
+        }
+    }
+}
+
+fn optional_wire_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, LlmRequestError<OpenAiCompatibleError>> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(invalid_response(HttpEnvelopeViolation::InvalidFieldType)),
+    }
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn parse_stream_json(data: &[u8]) -> Result<Value, LlmRequestError<OpenAiCompatibleError>> {
+    serde_json::from_slice(data)
+        .map_err(|_| invalid_response(HttpEnvelopeViolation::InvalidStreamEvent))
+}
+
+fn parse_responses_stream_event(
+    event: SseEvent,
+) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
+    if event.data == b"[DONE]" {
+        return Err(invalid_response(HttpEnvelopeViolation::InvalidContract));
+    }
+    let wire = parse_stream_json(&event.data)?;
+    let object = wire
+        .as_object()
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
+    let event_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
+    if let Some(explicit_event_type) = event.event_type {
+        let explicit_event_type = std::str::from_utf8(&explicit_event_type)
+            .map_err(|_| invalid_response(HttpEnvelopeViolation::InvalidStreamEncoding))?;
+        if (explicit_event_type == "error" || explicit_event_type.starts_with("response."))
+            && explicit_event_type != event_type
+        {
+            return Err(invalid_response(HttpEnvelopeViolation::EventTypeMismatch));
+        }
+    }
+
+    match event_type {
+        "response.completed" | "response.incomplete" => {
+            let expected_status = event_type
+                .strip_prefix("response.")
+                .expect("已匹配的 Responses 终态事件必须有固定前缀");
+            let response = object
+                .get("response")
+                .and_then(Value::as_object)
+                .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
+            if response.get("status").and_then(Value::as_str) != Some(expected_status) {
+                return Err(invalid_response(HttpEnvelopeViolation::InvalidContract));
+            }
+            parse_responses_response(response).map(Some)
+        }
+        "response.failed" | "error" => {
+            Err(invalid_response(HttpEnvelopeViolation::StreamErrorEvent))
+        }
+        _ => Ok(None),
+    }
 }
 
 async fn wait_for_rate(
@@ -1150,9 +1249,11 @@ fn classify_transport_error(
 ) -> LlmRequestError<OpenAiCompatibleError> {
     let phase = effective_transport_phase(phase, &source);
     let is_tls = error_chain_contains::<native_tls::Error>(&source);
-    let retry = !source.is_builder()
+    let retry = !reqwest_error_chain_matches(&source, reqwest::Error::is_builder)
         && !is_tls
-        && (source.is_timeout() || source.is_connect() || source.is_request() || source.is_body());
+        && reqwest_error_chain_matches(&source, |error| {
+            error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+        });
     if retry {
         retryable(OpenAiCompatibleError::Transport { phase, source })
     } else {
@@ -1210,23 +1311,30 @@ fn typed_transport_kind(source: &reqwest::Error, phase: HttpTransportPhase) -> H
     if error_chain_contains::<native_tls::Error>(source) {
         return HttpTransportKind::Tls;
     }
-    if source.is_timeout() {
+    if reqwest_error_chain_matches(source, reqwest::Error::is_timeout) {
         return HttpTransportKind::Timeout;
     }
-    if source.is_connect()
+    if reqwest_error_chain_matches(source, reqwest::Error::is_connect)
         && error_chain_io(source)
             .and_then(std::io::Error::raw_os_error)
             .is_some_and(|code| matches!(code, 11001..=11004))
     {
         return HttpTransportKind::Dns;
     }
-    if source.is_connect() {
+    if reqwest_error_chain_matches(source, reqwest::Error::is_connect) {
         return HttpTransportKind::Connect;
     }
-    if source.is_decode() {
+    if matches!(
+        phase,
+        HttpTransportPhase::ReadErrorResponse | HttpTransportPhase::ReadSuccessResponse
+    ) && reqwest_error_chain_matches(source, reqwest::Error::is_body)
+    {
+        return HttpTransportKind::Read;
+    }
+    if reqwest_error_chain_matches(source, reqwest::Error::is_decode) {
         return HttpTransportKind::Decode;
     }
-    if source.is_redirect() {
+    if reqwest_error_chain_matches(source, reqwest::Error::is_redirect) {
         return HttpTransportKind::Redirect;
     }
     match phase {
@@ -1242,11 +1350,28 @@ fn effective_transport_phase(
     declared: HttpTransportPhase,
     source: &reqwest::Error,
 ) -> HttpTransportPhase {
-    if source.is_connect() {
+    if reqwest_error_chain_matches(source, reqwest::Error::is_connect) {
         HttpTransportPhase::Connect
     } else {
         declared
     }
+}
+
+fn reqwest_error_chain_matches(
+    source: &reqwest::Error,
+    mut predicate: impl FnMut(&reqwest::Error) -> bool,
+) -> bool {
+    let mut current: Option<&(dyn Error + 'static)> = Some(source);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(&mut predicate)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 fn error_chain_contains<T>(source: &(dyn Error + 'static)) -> bool
@@ -1368,21 +1493,28 @@ fn parse_chat_completions_response(
         .get("message")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingMessage))?;
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingContent))?;
     let finish_reason = choice
         .get("finish_reason")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
-    let finish_reason = match finish_reason {
+    let content = optional_wire_string(message, "content")?;
+    let refusal = optional_wire_string(message, "refusal")?;
+    if let Some(content) = content {
+        return Ok(LlmResponse::new(content, llm_finish_reason(finish_reason)));
+    }
+    if let Some(refusal) = refusal {
+        return Ok(LlmResponse::new(refusal, LlmFinishReason::ContentFilter));
+    }
+    Err(invalid_response(HttpEnvelopeViolation::MissingContent))
+}
+
+fn llm_finish_reason(finish_reason: &str) -> LlmFinishReason {
+    match finish_reason {
         "stop" => LlmFinishReason::Stop,
         "length" => LlmFinishReason::Length,
         "content_filter" => LlmFinishReason::ContentFilter,
         other => LlmFinishReason::Other(other.to_owned()),
-    };
-    Ok(LlmResponse::new(content, finish_reason))
+    }
 }
 
 fn parse_responses_response(
@@ -1516,7 +1648,6 @@ impl LlmLifecycle {
             return Err(state.service_stop.as_ref().map_or_else(
                 || LlmRequestError::Fatal(OpenAiCompatibleError::ExecutorClosed),
                 |stopped| LlmRequestError::AdmissionStopped {
-                    service_status: stopped.service_status,
                     diagnostic: stopped.diagnostic.clone(),
                 },
             ));
@@ -1558,7 +1689,6 @@ impl LlmLifecycle {
         state.service_stop.as_ref().map_or_else(
             || LlmRequestError::Fatal(OpenAiCompatibleError::WaitCancelled),
             |stopped| LlmRequestError::AdmissionStopped {
-                service_status: stopped.service_status,
                 diagnostic: stopped.diagnostic.clone(),
             },
         )
@@ -1749,9 +1879,13 @@ mod tests {
 
     #[test]
     fn executor_request_diagnostic_redacts_selected_api_key_from_host() {
-        let client = OpenAiCompatibleClient::new(
-            Url::parse("https://test-secret.example.test/v1/chat/completions")
-                .expect("测试 URL 有效"),
+        let client = OpenAiCompatibleClient::new_with_endpoint(
+            OpenAiEndpoint::new(
+                Url::parse("https://test-secret.example.test/v1/chat/completions")
+                    .expect("测试 URL 有效"),
+                OpenAiProtocol::ChatCompletions,
+                false,
+            ),
             SecretString::from("test-secret"),
             "test-model",
             NonZeroUsize::new(1).expect("测试并发非零"),
@@ -1794,8 +1928,17 @@ mod tests {
         protocol: OpenAiProtocol,
         parameters: Map<String, Value>,
     ) -> OpenAiCompatibleClient {
+        client_with_protocol_and_stream(url, protocol, false, parameters)
+    }
+
+    fn client_with_protocol_and_stream(
+        url: &str,
+        protocol: OpenAiProtocol,
+        stream: bool,
+        parameters: Map<String, Value>,
+    ) -> OpenAiCompatibleClient {
         OpenAiCompatibleClient::new_with_endpoint(
-            OpenAiEndpoint::new(Url::parse(url).expect("测试 URL 有效"), protocol),
+            OpenAiEndpoint::new(Url::parse(url).expect("测试 URL 有效"), protocol, stream),
             SecretString::from("test-secret"),
             "test-model",
             non_zero_usize(8),
@@ -1811,8 +1954,12 @@ mod tests {
         rpm: u32,
         burst: u32,
     ) -> OpenAiCompatibleClient {
-        OpenAiCompatibleClient::new(
-            Url::parse(url).expect("测试 URL 有效"),
+        OpenAiCompatibleClient::new_with_endpoint(
+            OpenAiEndpoint::new(
+                Url::parse(url).expect("测试 URL 有效"),
+                OpenAiProtocol::ChatCompletions,
+                false,
+            ),
             SecretString::from("test-secret"),
             "test-model",
             non_zero_usize(8),
@@ -2126,6 +2273,15 @@ mod tests {
         .into_bytes()
     }
 
+    fn sse_response(body: &[u8], declared_length: usize) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
     fn core_success_body() -> &'static str {
         r#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":"stop"}]}"#
     }
@@ -2161,8 +2317,12 @@ mod tests {
             "vendor_option".to_owned(),
             Value::String("ordinary-value/api-secret".to_owned()),
         );
-        let client = OpenAiCompatibleClient::new(
-            Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
+        let client = OpenAiCompatibleClient::new_with_endpoint(
+            OpenAiEndpoint::new(
+                Url::parse("https://example.com/v1/chat/completions").expect("测试 URL 有效"),
+                OpenAiProtocol::ChatCompletions,
+                false,
+            ),
             SecretString::from("api-secret"),
             "test-model",
             non_zero_usize(8),
@@ -2175,128 +2335,6 @@ mod tests {
         assert!(debug.contains("ordinary-value"));
         assert!(debug.contains("[REDACTED API KEY]"));
         assert!(!debug.contains("api-secret"));
-    }
-
-    #[test]
-    fn semantic_identity_includes_protocol_url_model_and_parameters() {
-        let mut extra = Map::new();
-        extra.insert("temperature".to_owned(), serde_json::json!(0.2));
-        extra.insert(
-            "vendor".to_owned(),
-            serde_json::json!({"mode": "quality", "nested": {"b": 2, "a": 1}}),
-        );
-        let first = OpenAiCompatibleClient::new(
-            Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            SecretString::from("first-secret"),
-            "model-a",
-            non_zero_usize(8),
-            Duration::from_secs(2),
-            Some((non_zero_u32(60), non_zero_u32(2))),
-            extra.clone(),
-        );
-        let operationally_different = OpenAiCompatibleClient::new(
-            Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            SecretString::from("different-secret"),
-            "model-a",
-            non_zero_usize(1),
-            Duration::from_secs(90),
-            Some((non_zero_u32(1), non_zero_u32(1))),
-            extra.clone(),
-        );
-        let mut nested_reordered = Map::new();
-        nested_reordered.insert("a".to_owned(), serde_json::json!(1));
-        nested_reordered.insert("b".to_owned(), serde_json::json!(2));
-        let mut vendor_reordered = Map::new();
-        vendor_reordered.insert("nested".to_owned(), Value::Object(nested_reordered));
-        vendor_reordered.insert("mode".to_owned(), serde_json::json!("quality"));
-        let mut extra_reordered = Map::new();
-        extra_reordered.insert("vendor".to_owned(), Value::Object(vendor_reordered));
-        extra_reordered.insert("temperature".to_owned(), serde_json::json!(0.2));
-        let textually_reordered = OpenAiCompatibleClient::new(
-            Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            SecretString::from("first-secret"),
-            "model-a",
-            non_zero_usize(8),
-            Duration::from_secs(2),
-            Some((non_zero_u32(60), non_zero_u32(2))),
-            extra_reordered.clone(),
-        );
-        let mut numerically_equivalent_extra = extra_reordered;
-        numerically_equivalent_extra.insert(
-            "temperature".to_owned(),
-            serde_json::from_str("2e-1").expect("测试任意精度数字应有效"),
-        );
-        let numerically_equivalent = OpenAiCompatibleClient::new(
-            Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            SecretString::from("first-secret"),
-            "model-a",
-            non_zero_usize(8),
-            Duration::from_secs(2),
-            Some((non_zero_u32(60), non_zero_u32(2))),
-            numerically_equivalent_extra,
-        );
-        let different_model = OpenAiCompatibleClient::new(
-            Url::parse("https://example.com/v1/chat/completions").unwrap(),
-            SecretString::from("first-secret"),
-            "model-b",
-            non_zero_usize(8),
-            Duration::from_secs(2),
-            Some((non_zero_u32(60), non_zero_u32(2))),
-            extra,
-        );
-        let responses = client_with_protocol(
-            "https://example.com/v1",
-            OpenAiProtocol::Responses,
-            first.parameters.as_ref().clone(),
-        );
-
-        assert_eq!(
-            first.semantic_fingerprint(),
-            operationally_different.semantic_fingerprint(),
-            "凭据和运行资源参数不应使已接受译文失效"
-        );
-        assert_eq!(
-            first.semantic_fingerprint(),
-            textually_reordered.semantic_fingerprint(),
-            "对象键书写顺序不属于扩展正文的值语义"
-        );
-        assert_eq!(
-            first.semantic_fingerprint(),
-            numerically_equivalent.semantic_fingerprint(),
-            "JSON 数字的等价十进制写法不应使已接受译文失效"
-        );
-        assert_ne!(
-            first.semantic_fingerprint(),
-            different_model.semantic_fingerprint(),
-            "模型是译文语义的一部分"
-        );
-        assert_ne!(
-            first.semantic_fingerprint(),
-            responses.semantic_fingerprint(),
-            "请求协议是译文语义的一部分"
-        );
-    }
-
-    #[test]
-    fn arbitrary_precision_json_number_semantics_are_exact_and_not_textual() {
-        let expected = canonical_json_number("0.2");
-        for equivalent in ["2e-1", "0.20", "20e-2", "200e-3"] {
-            assert_eq!(canonical_json_number(equivalent), expected);
-        }
-        assert_eq!(
-            canonical_json_number("-0.000e999999999999"),
-            canonical_json_number("0")
-        );
-        assert_eq!(
-            canonical_json_number("1e1000000000000000000000000"),
-            canonical_json_number("10e999999999999999999999999"),
-            "任意长度指数的进位必须保持精确"
-        );
-        assert_ne!(
-            canonical_json_number("1234567890123456789012345678901234567890"),
-            canonical_json_number("1234567890123456789012345678901234567891"),
-            "相邻任意精度整数不能碰撞"
-        );
     }
 
     #[test]
@@ -2329,7 +2367,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                OpenAiEndpoint::new(Url::parse(source).expect("测试 URL 有效"), protocol)
+                OpenAiEndpoint::new(Url::parse(source).expect("测试 URL 有效"), protocol, false,)
                     .url
                     .as_str(),
                 expected
@@ -2353,6 +2391,119 @@ mod tests {
         assert_eq!(object["stream"], false);
         assert_eq!(object["messages"][0]["role"], "user");
         assert_eq!(object["messages"][0]["content"], "待翻译内容");
+    }
+
+    #[test]
+    fn client_stream_selection_is_written_for_both_protocols() {
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let client = client_with_protocol_and_stream(
+                "https://example.com/v1",
+                protocol,
+                true,
+                Map::new(),
+            );
+            let bytes = serialize_request(&client, &[]).expect("流式请求应可序列化");
+            let wire: Value = serde_json::from_slice(&bytes).expect("请求应为 JSON");
+
+            assert!(client.stream());
+            assert_eq!(wire["stream"], true);
+            if protocol == OpenAiProtocol::Responses {
+                assert_eq!(wire["background"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn sse_decoder_accepts_arbitrary_chunks_utf8_crlf_comments_and_multiline_data() {
+        let source = concat!(
+            "\u{feff}: 心跳\r\n",
+            "vendor: 普通扩展\r\n",
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\r\n",
+            "data: \"delta\":\"译文\"}\r\n",
+            "\r\n",
+            "data: [DONE]\n",
+            "\n",
+        );
+        let mut decoder = SseDecoder::default();
+        let mut events = Vec::new();
+        for byte in source.as_bytes() {
+            events.extend(
+                decoder
+                    .push(std::slice::from_ref(byte))
+                    .expect("逐字节 SSE 应合法"),
+            );
+        }
+
+        assert_eq!(
+            events,
+            [
+                SseEvent {
+                    event_type: Some(b"response.output_text.delta".to_vec()),
+                    data: b"{\"type\":\"response.output_text.delta\",\n\"delta\":\"\xe8\xaf\x91\xe6\x96\x87\"}"
+                        .to_vec(),
+                },
+                SseEvent {
+                    event_type: None,
+                    data: b"[DONE]".to_vec(),
+                },
+            ]
+        );
+        assert!(
+            decoder
+                .push(b"data: not-dispatched")
+                .expect("未闭合事件仍是合法前缀")
+                .is_empty(),
+            "EOF 不得补发没有空行终止的残留事件"
+        );
+    }
+
+    #[test]
+    fn sse_decoder_rejects_invalid_utf8_even_in_comments_or_unknown_fields() {
+        for line in [b": \xff\n".as_slice(), b"vendor: \xff\n".as_slice()] {
+            assert!(matches!(
+                SseDecoder::default().push(line),
+                Err(LlmRequestError::Fatal(
+                    OpenAiCompatibleError::InvalidResponseWire { .. }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn sse_decoder_confirms_trailing_bare_cr_without_inventing_a_missing_blank_line() {
+        let mut terminated = SseDecoder::default();
+        assert!(
+            terminated
+                .push(b"data: [DONE]\r")
+                .expect("chunk 末尾 CR 应先等待下一字节")
+                .is_empty()
+        );
+        assert!(
+            terminated
+                .push(b"\r")
+                .expect("第二个 CR 前仍没有完整空行")
+                .is_empty()
+        );
+        assert_eq!(
+            terminated.finish().expect("EOF 应确认最后一个裸 CR"),
+            [SseEvent {
+                event_type: None,
+                data: b"[DONE]".to_vec(),
+            }]
+        );
+
+        let mut unterminated = SseDecoder::default();
+        assert!(
+            unterminated
+                .push(b"data: [DONE]\r")
+                .expect("单个裸 CR 是 data 行结束")
+                .is_empty()
+        );
+        assert!(
+            unterminated.finish().expect("EOF 不应补造空行").is_empty(),
+            "只有 data 行终止符时不得分派 SSE 事件"
+        );
     }
 
     #[test]
@@ -2464,6 +2615,118 @@ mod tests {
     }
 
     #[test]
+    fn chat_wire_uses_content_before_refusal_and_preserves_refusal_alone() {
+        let content = parse_success_response(
+            br#"{"choices":[{"index":0,"message":{"content":"selected","refusal":"ignored"},"finish_reason":"stop"}]}"#,
+        )
+        .expect("content 与 refusal 同时存在时应使用 content");
+        assert_eq!(content.content(), "selected");
+        assert_eq!(content.finish_reason(), &LlmFinishReason::Stop);
+
+        let refusal = parse_success_response(
+            r#"{"choices":[{"index":0,"message":{"content":null,"refusal":"不能处理"},"finish_reason":"stop"}]}"#
+                .as_bytes(),
+        )
+        .expect("仅 refusal 的 Chat 响应应建立统一内容过滤响应");
+        assert_eq!(refusal.content(), "不能处理");
+        assert_eq!(refusal.finish_reason(), &LlmFinishReason::ContentFilter);
+
+        for body in [
+            br#"{"choices":[{"index":0,"message":{"content":[],"refusal":"fallback"},"finish_reason":"stop"}]}"#.as_slice(),
+            br#"{"choices":[{"index":0,"message":{"content":"selected","refusal":[]},"finish_reason":"stop"}]}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                parse_success_response(body),
+                Err(LlmRequestError::Fatal(
+                    OpenAiCompatibleError::InvalidResponseWire { .. }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn chat_stream_aggregates_index_zero_and_done_completes_finished_stream() {
+        let mut stream = ChatCompletionsStream::default();
+        for data in [
+            r#"{"choices":[{"index":1,"delta":{"content":"ignored"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"译"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"文"},"finish_reason":"length"}]}"#,
+            r#"{"choices":[],"usage":{"total_tokens":3}}"#,
+        ] {
+            assert!(
+                stream
+                    .accept(SseEvent {
+                        event_type: None,
+                        data: data.as_bytes().to_vec(),
+                    })
+                    .expect("合法 Chat 流事件应通过")
+                    .is_none()
+            );
+        }
+        let response = stream
+            .accept(SseEvent {
+                event_type: None,
+                data: b" \t[DONE]\r ".to_vec(),
+            })
+            .expect("ASCII 空白包围的 DONE 应终止 Chat 流")
+            .expect("DONE 应建立统一响应");
+        assert_eq!(response.content(), "译文");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::Length);
+    }
+
+    #[test]
+    fn chat_stream_refusal_is_content_filter_and_invalid_core_events_are_fatal() {
+        let mut refusal = ChatCompletionsStream::default();
+        for data in [
+            r#"{"choices":[{"index":0,"delta":{"refusal":"不能"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"refusal":"处理"},"finish_reason":"stop"}]}"#,
+        ] {
+            refusal
+                .accept(SseEvent {
+                    event_type: None,
+                    data: data.as_bytes().to_vec(),
+                })
+                .expect("refusal delta 应合法");
+        }
+        let response = refusal
+            .accept(SseEvent {
+                event_type: None,
+                data: b"[DONE]".to_vec(),
+            })
+            .expect("refusal 流应终止")
+            .expect("refusal 流应建立统一响应");
+        assert_eq!(response.content(), "不能处理");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::ContentFilter);
+
+        for data in [
+            r#"{"error":{"message":"failed"}}"#,
+            r#"{"type":"error","choices":[]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":[]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"refusal":[]},"finish_reason":null}]}"#,
+        ] {
+            assert!(matches!(
+                ChatCompletionsStream::default().accept(SseEvent {
+                    event_type: None,
+                    data: data.as_bytes().to_vec(),
+                }),
+                Err(LlmRequestError::Fatal(
+                    OpenAiCompatibleError::InvalidResponseWire { .. }
+                ))
+            ));
+        }
+        assert!(matches!(
+            ChatCompletionsStream::default().accept(SseEvent {
+                event_type: None,
+                data: b"[DONE]".to_vec(),
+            }),
+            Err(LlmRequestError::Fatal(
+                OpenAiCompatibleError::InvalidResponseWire { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn successful_wire_rejects_missing_or_duplicate_index_zero_and_invalid_core_fields() {
         for body in [
             br#"[]"#.as_slice(),
@@ -2571,6 +2834,78 @@ mod tests {
         ] {
             assert!(matches!(
                 super::parse_success_response(OpenAiProtocol::Responses, body),
+                Err(LlmRequestError::Fatal(
+                    OpenAiCompatibleError::InvalidResponseWire { .. }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn responses_stream_uses_matching_terminal_response_and_rejects_error_terminals() {
+        let incremental = parse_responses_stream_event(SseEvent {
+            event_type: Some(b"response.output_text.delta".to_vec()),
+            data: br#"{"type":"response.output_text.delta","delta":"ignored"}"#.to_vec(),
+        })
+        .expect("合法增量事件应忽略");
+        assert!(incremental.is_none());
+
+        let completed = parse_responses_stream_event(SseEvent {
+            event_type: Some(b"response.completed".to_vec()),
+            data: r#"{
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[{"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":"译文"}
+                    ]}]
+                }
+            }"#
+            .as_bytes()
+            .to_vec(),
+        })
+        .expect("合法 completed 事件应通过")
+        .expect("completed 应建立统一响应");
+        assert_eq!(completed.content(), "译文");
+        assert_eq!(completed.finish_reason(), &LlmFinishReason::Stop);
+
+        let incomplete = parse_responses_stream_event(SseEvent {
+            event_type: None,
+            data: br#"{
+                "type":"response.incomplete",
+                "response":{
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "output":[]
+                }
+            }"#
+            .to_vec(),
+        })
+        .expect("合法 incomplete 事件应通过")
+        .expect("incomplete 应建立统一响应");
+        assert_eq!(incomplete.content(), "");
+        assert_eq!(incomplete.finish_reason(), &LlmFinishReason::Length);
+
+        for event in [
+            SseEvent {
+                event_type: Some(b"response.completed".to_vec()),
+                data: br#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#.to_vec(),
+            },
+            SseEvent {
+                event_type: None,
+                data: br#"{"type":"response.failed","response":{"status":"failed"}}"#.to_vec(),
+            },
+            SseEvent {
+                event_type: Some(b"error".to_vec()),
+                data: br#"{"type":"error","message":"failed"}"#.to_vec(),
+            },
+            SseEvent {
+                event_type: None,
+                data: b"[DONE]".to_vec(),
+            },
+        ] {
+            assert!(matches!(
+                parse_responses_stream_event(event),
                 Err(LlmRequestError::Fatal(
                     OpenAiCompatibleError::InvalidResponseWire { .. }
                 ))
@@ -2906,6 +3241,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_server_streams_chat_completions_to_the_unified_response() {
+        let body = concat!(
+            ": heartbeat\r\n\r\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"ignored\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"译\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"文\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\r\n\r\n",
+            "data: [DONE]\r\r",
+        );
+        let server = spawn_test_server(vec![sse_response(body.as_bytes(), body.len())], false);
+        let client = client_with_protocol_and_stream(
+            &server.endpoint,
+            OpenAiProtocol::ChatCompletions,
+            true,
+            Map::new(),
+        );
+        let executor = executor(1);
+
+        let response = executor
+            .request(
+                &client,
+                &[ChatMessage::new(ChatMessageRole::User, "content")],
+            )
+            .await
+            .expect("Chat SSE 应建立统一响应");
+        assert_eq!(response.content(), "译文");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::Stop);
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("流式 Chat 请求应被记录");
+        let wire: Value = serde_json::from_slice(request_body(&request)).expect("请求应为 JSON");
+        assert_eq!(wire["stream"], true);
+
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn local_server_streams_responses_terminal_to_the_unified_response() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ignored\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"译文\"}]}]}}\r\r",
+        );
+        let server = spawn_test_server(vec![sse_response(body.as_bytes(), body.len())], false);
+        let base = server
+            .endpoint
+            .strip_suffix("/chat/completions")
+            .expect("测试服务器 endpoint 应使用 Chat 后缀");
+        let client =
+            client_with_protocol_and_stream(base, OpenAiProtocol::Responses, true, Map::new());
+        let executor = executor(1);
+
+        let response = executor
+            .request(
+                &client,
+                &[ChatMessage::new(ChatMessageRole::User, "content")],
+            )
+            .await
+            .expect("Responses SSE 应建立统一响应");
+        assert_eq!(response.content(), "译文");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::Stop);
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("流式 Responses 请求应被记录");
+        assert!(request_headers(&request).starts_with("POST /v1/responses HTTP/1.1"));
+        let wire: Value = serde_json::from_slice(request_body(&request)).expect("请求应为 JSON");
+        assert_eq!(wire["stream"], true);
+        assert_eq!(wire["background"], false);
+
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn clean_eof_after_finish_is_complete_but_missing_finish_and_truncation_retry() {
+        let finished_without_done = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let unterminated = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let mut finished_with_residual = finished_without_done.to_vec();
+        finished_with_residual.extend_from_slice(b"data: unfinished");
+        let server = spawn_test_server(
+            vec![
+                sse_response(finished_without_done, finished_without_done.len()),
+                sse_response(unterminated, unterminated.len()),
+                sse_response(&finished_with_residual, finished_with_residual.len()),
+                sse_response(unterminated, unterminated.len() + 32),
+            ],
+            false,
+        );
+        let client = client_with_protocol_and_stream(
+            &server.endpoint,
+            OpenAiProtocol::ChatCompletions,
+            true,
+            Map::new(),
+        );
+        let executor = executor(1);
+
+        let complete = executor
+            .request(&client, &[])
+            .await
+            .expect("明确 finish 后的正常 HTTP EOF 应建立完整响应");
+        assert_eq!(complete.content(), "complete");
+        assert_eq!(complete.finish_reason(), &LlmFinishReason::Stop);
+
+        let missing_finish = executor.request(&client, &[]).await;
+        assert!(matches!(
+            missing_finish,
+            Err(LlmRequestError::Retryable {
+                source: OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                },
+                retry_after: None,
+            })
+        ));
+        let residual = executor.request(&client, &[]).await;
+        assert!(matches!(
+            residual,
+            Err(LlmRequestError::Retryable {
+                source: OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::StreamEndedBeforeTerminal,
+                },
+                retry_after: None,
+            })
+        ));
+        let truncated = executor.request(&client, &[]).await;
+        assert!(
+            matches!(
+                truncated,
+                Err(LlmRequestError::Retryable {
+                    source: OpenAiCompatibleError::Transport {
+                        phase: HttpTransportPhase::ReadSuccessResponse,
+                        ..
+                    },
+                    retry_after: None,
+                })
+            ),
+            "截断响应应按读取传输失败处理，实际为 {truncated:?}"
+        );
+
+        for _ in 0..4 {
+            assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        }
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn stream_json_and_terminal_error_events_are_retryable_with_typed_violations() {
+        let cases = [
+            (
+                b"data: {not-json}\n\n".as_slice(),
+                HttpEnvelopeViolation::InvalidStreamEvent,
+            ),
+            (
+                b"data: {\"error\":{\"message\":\"failed\"}}\n\n".as_slice(),
+                HttpEnvelopeViolation::StreamErrorEvent,
+            ),
+        ];
+        for (body, expected) in cases {
+            let server = spawn_test_server(vec![sse_response(body, body.len())], false);
+            let client = client_with_protocol_and_stream(
+                &server.endpoint,
+                OpenAiProtocol::ChatCompletions,
+                true,
+                Map::new(),
+            );
+            let executor = executor(1);
+
+            assert!(matches!(
+                executor.request(&client, &[]).await,
+                Err(LlmRequestError::Retryable {
+                    source: OpenAiCompatibleError::InvalidResponseWire { violation },
+                    retry_after: None,
+                }) if violation == expected
+            ));
+            executor.shutdown().await;
+            server.worker.join().expect("测试服务器应正常退出");
+        }
+    }
+
+    #[tokio::test]
     async fn success_ignores_content_type_and_invalid_request_id_metadata() {
         let server = spawn_test_server(
             vec![
@@ -3118,7 +3639,8 @@ mod tests {
 
         let (slow_outcome, _) = slow.await.expect("慢成功任务不应 panic").into_parts();
         let (failure_outcome, _) = failure.await.expect("永久错误任务不应 panic").into_parts();
-        let (waiting_outcome, _) = waiting.await.expect("等待任务不应 panic").into_parts();
+        let (waiting_outcome, waiting_evidence) =
+            waiting.await.expect("等待任务不应 panic").into_parts();
         assert!(matches!(
             slow_outcome,
             LlmRequestExecutionOutcome::Response { .. }
@@ -3130,11 +3652,13 @@ mod tests {
         ));
         assert!(matches!(
             waiting_outcome,
-            LlmRequestExecutionOutcome::AdmissionStopped {
-                service_status: LlmServiceStatus::PermanentAuthorization,
-                ..
-            }
+            LlmRequestExecutionOutcome::AdmissionStopped { .. }
         ));
+        assert_eq!(
+            waiting_evidence.attempt_count(),
+            0,
+            "永久错误后的本地准入拒绝不得伪造 HTTP attempt"
+        );
         assert!(
             !extra_request_seen
                 .recv_timeout(Duration::from_secs(1))
@@ -3229,10 +3753,7 @@ mod tests {
         ));
         assert!(matches!(
             waiting,
-            LlmRequestExecutionOutcome::AdmissionStopped {
-                service_status: LlmServiceStatus::PermanentQuota,
-                ..
-            }
+            LlmRequestExecutionOutcome::AdmissionStopped { .. }
         ));
         assert!(
             !extra_after_body
@@ -3336,10 +3857,7 @@ mod tests {
         ));
         assert!(matches!(
             waiting_outcome,
-            LlmRequestExecutionOutcome::AdmissionStopped {
-                service_status: LlmServiceStatus::RateLimited,
-                ..
-            }
+            LlmRequestExecutionOutcome::AdmissionStopped { .. }
         ));
         assert!(
             !extra_request_seen
@@ -3718,7 +4236,6 @@ mod tests {
             "http://{}/v1/chat/completions",
             listener.local_addr().expect("测试地址应可读")
         );
-        drop(listener);
         let client = client(&endpoint, Map::new());
         let executor = executor(1);
 
@@ -3735,6 +4252,7 @@ mod tests {
             })
         ));
         executor.shutdown().await;
+        drop(listener);
     }
 
     #[tokio::test]

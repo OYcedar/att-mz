@@ -33,7 +33,7 @@ use crate::rpg_maker::extract::document::{
     RpgMakerDocumentId, RpgMakerDocumentSelection, RpgMakerProjectDocumentReader,
     RpgMakerProjectDocumentReadingDiagnostic, RpgMakerProjectDocuments,
 };
-use crate::rpg_maker::model::DialogueLinePart;
+use crate::rpg_maker::model::{DialogueLinePart, choice_branch_value_is_integer};
 use crate::rpg_maker::project::OpenedProject;
 use crate::rpg_maker::structured_path::{
     StructuredPathAccessError, StructuredPathCodec, StructuredPathDecoder, StructuredPathError,
@@ -700,7 +700,7 @@ fn apply_mutations(
 
     apply_value_mutations(documents, &value_mutations)?;
 
-    // 选项只修改既有值，但必须在任何事件列表 splice 前按整组验收并同步 102/402。
+    // 选项只改写 102 文案；先验收同层 402 索引和 404 边界，再保持分支命令逐字不动。
     for mutation in choices_mutations {
         apply_choices_mutation(documents, mutation)?;
     }
@@ -1515,7 +1515,6 @@ fn apply_choices_mutation(
         ));
     }
 
-    let mut branches = BTreeMap::<usize, usize>::new();
     let mut command_index = key.start_index + 1;
     let mut found_end = false;
     while let Some(command) = list.get(command_index) {
@@ -1527,31 +1526,10 @@ fn apply_choices_mutation(
         }
         if code == 402 && indent == header_indent {
             let parameters = command_parameters(command, location)?;
-            let choice_index = parameters
-                .first()
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| {
-                    mutation_failure(location, WriteBackMutationViolation::InvalidChoiceIndex)
-                })?;
-            let label = parameters.get(1).and_then(Value::as_str).ok_or_else(|| {
-                mutation_failure(location, WriteBackMutationViolation::ChoiceLabelNotString)
-            })?;
-            if mutation
-                .source_lines()
-                .get(choice_index)
-                .map(String::as_str)
-                != Some(label)
-            {
+            if !choice_branch_value_is_integer(parameters.first()) {
                 return Err(mutation_failure(
                     location,
-                    WriteBackMutationViolation::ChoiceLabelMismatch,
-                ));
-            }
-            if branches.insert(choice_index, command_index).is_some() {
-                return Err(mutation_failure(
-                    location,
-                    WriteBackMutationViolation::DuplicateChoiceIndex,
+                    WriteBackMutationViolation::InvalidChoiceIndex,
                 ));
             }
         }
@@ -1563,33 +1541,17 @@ fn apply_choices_mutation(
             WriteBackMutationViolation::MissingChoiceEnd,
         ));
     }
-    if branches.len() != mutation.source_lines().len()
-        || (0..mutation.source_lines().len()).any(|index| !branches.contains_key(&index))
-    {
-        return Err(mutation_failure(
-            location,
-            WriteBackMutationViolation::IncompleteChoiceCoverage,
-        ));
-    }
-
-    let mut expected_targets = BTreeSet::new();
-    for choice_index in 0..mutation.source_lines().len() {
-        expected_targets.insert(choice_value_location(
-            source,
-            &key.list_steps,
-            key.start_index,
-            0,
-            Some(choice_index),
-        ));
-        let branch_index = *branches.get(&choice_index).expect("已经验证分支索引完整");
-        expected_targets.insert(choice_value_location(
-            source,
-            &key.list_steps,
-            branch_index,
-            1,
-            None,
-        ));
-    }
+    let expected_targets = (0..mutation.source_lines().len())
+        .map(|choice_index| {
+            choice_value_location(
+                source,
+                &key.list_steps,
+                key.start_index,
+                0,
+                Some(choice_index),
+            )
+        })
+        .collect::<BTreeSet<_>>();
     let actual_targets = mutation
         .recipes()
         .iter()
@@ -1611,28 +1573,10 @@ fn apply_choices_mutation(
         .cloned()
         .map(Value::String)
         .collect();
-    let mut rebuilt_branches = Vec::with_capacity(branches.len());
-    for (choice_index, command_index) in branches {
-        let mut command = StackSafeJsonValue::new(clone_value(&list[command_index]));
-        set_command_parameter_text(
-            &mut command,
-            1,
-            &mutation.replacement_lines()[choice_index],
-            location,
-        )?;
-        rebuilt_branches.push((command_index, command));
-    }
-
     drop_value(std::mem::replace(
         &mut list[key.start_index],
         rebuilt_header.into_inner(),
     ));
-    for (command_index, command) in rebuilt_branches {
-        drop_value(std::mem::replace(
-            &mut list[command_index],
-            command.into_inner(),
-        ));
-    }
     documents.mark_document_changed(id);
     Ok(())
 }
@@ -2353,11 +2297,7 @@ pub(crate) enum WriteBackMutationViolation {
     ChoiceStartNot102,
     FrozenChoicesMismatch,
     InvalidChoiceIndex,
-    ChoiceLabelNotString,
-    ChoiceLabelMismatch,
-    DuplicateChoiceIndex,
     MissingChoiceEnd,
-    IncompleteChoiceCoverage,
     ChoiceRecipeTargetMismatch,
     EventBodyStartOutOfBounds,
     EventBodyCodeMismatch,
@@ -2423,12 +2363,8 @@ impl fmt::Display for WriteBackMutationViolation {
             Self::ChoiceStartNot102 => "选项起始命令不是 102",
             Self::FrozenChoicesMismatch => "冻结 102.parameters[0] 与选项原文不一致",
             Self::InvalidChoiceIndex => "同层 402.parameters[0] 不是有效选项索引",
-            Self::ChoiceLabelNotString => "同层 402.parameters[1] 不是字符串",
-            Self::ChoiceLabelMismatch => "同层 402 标签与冻结 102 选项不一致",
-            Self::DuplicateChoiceIndex => "同层 402 重复选项索引",
             Self::MissingChoiceEnd => "选项块缺少同层 404 结束命令",
-            Self::IncompleteChoiceCoverage => "选项块没有完整覆盖全部同层 402",
-            Self::ChoiceRecipeTargetMismatch => "选项配方目标与冻结 102/402 块不一致",
+            Self::ChoiceRecipeTargetMismatch => "选项配方目标与冻结 102 列表不一致",
             Self::EventBodyStartOutOfBounds => "事件正文起始命令索引越界",
             Self::EventBodyCodeMismatch => "事件正文起始命令码与正文类型不一致",
             Self::EventBodyTooLong => "事件正文段数超过冻结命令列表",
@@ -2792,11 +2728,7 @@ fn diagnostic_mutation_violation(
         ChoiceStartNot102,
         FrozenChoicesMismatch,
         InvalidChoiceIndex,
-        ChoiceLabelNotString,
-        ChoiceLabelMismatch,
-        DuplicateChoiceIndex,
         MissingChoiceEnd,
-        IncompleteChoiceCoverage,
         ChoiceRecipeTargetMismatch,
         EventBodyStartOutOfBounds,
         EventBodyCodeMismatch,
@@ -4217,7 +4149,7 @@ mod tests {
     }
 
     #[test]
-    fn choices_update_the_102_list_and_same_level_402_labels_atomically() {
+    fn choices_update_only_the_102_list_and_preserve_all_402_bytes() {
         let source = RpgMakerSource::map(10);
         let list_steps = vec![RpgMakerLocationStep::key("list")];
         let group_location = RpgMakerLocation::value(
@@ -4247,8 +4179,6 @@ mod tests {
         let recipes = vec![
             recipe(target(0, 0, Some(0)), 0, "はい"),
             recipe(target(0, 0, Some(1)), 1, "いいえ"),
-            recipe(target(1, 1, None), 0, "はい"),
-            recipe(target(6, 1, None), 1, "いいえ"),
         ];
         let mutation = ReplaceChoicesMutation::new(
             group_location,
@@ -4286,12 +4216,12 @@ mod tests {
                 json!({
                     "list": [
                         {"code":102,"indent":0,"parameters":[["はい","いいえ"],0,0,2,0],"headerUnknown":true},
-                        {"code":402,"indent":0,"parameters":[0,"はい"],"branchUnknown":"first"},
+                        {"code":402,"indent":0,"parameters":[2,{"editorOnly":"旧标签"}],"branchUnknown":"first"},
                         {"code":102,"indent":1,"parameters":[["内側"],0,0,2,0]},
                         {"code":402,"indent":1,"parameters":[0,"内側"]},
                         {"code":404,"indent":1,"parameters":[]},
                         {"code":0,"indent":1,"parameters":[]},
-                        {"code":402,"indent":0,"parameters":[1,"いいえ"],"branchUnknown":"second"},
+                        {"code":0,"indent":0,"parameters":["没有第二个 402 分支"]},
                         {"code":404,"indent":0,"parameters":[]},
                         {"code":0,"indent":0,"parameters":[]},
                         {"code":105,"indent":0,"parameters":[2,false],"eventHeaderUnknown":true},
@@ -4309,11 +4239,11 @@ mod tests {
             workspace_root(),
             documents,
             plan(vec![
-                RpgMakerWriteBackMutation::ReplaceChoices(mutation),
+                RpgMakerWriteBackMutation::ReplaceChoices(mutation.clone()),
                 RpgMakerWriteBackMutation::ReplaceEventBody(event_mutation),
             ]),
         )
-        .expect("选项头、分支标签与同 list 事件正文应能原子同步");
+        .expect("选项头与同 list 事件正文应能原子同步，402 编辑器数据保持原样");
         assert_eq!(
             structural_list_rebuild_count(),
             1,
@@ -4323,17 +4253,53 @@ mod tests {
             serde_json::from_str(file_text(&candidate, Path::new("data/Map010.json"))).unwrap();
         let list = map["list"].as_array().unwrap();
         assert_eq!(list[0]["parameters"][0], json!(["是", "否"]));
-        assert_eq!(list[1]["parameters"][1], "是");
-        assert_eq!(list[6]["parameters"][1], "否");
+        assert_eq!(
+            list[1],
+            json!({
+                "code": 402,
+                "indent": 0,
+                "parameters": [2, {"editorOnly": "旧标签"}],
+                "branchUnknown": "first"
+            }),
+            "越界整数分支及全部 402 数据必须原样保留"
+        );
+        assert_eq!(list[6]["parameters"][0], "没有第二个 402 分支");
         assert_eq!(list[3]["parameters"][1], "内側");
         assert_eq!(list[0]["headerUnknown"], true);
         assert_eq!(list[1]["branchUnknown"], "first");
-        assert_eq!(list[6]["branchUnknown"], "second");
         assert_eq!(list[9]["eventHeaderUnknown"], true);
         assert_eq!(list[10]["parameters"][0], "滚动译文一");
         assert_eq!(list[11]["parameters"][0], "滚动译文二");
         assert_eq!(list[10]["eventBodyUnknown"], true);
         assert_eq!(list[11]["eventBodyUnknown"], true);
+
+        let invalid_index = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(
+                RpgMakerDocumentId::Map(MapId::new(10).unwrap()),
+                json!({
+                    "list": [
+                        {"code":102,"indent":0,"parameters":[["はい","いいえ"],0,0,2,0]},
+                        {"code":402,"indent":0,"parameters":[0.5,"ignored"]},
+                        {"code":404,"indent":0,"parameters":[]}
+                    ]
+                }),
+            )]),
+            Vec::new(),
+        );
+        let error = rewrite_documents(
+            project_name(),
+            workspace_root(),
+            invalid_index,
+            plan(vec![RpgMakerWriteBackMutation::ReplaceChoices(mutation)]),
+        )
+        .expect_err("402 分支值仍必须是整数");
+        assert!(matches!(
+            error,
+            RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation {
+                violation: WriteBackMutationViolation::InvalidChoiceIndex,
+                ..
+            }
+        ));
     }
 
     #[test]

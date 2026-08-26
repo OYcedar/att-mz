@@ -311,7 +311,6 @@ SET source_language = ?1,
     target_language = ?2,
     source_snapshot_fingerprint = ?3
 WHERE name = ?4"#;
-const CLEAR_RPG_MAKER_TEXT_TRANSLATIONS: &str = "UPDATE rpg_maker_text_unit SET translation_content_json = NULL, translation_state = NULL WHERE translation_content_json IS NOT NULL OR translation_state IS NOT NULL";
 const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE rpg_maker_translation_resource
 SET canonical_json = '[]'
 WHERE resource_kind = 'terminology'"#;
@@ -3288,15 +3287,10 @@ where
         project_definitions_cas(&current),
     ];
     if language_changed {
-        for statement in [
-            CLEAR_RPG_MAKER_TEXT_TRANSLATIONS,
+        steps.push(SqliteTransactionStep::Execute(SqliteCommand::new(
             RESET_TERMINOLOGY_RESOURCE,
-        ] {
-            steps.push(SqliteTransactionStep::Execute(SqliteCommand::new(
-                statement,
-                Vec::new(),
-            )));
-        }
+            Vec::new(),
+        )));
     }
     steps.push(SqliteTransactionStep::Execute(SqliteCommand::new(
         UPDATE_METADATA,

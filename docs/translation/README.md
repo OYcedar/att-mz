@@ -15,7 +15,7 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 | Unit、Group、Semantic Scope、稳定装箱或临时 ID | [TaskBlock 规划](task-planning.md) |
 | System/User、响应 JSON、ID、形状或逐项验收 | [Prompt 与模型协议](prompts.md) |
 | 实际请求、原始 Assistant 或最终任务结果 | [模型任务记录](task-records.md) |
-| HTTP、模型请求协议、超时、限速或运行时有限重试 | [OpenAI-compatible HTTP](../runtime/openai-compatible.md) |
+| HTTP、模型请求协议、流式响应、超时、限速或运行时有限重试 | [OpenAI-compatible HTTP](../runtime/openai-compatible.md) |
 | Current、Partial、Unavailable 或引擎状态 | 对应 [MV/MZ Translate](../rpg-maker/translation.md)或 [Generic Translate](../generic/translation.md) |
 | 人工或 agent 补译、定点修订 | [Manual TOML](../manual/README.md)；需要批量上下文或特殊数据库操作时再读 [Lua](../lua/README.md) |
 | WriteBack 精确断行、401/405 或字符串 LF | [WriteBack 排版规则](write-back-layout-rules.md)与对应引擎 WriteBack 规格 |

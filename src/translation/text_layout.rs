@@ -10,12 +10,6 @@ use crate::translation::placeholder_token;
 const FULLWIDTH_INDENT: &str = "　";
 const CONTINUATION_INDENT_CELLS: u64 = 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LayoutTextSyntax {
-    Plain,
-    RpgMaker,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LaidOutTextLine {
     text: String,
@@ -57,14 +51,13 @@ pub(crate) fn layout_text(
     text: &str,
     max_fullwidth_chars: Option<u32>,
     complete_continuation_whitespace: bool,
-    syntax: LayoutTextSyntax,
 ) -> Option<LaidOutText> {
     let max_cells = max_fullwidth_chars.map(|width| u64::from(width) * 2);
     let mut lines = Vec::new();
     let mut wrapping_stack = Vec::new();
 
     for (source_line_index, hard_line) in text.split('\n').enumerate() {
-        let tokens = scan_line(hard_line, syntax)?;
+        let tokens = scan_line(hard_line)?;
         let semantic_indent_required = complete_continuation_whitespace
             && !wrapping_stack.is_empty()
             && continuation_indent_position(&tokens).is_some();
@@ -87,7 +80,7 @@ pub(crate) fn layout_text(
             _ => vec![hard_line.to_owned()],
         };
         for (index, text) in wrapped.into_iter().enumerate() {
-            let line_tokens = scan_line(&text, syntax)?;
+            let line_tokens = scan_line(&text)?;
             update_wrapping_stack(&line_tokens, &mut wrapping_stack);
             lines.push(WorkingLine {
                 text,
@@ -99,7 +92,7 @@ pub(crate) fn layout_text(
     }
 
     if complete_continuation_whitespace {
-        apply_continuation_indents(&mut lines, max_cells, syntax)?;
+        apply_continuation_indents(&mut lines, max_cells)?;
     }
     Some(LaidOutText {
         lines: lines
@@ -134,7 +127,8 @@ struct DisplayToken<'a> {
     width_cells: u64,
 }
 
-fn scan_line(line: &str, syntax: LayoutTextSyntax) -> Option<Vec<DisplayToken<'_>>> {
+// 排版层只信任上游语义所有者建立的 ATT token；其他字符（包括反斜杠形式）都按可见文本计量。
+fn scan_line(line: &str) -> Option<Vec<DisplayToken<'_>>> {
     let mut tokens = Vec::new();
     let mut offset = 0_usize;
     while offset < line.len() {
@@ -151,17 +145,6 @@ fn scan_line(line: &str, syntax: LayoutTextSyntax) -> Option<Vec<DisplayToken<'_
             offset += end;
             continue;
         }
-        if syntax == LayoutTextSyntax::RpgMaker && remaining.starts_with('\\') {
-            let control_length = control_sequence_length(remaining)?;
-            tokens.push(DisplayToken {
-                text: &remaining[..control_length],
-                kind: DisplayTokenKind::Control,
-                width_cells: 0,
-            });
-            offset += control_length;
-            continue;
-        }
-
         let grapheme = remaining.graphemes(true).next()?;
         if grapheme
             .chars()
@@ -189,61 +172,6 @@ fn scan_line(line: &str, syntax: LayoutTextSyntax) -> Option<Vec<DisplayToken<'_
         offset += grapheme.len();
     }
     Some(tokens)
-}
-
-fn control_sequence_length(input: &str) -> Option<usize> {
-    let after_slash = input.get(1..)?;
-    let first = after_slash.chars().next()?;
-    if matches!(
-        first,
-        '{' | '}' | '\\' | '$' | '.' | '|' | '!' | '>' | '<' | '^'
-    ) {
-        return Some(1 + first.len_utf8());
-    }
-    if !first.is_ascii_alphabetic() {
-        return None;
-    }
-    let mut command_length = 0_usize;
-    for character in after_slash.chars() {
-        if character.is_ascii_alphabetic() {
-            command_length += character.len_utf8();
-        } else {
-            break;
-        }
-    }
-    for character in after_slash[command_length..].chars() {
-        if character.is_ascii_digit() {
-            command_length += character.len_utf8();
-        } else {
-            break;
-        }
-    }
-    let after_command = &after_slash[command_length..];
-    if let Some(parameter) = after_command.strip_prefix('[') {
-        let closing_offset = parameter.find(']')?;
-        if parameter[..closing_offset].chars().any(char::is_control) {
-            return None;
-        }
-        return Some(1 + command_length + 1 + closing_offset + 1);
-    }
-    if command_length == 1 && first.eq_ignore_ascii_case(&'n') {
-        let name_box = after_command.strip_prefix('<')?;
-        let closing_offset = name_box.find('>')?;
-        if name_box[..closing_offset].chars().any(char::is_control) {
-            return None;
-        }
-        return Some(1 + command_length + 1 + closing_offset + 1);
-    }
-    if command_length == 1
-        && first.eq_ignore_ascii_case(&'g')
-        && after_command
-            .chars()
-            .next()
-            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '[')
-    {
-        return Some(2);
-    }
-    None
 }
 
 fn line_width(tokens: &[DisplayToken<'_>]) -> u64 {
@@ -423,25 +351,21 @@ fn join_tokens(tokens: &[DisplayToken<'_>]) -> String {
     output
 }
 
-fn apply_continuation_indents(
-    lines: &mut [WorkingLine],
-    max_cells: Option<u64>,
-    syntax: LayoutTextSyntax,
-) -> Option<()> {
+fn apply_continuation_indents(lines: &mut [WorkingLine], max_cells: Option<u64>) -> Option<()> {
     let mut wrapping_stack = Vec::new();
     for line in lines {
         let insert_at = if (line.automatically_generated_continuation
             || line.semantic_indent_required)
             && !wrapping_stack.is_empty()
         {
-            continuation_indent_position(&scan_line(&line.text, syntax)?)
+            continuation_indent_position(&scan_line(&line.text)?)
         } else {
             None
         };
         if let Some(insert_at) = insert_at {
             line.text.insert_str(insert_at, FULLWIDTH_INDENT);
         }
-        let tokens = scan_line(&line.text, syntax)?;
+        let tokens = scan_line(&line.text)?;
         if max_cells.is_some_and(|maximum| line_width(&tokens) > maximum) {
             return None;
         }
@@ -503,8 +427,7 @@ mod tests {
 
     #[test]
     fn wraps_at_punctuation_and_indents_inside_quote() {
-        let laid_out = layout_text("「甲乙，丙丁」", Some(4), true, LayoutTextSyntax::RpgMaker)
-            .expect("标点断点应可安全排版");
+        let laid_out = layout_text("「甲乙，丙丁」", Some(4), true).expect("标点断点应可安全排版");
         assert_eq!(
             laid_out
                 .lines()
@@ -516,25 +439,36 @@ mod tests {
     }
 
     #[test]
-    fn independent_whitespace_completion_handles_existing_hard_line_after_controls() {
-        let laid_out = layout_text("「甲\n\\SE[2]乙」", None, true, LayoutTextSyntax::RpgMaker)
-            .expect("合法控制符后的续行应可补空白");
-        assert_eq!(laid_out.joined_text(), "「甲\n\\SE[2]　乙」");
+    fn independent_whitespace_completion_handles_protected_controls() {
+        let laid_out = layout_text("「甲\n⟦ATT_CONTROL⟧乙」", None, true)
+            .expect("语义所有者建立的控制符 token 后应可补空白");
+        assert_eq!(laid_out.joined_text(), "「甲\n⟦ATT_CONTROL⟧　乙」");
+    }
+
+    #[test]
+    fn unknown_backslash_forms_remain_visible_text() {
+        for text in ["「甲\n\\SE[2]乙」", "「甲\n\\N<姓名>乙」"] {
+            let laid_out = layout_text(text, None, true).expect("普通可见文本应可排版");
+            assert_eq!(
+                laid_out.joined_text(),
+                text.replacen('\n', "\n　", 1),
+                "没有实际消费者建立 token 的反斜杠形式不能被当作零宽控制符"
+            );
+        }
     }
 
     #[test]
     fn existing_leading_whitespace_is_not_duplicated() {
         for whitespace in [" ", "　", "\u{00a0}"] {
             let text = format!("「甲\n{whitespace}乙」");
-            let laid_out =
-                layout_text(&text, None, true, LayoutTextSyntax::Plain).expect("既有空白应保持");
+            let laid_out = layout_text(&text, None, true).expect("既有空白应保持");
             assert_eq!(laid_out.joined_text(), text);
         }
     }
 
     #[test]
     fn tracks_a_new_pair_after_closing_an_old_pair_on_the_same_line() {
-        let laid_out = layout_text("「甲」又「乙\n丙」", None, true, LayoutTextSyntax::Plain)
+        let laid_out = layout_text("「甲」又「乙\n丙」", None, true)
             .expect("同一行重新打开的引号应延续到下一硬行");
         assert_eq!(laid_out.joined_text(), "「甲」又「乙\n　丙」");
     }

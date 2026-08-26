@@ -266,6 +266,7 @@ diagnostic-failure-value = { $code ->
     [request_serialization_failed] Не удалось сериализовать запрос к модели
     [response_parsing_failed] Ответ модели не является допустимым JSON
     [invalid_response_contract] Ответ модели не соответствует обязательному контракту
+    [model_stream_incomplete] Поток модели завершился до явного конечного результата
     [transport_failed] Перед получением допустимого ответа произошла ошибка транспорта HTTP
     [lua_compilation_failed] Не удалось скомпилировать основную программу Lua
     [lua_execution_failed] Ошибка во время выполнения основной программы Lua

@@ -37,14 +37,16 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
 `observe` 不自动切换场景。省略 `--duration` 时持续到游戏窗口关闭或按 Ctrl+C；传入秒数时才
 定时结束。应使用鼠标或游戏本身支持的正常控制方式游玩。
 
-输出目录包含 `report.json`、实际绘制 `draws.jsonl`、英文候选、像素越界、字体加载检查、
+输出目录包含 `report.json`、按递增序列记录的完整 `events.jsonl`、实际绘制 `draws.jsonl`、英文候选、像素越界、字体加载检查、
 `runtime-errors.jsonl` 和截图。工具会记录页面未捕获异常、未处理 Promise rejection、
 `Graphics.printError`、资源加载错误和 RPG Maker 的 `ErrorPrinter` 错误画面。`qa_status` 解释如下：
 
 - `needs_review`：启动没有完成，或实际观察到运行时错误、英文、可测的像素越界、请求的
   font family 未加载；
 - `unverified`：没有上述发现，但仍有未访问场景，或无法证明每个 glyph 没有回退字体；
-- `clean`：`smoke` 的必验场景都有实际绘制证据，且没有已知发现或未验证项。
+- `clean`：`smoke` 的观察器必需 hooks 全部安装且完成过安装轮询；每个必验场景的动作受支持，
+  本场景序列边界内存在语义匹配的非空文本绘制，并有至少 64×64、可完整解码的 PNG 截图；同时
+  没有已知发现或未验证项。前一场景、启动期或场景切换期的绘制不能证明后一场景。
 
 英文候选仍需区分专名、资源事实和漏译。像素越界会同时检查 `Bitmap.drawText` 的实际位图
 边界与可安全测量的纯文本 `Window_Base.drawTextEx`；含控制符或换行的 `drawTextEx` 不猜测
@@ -72,7 +74,8 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py inspect `
   --game D:\games\translated `
   --font noto-sans-sc `
-  --coverage-text D:\review\all-visible-chinese.txt `
+  --translations D:\review\translations-after-manual.jsonl `
+  --coverage-text D:\review\additional-player-text.txt `
   --output D:\review\font-inspect.json
 ```
 
@@ -91,16 +94,24 @@ CSS `@font-face` 和字体加载 API 已注册的运行时别名会原样保留�
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
   --game D:\games\translated `
   --font lxgw-wenkai `
-  --coverage-text D:\review\all-visible-chinese.txt `
+  --translations D:\review\translations-after-manual.jsonl `
+  --coverage-text D:\review\additional-player-text.txt `
   --state D:\review\font-state `
   --output D:\review\font-apply.json
 ```
 
 `apply` 每次都按当前游戏和字体输入重新扫描、生成计划并验证，不依赖之前的 `inspect` 结果。它先建立
-包含每项替换前后完整字节和摘要的 `state`，再原子写入。选中字体缺少
-`--coverage-text` 中的字符只会进入 Review，不会阻止安全的已证明引用替换。没有已证明引用、
+包含每项替换前后完整字节和摘要的 `state`，再原子写入。`--translations` 必须是 ATT 当前
+`translation export`：工具严格校验自然 ID、状态和字段组合，并按 WriteBack 行为投影字符——
+current 使用译文，pending/rejected 使用仍会写回的原文。这只能证明该导出自身的字符投影；字体
+工具没有同时消费同源 Survey、finalize coverage、实际 WriteBack 和运行副本，不能据此证明项目
+全部字体消费者范围。
+`--coverage-text` 只是已知额外玩家文本，可以重复传入；它的覆盖结论只适用于所给文本，不能因
+含有任意一个已覆盖字符而把项目报告提升为 `clean`。选中字体缺少任一已检查字符只会进入 Review，
+不会阻止安全的已证明引用替换。未提供 Translation export、其投影没有非空字符、没有已证明引用、
 或所有引用已经指向选中字体时命令仍成功退出；报告用 `applied`、`no_op` 和 `qa_status`
-分别说明是否写入、是否无需写入和质量结论。
+分别说明是否写入、是否无需写入和质量结论。字体工具没有发现问题时仍为 scoped `unverified`；
+缺少任一已检查字符会成为 `needs_review`，并使 `review_required` 为 true，即使静态引用 Review 为空。
 
 恢复：
 

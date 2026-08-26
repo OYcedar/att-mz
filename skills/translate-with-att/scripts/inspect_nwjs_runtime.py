@@ -13,8 +13,8 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TextIO, cast
 
@@ -45,9 +45,24 @@ from att_toolbox.nwjs import (
     wait_for_owned_loopback_listener,
     wait_for_page_target,
 )
+from att_toolbox.png import decode_png_size
 from att_toolbox.rpg import discover_game, require_game_root
 
 _SCENARIOS = ("title", "new_game", "dialogue", "menu", "quest_log", "options", "save")
+_DRAW_KINDS = frozenset({"Bitmap.drawText", "Window_Base.drawText", "Window_Base.drawTextEx"})
+_OBSERVER_HOOKS = frozenset(
+    {
+        "bitmapDrawText",
+        "windowDrawText",
+        "windowDrawTextEx",
+        "addCommand",
+        "loadFont",
+        "fontManagerLoad",
+        "graphicsPrintError",
+        "graphicsPrintLoadingError",
+    }
+)
+_MIN_REVIEW_SCREENSHOT_DIMENSION = 64
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -186,28 +201,78 @@ def _capture_screenshot(connection: CdpConnection) -> bytes:
     if not isinstance(data, str):
         raise CdpProtocolError("Page.captureScreenshot 缺少 PNG 数据")
     try:
-        return base64.b64decode(data, validate=True)
+        screenshot = base64.b64decode(data, validate=True)
     except ValueError as error:
         raise CdpProtocolError("Page.captureScreenshot 返回无效 base64") from error
+    try:
+        decode_png_size(screenshot)
+    except ValueError as error:
+        raise CdpProtocolError("Page.captureScreenshot 返回无法解码的非空 PNG") from error
+    return screenshot
+
+
+def _observer_ready(snapshot: Mapping[str, object]) -> bool:
+    requirements = snapshot.get("hookRequirements")
+    sequence = snapshot.get("sequence")
+    typed_requirements: Mapping[object, object] = (
+        cast(Mapping[object, object], requirements)
+        if isinstance(requirements, Mapping)
+        else cast(Mapping[object, object], {})
+    )
+    return bool(
+        snapshot.get("installed") is True
+        and snapshot.get("requiredHooksInstalled") is True
+        and snapshot.get("pageLoadFinished") is True
+        and snapshot.get("pollingObserved") is True
+        and snapshot.get("installationFinished") is True
+        and len(typed_requirements) == len(_OBSERVER_HOOKS)
+        and all(isinstance(key, str) for key in typed_requirements)
+        and {cast(str, key) for key in typed_requirements} == set(_OBSERVER_HOOKS)
+        and all(value is True for value in typed_requirements.values())
+        and isinstance(sequence, int)
+        and not isinstance(sequence, bool)
+        and sequence >= 0
+    )
+
+
+def _snapshot_sequence(snapshot: Mapping[str, object]) -> int:
+    sequence = snapshot.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise CdpProtocolError("观察器快照缺少有效事件序列边界")
+    return sequence
+
+
+def _event_sequence(event: Mapping[str, object]) -> int:
+    sequence = event.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+        raise CdpProtocolError("观察器事件缺少有效序列")
+    return sequence
 
 
 def _wait_for_observer(connection: CdpConnection, timeout: float) -> dict[str, object]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = connection.evaluate(
-            "window.__ATT_NW_OBSERVER__ ? "
-            "({installed:true,hooks:__ATT_NW_OBSERVER__.installed,scene:__ATT_NW_OBSERVER__.scene()}) : "
-            "({installed:false})"
+            "window.__ATT_NW_OBSERVER__ ? __ATT_NW_OBSERVER__.snapshot() : ({installed:false})"
         )
         result = _mapping(value)
-        if result.get("installed") is True:
+        if (
+            result.get("installed") is True
+            and result.get("pageLoadFinished") is True
+            and result.get("pollingObserved") is True
+        ):
             return result
         time.sleep(0.05)
     raise CdpUnavailableError("页面观察器没有建立")
 
 
-def _take_events(connection: CdpConnection) -> list[dict[str, object]]:
-    return _event_list(connection.evaluate("__ATT_NW_OBSERVER__.take()"))
+def _take_observation(connection: CdpConnection) -> tuple[list[dict[str, object]], dict[str, object]]:
+    value = connection.evaluate(
+        "(() => { const events = __ATT_NW_OBSERVER__.take(); "
+        "return {events:events,snapshot:__ATT_NW_OBSERVER__.snapshot()}; })()"
+    )
+    result = _mapping(value)
+    return _event_list(result.get("events")), _mapping(result.get("snapshot"))
 
 
 def _take_runtime_errors(connection: CdpConnection) -> list[dict[str, object]]:
@@ -255,6 +320,7 @@ def wait_for_runtime_start(
 
 @dataclass(slots=True)
 class _ObservationStats:
+    event_count: int = 0
     draw_count: int = 0
     english_count: int = 0
     overflow_count: int = 0
@@ -262,50 +328,72 @@ class _ObservationStats:
     measurement_unverified_count: int = 0
     glyph_fallback_unverified: bool = False
     runtime_error_count: int = 0
-    message_draw_observed: bool = False
-    scene_and_context: set[str] = field(default_factory=set)
-
-    def has_scene(self, expected: str) -> bool:
-        normalized = expected.casefold()
-        return any(normalized in value.casefold() for value in self.scene_and_context)
+    last_event_sequence: int = 0
 
 
 def _write_event(handle: TextIO, event: Mapping[str, object]) -> None:
     handle.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _record_events(work: Path, events: list[dict[str, object]], stats: _ObservationStats) -> None:
+def _record_events(
+    work: Path,
+    events: list[dict[str, object]],
+    stats: _ObservationStats,
+    *,
+    phase: str,
+    scenario: str | None = None,
+) -> list[dict[str, object]]:
     if not events:
-        return
+        return []
+    event_path = work / "events.jsonl"
     draws = work / "draws.jsonl"
     english_path = work / "english-candidates.jsonl"
     overflow_path = work / "pixel-overflows.jsonl"
     measurement_path = work / "layout-measurement-unverified.jsonl"
     font_path = work / "font-load-review.jsonl"
+    recorded_draws: list[dict[str, object]] = []
     with (
+        event_path.open("a", encoding="utf-8", newline="\n") as event_handle,
         draws.open("a", encoding="utf-8", newline="\n") as draw_handle,
         english_path.open("a", encoding="utf-8", newline="\n") as english_handle,
         overflow_path.open("a", encoding="utf-8", newline="\n") as overflow_handle,
         measurement_path.open("a", encoding="utf-8", newline="\n") as measurement_handle,
         font_path.open("a", encoding="utf-8", newline="\n") as font_handle,
     ):
-        for event in events:
-            _write_event(draw_handle, event)
-            stats.draw_count += 1
-            scene = event.get("scene")
-            context = event.get("context")
-            if isinstance(scene, str):
-                stats.scene_and_context.add(scene)
-            if isinstance(context, str):
-                stats.scene_and_context.add(context)
+        for raw_event in events:
+            sequence = raw_event.get("sequence")
+            if (
+                not isinstance(sequence, int)
+                or isinstance(sequence, bool)
+                or sequence <= stats.last_event_sequence
+                or not isinstance(raw_event.get("timestampMs"), (int, float))
+                or isinstance(raw_event.get("timestampMs"), bool)
+                or not isinstance(raw_event.get("kind"), str)
+                or not isinstance(raw_event.get("text"), str)
+                or not isinstance(raw_event.get("scene"), str)
+                or not isinstance(raw_event.get("context"), str)
+                or not isinstance(raw_event.get("geometry"), Mapping)
+                or not isinstance(raw_event.get("font"), Mapping)
+            ):
+                raise CdpProtocolError("观察器事件缺少递增序列或完整绘制语义")
+            stats.last_event_sequence = sequence
+            event = dict(raw_event)
+            event["observation_scope"] = {"phase": phase, "scenario": scenario}
+            _write_event(event_handle, event)
+            stats.event_count += 1
+            is_draw = event["kind"] in _DRAW_KINDS
+            if is_draw:
+                _write_event(draw_handle, event)
+                recorded_draws.append(event)
+                stats.draw_count += 1
             text = event.get("text")
-            if isinstance(text, str) and text:
+            if is_draw and isinstance(text, str) and text:
                 stats.glyph_fallback_unverified = True
                 if any("A" <= character <= "Z" or "a" <= character <= "z" for character in text):
                     stats.english_count += 1
                     _write_event(english_handle, event)
             geometry = event.get("geometry")
-            if isinstance(geometry, Mapping):
+            if is_draw and isinstance(geometry, Mapping):
                 typed_geometry = cast(Mapping[object, object], geometry)
                 if any(
                     typed_geometry.get(field) is True
@@ -324,13 +412,8 @@ def _record_events(work: Path, events: list[dict[str, object]], stats: _Observat
             ):
                 stats.requested_font_not_loaded_count += 1
                 _write_event(font_handle, event)
-            if (
-                event.get("kind") == "Window_Base.drawTextEx"
-                and isinstance(context, str)
-                and "Window_Message" in context
-            ):
-                stats.message_draw_observed = True
         for handle in (
+            event_handle,
             draw_handle,
             english_handle,
             overflow_handle,
@@ -338,33 +421,61 @@ def _record_events(work: Path, events: list[dict[str, object]], stats: _Observat
             font_handle,
         ):
             handle.flush()
+    return recorded_draws
 
 
 def _record_runtime_errors(
     work: Path,
     errors: list[dict[str, object]] | tuple[dict[str, object], ...],
     stats: _ObservationStats,
+    *,
+    phase: str,
+    scenario: str | None = None,
 ) -> None:
     if not errors:
         return
     with (work / "runtime-errors.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
-        for error in errors:
+        for raw_error in errors:
+            error = dict(raw_error)
+            error["observation_scope"] = {"phase": phase, "scenario": scenario}
             _write_event(handle, error)
             stats.runtime_error_count += 1
         handle.flush()
 
 
-def _scenario_status(
+def scenario_status(
     name: str,
     action: Mapping[str, object],
-    stats: _ObservationStats,
+    events: Sequence[Mapping[str, object]],
+    *,
+    observer_start: Mapping[str, object] | None = None,
+    observer_end: Mapping[str, object] | None = None,
+    screenshot_size: tuple[int, int] | None = None,
 ) -> tuple[str, str]:
     if action.get("supported") is not True:
         return "unverified", "运行时不支持或无法唯一定位该场景"
+    if observer_start is not None and not _observer_ready(observer_start):
+        return "unverified", "场景开始时观察器 hooks 或安装轮询不完整"
+    if observer_end is not None and not _observer_ready(observer_end):
+        return "unverified", "场景结束时观察器 hooks 或安装轮询不完整"
+    if screenshot_size is not None and (
+        screenshot_size[0] < _MIN_REVIEW_SCREENSHOT_DIMENSION
+        or screenshot_size[1] < _MIN_REVIEW_SCREENSHOT_DIMENSION
+    ):
+        return "unverified", "场景截图尺寸不足以审核界面文本"
+    if not events:
+        return "unverified", "当前场景没有观察到实际文本绘制"
     if name == "dialogue":
         return (
             ("verified", "观察到 Window_Message 的真实 drawTextEx")
-            if stats.message_draw_observed
+            if any(
+                event.get("kind") == "Window_Base.drawTextEx"
+                and isinstance(event.get("text"), str)
+                and bool(cast(str, event["text"]).strip())
+                and isinstance(event.get("context"), str)
+                and "Window_Message" in cast(str, event["context"])
+                for event in events
+            )
             else ("unverified", "没有观察到真实消息窗口文本绘制")
         )
     expected = {
@@ -375,7 +486,14 @@ def _scenario_status(
         "options": "Options",
         "save": "Save",
     }.get(name, name)
-    if stats.has_scene(expected):
+    if any(
+        isinstance(event.get("text"), str)
+        and bool(cast(str, event["text"]).strip())
+        and isinstance(value, str)
+        and expected.casefold() in value.casefold()
+        for event in events
+        for value in (event.get("scene"), event.get("context"))
+    ):
         return "verified", f"观察到 {expected} 的实际绘制"
     return "unverified", f"没有观察到 {expected} 的实际绘制"
 
@@ -487,11 +605,18 @@ def main() -> int:
             timeout=startup_timeout,
             process_exited=lambda: _owned_process_exited(process),
         )
-        _record_runtime_errors(work, startup.runtime_errors, stats)
+        _record_runtime_errors(work, startup.runtime_errors, stats, phase="startup")
+        current_observer = installation
+        if process.poll() is None:
+            startup_events, current_observer = _take_observation(connection)
+            _record_events(work, startup_events, stats, phase="startup")
         startup_screenshot: str | None = None
+        startup_screenshot_size: tuple[int, int] | None = None
         if startup.status != "ready" and process.poll() is None:
             startup_screenshot = "screenshots/00-startup.png"
-            files[startup_screenshot] = _capture_screenshot(connection)
+            startup_png = _capture_screenshot(connection)
+            startup_screenshot_size = decode_png_size(startup_png)
+            files[startup_screenshot] = startup_png
         observation_started = time.monotonic()
         if mode == "smoke":
             if startup.status != "ready":
@@ -507,34 +632,84 @@ def main() -> int:
                             "status": "unverified",
                             "evidence": reason,
                             "action": {"supported": False, "reason": f"startup_{startup.status}"},
+                            "event_sequence_start": _snapshot_sequence(current_observer),
+                            "event_sequence_end": _snapshot_sequence(current_observer),
+                            "observed_events": 0,
                             "observed_draws": 0,
                             "screenshot": None,
+                            "screenshot_width": None,
+                            "screenshot_height": None,
+                            "observer_start": current_observer,
+                            "observer_end": current_observer,
                         }
                     )
             else:
                 for index, name in enumerate(_SCENARIOS, start=1):
+                    transition_events, observer_start = _take_observation(connection)
+                    _record_events(
+                        work,
+                        transition_events,
+                        stats,
+                        phase="transition",
+                        scenario=name,
+                    )
+                    sequence_start = _snapshot_sequence(observer_start)
                     action = scenario_action(connection, name)
                     time.sleep(settle_ms / 1000.0)
-                    events = _take_events(connection)
-                    _record_events(work, events, stats)
+                    events, observer_end = _take_observation(connection)
+                    sequence_end = _snapshot_sequence(observer_end)
+                    if sequence_end < sequence_start or any(
+                        not sequence_start < _event_sequence(event) <= sequence_end for event in events
+                    ):
+                        raise CdpProtocolError("场景事件不在本场景观察序列边界内")
+                    draws = _record_events(
+                        work,
+                        events,
+                        stats,
+                        phase="scenario",
+                        scenario=name,
+                    )
                     runtime_errors = _take_runtime_errors(connection)
-                    _record_runtime_errors(work, runtime_errors, stats)
-                    status, evidence = _scenario_status(name, action, stats)
+                    _record_runtime_errors(
+                        work,
+                        runtime_errors,
+                        stats,
+                        phase="scenario",
+                        scenario=name,
+                    )
+                    screenshot_name = f"screenshots/{index:02d}-{name}.png"
+                    screenshot_png = _capture_screenshot(connection)
+                    screenshot_width, screenshot_height = decode_png_size(screenshot_png)
+                    files[screenshot_name] = screenshot_png
+                    status, evidence = scenario_status(
+                        name,
+                        action,
+                        draws,
+                        observer_start=observer_start,
+                        observer_end=observer_end,
+                        screenshot_size=(screenshot_width, screenshot_height),
+                    )
                     if runtime_errors:
                         status = "unverified"
                         evidence = "场景执行期间发生运行时错误"
-                    screenshot_name = f"screenshots/{index:02d}-{name}.png"
-                    files[screenshot_name] = _capture_screenshot(connection)
                     scenarios.append(
                         {
                             "name": name,
                             "status": status,
                             "evidence": evidence,
                             "action": action,
-                            "observed_draws": len(events),
+                            "event_sequence_start": sequence_start,
+                            "event_sequence_end": sequence_end,
+                            "observed_events": len(events),
+                            "observed_draws": len(draws),
                             "screenshot": screenshot_name,
+                            "screenshot_width": screenshot_width,
+                            "screenshot_height": screenshot_height,
+                            "observer_start": observer_start,
+                            "observer_end": observer_end,
                         }
                     )
+                    current_observer = observer_end
                     if runtime_errors:
                         for remaining in _SCENARIOS[index:]:
                             scenarios.append(
@@ -543,8 +718,15 @@ def main() -> int:
                                     "status": "unverified",
                                     "evidence": "前一场景发生运行时错误，未继续执行",
                                     "action": {"supported": False, "reason": "runtime_error"},
+                                    "event_sequence_start": sequence_end,
+                                    "event_sequence_end": sequence_end,
+                                    "observed_events": 0,
                                     "observed_draws": 0,
                                     "screenshot": None,
+                                    "screenshot_width": None,
+                                    "screenshot_height": None,
+                                    "observer_start": observer_end,
+                                    "observer_end": observer_end,
                                 }
                             )
                         break
@@ -557,9 +739,10 @@ def main() -> int:
                     while process.poll() is None and (deadline is None or time.monotonic() < deadline):
                         wait = 0.5 if deadline is None else min(0.5, max(0.0, deadline - time.monotonic()))
                         time.sleep(wait)
-                        _record_events(work, _take_events(connection), stats)
+                        events, current_observer = _take_observation(connection)
+                        _record_events(work, events, stats, phase="observe")
                         runtime_errors = _take_runtime_errors(connection)
-                        _record_runtime_errors(work, runtime_errors, stats)
+                        _record_runtime_errors(work, runtime_errors, stats, phase="observe")
                         if runtime_errors:
                             observation_stop = "runtime_error"
                             break
@@ -568,18 +751,27 @@ def main() -> int:
                 if observation_stop is None:
                     observation_stop = "game_closed" if process.poll() is not None else "duration_elapsed"
                 if process.poll() is None:
-                    _record_events(work, _take_events(connection), stats)
-                    _record_runtime_errors(work, _take_runtime_errors(connection), stats)
+                    events, current_observer = _take_observation(connection)
+                    _record_events(work, events, stats, phase="observe")
+                    _record_runtime_errors(
+                        work,
+                        _take_runtime_errors(connection),
+                        stats,
+                        phase="observe",
+                    )
                     files["screenshots/final.png"] = _capture_screenshot(connection)
         if process.poll() is None:
-            _record_runtime_errors(work, _take_runtime_errors(connection), stats)
-            installation = _mapping(
-                connection.evaluate(
-                    "({installed:!!window.__ATT_NW_OBSERVER__,hooks:__ATT_NW_OBSERVER__.installed,"
-                    "scene:__ATT_NW_OBSERVER__.scene(),polling:!!__ATT_NW_OBSERVER__.installTimer})"
-                )
+            trailing_events, current_observer = _take_observation(connection)
+            _record_events(work, trailing_events, stats, phase="trailing")
+            _record_runtime_errors(
+                work,
+                _take_runtime_errors(connection),
+                stats,
+                phase="trailing",
             )
+            installation = current_observer
         for name in (
+            "events.jsonl",
             "draws.jsonl",
             "english-candidates.jsonl",
             "pixel-overflows.jsonl",
@@ -592,7 +784,10 @@ def main() -> int:
                 path.write_text("", encoding="utf-8")
             files[name] = path
         summary: dict[str, object] = {
+            "event_count": stats.event_count,
+            "events_file": "events.jsonl",
             "draw_count": stats.draw_count,
+            "draws_file": "draws.jsonl",
             "english_candidate_count": stats.english_count,
             "english_candidates_file": "english-candidates.jsonl",
             "pixel_overflow_count": stats.overflow_count,
@@ -612,6 +807,7 @@ def main() -> int:
         has_unverified = bool(
             unverified_scenarios
             or mode == "observe"
+            or not _observer_ready(installation)
             or stats.glyph_fallback_unverified
             or stats.measurement_unverified_count
         )
@@ -628,6 +824,8 @@ def main() -> int:
             "game_root": str(game_root),
             "content_root": str(game.content_root),
             "owned_pid": process.pid,
+            "cdp_listener_pid": listener_pid,
+            "page_target": target.url,
             "input_confirmed_isolated_copy": True,
             "keyboard_injection_used": False,
             "startup": {
@@ -635,6 +833,12 @@ def main() -> int:
                 "scene": startup.scene,
                 "wait_seconds": startup.wait_seconds,
                 "screenshot": startup_screenshot,
+                "screenshot_width": (
+                    startup_screenshot_size[0] if startup_screenshot_size is not None else None
+                ),
+                "screenshot_height": (
+                    startup_screenshot_size[1] if startup_screenshot_size is not None else None
+                ),
             },
             "observer": installation,
             "scenarios": scenarios,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -34,6 +35,11 @@ from att_toolbox.fonts import (
     restore_font_state,
 )
 from att_toolbox.rpg import discover_game, require_game_root
+from att_toolbox.translation_export import (
+    projected_write_back_text,
+    read_translation_export,
+    translation_export_identity,
+)
 
 _BUNDLED_FONT_ROOT = Path(__file__).resolve().parents[1] / "assets" / "fonts"
 _BUNDLED_FONTS = {
@@ -56,7 +62,12 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         type=Path,
         default=[],
-        help="需要字体覆盖的 UTF-8 文本文件；可重复传入",
+        help="额外需要检查的 UTF-8 文本；只证明这些补充文本自身，可重复传入",
+    )
+    parser.add_argument(
+        "--translations",
+        type=Path,
+        help="当前 ATT translation export JSONL；项目 WriteBack 字符覆盖的唯一权威",
     )
     parser.add_argument("--replace", action="store_true", help="替换已存在的 Review JSON")
 
@@ -81,12 +92,65 @@ def _coverage_paths(arguments: argparse.Namespace) -> tuple[Path, ...]:
     return tuple(require_file(path, "字符覆盖文本") for path in cast(list[Path], arguments.coverage_text))
 
 
+def _visible_characters(text: str) -> str:
+    return "".join(
+        sorted(
+            {
+                character
+                for character in text
+                if character not in {"\ufeff", "\ufffe", "\xffff"} and not character.isspace()
+            },
+            key=ord,
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CoverageProjection:
+    translation_path: Path | None
+    translation_identity: dict[str, JsonValue] | None
+    project_text: str
+    additional_paths: tuple[Path, ...]
+    additional_text: str
+
+
+def _coverage_projection(arguments: argparse.Namespace) -> _CoverageProjection:
+    translation_argument = cast(Path | None, arguments.translations)
+    if translation_argument is None:
+        translation_path = None
+        identity = None
+        project_text = ""
+    else:
+        translation_path = require_file(translation_argument, "ATT Translation export JSONL")
+        rows = read_translation_export(translation_path)
+        project_text, _translated = projected_write_back_text(rows)
+        identity = translation_export_identity(translation_path, rows)
+    additional_paths = _coverage_paths(arguments)
+    additional_parts: list[str] = []
+    for path in additional_paths:
+        try:
+            additional_parts.append(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError) as error:
+            fail(
+                str(path),
+                f"额外字符覆盖文本无法按 UTF-8 读取（{type(error).__name__}）",
+                "修复或重新生成该补充文本",
+            )
+    return _CoverageProjection(
+        translation_path,
+        identity,
+        project_text,
+        additional_paths,
+        "".join(additional_parts),
+    )
+
+
 def _font_path(value: str) -> Path:
     bundled_name = _BUNDLED_FONTS.get(value)
     return _BUNDLED_FONT_ROOT / bundled_name if bundled_name is not None else Path(value)
 
 
-def _plan(arguments: argparse.Namespace) -> FontPlan:
+def _plan(arguments: argparse.Namespace, coverage: _CoverageProjection) -> FontPlan:
     game = discover_game(cast(Path, arguments.game))
     game_root = require_game_root(game)
     font = require_file(_font_path(cast(str, arguments.font)), "替换字体")
@@ -94,11 +158,16 @@ def _plan(arguments: argparse.Namespace) -> FontPlan:
         game_root=game_root,
         content_root=game.content_root,
         selected_font=font,
-        coverage_texts=_coverage_paths(arguments),
+        coverage_characters=coverage.project_text + coverage.additional_text,
     )
 
 
-def _font_report(plan: FontPlan, *, applied: bool) -> dict[str, JsonValue]:
+def _font_report(
+    plan: FontPlan,
+    *,
+    applied: bool,
+    coverage: _CoverageProjection,
+) -> dict[str, JsonValue]:
     assets: list[JsonValue] = [
         {
             "path": asset.relative_path,
@@ -146,12 +215,18 @@ def _font_report(plan: FontPlan, *, applied: bool) -> dict[str, JsonValue]:
         }
         for mutation in plan.mutations
     ]
-    if reviews or plan.coverage.missing_characters:
-        qa_status = "needs_review"
-    elif references and (applied or not plan.mutations):
-        qa_status = "clean"
-    else:
-        qa_status = "unverified"
+    project_characters = _visible_characters(coverage.project_text)
+    additional_characters = _visible_characters(coverage.additional_text)
+    missing = set(plan.coverage.missing_characters)
+    project_missing = "".join(character for character in project_characters if character in missing)
+    additional_missing = "".join(character for character in additional_characters if character in missing)
+    translation_projection_available = (
+        bool(project_characters) and coverage.translation_identity is not None
+    )
+    # Translation export 只能证明 ATT 当前导出在 WriteBack 语义下会产生哪些字符，
+    # 不能单独证明它覆盖了这个游戏副本的全部实际字体消费者。完整项目结论还需要
+    # 同源 Survey/coverage、实际 WriteBack 和运行副本之间的绑定；本工具不拥有这些输入。
+    qa_status = "needs_review" if reviews or plan.coverage.missing_characters else "unverified"
     return {
         "qa_status": qa_status,
         "applied": applied,
@@ -164,6 +239,14 @@ def _font_report(plan: FontPlan, *, applied: bool) -> dict[str, JsonValue]:
             "glyph_count": plan.coverage.glyph_count,
         },
         "coverage": {
+            "translation_export": coverage.translation_identity,
+            "translation_projection_available": translation_projection_available,
+            "scope": "translation_export_and_explicit_additions",
+            "project_checked_characters": project_characters,
+            "project_missing_characters": project_missing,
+            "additional_text_files": [str(path.resolve()) for path in coverage.additional_paths],
+            "additional_checked_characters": additional_characters,
+            "additional_missing_characters": additional_missing,
             "checked_characters": plan.coverage.checked_characters,
             "missing_characters": plan.coverage.missing_characters,
             "missing_count": len(plan.coverage.missing_characters),
@@ -176,10 +259,13 @@ def _font_report(plan: FontPlan, *, applied: bool) -> dict[str, JsonValue]:
         "mutation_count": len(mutations),
         "review": reviews,
         "review_count": len(reviews),
-        "review_required": bool(reviews),
+        "review_required": bool(reviews or plan.coverage.missing_characters),
         "no_op": not plan.mutations,
         "interpretation": (
             "apply 会处理 confirmed_references 指向的字体资源并保留已注册运行时别名；"
+            "项目字符只从当前 ATT Translation export 投影；该投影未与同源 Survey、coverage、"
+            "实际 WriteBack 和运行副本绑定，因此字体报告只给出 scoped/unverified 结论；"
+            "coverage-text 只证明补充文本自身；"
             "review 只包含动态、无法解析或未证明消费者的字体事实。"
         ),
     }
@@ -205,24 +291,35 @@ def _write_apply_marker(state: Path, report: dict[str, JsonValue]) -> None:
 
 
 def _run_inspect(arguments: argparse.Namespace) -> int:
-    plan = _plan(arguments)
+    coverage = _coverage_projection(arguments)
+    plan = _plan(arguments, coverage)
     output = cast(Path, arguments.output)
+    coverage_inputs = coverage.additional_paths
+    if coverage.translation_path is not None:
+        coverage_inputs = (coverage.translation_path, *coverage_inputs)
     protect_outputs(
         [output],
-        inputs=[plan.game_root, plan.selected_font, *_coverage_paths(arguments)],
+        inputs=[plan.game_root, plan.selected_font, *coverage_inputs],
         forbidden_roots=[plan.game_root],
         replace=cast(bool, arguments.replace),
     )
-    write_json(output, _font_report(plan, applied=False), replace=cast(bool, arguments.replace))
+    write_json(
+        output,
+        _font_report(plan, applied=False, coverage=coverage),
+        replace=cast(bool, arguments.replace),
+    )
     print(f"字体调查完成：{output.resolve(strict=False)}")
     return 0
 
 
 def _run_apply(arguments: argparse.Namespace) -> int:
-    plan = _plan(arguments)
+    coverage = _coverage_projection(arguments)
+    plan = _plan(arguments, coverage)
     output = cast(Path, arguments.output)
     state = cast(Path, arguments.state)
-    coverage_inputs = _coverage_paths(arguments)
+    coverage_inputs = coverage.additional_paths
+    if coverage.translation_path is not None:
+        coverage_inputs = (coverage.translation_path, *coverage_inputs)
     protect_outputs(
         [output],
         inputs=[plan.game_root, plan.selected_font, *coverage_inputs],
@@ -236,13 +333,21 @@ def _run_apply(arguments: argparse.Namespace) -> int:
         replace=False,
     )
     if not plan.mutations:
-        report = _font_report(plan, applied=False)
+        report = _font_report(
+            plan,
+            applied=False,
+            coverage=coverage,
+        )
         write_json(output, report, replace=cast(bool, arguments.replace))
         print(f"字体检查完成，无需写入：{output.resolve(strict=False)}")
         return 0
     atomic_write_directory(state, font_state_files(plan), replace=False)
     apply_font_plan(plan, state=state)
-    report = _font_report(plan, applied=True)
+    report = _font_report(
+        plan,
+        applied=True,
+        coverage=coverage,
+    )
     try:
         _write_apply_marker(state, report)
         write_json(output, report, replace=cast(bool, arguments.replace))

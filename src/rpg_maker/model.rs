@@ -11,6 +11,22 @@ use crate::translation::candidate_validation::is_structural_blank;
 use super::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, TextGroupKind};
 use crate::diagnostic::{RpgMakerDiagnosticRole, RpgMakerProjectionModelViolation};
 
+/// 按 MV/MZ JavaScript number 语义判断 402.parameters[0] 是否为整数。
+///
+/// 引擎只把该值与实际选择的整数作严格相等比较；不相等的分支自然不会执行，因此 ATT
+/// 不根据 102 的选项数量另造范围限制，也不需要把这个值转换成本机索引。
+pub(crate) fn choice_branch_value_is_integer(value: Option<&serde_json::Value>) -> bool {
+    let Some(number) = value.and_then(serde_json::Value::as_number) else {
+        return false;
+    };
+    if number.as_i64().is_some() || number.as_u64().is_some() {
+        return true;
+    }
+    number
+        .as_f64()
+        .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+}
+
 /// 标量字段的稳定、由提取器生成的语义键。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ScalarFieldKey(String);

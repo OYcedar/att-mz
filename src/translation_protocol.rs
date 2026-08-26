@@ -1601,14 +1601,34 @@ mod tests {
         );
 
         let quoted = parse_translation_response(r#"{"0":["type: "free""]}"#, mode(false, false))
-            .expect("无歧义的内部双引号应被转义");
+            .expect_err("内部双引号存在多种合理解释时必须拒绝整份响应");
         assert_eq!(
-            quoted.entries()[0]
-                .decode_translation_value_with_cancellation::<Infallible>(|| Ok(()))
-                .expect("未取消"),
-            DecodedTranslationAssistantValue::Translation(DecodedJsonStringArray::Strings(vec![
-                "type: \"free\"".to_owned(),
-            ]))
+            quoted.kind(),
+            TranslationTaskResponseParseErrorKind::JsonRepair {
+                category: TranslationTaskResponseJsonErrorCategory::Syntax,
+                repair: RepairErrorKind::AmbiguousStringQuote,
+            }
+        );
+
+        let adjacent =
+            parse_translation_response(r#"{"0":["第一行" "第二行"]}"#, mode(false, false))
+                .expect_err("空白分隔的相邻引号也不能被猜成两个译文数组项");
+        assert_eq!(
+            adjacent.kind(),
+            TranslationTaskResponseParseErrorKind::JsonRepair {
+                category: TranslationTaskResponseJsonErrorCategory::Syntax,
+                repair: RepairErrorKind::AmbiguousStringQuote,
+            }
+        );
+
+        let unterminated = parse_translation_response("{\"0\":[\"unfinished]}", mode(false, false))
+            .expect_err("未结束字符串不能由保守修复器补造结束引号");
+        assert_eq!(
+            unterminated.kind(),
+            TranslationTaskResponseParseErrorKind::JsonRepair {
+                category: TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
+                repair: RepairErrorKind::UnterminatedString,
+            }
         );
 
         let repaired_shape = parse_translation_response(

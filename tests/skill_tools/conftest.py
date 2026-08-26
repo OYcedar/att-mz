@@ -9,17 +9,16 @@ import pytest
 sys.dont_write_bytecode = True
 
 
-def _skill_bytecode_snapshot() -> tuple[tuple[str, str, int, int], ...]:
+def _skill_bytecode_snapshot() -> tuple[tuple[str, int, int], ...]:
     skill_root = Path(__file__).resolve().parents[2] / "skills"
-    entries: list[tuple[str, str, int, int]] = []
+    entries: list[tuple[str, int, int]] = []
     for path in skill_root.rglob("*"):
-        if path.name != "__pycache__" and path.suffix not in {".pyc", ".pyo"}:
+        if not path.is_file() or path.suffix not in {".pyc", ".pyo"}:
             continue
         metadata = path.stat()
         entries.append(
             (
                 path.relative_to(skill_root).as_posix(),
-                "directory" if path.is_dir() else "file",
                 metadata.st_size,
                 metadata.st_mtime_ns,
             )
@@ -31,5 +30,5 @@ _SKILL_BYTECODE_AT_PYTEST_START = _skill_bytecode_snapshot()
 
 
 @pytest.fixture(scope="session")
-def skill_bytecode_at_pytest_start() -> tuple[tuple[str, str, int, int], ...]:
+def skill_bytecode_at_pytest_start() -> tuple[tuple[str, int, int], ...]:
     return _SKILL_BYTECODE_AT_PYTEST_START

@@ -13,8 +13,6 @@ use std::sync::Arc;
 
 use language_tags::{LanguageTag, ParseError as LanguageTagParseError, ValidationError};
 
-use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
-
 const LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
 /// 已按 RFC 5646 验证并规范化的语言标签。
@@ -709,19 +707,6 @@ impl LanguageAnalysis {
 
 /// Translate 使用的源语言策略。
 pub(crate) trait LanguageModule: Send + Sync {
-    /// 返回仅由当前语言策略决定的稳定语义指纹。
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint;
-
-    fn semantic_fingerprint_with_cancellation(
-        &self,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<Sha256Fingerprint, LanguageOperationCancelled> {
-        ensure_running()?;
-        let fingerprint = self.semantic_fingerprint();
-        ensure_running()?;
-        Ok(fingerprint)
-    }
-
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis;
 
     fn find_source_residual(
@@ -917,28 +902,6 @@ impl JapaneseLanguageModule {
         Self { residual_policy }
     }
 
-    fn semantic_fingerprint_with_check<E>(
-        &self,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Sha256Fingerprint, E> {
-        ensure_running()?;
-        let chunk_size =
-            NonZeroUsize::new(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES).expect("检查块大小必须非零");
-        let mut hasher = Sha256FramedHasher::new(b"att.language.japanese");
-        hasher.frame(
-            1,
-            &u64::try_from(self.residual_policy.minimum_kana_characters.get())
-                .expect("x86_64 usize 必须可表示为 u64")
-                .to_be_bytes(),
-        );
-        for term in &self.residual_policy.allowed_terms {
-            ensure_running()?;
-            hasher.try_frame_chunks(2, term.as_bytes(), chunk_size, &mut ensure_running)?;
-        }
-        ensure_running()?;
-        Ok(hasher.finish())
-    }
-
     fn analyze_source_with_check<E>(
         &self,
         text: &LanguageText,
@@ -1001,20 +964,6 @@ pub(crate) struct JapaneseLanguageAnalysis {
 }
 
 impl LanguageModule for JapaneseLanguageModule {
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-        match self.semantic_fingerprint_with_check(|| Ok::<_, Infallible>(())) {
-            Ok(fingerprint) => fingerprint,
-            Err(unreachable) => match unreachable {},
-        }
-    }
-
-    fn semantic_fingerprint_with_cancellation(
-        &self,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<Sha256Fingerprint, LanguageOperationCancelled> {
-        self.semantic_fingerprint_with_check(ensure_running)
-    }
-
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
         match self.analyze_source_with_check(text, || Ok::<_, Infallible>(())) {
             Ok(analysis) => analysis,
@@ -1118,40 +1067,6 @@ impl EnglishLanguageModule {
         }
     }
 
-    fn semantic_fingerprint_with_check<E>(
-        &self,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Sha256Fingerprint, E> {
-        ensure_running()?;
-        let chunk_size =
-            NonZeroUsize::new(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES).expect("检查块大小必须非零");
-        let mut hasher = Sha256FramedHasher::new(b"att.language.english");
-        for (tag, value) in [
-            (1, self.detection_policy.minimum_word_count.get()),
-            (2, self.detection_policy.minimum_letter_count.get()),
-            (4, self.residual_policy.minimum_copied_word_count.get()),
-            (5, self.residual_policy.minimum_copied_letter_count.get()),
-        ] {
-            ensure_running()?;
-            hasher.frame(
-                tag,
-                &u64::try_from(value)
-                    .expect("x86_64 usize 必须可表示为 u64")
-                    .to_be_bytes(),
-            );
-        }
-        for term in &self.detection_policy.ignored_terms {
-            ensure_running()?;
-            hasher.try_frame_chunks(3, term.as_bytes(), chunk_size, &mut ensure_running)?;
-        }
-        for term in &self.residual_policy.allowed_terms {
-            ensure_running()?;
-            hasher.try_frame_chunks(6, term.as_bytes(), chunk_size, &mut ensure_running)?;
-        }
-        ensure_running()?;
-        Ok(hasher.finish())
-    }
-
     fn analyze_source_with_check<E>(
         &self,
         text: &LanguageText,
@@ -1244,20 +1159,6 @@ pub(crate) struct EnglishLanguageAnalysis {
 }
 
 impl LanguageModule for EnglishLanguageModule {
-    fn semantic_fingerprint(&self) -> Sha256Fingerprint {
-        match self.semantic_fingerprint_with_check(|| Ok::<_, Infallible>(())) {
-            Ok(fingerprint) => fingerprint,
-            Err(unreachable) => match unreachable {},
-        }
-    }
-
-    fn semantic_fingerprint_with_cancellation(
-        &self,
-        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
-    ) -> Result<Sha256Fingerprint, LanguageOperationCancelled> {
-        self.semantic_fingerprint_with_check(ensure_running)
-    }
-
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
         match self.analyze_source_with_check(text, || Ok::<_, Infallible>(())) {
             Ok(analysis) => analysis,
@@ -2003,37 +1904,6 @@ mod tests {
 
         assert_eq!(result, Err(LanguageOperationCancelled));
         assert_eq!(polls, 6);
-    }
-
-    #[test]
-    fn semantic_fingerprint_can_cancel_inside_a_long_policy_term() {
-        let long_term = "カ".repeat(LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES * 2);
-        let module = JapaneseLanguageModule::new(
-            JapaneseResidualPolicy::new(non_zero(2), [long_term]).expect("测试策略应有效"),
-        );
-        let expected = module.semantic_fingerprint();
-        let module: &dyn LanguageModule = &module;
-        let mut successful_polls = 0_usize;
-        let actual = module
-            .semantic_fingerprint_with_cancellation(&mut || {
-                successful_polls += 1;
-                Ok(())
-            })
-            .expect("检查不会取消");
-        assert_eq!(actual, expected);
-        assert!(successful_polls > 2);
-
-        let mut polls = 0_usize;
-        let cancelled = module.semantic_fingerprint_with_cancellation(&mut || {
-            polls += 1;
-            if polls == 4 {
-                Err(LanguageOperationCancelled)
-            } else {
-                Ok(())
-            }
-        });
-        assert_eq!(cancelled, Err(LanguageOperationCancelled));
-        assert_eq!(polls, 4);
     }
 
     #[test]

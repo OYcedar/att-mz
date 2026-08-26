@@ -47,14 +47,15 @@ target_task_user_message_characters = 24000
 
 - Prompt 的 `thinking_output` 与 `source_echo` 都必填，分别控制可读翻译思考和原文回显；
   两个开关互不排斥，可以同时开启；
-- 两个开关及其实际选择的 Prompt 内容都进入自动译文状态；改变任一开关会使受影响的
-  自动译文不再是 Current；
+- 两个开关及其实际选择的 Prompt 内容只决定后续模型请求的形状；改变它们
+  不会使既有人工或自动译文失去 Current；
 - `record_translation_tasks` 可省略，默认 `true`；只有操作者明确不需要可读的模型任务记录时才设为 `false`；
 - Profile 的 `id` 和 `llm_client` 必须非空；
 - `llm_client` 必须引用现有 Client；
 - `target_task_user_message_characters` 是正整数，是完整原文稳定投影的 TaskBlock 装箱目标，
   不是最终 user message 的硬上限；译文、术语、Placeholder token 和临时 ID 不参与装箱；
-- MV、MZ 和 Generic 共用 Profile 定义，但每个项目分别保存最近采用的 ID。
+- MV、MZ 和 Generic 共用 Profile 定义，但每个项目分别保存最近采用的 ID；
+  Profile 及其 Client 只选择未来请求，不定义既有译文正文的适用性。
 
 Prompt 文件和模型协议见[Prompt 规格](../translation/prompts.md)，任务记录见
 [任务记录规格](../translation/task-records.md)。
@@ -82,7 +83,8 @@ allowed_terms = ["Page Up", "Page Down"]
 每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
 模块。英语的 `ignored_terms`
 只改变译前准入；`allowed_terms` 只允许译文保留已经确认的英文项，不改变译前判断或临时
-ID 分配。WriteBack 不读取语言配置；它只按本规格的独立正文开关处理当前译文。完整语言
+ID 分配。这些语言检查阈值和允许项只用于后续准入与候选验收，不参与既有正文的
+Current 身份。WriteBack 不读取语言配置；它只按本规格的独立正文开关处理当前译文。完整语言
 语义见[语言规格](../translation/language.md)。
 
 ## 4. WriteBack 正文开关
@@ -113,6 +115,8 @@ complete_continuation_whitespace = true
 
 下面是发行模板采用的高吞吐配置。模型服务确有更低并发、限速、代理、证书或超时限制时，
 操作者按该服务的实际限制调整对应字段；这些外部限制不改变 ATT 的翻译验收和持久化语义。
+更换 Client、Endpoint、Model、协议、流式开关或 `parameters` 只影响之后实际发出的请求，不会让
+项目里已经接受的译文失去 Current，也不授权 Translate 或 WriteBack 删除它们。
 
 ```toml
 [llm.clients.primary]
@@ -120,6 +124,7 @@ protocol = "chat_completions"
 url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"
 model = "replace-with-model-id"
+stream = false
 max_concurrent_requests = 16
 connect_timeout_ms = 5000
 read_timeout_ms = 120000
@@ -137,6 +142,10 @@ parameters = '''
 只按该字段选择请求和响应协议，不从 URL 或模型名猜测。`url` 可以是包含供应商路径前缀的
 基础地址，也可以是已经以 `/chat/completions` 或 `/responses` 结尾的完整端点；ATT 会保留
 路径前缀和 query，并把已知后缀规范化为所选协议的路径。它不自行插入 `/v1` 等供应商版本路径。
+
+`stream` 是必填布尔值。`true` 以流式 HTTP 响应接收模型结果，`false` 等待完整 JSON。
+流式传输只改变 HTTP 接收方式；ATT 会等待协议的完整终态，再把组装后的同一份 Assistant
+正文交给翻译验收和任务记录，不提交或记录尚未结束的响应片段。
 
 `rate_limit` 整表可省略；一旦给出，两个值都必须为正。`proxy` 取 `false` 或一个
 不含凭据的 URL。`parameters` 是严格 JSON object，顶层留给 ATT 的 `model`、`stream`

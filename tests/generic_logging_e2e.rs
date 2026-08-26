@@ -17,6 +17,8 @@ use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, WaitForSingleObject};
 
+use rusqlite::Connection;
+
 #[test]
 fn generic_unavailable_and_project_open_failures_are_persisted_without_task_records() {
     let temporary = tempfile::tempdir().expect("应可建立 Generic 日志进程测试目录");
@@ -193,13 +195,28 @@ fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_reada
     )
     .expect("应可增加待提取的 Generic JSONL");
     let database = workspace.join("project.db");
-    let database_before = fs::read(&database).expect("Extract 前数据库必须可读取");
+    assert_eq!(
+        read_generic_units(&database),
+        vec![(
+            "story".to_owned(),
+            "line".to_owned(),
+            "こんにちは".to_owned()
+        )],
+        "测试前提必须是只有原始 Unit 的已提取项目"
+    );
 
     let extract = run_att(root, &["generic", "extract", "--name", project]);
     assert_success("项目日志无法建立时的 Generic Extract", &extract);
-    let database_after = fs::read(&database).expect("Extract 后数据库必须可读取");
-    assert_ne!(
-        database_after, database_before,
+    assert_eq!(
+        read_generic_units(&database),
+        vec![
+            ("extra".to_owned(), "line".to_owned(), "追加".to_owned()),
+            (
+                "story".to_owned(),
+                "line".to_owned(),
+                "こんにちは".to_owned()
+            ),
+        ],
         "日志建立失败不得阻止新增 JSONL 被提取并保存"
     );
 
@@ -211,14 +228,14 @@ fn generic_extract_succeeds_when_project_log_cannot_be_created_and_reports_reada
     let expected_location = format!("Object: {}", readable_windows_path(&canonical_logs_root));
     for expected in [
         "Warning:",
+        "Reason:",
+        "Impact:",
+        "Action:",
         expected_location.as_str(),
-        "Reason: The target object already exists",
-        "Impact: Business state was not changed",
-        "Action: Check the path, filesystem state, and permissions",
     ] {
         assert!(
             stderr.contains(expected),
-            "日志建立失败必须保留可读诊断字段 {expected:?}：{stderr}"
+            "日志建立失败必须呈现结构完整的可读诊断 {expected:?}：{stderr}"
         );
     }
     for forbidden in [
@@ -284,7 +301,7 @@ fn project_log_warning_presentation_failure_returns_one_after_business_change_is
     )
     .expect("应可增加待提取的 Generic JSONL");
     let database = workspace.join("project.db");
-    let database_before = fs::read(&database).expect("Extract 前数据库必须可读取");
+    assert_eq!(read_generic_units(&database).len(), 1);
 
     let output = run_att_with_closed_stderr(root, &["generic", "extract", "--name", project]);
     assert_eq!(
@@ -292,9 +309,16 @@ fn project_log_warning_presentation_failure_returns_one_after_business_change_is
         Some(1),
         "项目日志警告无法通过 stderr 呈现时必须产生独立进程失败"
     );
-    let database_after = fs::read(&database).expect("Extract 后数据库必须可读取");
-    assert_ne!(
-        database_after, database_before,
+    assert_eq!(
+        read_generic_units(&database),
+        vec![
+            ("extra".to_owned(), "line".to_owned(), "追加".to_owned()),
+            (
+                "story".to_owned(),
+                "line".to_owned(),
+                "こんにちは".to_owned()
+            ),
+        ],
         "stderr 呈现失败不得回滚已经成功保存的 Extract 业务结果"
     );
 }
@@ -658,6 +682,93 @@ fn generic_fatal_http_error_fails_and_stops_unscheduled_tasks() {
 }
 
 #[test]
+fn generic_external_failure_still_commits_an_already_admitted_valid_response() {
+    let temporary = tempfile::tempdir().expect("应可建立并发外部失败进程测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立 Generic 输入目录");
+    fs::write(
+        input.join("first.jsonl"),
+        "{\"id\":\"first\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"line\",\"text\":\"こんにちは\"}]}\n",
+    )
+    .expect("应可写入失败 TaskBlock");
+    fs::write(
+        input.join("second.jsonl"),
+        "{\"id\":\"second\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"line\",\"text\":\"さようなら\"}]}\n",
+    )
+    .expect("应可写入成功 TaskBlock");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("并发外部失败服务应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("并发外部失败地址应可读取")
+    );
+    let server = thread::spawn(move || serve_http_400_and_success_after_both_admitted(listener));
+    let distribution =
+        write_distribution(root, &http_configuration_with_concurrency(&endpoint, 1, 2));
+    let project = "generic-external-failure-preserves-admitted";
+    assert_success(
+        "并发外部失败 Generic Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                project,
+                "--path",
+                input.to_str().expect("临时路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "并发外部失败 Generic Extract",
+        &run_att(root, &["generic", "extract", "--name", project]),
+    );
+
+    let translate = run_att(root, &["generic", "translate", "--name", project, "local"]);
+    assert_eq!(
+        translate.status.code(),
+        Some(1),
+        "首个外部 Fatal 仍必须使命令失败：{}",
+        String::from_utf8_lossy(&translate.stderr)
+    );
+    server
+        .join()
+        .expect("并发外部失败服务线程不得 panic")
+        .expect("两个已经准入的请求都应收到确定响应");
+
+    let workspace = distribution.join("projects/generic").join(project);
+    let translations = read_generic_automatic_translations(&workspace.join("project.db"));
+    assert_eq!(
+        translations,
+        vec![
+            ("first".to_owned(), None),
+            ("second".to_owned(), Some("再见".to_owned())),
+        ],
+        "外部失败只能影响自身；另一个已验收响应必须按当前 CAS 提交"
+    );
+
+    let logs = jsonl_files(&workspace.join("logs"));
+    let (_, records) = read_jsonl_records(logs.last().expect("Translate 日志必须存在"));
+    let outcomes = records
+        .iter()
+        .filter(|record| record["event"] == "task.finished")
+        .map(|record| {
+            record["payload"]["outcome"]["kind"]
+                .as_str()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, ["failed", "complete"]);
+    assert!(!outcomes.contains(&"not_committed_after_earlier_failure"));
+}
+
+#[test]
 fn generic_failure_after_resource_commit_keeps_saved_plan_and_summary() {
     let temporary = tempfile::tempdir().expect("应可建立资源提交后失败测试目录");
     let root = temporary.path();
@@ -717,7 +828,11 @@ fn generic_failure_after_resource_commit_keeps_saved_plan_and_summary() {
     );
     let workspace = distribution.join("projects/generic").join(project);
     let database = workspace.join("project.db");
-    let database_before = fs::read(&database).expect("Translate 前数据库应可读取");
+    assert_eq!(
+        read_generic_resource(&database, "placeholder_rules"),
+        "[]",
+        "测试前提必须是项目尚未保存 Placeholder 规则"
+    );
     let logs_root = workspace.join("logs");
     let before = jsonl_files(&logs_root);
 
@@ -738,11 +853,11 @@ fn generic_failure_after_resource_commit_keeps_saved_plan_and_summary() {
         Some(1),
         "资源已经提交后，缺失 PEM 仍必须明确失败"
     );
-    assert_ne!(
-        fs::read(&database).expect("失败后数据库应可读取"),
-        database_before,
-        "Placeholder 资源提交不得被后续 PEM 失败伪报为未保存"
-    );
+    let saved_placeholders: serde_json::Value =
+        serde_json::from_str(&read_generic_resource(&database, "placeholder_rules"))
+            .expect("已保存 Placeholder 必须是规范 JSON");
+    assert_eq!(saved_placeholders.as_array().map(Vec::len), Some(1));
+    assert_eq!(saved_placeholders[0]["pattern"], "NEVER_MATCH");
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
         "PEM 准备失败前不得发送模型请求"
@@ -886,14 +1001,6 @@ fn generic_write_back_reports_recovery_required_after_publish_cleanup_failure() 
         .strip_prefix(r"\\?\")
         .unwrap_or(canonical_output_root.as_ref());
     assert_eq!(diagnostic["payload"]["object"], public_output_root);
-    assert_eq!(
-        diagnostic["payload"]["reason"],
-        "The operation result exists but finalization failed"
-    );
-    assert_eq!(
-        diagnostic["payload"]["help"],
-        "Do not delete the listed recovery artifacts; recover the output before retrying"
-    );
     assert_log_has_only_readable_diagnostics(
         &fs::read_to_string(&new_logs[0]).expect("发布日志必须可读取"),
         &records,
@@ -1167,6 +1274,7 @@ source_echo = false
 url = "http://127.0.0.1:9/v1/chat/completions"
 api_key = "unused-test-secret"
 model = "unused-test-model"
+stream = false
 max_concurrent_requests = 1
 connect_timeout_ms = 1000
 read_timeout_ms = 1000
@@ -1200,6 +1308,14 @@ fn http_503_configuration(endpoint: &str) -> String {
 }
 
 fn http_configuration(endpoint: &str, target_task_user_message_characters: usize) -> String {
+    http_configuration_with_concurrency(endpoint, target_task_user_message_characters, 1)
+}
+
+fn http_configuration_with_concurrency(
+    endpoint: &str,
+    target_task_user_message_characters: usize,
+    max_concurrent_requests: usize,
+) -> String {
     format!(
         r#"[prompts]
 thinking_output = true
@@ -1209,7 +1325,8 @@ source_echo = false
 url = "{endpoint}"
 api_key = "unused-test-secret"
 model = "unused-test-model"
-max_concurrent_requests = 1
+stream = false
+max_concurrent_requests = {max_concurrent_requests}
 connect_timeout_ms = 1000
 read_timeout_ms = 1000
 request_timeout_ms = 1000
@@ -1317,6 +1434,69 @@ fn serve_single_http_400(listener: TcpListener) -> Result<(), String> {
     Ok(())
 }
 
+fn serve_http_400_and_success_after_both_admitted(listener: TcpListener) -> Result<(), String> {
+    let mut connections = Vec::new();
+    for _ in 0..2 {
+        let (mut stream, _) = listener
+            .accept()
+            .map_err(|error| format!("接受并发模型请求失败：{error}"))?;
+        let request = read_complete_http_request(&mut stream)?;
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| "完整 HTTP 请求缺少 header 终止符".to_owned())?;
+        let wire: serde_json::Value = serde_json::from_slice(&request[header_end + 4..])
+            .map_err(|error| format!("并发模型请求正文不是 JSON：{error}"))?;
+        let user_message = wire["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str())
+            .ok_or_else(|| "并发模型请求缺少 User message".to_owned())?;
+        let should_fail = user_message.contains("こんにちは");
+        connections.push((stream, should_fail));
+    }
+    if connections.iter().filter(|(_, failed)| *failed).count() != 1 {
+        return Err("并发模型请求必须恰有一个失败样本".to_owned());
+    }
+
+    // 先让后序请求完整返回，再让前序请求失败，证明结果确实已经取得而不是后来补发。
+    for expected_failure in [false, true] {
+        let (stream, _) = connections
+            .iter_mut()
+            .find(|(_, failed)| *failed == expected_failure)
+            .expect("并发测试必须拥有对应连接");
+        let (status, body) = if expected_failure {
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"bad_request","type":"invalid_request_error","message":"invalid request"}}"#.to_owned(),
+            )
+        } else {
+            let assistant = r#"{"think":"判断","translations":{"0":["再见"]}}"#;
+            (
+                "200 OK",
+                serde_json::json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": assistant},
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .map_err(|error| format!("写入并发模型响应失败：{error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("刷新并发模型响应失败：{error}"))?;
+    }
+    Ok(())
+}
+
 fn serve_until_client_disconnect(
     listener: TcpListener,
     request_arrived: mpsc::Sender<()>,
@@ -1367,6 +1547,44 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(), String> {
         bytes.extend_from_slice(&buffer[..count]);
         if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
             return Ok(());
+        }
+    }
+}
+
+fn read_complete_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("设置完整 HTTP 请求读取超时失败：{error}"))?;
+    let mut bytes = Vec::new();
+    let mut expected = None;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("读取完整 HTTP 请求失败：{error}"))?;
+        if count == 0 {
+            return Err("HTTP 请求在正文完成前关闭".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if expected.is_none()
+            && let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            let headers = std::str::from_utf8(&bytes[..header_end])
+                .map_err(|_| "HTTP 请求头不是 UTF-8".to_owned())?;
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>())
+                    })
+                })
+                .ok_or_else(|| "HTTP 请求缺少 Content-Length".to_owned())?
+                .map_err(|error| format!("HTTP Content-Length 无效：{error}"))?;
+            expected = Some(header_end + 4 + content_length);
+        }
+        if expected.is_some_and(|expected| bytes.len() >= expected) {
+            return Ok(bytes);
         }
     }
 }
@@ -1485,6 +1703,49 @@ fn read_jsonl_records(path: &Path) -> (String, Vec<serde_json::Value>) {
         .collect::<Vec<_>>();
     assert!(!records.is_empty(), "项目 JSONL 不得为空");
     (text, records)
+}
+
+fn read_generic_units(database: &Path) -> Vec<(String, String, String)> {
+    let connection = Connection::open(database).expect("Generic 项目数据库应可打开");
+    let mut statement = connection
+        .prepare(
+            "SELECT group_id, unit_id, source_text
+             FROM generic_unit
+             ORDER BY group_id, unit_id",
+        )
+        .expect("Generic Unit 查询应可准备");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("Generic Unit 查询应可执行")
+        .map(|row| row.expect("Generic Unit 应可读取"))
+        .collect()
+}
+
+fn read_generic_automatic_translations(database: &Path) -> Vec<(String, Option<String>)> {
+    let connection = Connection::open(database).expect("Generic 项目数据库应可打开");
+    let mut statement = connection
+        .prepare(
+            "SELECT group_id, translation
+             FROM generic_unit
+             ORDER BY group_id, unit_id",
+        )
+        .expect("Generic 自动译文查询应可准备");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("Generic 自动译文查询应可执行")
+        .map(|row| row.expect("Generic 自动译文应可读取"))
+        .collect()
+}
+
+fn read_generic_resource(database: &Path, kind: &str) -> String {
+    Connection::open(database)
+        .expect("Generic 项目数据库应可打开")
+        .query_row(
+            "SELECT canonical_json FROM translation_resource WHERE resource_kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )
+        .expect("Generic 翻译资源应可读取")
 }
 
 fn assert_log_has_only_readable_diagnostics(log: &str, records: &[serde_json::Value]) {

@@ -5,7 +5,8 @@ att mv write-back --name NAME [--layout-rules FILE]
 att mz write-back --name NAME [--layout-rules FILE]
 ```
 
-WriteBack 不使用 Lua。它只读取冻结来源、当前提取资产和译文，在项目工作区生成：
+WriteBack 不使用 Lua，也不构造模型 Client、读取 Prompt/Profile 或发出模型请求。它只读取
+冻结来源、当前提取资产和译文，在项目工作区生成：
 
 ```text
 <att-dir>/projects/<mv|mz>/<name>/write_back/
@@ -16,7 +17,9 @@ WriteBack 不使用 Lua。它只读取冻结来源、当前提取资产和译文
 ## 1. 候选构建
 
 ATT 从冻结来源建立完整内容树，并按 recipe 把当前译文写回对应 RPG Maker 值。人工译文
-优先于自动译文。写回前先重新执行当前 Placeholder 和结构强校验；源语言残留仍只是一项
+优先于自动译文。自动正文的 V2 状态必须与当前源文、完整 Group 来源语境、项目语言对、
+位置、角色和写回结构精确匹配，写回前再独立执行当前 Placeholder 和结构强校验；两项都
+成立才会写回。Client、Profile、Prompt、术语和语言检查阈值不参与 V2 状态判断。源语言残留仍只是一项
 Review，不会拒绝候选或阻止 WriteBack。
 
 正文处理顺序为：可选自动译文标点修复、规则命中的自动排版、独立续行补空白，再按 recipe
@@ -37,11 +40,14 @@ Review，不会拒绝候选或阻止 WriteBack。
 - 普通字符串替换完整值；
 - 固定逐行或逐项内容保持规定的槽数和空槽；
 - 自由断行内容按数据库中的目标数组重建；
-- 对话、选项和滚动文本按事件命令结构重建；
+- 对话、选项和滚动文本按事件命令结构重建；选项只改写 `102.parameters[0]`，同层 `402`
+  的整数分支值及全部其他数据原样保留，不按 102 的选项数量重解释；
 - Rules 的嵌套 JSON、捕获与 Literal 按原 grammar 重新编码。
 
-未译或非 Current Unit 保留冻结原文。Partial 项目同样可以生成候选，结果会明确报告
-保留原文的数量。
+未译或非 Current Unit 保留冻结原文。不匹配当前语言对或 Group 来源语境的正文和状态仍保留
+在项目中，不发布，也不在 WriteBack 时删除；绑定事实恢复后，原 V2 状态可以重新匹配。
+Partial 项目同样可以生成候选，结果会明确报告保留
+原文的数量。
 
 WriteBack 不使用 Init 中的统一宽度，也不扫描全部文本猜测可换行位置。语言、术语、措辞和
 未被规则处理的运行时显示风险仍由译后 QA 生成 Review；需要修订时按自然 ID 使用

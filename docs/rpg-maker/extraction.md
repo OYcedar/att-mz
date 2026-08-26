@@ -98,15 +98,16 @@ Builtin 只读取下表中的标准字段。数据库数组里的 `null` 条目�
 
 | code | Builtin 文本与结构 |
 |---:|---|
-| `101` + 连续 `401` | 对话块；每条 `401.parameters[0]` 是一行正文。MZ 另把存在且非空白的 `101.parameters[4]` 作为 Speaker；MV 不读取该参数，而是按可选的 dialogue rules 从第一条 `401` 投影 Speaker。孤立 `401` 是结构错误。 |
-| `102`、同缩进 `402`、`404` | `102.parameters[0]` 是选项字符串数组；只要存在非空白选项，每个 `402.parameters[0]` 就必须是选项下标，`parameters[1]` 必须与对应选项完全一致，`404` 结束该组且所有分支必须完整出现。`402` 不建立独立译文。全部选项为空白时整个块忽略。 |
+| `101` + 连续 `401` | 对话块；每条 `401.parameters[0]` 是一行正文。MZ 把真值且非空白字符串的 `101.parameters[4]` 作为 Speaker；缺失或 JavaScript falsy 值表示没有 Speaker，真值非字符串无效。MV 不读取该参数，而是按可选的 dialogue rules 从第一条 `401` 投影 Speaker。孤立 `401` 是结构错误。 |
+| `102`、同缩进 `402`、`404` | `102.parameters[0]` 是唯一的选项显示字符串数组。现有同缩进 `402` 只把整数 `parameters[0]` 与实际选择值比较；ATT 不要求它落在 102 数组范围内，不相等的分支由引擎自然跳过。它的其他参数是编辑器冗余数据，不要求与 102 文案相等，也不要求每个选项都存在 `402`。`404` 结束该块，`402` 不建立独立译文。全部选项为空白时整个块忽略。 |
 | `105` + 连续 `405` | 滚动文本块；每条 `405.parameters[0]` 是一行正文。孤立 `405` 是结构错误。 |
 | `320` | `parameters[1]`：角色新 `name`。 |
 | `324` | `parameters[1]`：角色新 `nickname`。 |
 | `325` | `parameters[1]`：角色新 `profile`。 |
 
-MZ 的 `101.parameters[4]` 可以缺少；存在时必须是字符串，纯空白表示没有 Speaker。MV
-从不读取这个参数。`102` 的选项全部为空白时不建立 Unit；只要有一项非空，块内其他空白
+MZ 的 `101.parameters[4]` 可以缺少；JSON 中可达的 JavaScript falsy 值为 `null`、`false`、数值零
+和空字符串，它们都按没有 Speaker 处理。纯空白字符串同样不建立可翻译 Speaker。MV 从不
+读取这个参数。`102` 的选项全部为空白时不建立 Unit；只要有一项非空，块内其他空白
 选项仍作为位置槽保留。每条事件指令本身仍必须是对象，并具有整数 `code` 和数组
 `parameters`；“不提取某个 code”不表示接受损坏的事件列表结构。
 
@@ -130,14 +131,21 @@ MV/MZ `ownership export` 在一个只读快照中导出全部当前 Extract Unit
 owner 成功提交时：
 
 - 身份和源语境仍相同的 Unit 继承自动译文与状态；
-- 原文、形状、Group 语境或写回关系改变的 Unit 清除旧自动译文；
+- 只有兄弟 Unit 使完整 Group 语境改变时，仍能唯一对应的 Unit 保留自动正文和原状态；该状态
+  与新 Group 事实不匹配，因此不再 Current，也不参与 WriteBack 或后续模型语境；
+- 自身原文、形状或写回关系改变的 Unit 不继承旧自动译文；
 - 删除的 Unit 与自动状态一并删除；
 - 新 Unit 为未翻译。
 
 Extract 不删除 `rpg_maker_manual_translation`。位置不存在，或 Group kind、Unit 角色、写回
-recipe、正文形状或原文改变时，人工记录成为过期，但旧原文和译文继续保留。上下文、相邻
-文本、语言、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工失效。条件重新
+recipe、正文形状、原文或项目语言对改变时，人工记录成为过期，但旧原文和译文继续保留。
+完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工失效。条件重新
 匹配时，记录可以再次成为当前。
+
+Extract 替换 owner 快照时，同一自然位置和角色上的 Rejected 候选及其状态随 Unit 原样保留。
+只有带当前 V2 身份且与新事实精确匹配的状态才是 Current；未知或未标记状态不由现行命令
+改写，也永不作为 Current。绑定事实恢复后，原本有效的 V2 状态可以重新匹配。位置或角色已经
+不存在时没有可挂接的当前 Unit，候选随旧 Unit 删除。
 
 Extract 只负责提取，全程不发出模型请求。成功结果必须包含 owner、Group、Unit、冲突
 摘要和来源指纹，供 Translate 与 WriteBack 重新检查。

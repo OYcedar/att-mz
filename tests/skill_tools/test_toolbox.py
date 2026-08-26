@@ -68,16 +68,15 @@ def run_script(
     return result
 
 
-def skill_bytecode_snapshot(root: Path) -> tuple[tuple[str, str, int, int], ...]:
-    entries: list[tuple[str, str, int, int]] = []
+def skill_bytecode_snapshot(root: Path) -> tuple[tuple[str, int, int], ...]:
+    entries: list[tuple[str, int, int]] = []
     for path in root.rglob("*"):
-        if path.name != "__pycache__" and path.suffix not in {".pyc", ".pyo"}:
+        if not path.is_file() or path.suffix not in {".pyc", ".pyo"}:
             continue
         metadata = path.stat()
         entries.append(
             (
                 path.relative_to(root).as_posix(),
-                "directory" if path.is_dir() else "file",
                 metadata.st_size,
                 metadata.st_mtime_ns,
             )
@@ -597,7 +596,7 @@ translation = []
 
 
 def test_pytest_imports_do_not_write_skill_bytecode(
-    skill_bytecode_at_pytest_start: tuple[tuple[str, str, int, int], ...],
+    skill_bytecode_at_pytest_start: tuple[tuple[str, int, int], ...],
 ) -> None:
     assert skill_bytecode_snapshot(ROOT / "skills") == skill_bytecode_at_pytest_start
 
@@ -1047,7 +1046,12 @@ call() / maybe / flag;
     nested: object = {"caption": "Deep text"}
     for _ in range(12):
         nested = json.dumps(nested, ensure_ascii=False)
-    leaves = list(iter_string_leaves(cast(att_common.JsonValue, nested)))
+    leaves = list(
+        iter_string_leaves(
+            cast(att_common.JsonValue, nested),
+            decode_serialized_at=lambda _path, positions: len(positions) < 12,
+        )
+    )
     assert [(leaf.path, leaf.value, leaf.decoded_layers) for leaf in leaves] == [
         (("caption",), "Deep text", 12)
     ]
@@ -1135,16 +1139,31 @@ def test_bracketed_player_text_is_not_treated_as_nested_json(value: str) -> None
 
 def test_serialized_json_array_is_decoded() -> None:
     value = '["Gallery", {"label": "Ignite"}]'
-    leaves = list(iter_string_leaves(cast(att_common.JsonValue, value)))
+    ordinary = list(iter_string_leaves(cast(att_common.JsonValue, value)))
+    assert [(leaf.path, leaf.value, leaf.decoded_layers) for leaf in ordinary] == [((), value, 0)]
+    leaves = list(
+        iter_string_leaves(
+            cast(att_common.JsonValue, value),
+            decode_serialized_at=lambda _path, positions: not positions,
+        )
+    )
     assert [(leaf.path, leaf.value, leaf.decoded_layers) for leaf in leaves] == [
         ((0,), "Gallery", 1),
         ((1, "label"), "Ignite", 1),
     ]
 
 
-def test_damaged_serialized_json_array_fails_strictly() -> None:
+def test_json_looking_player_text_does_not_turn_a_guess_into_source_damage() -> None:
+    value = '["Gallery",]'
+    leaves = list(iter_string_leaves(cast(att_common.JsonValue, value)))
+    assert [(leaf.path, leaf.value, leaf.decoded_layers) for leaf in leaves] == [((), value, 0)]
     with pytest.raises(att_common.ToolError, match="JSON 语法错误"):
-        list(iter_string_leaves(cast(att_common.JsonValue, '["Gallery",]')))
+        list(
+            iter_string_leaves(
+                cast(att_common.JsonValue, value),
+                decode_serialized_at=lambda _path, positions: not positions,
+            )
+        )
 
 
 def test_terminology_exact_whitespace_and_control_contract(tmp_path: Path) -> None:

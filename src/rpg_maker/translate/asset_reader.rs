@@ -173,6 +173,8 @@ where
             .await
             .map_err(|error| map_query_error(database_path.clone(), error))?;
         let expected_source_snapshot = project.source_snapshot_fingerprint();
+        let source_language = project.source_language().as_str().to_owned();
+        let target_language = project.target_language().as_str().to_owned();
         let preparation_database_path = database_path.clone();
         let prepared = self
             .cpu
@@ -190,7 +192,9 @@ where
         let decode_database_path = database_path.clone();
         let decoded_units = self
             .cpu
-            .execute_ordered_map(prepared.units, move |row| decode_unit(row, active_owners))
+            .execute_ordered_map(prepared.units, move |row| {
+                decode_unit_for_language(row, active_owners, &source_language, &target_language)
+            })
             .await
             .map_err(
                 |source| RpgMakerTranslationAssetReadingError::ScheduleDecode {
@@ -1355,15 +1359,18 @@ struct DecodedUnit {
     semantic_order_key: RpgMakerSemanticOrderKey,
     source_content: TextUnitContent,
     source_context_json: String,
+    recipe_shape: String,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
     manual: bool,
     rejected: Option<RpgMakerStoredRejectedTranslation>,
 }
 
-fn decode_unit(
+fn decode_unit_for_language(
     OwnerSqliteRow { owner, row }: OwnerSqliteRow,
     active_owners: ActiveOwners,
+    source_language: &str,
+    target_language: &str,
 ) -> Result<DecodedUnit, InvalidRpgMakerTranslationAssetSnapshot> {
     if !active_owners.contains(owner) {
         return Err(InvalidRpgMakerTranslationAssetSnapshot::InactiveOwner(
@@ -1481,13 +1488,17 @@ fn decode_unit(
         RpgMakerProjectionCodec::encode_role_recipe_shape(&projection_recipe_json, &role)
             .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidRole)?;
     let expected_manual_state = crate::manual::rpg_maker_manual_applicability(
-        owner.storage_name(),
-        &group_location_raw,
-        kind.storage_name(),
-        &role_raw,
-        &recipe_shape,
-        manual_type,
-        &source_lines,
+        crate::manual::RpgMakerManualApplicabilityFacts {
+            owner: owner.storage_name(),
+            group_location: &group_location_raw,
+            kind: kind.storage_name(),
+            role: &role_raw,
+            recipe_shape: &recipe_shape,
+            translation_type: manual_type,
+            source_language,
+            target_language,
+            source: &source_lines,
+        },
     );
     let manual_translation = match (manual_translation_json, manual_state) {
         (None, None) => None,
@@ -1582,11 +1593,20 @@ fn decode_unit(
         semantic_order_key,
         source_content,
         source_context_json,
+        recipe_shape,
         translation,
         translation_state,
         manual,
         rejected,
     })
+}
+
+#[cfg(test)]
+fn decode_unit(
+    row: OwnerSqliteRow,
+    active_owners: ActiveOwners,
+) -> Result<DecodedUnit, InvalidRpgMakerTranslationAssetSnapshot> {
+    decode_unit_for_language(row, active_owners, "ja", "zh-Hans")
 }
 
 fn validate_persisted_source_content(
@@ -1840,6 +1860,7 @@ fn assemble_corpus(
             RpgMakerTranslationAsset::with_manual_semantic_order_key(
                 identity,
                 unit.semantic_order_key,
+                unit.recipe_shape,
                 unit.translation.expect("当前人工译文必须包含正文"),
                 unit.translation_state
                     .expect("当前人工译文必须包含结构指纹"),
@@ -1848,6 +1869,7 @@ fn assemble_corpus(
             RpgMakerTranslationAsset::with_rejected_semantic_order_key(
                 identity,
                 unit.semantic_order_key,
+                unit.recipe_shape,
                 unit.translation,
                 unit.translation_state,
                 unit.rejected,
@@ -2217,6 +2239,7 @@ mod tests {
                     ),
                     source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
                     source_context_json: "{}".to_owned(),
+                    recipe_shape: "[]".to_owned(),
                     translation: None,
                     translation_state: None,
                     manual: false,
@@ -2327,6 +2350,7 @@ mod tests {
             semantic_order_key,
             source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
             source_context_json: "{}".to_owned(),
+            recipe_shape: "[]".to_owned(),
             translation: None,
             translation_state: None,
             manual: false,

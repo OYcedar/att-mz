@@ -2498,13 +2498,16 @@ fn load_generic_entries(
     source_language: Option<&dyn LanguageModule>,
 ) -> Result<Vec<ManualTranslationEntry>, ManualDatabaseError> {
     let mut statement = connection.prepare(
-        "SELECT f.relative_path, g.group_id, g.ordinal, g.kind,
-                u.unit_id, u.ordinal, u.source_text, u.translation,
+        "SELECT f.relative_path, g.group_id, g.ordinal, g.kind, g.context_fingerprint,
+                u.unit_id, u.ordinal, u.source_text, u.translation, u.translation_state,
                 manual.readable_id, manual.source_json, manual.translation_json,
                 manual.applicability_fingerprint,
                 rejected.readable_id, rejected.origin, rejected.source_json,
-                rejected.candidate_json, rejected.violation_json
+                rejected.candidate_json, rejected.violation_json,
+                rejected.group_context, rejected.planning_state,
+                project.source_language, project.target_language
          FROM generic_file AS f
+         CROSS JOIN generic_project AS project
          JOIN generic_group AS g ON g.relative_path = f.relative_path
          JOIN generic_unit AS u ON u.group_id = g.group_id
          LEFT JOIN generic_manual_translation AS manual
@@ -2521,22 +2524,58 @@ fn load_generic_entries(
         let group_id: String = row.get(1)?;
         let line: i64 = row.get(2)?;
         let kind: String = row.get(3)?;
-        let unit_id: String = row.get(4)?;
-        let unit: i64 = row.get(5)?;
-        let source_text: String = row.get(6)?;
-        let automatic: Option<String> = row.get(7)?;
+        let group_context =
+            Sha256Fingerprint::from_slice(&row.get::<_, Vec<u8>>(4)?).map_err(|_| {
+                ManualDatabaseError::InvalidProject("Generic Group 语境指纹长度无效".to_owned())
+            })?;
+        let unit_id: String = row.get(5)?;
+        let unit: i64 = row.get(6)?;
+        let source_text: String = row.get(7)?;
+        let automatic: Option<String> = row.get(8)?;
+        let automatic_state: Option<Vec<u8>> = row.get(9)?;
+        let project_source_language: String = row.get(21)?;
+        let project_target_language: String = row.get(22)?;
+        let expected_automatic_applicability =
+            crate::translation::generic_automatic_applicability_v2(
+                &project_source_language,
+                &project_target_language,
+                &group_id,
+                &unit_id,
+                &source_text,
+                group_context,
+            );
+        let automatic = match (automatic, automatic_state) {
+            (None, None) => None,
+            (Some(translation), Some(state)) => {
+                let state = Sha256Fingerprint::from_slice(&state).map_err(|_| {
+                    ManualDatabaseError::InvalidProject("Generic 自动译文状态长度无效".to_owned())
+                })?;
+                crate::translation::generic_automatic_applicability_is_current(
+                    state,
+                    expected_automatic_applicability,
+                )
+                .then_some(translation)
+            }
+            _ => {
+                return Err(ManualDatabaseError::InvalidProject(
+                    "Generic 自动译文正文与状态不完整".to_owned(),
+                ));
+            }
+        };
         let stored_manual = parse_stored_generic_manual_translation(
-            row.get(8)?,
-            row.get(9)?,
             row.get(10)?,
             row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
         )?;
         let rejected_row = (
-            row.get::<_, Option<String>>(12)?,
-            row.get::<_, Option<String>>(13)?,
             row.get::<_, Option<String>>(14)?,
             row.get::<_, Option<String>>(15)?,
             row.get::<_, Option<String>>(16)?,
+            row.get::<_, Option<String>>(17)?,
+            row.get::<_, Option<String>>(18)?,
+            row.get::<_, Option<Vec<u8>>>(19)?,
+            row.get::<_, Option<Vec<u8>>>(20)?,
         );
         let source = source_text
             .split('\n')
@@ -2548,20 +2587,53 @@ fn load_generic_entries(
             natural_generic_ordinal(line, "行号")?,
             natural_generic_ordinal(unit, "Unit 序号")?,
         );
+        let automatic = automatic.filter(|translation| {
+            validate_translation_placeholders_with_cancellation(
+                placeholder_service,
+                placeholder_rules,
+                &id,
+                &kind,
+                &source_text,
+                translation,
+                || Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|unreachable| match unreachable {})
+            .is_ok()
+        });
         let rejected = match rejected_row {
-            (None, None, None, None, None) => None,
+            (None, None, None, None, None, None, None) => None,
             (
-                Some(readable_id),
+                Some(_readable_id),
                 Some(origin),
                 Some(rejected_source_json),
                 Some(candidate_json),
                 Some(violation_json),
+                Some(rejected_group_context),
+                Some(rejected_planning_state),
             ) => {
                 let rejected_source = serde_json::from_str::<Vec<String>>(&rejected_source_json)
                     .map_err(|_| {
                         ManualDatabaseError::InvalidProject(format!("{id} 的 Rejected 原文无效"))
                     })?;
-                if readable_id != id || rejected_source != source {
+                let rejected_group_context = Sha256Fingerprint::from_slice(&rejected_group_context)
+                    .map_err(|_| {
+                        ManualDatabaseError::InvalidProject(format!(
+                            "{id} 的 Rejected Group 语境指纹长度无效"
+                        ))
+                    })?;
+                let rejected_planning_state =
+                    Sha256Fingerprint::from_slice(&rejected_planning_state).map_err(|_| {
+                        ManualDatabaseError::InvalidProject(format!(
+                            "{id} 的 Rejected 适用状态长度无效"
+                        ))
+                    })?;
+                if rejected_source != source
+                    || rejected_group_context != group_context
+                    || !crate::translation::generic_automatic_applicability_is_current(
+                        rejected_planning_state,
+                        expected_automatic_applicability,
+                    )
+                {
                     None
                 } else {
                     Some(parse_manual_rejected_candidate(
@@ -2579,8 +2651,15 @@ fn load_generic_entries(
                 )));
             }
         };
-        let applicability =
-            generic_manual_applicability(&group_id, &unit_id, &readable_path, &kind, &source);
+        let applicability = generic_manual_applicability(
+            &group_id,
+            &unit_id,
+            &readable_path,
+            &kind,
+            &project_source_language,
+            &project_target_language,
+            &source,
+        );
         let current_manual = stored_manual
             .as_ref()
             .filter(|manual| manual.applicability == applicability);
@@ -2711,7 +2790,6 @@ fn load_rpg_maker_manual_command_snapshot(
                 service.clone(),
                 compiled.clone(),
                 source_language,
-                Sha256Fingerprint::from_bytes([0; 32]),
             )
         });
     let entries = load_rpg_maker_entries(connection, engine, semantics.as_ref())?;
@@ -2783,15 +2861,212 @@ pub(crate) fn load_rpg_maker_manual_lua_snapshot(
     })
 }
 
+struct ManualAutomaticApplicabilityUnit {
+    role: String,
+    semantic_order_key: Vec<u8>,
+    source_content_json: String,
+    source_context_json: String,
+}
+
+struct ManualAutomaticApplicabilityGroup {
+    owner: String,
+    location: String,
+    kind: String,
+    projection_recipe_json: String,
+    semantic_order_key: Vec<u8>,
+    units: Vec<ManualAutomaticApplicabilityUnit>,
+}
+
+#[derive(Clone, Copy)]
+struct ManualRpgMakerApplicability {
+    automatic: Sha256Fingerprint,
+    rejected: Sha256Fingerprint,
+}
+
+fn load_rpg_maker_automatic_applicability(
+    connection: &Connection,
+) -> Result<HashMap<(String, String, String), ManualRpgMakerApplicability>, ManualDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT g.owner, g.group_location, g.group_kind, g.projection_recipe_json,
+                g.semantic_order_key, u.unit_role, u.semantic_order_key,
+                u.source_content_json, u.source_context_json
+         FROM rpg_maker_text_group AS g
+         JOIN rpg_maker_text_unit AS u
+           ON u.owner = g.owner AND u.group_id = g.group_id
+         ORDER BY CASE g.owner WHEN 'builtin' THEN 0 ELSE 1 END,
+                  g.semantic_order_key, u.semantic_order_key",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut groups = Vec::<ManualAutomaticApplicabilityGroup>::new();
+    while let Some(row) = rows.next()? {
+        let owner: String = row.get(0)?;
+        let location: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let projection_recipe_json: String = row.get(3)?;
+        let group_order: Vec<u8> = row.get(4)?;
+        let role: String = row.get(5)?;
+        let unit_order: Vec<u8> = row.get(6)?;
+        let source_content_json: String = row.get(7)?;
+        let source_context_json: String = row.get(8)?;
+        if RpgMakerAssetOwner::from_storage_name(&owner).is_none() {
+            return Err(ManualDatabaseError::InvalidProject(
+                "RPG Maker 自动译文 owner 无效".to_owned(),
+            ));
+        }
+        let new_group = groups
+            .last()
+            .is_none_or(|group| group.owner != owner || group.location != location);
+        if new_group {
+            groups.push(ManualAutomaticApplicabilityGroup {
+                owner,
+                location,
+                kind,
+                projection_recipe_json,
+                semantic_order_key: group_order,
+                units: Vec::new(),
+            });
+        } else {
+            let group = groups.last().expect("已确认当前行属于已有 Group");
+            if group.kind != kind
+                || group.projection_recipe_json != projection_recipe_json
+                || group.semantic_order_key != group_order
+            {
+                return Err(ManualDatabaseError::InvalidProject(
+                    "RPG Maker Group 自动译文事实不一致".to_owned(),
+                ));
+            }
+        }
+        groups
+            .last_mut()
+            .expect("当前行必须建立或命中一个 Group")
+            .units
+            .push(ManualAutomaticApplicabilityUnit {
+                role,
+                semantic_order_key: unit_order,
+                source_content_json,
+                source_context_json,
+            });
+    }
+    drop(rows);
+    drop(statement);
+
+    if groups.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (source_language, target_language): (String, String) = connection
+        .query_row(
+            "SELECT source_language, target_language FROM metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(ManualDatabaseError::Sqlite)?;
+
+    let mut logical_group_indexes = HashMap::<String, Vec<usize>>::new();
+    for (index, group) in groups.iter().enumerate() {
+        logical_group_indexes
+            .entry(group.location.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut logical_group_contexts = HashMap::new();
+    for (location, indexes) in logical_group_indexes {
+        let definition = &groups[indexes[0]];
+        if indexes.iter().any(|index| {
+            groups[*index].kind != definition.kind
+                || groups[*index].semantic_order_key != definition.semantic_order_key
+        }) {
+            return Err(ManualDatabaseError::InvalidProject(format!(
+                "{location} 的跨 owner Group 定义不一致"
+            )));
+        }
+        let mut units = indexes
+            .iter()
+            .flat_map(|index| groups[*index].units.iter())
+            .collect::<Vec<_>>();
+        units.sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
+        let context = crate::translation::rpg_maker_group_source_context_v2(
+            &definition.kind,
+            units.iter().map(|unit| {
+                (
+                    unit.role.as_str(),
+                    unit.semantic_order_key.as_slice(),
+                    unit.source_content_json.as_str(),
+                    unit.source_context_json.as_str(),
+                )
+            }),
+        );
+        logical_group_contexts.insert(location, context);
+    }
+
+    let mut applicability = HashMap::new();
+    for group in groups {
+        let group_context = *logical_group_contexts
+            .get(&group.location)
+            .expect("每个物理 Group 必须属于一个完整逻辑 Group");
+        for unit in group.units {
+            let role = RpgMakerProjectionCodec::decode_role(&unit.role).map_err(|_| {
+                ManualDatabaseError::InvalidProject("RPG Maker 自动译文 Unit role 无效".to_owned())
+            })?;
+            let recipe_shape = RpgMakerProjectionCodec::encode_role_recipe_shape(
+                &group.projection_recipe_json,
+                &role,
+            )
+            .map_err(|_| {
+                ManualDatabaseError::InvalidProject("RPG Maker 自动译文写回结构无效".to_owned())
+            })?;
+            let automatic = crate::translation::rpg_maker_automatic_applicability_v2(
+                &source_language,
+                &target_language,
+                &group.owner,
+                &group.kind,
+                &group.location,
+                &unit.role,
+                &recipe_shape,
+                &unit.source_content_json,
+                &unit.source_context_json,
+                group_context,
+            );
+            let rejected = crate::translation::rpg_maker_rejected_applicability_v2(
+                &source_language,
+                &target_language,
+                &group.owner,
+                &group.kind,
+                &group.location,
+                &unit.role,
+                &recipe_shape,
+                &unit.source_content_json,
+                &unit.source_context_json,
+                group_context,
+            );
+            if applicability
+                .insert(
+                    (group.owner.clone(), group.location.clone(), unit.role),
+                    ManualRpgMakerApplicability {
+                        automatic,
+                        rejected,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ManualDatabaseError::InvalidProject(
+                    "RPG Maker 自动译文 Unit 重复".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(applicability)
+}
+
 fn load_rpg_maker_entries(
     connection: &Connection,
     _engine: RpgMakerEngine,
     semantics: Option<&ResolvedTranslationSemantics>,
 ) -> Result<Vec<ManualTranslationEntry>, ManualDatabaseError> {
+    let automatic_applicability = load_rpg_maker_automatic_applicability(connection)?;
     let mut statement = connection.prepare(
         "SELECT g.owner, g.group_location, g.group_kind, g.projection_recipe_json,
                 g.semantic_order_key, u.unit_role, u.source_content_json,
-                u.source_context_json, u.translation_content_json,
+                u.source_context_json, u.translation_content_json, u.translation_state,
                 u.semantic_order_key, manual.readable_id,
                 manual.translation_type, manual.source_json,
                 manual.translation_json, manual.applicability_fingerprint,
@@ -2799,8 +3074,11 @@ fn load_rpg_maker_entries(
                 rejected.readable_id, rejected.origin,
                 rejected.source_content_json, rejected.source_context_json,
                 rejected.candidate_json, rejected.translation_json,
-                rejected.violation_json
+                rejected.violation_json,
+                rejected.planning_state,
+                metadata.source_language, metadata.target_language
          FROM rpg_maker_text_group AS g
+         CROSS JOIN metadata
          JOIN rpg_maker_text_unit AS u
            ON u.owner = g.owner AND u.group_id = g.group_id
          LEFT JOIN rpg_maker_manual_translation AS manual
@@ -2835,24 +3113,28 @@ fn load_rpg_maker_entries(
         let source_json: String = row.get(6)?;
         let context_json: String = row.get(7)?;
         let automatic: Option<String> = row.get(8)?;
-        let unit_order_raw: Vec<u8> = row.get(9)?;
+        let automatic_state: Option<Vec<u8>> = row.get(9)?;
+        let unit_order_raw: Vec<u8> = row.get(10)?;
         let stored_manual = parse_stored_manual_translation(
-            row.get(10)?,
             row.get(11)?,
             row.get(12)?,
             row.get(13)?,
             row.get(14)?,
+            row.get(15)?,
         )?;
-        let rule_number: Option<i64> = row.get(15)?;
+        let rule_number: Option<i64> = row.get(16)?;
         let rejected_row = (
-            row.get::<_, Option<String>>(16)?,
             row.get::<_, Option<String>>(17)?,
             row.get::<_, Option<String>>(18)?,
             row.get::<_, Option<String>>(19)?,
             row.get::<_, Option<String>>(20)?,
             row.get::<_, Option<String>>(21)?,
             row.get::<_, Option<String>>(22)?,
+            row.get::<_, Option<String>>(23)?,
+            row.get::<_, Option<Vec<u8>>>(24)?,
         );
+        let source_language: String = row.get(25)?;
+        let target_language: String = row.get(26)?;
         let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(|| {
             ManualDatabaseError::InvalidProject("人工译文所属来源无效".to_owned())
         })?;
@@ -2935,15 +3217,16 @@ fn load_rpg_maker_entries(
         let source = rpg_maker_manual_source_lines(&content);
         let id = readable_rpg_maker_id(&group_location, kind, &role);
         let rejected = match rejected_row {
-            (None, None, None, None, None, None, None) => None,
+            (None, None, None, None, None, None, None, None) => None,
             (
-                Some(readable_id),
+                Some(_readable_id),
                 Some(origin),
                 Some(rejected_source_json),
                 Some(rejected_context_json),
                 Some(candidate_json),
                 translation_json,
                 Some(violation_json),
+                Some(planning_state),
             ) => {
                 let rejected_source = serde_json::from_str::<TextUnitContent>(
                     &rejected_source_json,
@@ -2951,9 +3234,29 @@ fn load_rpg_maker_entries(
                 .map_err(|_| {
                     ManualDatabaseError::InvalidProject(format!("{id} 的 Rejected 原文无效"))
                 })?;
-                if readable_id != id
-                    || rejected_source != content
+                let planning_state =
+                    Sha256Fingerprint::from_slice(&planning_state).map_err(|_| {
+                        ManualDatabaseError::InvalidProject(format!(
+                            "{id} 的 Rejected planning_state 无效"
+                        ))
+                    })?;
+                let expected_rejected = automatic_applicability
+                    .get(&(
+                        owner_raw.clone(),
+                        group_location_raw.clone(),
+                        role_raw.clone(),
+                    ))
+                    .ok_or_else(|| {
+                        ManualDatabaseError::InvalidProject(format!(
+                            "{id} 缺少 Rejected 适用性事实"
+                        ))
+                    })?;
+                if rejected_source != content
                     || rejected_context_json != identity.source_context_json()
+                    || !crate::translation::rpg_maker_rejected_applicability_is_current(
+                        planning_state,
+                        expected_rejected.rejected,
+                    )
                 {
                     None
                 } else {
@@ -2975,15 +3278,17 @@ fn load_rpg_maker_entries(
         let recipe_shape =
             RpgMakerProjectionCodec::encode_role_recipe_shape(&recipe_json, &role)
                 .map_err(|_| ManualDatabaseError::InvalidProject(format!("{id} 的写回结构无效")))?;
-        let applicability = rpg_maker_manual_applicability(
-            &owner_raw,
-            &group_location_raw,
-            &kind_raw,
-            &role_raw,
-            &recipe_shape,
-            manual_type,
-            &source,
-        );
+        let applicability = rpg_maker_manual_applicability(RpgMakerManualApplicabilityFacts {
+            owner: &owner_raw,
+            group_location: &group_location_raw,
+            kind: &kind_raw,
+            role: &role_raw,
+            recipe_shape: &recipe_shape,
+            translation_type: manual_type,
+            source_language: &source_language,
+            target_language: &target_language,
+            source: &source,
+        });
         let current_manual = stored_manual
             .as_ref()
             .filter(|manual| manual.applicability == applicability);
@@ -2991,14 +3296,38 @@ fn load_rpg_maker_entries(
             .as_ref()
             .filter(|manual| manual.applicability != applicability)
             .map(manual_outdated_snapshot);
-        let automatic = automatic
-            .as_deref()
-            .map(|value| {
-                serde_json::from_str::<TextUnitContent>(value).map_err(|_| {
-                    ManualDatabaseError::InvalidProject(format!("{id} 的自动译文无法读取"))
-                })
-            })
-            .transpose()?;
+        let automatic = match (automatic.as_deref(), automatic_state) {
+            (None, None) => None,
+            (Some(value), Some(state)) => {
+                let state = Sha256Fingerprint::from_slice(&state).map_err(|_| {
+                    ManualDatabaseError::InvalidProject(format!("{id} 的自动译文状态长度无效"))
+                })?;
+                let expected = automatic_applicability
+                    .get(&(
+                        owner_raw.clone(),
+                        group_location_raw.clone(),
+                        role_raw.clone(),
+                    ))
+                    .ok_or_else(|| {
+                        ManualDatabaseError::InvalidProject(format!("{id} 缺少自动译文适用性事实"))
+                    })?;
+                if crate::translation::rpg_maker_automatic_applicability_is_current(
+                    state,
+                    expected.automatic,
+                ) {
+                    Some(serde_json::from_str::<TextUnitContent>(value).map_err(|_| {
+                        ManualDatabaseError::InvalidProject(format!("{id} 的自动译文无法读取"))
+                    })?)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                return Err(ManualDatabaseError::InvalidProject(format!(
+                    "{id} 的自动译文正文与状态不完整"
+                )));
+            }
+        };
         let (current_translation, origin) = if let Some(manual) = current_manual {
             (
                 Some(manual.translation.clone()),
@@ -3545,6 +3874,8 @@ pub(crate) fn generic_manual_applicability(
     unit_id: &str,
     relative_path: &str,
     kind: &str,
+    source_language: &str,
+    target_language: &str,
     source: &[String],
 ) -> Sha256Fingerprint {
     let mut hasher = Sha256FramedHasher::new(b"att.generic.manual-translation");
@@ -3552,32 +3883,42 @@ pub(crate) fn generic_manual_applicability(
         .frame(1, group_id.as_bytes())
         .frame(2, unit_id.as_bytes())
         .frame(3, relative_path.as_bytes())
-        .frame(4, kind.as_bytes());
+        .frame(4, kind.as_bytes())
+        .frame(5, source_language.as_bytes())
+        .frame(6, target_language.as_bytes());
     for line in source {
-        hasher.frame(5, line.as_bytes());
+        hasher.frame(7, line.as_bytes());
     }
     hasher.finish()
 }
 
+pub(crate) struct RpgMakerManualApplicabilityFacts<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) group_location: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) role: &'a str,
+    pub(crate) recipe_shape: &'a str,
+    pub(crate) translation_type: ManualTranslationType,
+    pub(crate) source_language: &'a str,
+    pub(crate) target_language: &'a str,
+    pub(crate) source: &'a [String],
+}
+
 pub(crate) fn rpg_maker_manual_applicability(
-    owner: &str,
-    group_location: &str,
-    kind: &str,
-    role: &str,
-    recipe_shape: &str,
-    translation_type: ManualTranslationType,
-    source: &[String],
+    facts: RpgMakerManualApplicabilityFacts<'_>,
 ) -> Sha256Fingerprint {
     let mut hasher = Sha256FramedHasher::new(b"att.rpg-maker.manual-translation");
     hasher
-        .frame(1, owner.as_bytes())
-        .frame(2, group_location.as_bytes())
-        .frame(3, kind.as_bytes())
-        .frame(4, role.as_bytes())
-        .frame(5, recipe_shape.as_bytes())
-        .frame(6, manual_type_name(translation_type).as_bytes());
-    for line in source {
-        hasher.frame(7, line.as_bytes());
+        .frame(1, facts.owner.as_bytes())
+        .frame(2, facts.group_location.as_bytes())
+        .frame(3, facts.kind.as_bytes())
+        .frame(4, facts.role.as_bytes())
+        .frame(5, facts.recipe_shape.as_bytes())
+        .frame(6, manual_type_name(facts.translation_type).as_bytes())
+        .frame(7, facts.source_language.as_bytes())
+        .frame(8, facts.target_language.as_bytes());
+    for line in facts.source {
+        hasher.frame(9, line.as_bytes());
     }
     hasher.finish()
 }
@@ -3762,6 +4103,7 @@ mod tests {
     use super::*;
     use crate::generic::create_current_generic_schema_for_test;
     use crate::rpg_maker::project_database::create_current_rpg_maker_schema_for_test;
+    use crate::rpg_maker::text::StandardDataFile;
     use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
 
@@ -4557,6 +4899,110 @@ mod tests {
     }
 
     #[test]
+    fn generic_manual_rejected_uses_content_applicability_not_historical_readable_id() {
+        let connection = Connection::open_in_memory().expect("应建立 Generic 测试数据库");
+        create_current_generic_schema_for_test(&connection).expect("应建立当前 Generic schema");
+        let relative_path = Path::new("renamed.jsonl")
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let group_context = Sha256Fingerprint::from_bytes([81; 32]);
+        let current_state = crate::translation::generic_automatic_applicability_v2(
+            "ja",
+            "zh-Hans",
+            "g",
+            "u",
+            "原文",
+            group_context,
+        );
+        connection
+            .execute(
+                "INSERT INTO generic_project (
+                     singleton, project_name, source_root, source_language, target_language
+                 ) VALUES (1, 'game', X'0100', 'ja', 'zh-Hans')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_file (relative_path, ordinal) VALUES (?1, 0)",
+                [relative_path],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_group (
+                     group_id, relative_path, ordinal, kind, context_fingerprint
+                 ) SELECT 'g', relative_path, 0, 'dialogue', ?1 FROM generic_file",
+                [group_context.as_bytes().as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO generic_unit (group_id, unit_id, ordinal, source_text)
+                 VALUES ('g', 'u', 0, '原文')",
+                [],
+            )
+            .unwrap();
+        let violation = serde_json::to_string(&ProvenInvariantViolation::InvalidCandidateShape)
+            .expect("违反项应可编码");
+        connection
+            .execute(
+                "INSERT INTO generic_rejected_translation (
+                     group_id, unit_id, readable_id, origin, source_json, candidate_json,
+                     translation_shape, group_context, violation_json, planning_state
+                 ) VALUES ('g', 'u', 'old/path.jsonl:line9:unit9:text', 'automatic',
+                           '[\"原文\"]', '[\"旧候选\"]', 'free', ?1, ?2, ?3)",
+                params![
+                    group_context.as_bytes().as_slice(),
+                    violation,
+                    current_state.as_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        let service = GenericPlaceholderService::default();
+        let rules = service.compile(Vec::new()).unwrap();
+
+        let current = load_generic_entries(&connection, &service, &rules, None).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, "renamed.jsonl:line1:unit1:text");
+        assert_eq!(
+            current[0]
+                .rejected
+                .as_ref()
+                .and_then(|rejected| rejected.translation.as_deref()),
+            Some(["旧候选".to_owned()].as_slice()),
+            "历史 readable_id 变化不得隐藏仍适用的 Rejected"
+        );
+        connection
+            .execute(
+                "UPDATE generic_project SET target_language = 'en' WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        let other_language = load_generic_entries(&connection, &service, &rules, None).unwrap();
+        assert!(other_language[0].rejected.is_none());
+
+        connection
+            .execute(
+                "UPDATE generic_project SET target_language = 'zh-Hans' WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE generic_group SET context_fingerprint = ?1 WHERE group_id = 'g'",
+                [Sha256Fingerprint::from_bytes([83; 32])
+                    .as_bytes()
+                    .as_slice()],
+            )
+            .unwrap();
+        let other_context = load_generic_entries(&connection, &service, &rules, None).unwrap();
+        assert!(other_context[0].rejected.is_none());
+    }
+
+    #[test]
     fn generic_manual_commands_reject_a_trigger_attached_to_a_managed_table() {
         let directory = tempfile::tempdir().expect("应建立 Generic schema 测试目录");
         let database = directory.path().join("project.db");
@@ -4752,6 +5198,133 @@ mod tests {
     }
 
     #[test]
+    fn rpg_maker_manual_applicability_uses_the_complete_cross_owner_group() {
+        let connection = Connection::open_in_memory().expect("应建立内存数据库");
+        create_current_rpg_maker_schema_for_test(&connection).expect("应建立当前 schema");
+        connection
+            .execute_batch(
+                "INSERT INTO metadata VALUES ('game', 'ja', 'zh-Hans', zeroblob(32));
+                 INSERT INTO rpg_maker_asset_owner_state VALUES
+                    ('builtin', zeroblob(32), zeroblob(32)),
+                    ('rules', zeroblob(32), zeroblob(32));",
+            )
+            .expect("应建立项目语言事实");
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::Items),
+            vec![RpgMakerLocationStep::index(1)],
+        );
+        let location_raw = RpgMakerLocationCodec::encode(&location).expect("位置应可编码");
+        let group_order = RpgMakerSemanticOrderKey::new(vec![1], 0)
+            .encode()
+            .expect("Group 顺序应可编码");
+        let builtin_order = RpgMakerSemanticOrderKey::new(vec![1], 1)
+            .encode()
+            .expect("Builtin Unit 顺序应可编码");
+        let rules_order = RpgMakerSemanticOrderKey::new(vec![1], 2)
+            .encode()
+            .expect("Rules Unit 顺序应可编码");
+        let builtin_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::Scalar(
+            ScalarFieldKey::new("name").expect("Builtin role 应合法"),
+        ))
+        .expect("Builtin role 应可编码");
+        let rules_role = RpgMakerProjectionCodec::encode_role(&TextUnitRole::Scalar(
+            ScalarFieldKey::new("note").expect("Rules role 应合法"),
+        ))
+        .expect("Rules role 应可编码");
+        for (owner, group_id, role, rule_number, order, source) in [
+            (
+                "builtin",
+                1_i64,
+                builtin_role.as_str(),
+                None,
+                builtin_order.clone(),
+                r#""名称""#,
+            ),
+            (
+                "rules",
+                1_i64,
+                rules_role.as_str(),
+                Some(1_i64),
+                rules_order.clone(),
+                r#""备注""#,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO rpg_maker_text_group VALUES (?1, ?2, ?3, ?4, 'database_entry', '[]')",
+                    params![owner, group_id, &location_raw, &group_order],
+                )
+                .expect("跨 owner Group 应可写入");
+            connection
+                .execute(
+                    "INSERT INTO rpg_maker_text_unit (
+                         owner, group_id, unit_role, rule_number, semantic_order_key,
+                         source_content_json, source_context_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
+                    params![owner, group_id, role, rule_number, order, source],
+                )
+                .expect("跨 owner Unit 应可写入");
+        }
+
+        let actual = load_rpg_maker_automatic_applicability(&connection)
+            .expect("Manual 应建立跨 owner 完整 Group 适用性");
+        let complete_context = crate::translation::rpg_maker_group_source_context_v2(
+            "database_entry",
+            [
+                (
+                    builtin_role.as_str(),
+                    builtin_order.as_slice(),
+                    r#""名称""#,
+                    "{}",
+                ),
+                (
+                    rules_role.as_str(),
+                    rules_order.as_slice(),
+                    r#""备注""#,
+                    "{}",
+                ),
+            ]
+            .into_iter(),
+        );
+        let builtin = actual
+            .get(&(
+                "builtin".to_owned(),
+                location_raw.clone(),
+                builtin_role.clone(),
+            ))
+            .expect("Builtin Unit 应有适用性");
+        assert_eq!(
+            builtin.automatic,
+            crate::translation::rpg_maker_automatic_applicability_v2(
+                "ja",
+                "zh-Hans",
+                "builtin",
+                "database_entry",
+                &location_raw,
+                &builtin_role,
+                "[]",
+                r#""名称""#,
+                "{}",
+                complete_context,
+            )
+        );
+        let owner_only = crate::translation::rpg_maker_group_source_context_v2(
+            "database_entry",
+            [(
+                builtin_role.as_str(),
+                builtin_order.as_slice(),
+                r#""名称""#,
+                "{}",
+            )]
+            .into_iter(),
+        );
+        assert_ne!(
+            complete_context, owner_only,
+            "Rules sibling 必须进入 Manual/Lua Group 事实"
+        );
+    }
+
+    #[test]
     fn rpg_maker_manual_commands_reject_a_trigger_attached_to_a_managed_table() {
         let directory = tempfile::tempdir().expect("应建立 RPG Maker schema 测试目录");
         let database = directory.path().join("project.db");
@@ -4778,7 +5351,10 @@ mod tests {
         let unit_order = RpgMakerSemanticOrderKey::new(vec![0], 1).encode().unwrap();
         connection
             .execute_batch(
-                "INSERT INTO rpg_maker_asset_owner_state
+                "INSERT INTO metadata (
+                     name, source_language, target_language, source_snapshot_fingerprint
+                 ) VALUES ('game', 'ja', 'zh-Hans', zeroblob(32));
+                 INSERT INTO rpg_maker_asset_owner_state
                      VALUES ('builtin', zeroblob(32), zeroblob(32));",
             )
             .expect("应建立 RPG Maker owner 状态");
