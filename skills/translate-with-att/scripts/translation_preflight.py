@@ -300,7 +300,6 @@ def _coverage_context(
             or manual_id in unit_projection
             or owner not in {"builtin", "rules"}
             or not isinstance(item.get("source_text"), str)
-            or item.get("manual_type") not in {"fixed", "free"}
             or not isinstance(item.get("control_contract"), dict)
         ):
             fail("coverage.json", f"unit_projection 第 {number} 项无效或冲突", "重新运行 finalize")
@@ -323,13 +322,10 @@ def _coverage_context(
     contexts: list[dict[str, JsonValue]] = []
     for entry in manual_entries:
         location = unit_projection[entry.readable_id]
-        if (
-            location.get("source_text") != "\n".join(entry.source)
-            or location.get("manual_type") != entry.translation_type
-        ):
+        if location.get("source_text") != "\n".join(entry.source):
             fail(
                 entry.readable_id,
-                "Manual 原文或形状不能映射回 finalize 的 Unit 投影",
+                "Manual 原文不能映射回 finalize 的 Unit 投影",
                 "停止使用旧调查；对当前游戏重新 scan、finalize、Extract 和 audit",
             )
         control_contract = location.get("control_contract")

@@ -199,7 +199,6 @@ def scan_game(game_path: Path) -> SurveyBundle:
                         leaf.decode_positions,
                         source_file=path.name,
                     ),
-                    manual_type="fixed",
                     roles={"unknown"},
                     evidence=[*rule_evidence, *lexical_suggestion(leaf.value)],
                 )
@@ -287,7 +286,6 @@ def scan_game(game_path: Path) -> SurveyBundle:
                             command_group_steps=event.command_steps,
                             command_path_has_index=any(isinstance(step, int) for step in leaf.path),
                         ),
-                        manual_type="fixed",
                         roles={"unknown"},
                         evidence=[*rule_evidence, *lexical_suggestion(leaf.value)],
                     )

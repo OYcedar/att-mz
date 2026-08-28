@@ -32,7 +32,6 @@ class LocationFact:
     decode_positions: tuple[int, ...] = ()
     rule: dict[str, JsonValue] | None = None
     expected_manual_id: str | None = None
-    manual_type: str | None = None
     control_contract: dict[str, JsonValue] | None = None
     roles: set[str] = field(default_factory=set)
     evidence: list[dict[str, JsonValue]] = field(default_factory=list)
@@ -61,8 +60,6 @@ class LocationFact:
             value["rule"] = self.rule
         if self.expected_manual_id is not None:
             value["expected_manual_id"] = self.expected_manual_id
-        if self.manual_type is not None:
-            value["manual_type"] = self.manual_type
         if self.control_contract is not None:
             value["control_contract"] = self.control_contract
         if self.resource is not None:

@@ -496,7 +496,6 @@ def _coverage_projection(
             or not isinstance(candidate_id, str)
             or candidate_id not in locations_by_id
             or owner not in {"builtin", "rules"}
-            or item.get("manual_type") not in {"fixed", "free"}
             or not isinstance(item.get("source_text"), str)
             or not isinstance(item.get("source"), str)
         ):
@@ -735,13 +734,12 @@ def _bind_rpg_export_to_coverage(
         actual_rule = row.get("rule_number")
         if (
             "\n".join(cast(list[str], row["source"])) != expected.get("source_text")
-            or row.get("type") != expected.get("manual_type")
             or row.get("owner") != expected.get("owner")
             or actual_rule != expected_rule
         ):
             fail(
                 "Translation export",
-                f"{manual_id} 与 coverage 的来源、类型或所有权不一致",
+                f"{manual_id} 与 coverage 的来源或所有权不一致",
                 "使用同一项目最新 Extract 后的完整 translation export",
             )
 

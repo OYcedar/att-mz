@@ -700,7 +700,6 @@ def scan_code_sources(
                         decode_positions=physical_decode_positions,
                         rule=rule,
                         expected_manual_id=expected_manual_id,
-                        manual_type="fixed",
                         roles=roles,
                         evidence=[*evidence, *rule_evidence, *lexical_suggestion(leaf.value)],
                     )

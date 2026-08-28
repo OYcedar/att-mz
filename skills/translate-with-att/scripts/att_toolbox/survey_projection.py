@@ -48,7 +48,6 @@ def read_rules_manifest(path: Path) -> list[dict[str, JsonValue]]:
 def _projection_row(
     manual_id: str,
     source_text: str,
-    manual_type: str,
     control_contract: Mapping[str, JsonValue],
     location: Mapping[str, JsonValue],
     *,
@@ -58,7 +57,6 @@ def _projection_row(
     row: dict[str, JsonValue] = {
         "manual_id": manual_id,
         "source_text": source_text,
-        "manual_type": manual_type,
         "control_contract": dict(control_contract),
         "source": cast(str, location["source"]),
         "candidate_id": cast(str, location["candidate_id"]),
@@ -83,13 +81,11 @@ def project_builtin_units(
         if not isinstance(manual_id, str):
             continue
         source_text = item.get("source_text")
-        manual_type = item.get("manual_type")
         control_contract = item.get("control_contract")
         source = item.get("source")
         candidate_id = item.get("candidate_id")
         if (
             not isinstance(source_text, str)
-            or manual_type not in {"fixed", "free"}
             or not isinstance(control_contract, dict)
             or not isinstance(source, str)
             or not isinstance(candidate_id, str)
@@ -99,7 +95,6 @@ def project_builtin_units(
             _projection_row(
                 manual_id,
                 source_text,
-                cast(str, manual_type),
                 control_contract,
                 item,
                 owner="builtin",
@@ -154,12 +149,10 @@ def project_rule_units(
             natural_location = location.get("location")
             manual_id = location.get("expected_manual_id")
             source_text = location.get("source_text")
-            manual_type = location.get("manual_type")
             if (
                 not isinstance(natural_location, str)
                 or not isinstance(manual_id, str)
                 or not isinstance(source_text, str)
-                or manual_type not in {"fixed", "free"}
             ):
                 fail("locations.jsonl", f"{raw_candidate_id} 缺少 Rules 投影事实", "重新运行 scan")
             item_locations.append(natural_location)
@@ -192,7 +185,6 @@ def project_rule_units(
                     _projection_row(
                         projected_id,
                         projected_text,
-                        cast(str, manual_type),
                         contract,
                         location,
                         owner="rules",

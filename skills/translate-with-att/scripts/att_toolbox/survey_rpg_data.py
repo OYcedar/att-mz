@@ -137,7 +137,6 @@ def builtin_database_locations(
                         physical_file=relative_files[file_name],
                         json_path=(index, field_name),
                         expected_manual_id=f"{file_name}:{index}:{readable_component(field_name)}",
-                        manual_type="fixed",
                         control_contract=database_control_contract(engine, file_name, field_name).json(),
                         roles={"display"},
                     )
@@ -175,7 +174,6 @@ def builtin_system_locations(
                     kind="system",
                     role=role,
                 ),
-                manual_type="fixed",
                 control_contract=system_control_contract(path).json(),
                 roles={"display"},
             )
@@ -257,7 +255,6 @@ def builtin_event_locations(
                                     kind="event_dialogue",
                                     role="speaker",
                                 ),
-                                manual_type="fixed",
                                 control_contract=event_control_contract(
                                     "event_dialogue", "speaker", engine
                                 ).json(),
@@ -280,7 +277,6 @@ def builtin_event_locations(
                                 kind="event_dialogue",
                                 role=None,
                             ),
-                            manual_type="free",
                             control_contract=event_control_contract("event_dialogue").json(),
                             roles={"display"},
                             dialogue_first_line=lines[0] if engine == "mv" else None,
@@ -307,7 +303,6 @@ def builtin_event_locations(
                                 kind="event_choices",
                                 role=None,
                             ),
-                            manual_type="fixed",
                             control_contract=event_control_contract("event_choices").json(),
                             roles={"display"},
                         )
@@ -337,7 +332,6 @@ def builtin_event_locations(
                                 kind="event_scrolling_text",
                                 role=None,
                             ),
-                            manual_type="free",
                             control_contract=event_control_contract("event_scrolling_text").json(),
                             roles={"display"},
                         )
@@ -363,7 +357,6 @@ def builtin_event_locations(
                                 kind="event_command",
                                 role=field_name,
                             ),
-                            manual_type="fixed",
                             control_contract=event_control_contract("event_command", field_name).json(),
                             roles={"display"},
                         )
@@ -388,7 +381,6 @@ def builtin_event_locations(
                     physical_file=relative_files[name],
                     json_path=("displayName",),
                     expected_manual_id=f"{name}:displayName",
-                    manual_type="fixed",
                     control_contract=event_control_contract("map").json(),
                     roles={"display"},
                 )

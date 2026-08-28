@@ -71,7 +71,6 @@ def write_survey(tmp_path: Path) -> tuple[Path, Path]:
             "source_text": r"Use %1does and {{name}} \V[1]",
             "classification": "builtin",
             "expected_manual_id": "Map001.json:event1:page1:command1",
-            "manual_type": "fixed",
             "control_contract": {"consumer": "message_text"},
             "review_group_id": "shared-consumer-shape",
         },
@@ -81,7 +80,6 @@ def write_survey(tmp_path: Path) -> tuple[Path, Path]:
             "source_text": "Accept\n\nCancel",
             "classification": "builtin",
             "expected_manual_id": "Map001.json:event1:page1:choices2",
-            "manual_type": "fixed",
             "control_contract": {"consumer": "extended_text"},
         },
         {
@@ -90,7 +88,6 @@ def write_survey(tmp_path: Path) -> tuple[Path, Path]:
             "source_text": "Start \\Token[\nvalue] {{name}}",
             "classification": "review",
             "expected_manual_id": "Map001.json:event1:page1:command3",
-            "manual_type": "free",
             "review_group_id": "shared-consumer-shape",
         },
         {
@@ -99,7 +96,6 @@ def write_survey(tmp_path: Path) -> tuple[Path, Path]:
             "source_text": "\f",
             "classification": "builtin",
             "expected_manual_id": "Map001.json:event1:page1:dialogue4",
-            "manual_type": "fixed",
             "control_contract": {"consumer": "message_text"},
         },
     ]
@@ -156,7 +152,6 @@ def write_survey(tmp_path: Path) -> tuple[Path, Path]:
                     {
                         "manual_id": location["expected_manual_id"],
                         "source_text": location["source_text"],
-                        "manual_type": location["manual_type"],
                         "control_contract": location.get(
                             "control_contract",
                             {"consumer": "plain_text"},
@@ -199,12 +194,14 @@ def write_single_preflight_case(
     manual_id: str,
     source_text: str,
     control_contract: dict[str, object],
+    translation_type: str = "fixed",
 ) -> tuple[Path, Path, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     manual = tmp_path / "single.toml"
     manual.write_text(
         "[[translation]]\n"
         f"id = {json.dumps(manual_id)}\n"
-        "type = 'fixed'\n"
+        f"type = {json.dumps(translation_type)}\n"
         f"source = [{json.dumps(source_text)}]\n"
         "translation = ['']\n",
         encoding="utf-8",
@@ -222,7 +219,6 @@ def write_single_preflight_case(
         "source_text": source_text,
         "classification": "builtin",
         "expected_manual_id": manual_id,
-        "manual_type": "fixed",
         "control_contract": control_contract,
     }
     (survey / "survey.json").write_text(
@@ -262,7 +258,6 @@ def write_single_preflight_case(
                     {
                         "manual_id": manual_id,
                         "source_text": source_text,
-                        "manual_type": "fixed",
                         "control_contract": control_contract,
                         "source": location["source"],
                         "candidate_id": location["candidate_id"],
@@ -274,6 +269,47 @@ def write_single_preflight_case(
         encoding="utf-8",
     )
     return manual, survey, coverage
+
+
+def test_preflight_uses_manual_as_the_translation_type_authority(tmp_path: Path) -> None:
+    cases: list[tuple[str, str, str, str, dict[str, object]]] = [
+        (
+            "item-description",
+            "Items.json:1:description",
+            "Restores health",
+            "free",
+            {"consumer": "plain_text"},
+        ),
+        (
+            "scrolling-text",
+            "Map001.json:event1:page1:scrolling1",
+            "Credits",
+            "fixed",
+            {"consumer": "extended_text"},
+        ),
+    ]
+    for name, manual_id, source_text, translation_type, contract in cases:
+        case_root = tmp_path / name
+        manual, survey, coverage = write_single_preflight_case(
+            case_root,
+            engine="mv",
+            manual_id=manual_id,
+            source_text=source_text,
+            translation_type=translation_type,
+            control_contract=contract,
+        )
+        run_script(
+            [
+                "--manual",
+                manual,
+                "--survey",
+                survey,
+                "--coverage",
+                coverage,
+                "--output",
+                case_root / "preflight",
+            ]
+        )
 
 
 def test_preflight_uses_survey_coverage_and_records_fixed_slots_without_decisions(tmp_path: Path) -> None:

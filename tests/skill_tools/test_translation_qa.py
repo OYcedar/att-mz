@@ -162,9 +162,6 @@ def png_bytes(width: int = 80, height: int = 80) -> bytes:
 
 def write_survey(tmp_path: Path, rows: Sequence[Mapping[str, object]]) -> Path:
     normalized_rows = [dict(row) for row in rows]
-    for row in normalized_rows:
-        if row.get("classification") == "builtin" and isinstance(row.get("expected_manual_id"), str):
-            row.setdefault("manual_type", "fixed")
     game = tmp_path / "game"
     (game / "data").mkdir(parents=True)
     (game / "js").mkdir()
@@ -213,7 +210,6 @@ def write_coverage(tmp_path: Path, rows: Sequence[dict[str, object]], *, complet
             {
                 "manual_id": row["expected_manual_id"],
                 "source_text": row["source_text"],
-                "manual_type": "fixed",
                 "control_contract": row["control_contract"],
                 "source": row["source"],
                 "candidate_id": row["candidate_id"],
@@ -486,6 +482,61 @@ def _complete_rpg_qa_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     write_back = write_rpg_write_back(tmp_path, rows)
     runtime = write_runtime_report(tmp_path, write_back)
     return translations, survey, coverage, write_back, runtime
+
+
+def test_translation_qa_uses_export_as_the_translation_type_authority(tmp_path: Path) -> None:
+    rows: list[dict[str, object]] = [
+        {
+            "manual_id": "Items.json:1:description",
+            "source": ["Restores health"],
+            "translation": ["恢复生命值"],
+            "state": "current",
+            "origin": "automatic",
+            "type": "free",
+            "owner": "builtin",
+        },
+        {
+            "manual_id": "Map001.json:event1:page1:scrolling1",
+            "source": ["Credits", "The End"],
+            "translation": ["制作人员", "完"],
+            "state": "current",
+            "origin": "automatic",
+            "type": "fixed",
+            "owner": "builtin",
+        },
+    ]
+    translations = tmp_path / "translations.jsonl"
+    write_jsonl(translations, rows)
+    locations = [
+        {
+            "candidate_id": f"location-{number:06d}",
+            "source": (
+                "data/Items.json" if str(row["manual_id"]).startswith("Items.json") else "data/Map001.json"
+            ),
+            "source_text": "\n".join(cast(list[str], row["source"])),
+            "classification": "builtin",
+            "expected_manual_id": row["manual_id"],
+            "roles": ["display"],
+            "control_contract": {"consumer": "extended_text"},
+        }
+        for number, row in enumerate(rows, start=1)
+    ]
+    survey = write_survey(tmp_path, locations)
+    coverage = write_coverage(tmp_path, locations)
+
+    run_script(
+        [
+            "scan",
+            "--translations",
+            translations,
+            "--survey",
+            survey,
+            "--coverage",
+            coverage,
+            "--output",
+            tmp_path / "qa",
+        ]
+    )
 
 
 def test_standalone_generic_qa_binds_input_export_write_back_and_manual_output(tmp_path: Path) -> None:
@@ -1307,7 +1358,6 @@ def test_rules_coverage_must_be_rebuilt_from_survey_and_rules_manifest(tmp_path:
         "source_text": "<msg>Hello</msg>",
         "classification": "review",
         "expected_manual_id": manual_id,
-        "manual_type": "fixed",
         "roles": ["display_candidate"],
         "control_contract": {"consumer": "plain_text"},
         "rule": rule,
@@ -1331,7 +1381,6 @@ def test_rules_coverage_must_be_rebuilt_from_survey_and_rules_manifest(tmp_path:
     projection = {
         "manual_id": manual_id,
         "source_text": "Hello",
-        "manual_type": "fixed",
         "control_contract": {"consumer": "plain_text"},
         "source": location["source"],
         "candidate_id": candidate_id,

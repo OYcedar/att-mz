@@ -460,7 +460,7 @@ def write_projected_manual(
         chunks.append(
             "[[translation]]\n"
             f"id = {json.dumps(manual_id, ensure_ascii=False)}\n"
-            f"type = {json.dumps(str(fact['manual_type']))}\n"
+            'type = "fixed"\n'
             f"source = [{source}]\n"
             f"translation = [{translation}]\n\n"
         )
@@ -500,10 +500,10 @@ def test_finalize_uses_target_owner_and_audit_findings_are_nonfatal(
     coverage = json.loads((plan / "coverage.json").read_text(encoding="utf-8"))
     assert coverage["complete"] is True
     projection = cast(list[dict[str, object]], coverage["unit_projection"])
+    assert all("manual_type" not in item for item in projection)
     dialogue_body = next(item for item in projection if str(item["manual_id"]).endswith(":dialogue1"))
     assert all(not str(item["manual_id"]).endswith(":dialogue1:speaker") for item in projection)
     assert dialogue_body["source_text"] == r"\N1<Hero>Hello"
-    assert dialogue_body["manual_type"] == "free"
     dialogue_contract = cast(dict[str, object], dialogue_body["control_contract"])
     assert dialogue_contract["consumer"] == "message_text"
     wrapped = next(item for item in projection if item["source_text"] == "Wrapped")
