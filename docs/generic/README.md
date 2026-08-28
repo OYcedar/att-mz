@@ -11,7 +11,7 @@ Generic 是 ATT 面向任意游戏或文本的 JSONL 翻译域。它理解
 - 一批普通文本需要使用 ATT 的语言、术语、Placeholder、全局去重与模型执行能力。
 
 MV/MZ 项目分配前先按
-[翻译项目指南](../guides/translation-project.md#31-mvmz-必须先走原生能力判断)完成原生
+[翻译项目指南](../guides/translation-project.md#31-mvmz-按原生能力顺序判断)完成原生
 能力判断；具体边界只以 MV/MZ Extract 与 Rules 规格为准。
 
 外部操作者或工具负责生成 JSONL 和消费译后 JSONL，转换工具和实现方式由操作者选择；
@@ -41,4 +41,4 @@ Generic 来源可以长期修改。添加、删除、移动或改写内容后，
 避免重复提取或重复写回。
 
 失败与继续见[诊断与恢复指南](../guides/diagnosis-and-recovery.md)，外部转换、组合输出和
-实际消费者见[全量验收指南](../guides/acceptance.md)。
+实际消费者见[翻译验收指南](../guides/acceptance.md)。

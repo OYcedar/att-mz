@@ -3,6 +3,10 @@
 MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同的翻译能力。资源仍由每个
 项目分别保存；公共配置中的 Profile 定义可以复用，但每个项目独立记录实际选择。
 
+完整游戏翻译按“调查 → Extract → 术语 → Translate → QA → WriteBack → 字体/封包”推进，
+执行入口是[使用 ATT 完成游戏翻译](../../skills/translate-with-att/SKILL.md)。本页用于进入术语、
+Placeholder、任务规划、模型协议、Manual 和 WriteBack 排版等公共能力。
+
 按当前问题读取：
 
 | 当前问题 | 必读规格 |
@@ -23,7 +27,6 @@ MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同
 术语内容的发现、筛选和定译不由 ATT 文件格式决定。ATT 只接收已经确认的术语要求，并按
 [术语规格](terminology.md)读取和应用。
 
-处理失败、不完整结果或重复无进展时，先走
-[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)，不能从某一种错误推导
-通用重试、换模型或修改全局规则的方案。少量剩余条目优先使用 Manual TOML；只有需要
-复杂筛选、批量变换、诊断或特殊数据库修改时才直接使用 Lua。
+处理失败、不完整结果或重复无进展时，按
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)读取当前状态并选择恢复动作。
+少量剩余条目使用 Manual TOML；复杂筛选、批量变换、诊断或特殊数据库修改使用 Lua。

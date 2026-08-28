@@ -80,7 +80,7 @@ WriteBack 不执行脚本，也没有发布后回调。
 `write_back/` 是一棵内容树，而不是可以直接运行的完整游戏包。把它按实际部署方式
 放进隔离游戏副本、确认游戏真正读取了这些文件，这一步由操作者完成。
 
-发布完成后按[全量验收指南](../guides/acceptance.md)检查全部输出差异、源语残留、布局风险、
+发布完成后按[翻译验收指南](../guides/acceptance.md)检查全部输出差异、源语残留、布局风险、
 组合项目覆盖和实际加载；WriteBack 成功本身不是整个翻译任务的完成证明。
 
 每次命令写 `publication.started` 和唯一 `publication.finished`。成功时 RPG Maker 汇总保存

@@ -1,27 +1,24 @@
 # ATT 文档总入口
 
-这里描述当前发行版 ATT 的行为。指南负责判断现在该做什么、该读哪些规格；规格负责
-命令、格式、状态、错误和恢复事实。执行任何项目操作前，先把当前任务路由到的指南和
-规格完整读完。
-
-只使用与实际 `att.exe` 同一发行目录中的文档。阶段、项目类型、输入或诊断变化后，重新
-从本页选择；不要拿其他安装、源码仓库、旧对话或记忆补写规则。
+这里描述当前发行版 ATT 的行为。完整游戏翻译从
+[使用 ATT 完成游戏翻译](../skills/translate-with-att/SKILL.md)进入；指南组织行动，规格提供命令、
+格式、状态、错误和恢复事实。使用与实际 `att.exe` 同一发行目录中的文档，并在阶段、项目类型、
+输入或诊断变化后从本页选择对应入口。
 
 ## 1. 按当前任务进入
 
 | 当前任务 | 阅读顺序 |
 | --- | --- |
-| 调查新游戏、选择项目、建立完整翻译任务 | [翻译项目指南](guides/translation-project.md) → 对应引擎入口 → 当前阶段规格 |
+| 完成或返修一个游戏翻译 | [使用 ATT 完成游戏翻译](../skills/translate-with-att/SKILL.md) → [翻译项目指南](guides/translation-project.md) → 当前阶段规格 |
 | 从完整游戏原文制作术语表 | [游戏术语表制作 Skill](../skills/extract-game-terminology/SKILL.md) → [术语规格](translation/terminology.md) |
-| 继续旧任务且当前状态明确 | 唯一任务清单 → [翻译项目指南](guides/translation-project.md)的当前阶段 → 对应规格 |
-| 不知道旧任务停在哪里 | 唯一任务清单 → [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 权威状态所属规格 |
+| 继续旧任务且当前状态明确 | 当前 ATT 项目状态 → [翻译项目指南](guides/translation-project.md)的当前阶段 → 对应规格 |
+| 确认旧任务的续跑位置 | 当前 ATT 项目状态与日志 → [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 权威状态所属规格 |
 | 命令出现失败、Partial、Unavailable、取消、警告或结果未知 | [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 当前阶段规格 → 相关公共或运行时规格 |
-| 调查遗漏、审校质量、人工或 agent 补译、定点修订 | [全量验收指南](guides/acceptance.md) → [Manual](manual/README.md)；需要批量上下文或复杂数据库操作时再读 [Lua](lua/README.md) |
-| WriteBack、外部转换、部署或最终交付 | [全量验收指南](guides/acceptance.md) → 对应 WriteBack 规格 → [目录发布](runtime/directory-publishing.md) |
+| 调查遗漏、审校质量、人工或 agent 补译、定点修订 | [翻译验收指南](guides/acceptance.md) → [Manual](manual/README.md)；需要批量上下文或复杂数据库操作时再读 [Lua](lua/README.md) |
+| WriteBack、外部转换、部署或最终交付 | [翻译验收指南](guides/acceptance.md) → 对应 WriteBack 规格 → [目录发布](runtime/directory-publishing.md) |
 | 发行包缺文件、配置或 Prompt 来源不明 | [发行物规格](runtime/distribution.md)与[配置规格](runtime/configuration.md)；解决前不执行项目命令 |
-| 长期、跨会话或多人任务 | [任务材料规范](guides/task-artifacts.md)；确需新清单时再读[任务清单模板](guides/task-list-template.md) |
 
-## 2. 先选择项目，不要把复杂内容直接交给 Generic
+## 2. 为每段文本选择唯一项目
 
 同一游戏可以由一个或多个项目共同处理，但一段文本只能有一个项目所有者。
 
@@ -29,7 +26,7 @@
 
 先完整读取 [RPG Maker 项目入口](rpg-maker/README.md)、
 [Extract 规格](rpg-maker/extraction.md)和 [Rules 规格](rpg-maker/rules.md)，按
-[翻译项目指南](guides/translation-project.md#31-mvmz-必须先走原生能力判断)执行
+[翻译项目指南](guides/translation-project.md#31-mvmz-按原生能力顺序判断)执行
 Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获与不能表达的关系只由两份
 规格说明。
 
@@ -55,7 +52,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[HTTP](runtime/openai-compatible.md)、[任务记录](translation/task-records.md) |
 | 人工或 agent 查询与修订 | [Manual](manual/README.md) | [Manual](manual/README.md) | [Lua](lua/README.md)、[SQLite](runtime/sqlite.md)、[验收指南](guides/acceptance.md) |
 | WriteBack | [MV/MZ WriteBack](rpg-maker/write-back.md) | [Generic WriteBack](generic/write-back.md) | [排版规则](translation/write-back-layout-rules.md)、[目录发布](runtime/directory-publishing.md) |
-| 验收与交付 | [全量验收指南](guides/acceptance.md) | [全量验收指南](guides/acceptance.md) | 实际外部转换和消费者说明 |
+| 验收与交付 | [翻译验收指南](guides/acceptance.md) | [翻译验收指南](guides/acceptance.md) | 实际外部转换和消费者说明 |
 
 ## 4. 按观察结果进入
 
@@ -82,9 +79,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 
 - [翻译项目指南](guides/translation-project.md)
 - [诊断与恢复指南](guides/diagnosis-and-recovery.md)
-- [全量验收指南](guides/acceptance.md)
-- [任务材料规范](guides/task-artifacts.md)
-- [任务清单模板](guides/task-list-template.md)
+- [翻译验收指南](guides/acceptance.md)
 
 ### RPG Maker MV/MZ
 

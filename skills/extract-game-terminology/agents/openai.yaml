@@ -1,4 +1,4 @@
 interface:
   display_name: "游戏术语表制作"
-  short_description: "由 Agent 或 Formic 从完整原文制作 ATT 术语表"
-  default_prompt: "使用 $extract-game-terminology，从最终 Manual 完整原文提取、审核并定译术语，可按需用 Formic 批量处理。"
+  short_description: "从完整游戏原文提取并定译术语，生成供 ATT Translate 使用的术语表"
+  default_prompt: "使用 $extract-game-terminology，从最终 Extract 的完整 Manual 制作经审核的 terminology.toml，供 ATT Translate 使用。"

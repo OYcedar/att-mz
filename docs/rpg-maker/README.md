@@ -50,4 +50,4 @@ Builtin 和 Rules 可以在同一项目中搭配使用，只要两者声明的�
 
 完整任务顺序见[翻译项目指南](../guides/translation-project.md)，失败或不完整结果见
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md)，遗漏、补译、输出和实际加载见
-[全量验收指南](../guides/acceptance.md)。
+[翻译验收指南](../guides/acceptance.md)。
