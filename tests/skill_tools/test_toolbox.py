@@ -4,7 +4,6 @@ import json
 import shutil
 import subprocess
 import sys
-import time
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -22,12 +21,9 @@ from att_toolbox.roundtrip import (
     replace_reviewed_javascript_literal,
 )
 from att_toolbox.rpg import iter_string_leaves
-from term_toolbox import grouping as term_grouping
 
 ROOT = Path(__file__).resolve().parents[2]
 TRANSLATE_SCRIPTS = ROOT / "skills" / "translate-with-att" / "scripts"
-TERM_SCRIPTS = ROOT / "skills" / "extract-game-terminology" / "scripts"
-TERMINOLOGY_JOB = TERM_SCRIPTS / "terminology_job.py"
 PUBLIC_SCRIPT_RELATIVE_PATHS = (
     Path("translate-with-att/scripts/summarize_att_run.py"),
     Path("translate-with-att/scripts/rpg_maker_survey.py"),
@@ -35,7 +31,6 @@ PUBLIC_SCRIPT_RELATIVE_PATHS = (
     Path("translate-with-att/scripts/translation_qa.py"),
     Path("translate-with-att/scripts/inspect_nwjs_runtime.py"),
     Path("translate-with-att/scripts/manage_rpg_maker_fonts.py"),
-    Path("extract-game-terminology/scripts/terminology_job.py"),
 )
 _GENERIC_EVIDENCE_FOR_TEST = (
     "exact_location",
@@ -109,43 +104,6 @@ def write_jsonl(path: Path, values: Sequence[object]) -> None:
     path.write_text(
         "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in values),
         encoding="utf-8",
-    )
-
-
-def write_formic_summary(
-    out_root: Path,
-    *,
-    planned: int,
-    already_completed: int = 0,
-    published: int,
-    failed: int = 0,
-    stopped: int = 0,
-    not_started: int = 0,
-) -> None:
-    run = out_root / "runs" / "run-000001"
-    run.mkdir(parents=True, exist_ok=True)
-    write_json(
-        run / "summary.json",
-        {
-            "planned": planned,
-            "already_completed": already_completed,
-            "started": published + failed + stopped,
-            "published": published,
-            "failed": failed,
-            "stopped": stopped,
-            "not_started": not_started,
-            "first_failed": 2 if failed else None,
-            "failed_samples": [2] if failed else [],
-            "first_stopped": None,
-            "stopped_samples": [],
-            "first_incomplete": 2 if failed else None,
-            "incomplete_samples": [2] if failed else [],
-            "failure_reasons": {"monthly_quota": failed} if failed else {},
-            "stop_reason": None,
-            "llm_calls": published + failed,
-            "llm_calls_with_provider_usage": published,
-            "llm_calls_without_provider_usage": failed,
-        },
     )
 
 
@@ -525,76 +483,6 @@ def test_log_summary_requires_current_translate_schema_and_task_invariants(
     run_case("invalid-planned", {**valid_tasks, "planned": 2}, engine_summary, expected=1)
 
 
-def test_terminology_tools_and_four_field_error(tmp_path: Path) -> None:
-    manual = tmp_path / "manual.toml"
-    manual.write_text(
-        """\
-[[translation]]
-id = "Map001.json:event1:page1:dialogue1"
-type = "free"
-source = ["星読みの村"]
-translation = []
-
-[[translation]]
-id = "Map002.json:event1:page1:dialogue1"
-type = "free"
-source = ["星読みが来た"]
-translation = []
-""",
-        encoding="utf-8",
-    )
-    job = tmp_path / "formic-job"
-    run_script(TERMINOLOGY_JOB, ["prepare", "--manual", manual, "--output", job])
-    assert (job / "plan.jsonl").read_text(encoding="utf-8").count("\n") == 2
-    assert (job / "task.md").is_file()
-
-    formic_out = tmp_path / "formic-out"
-    results_root = formic_out / "results"
-    results_root.mkdir(parents=True)
-    (results_root / "1.md").write_text("星読み\n村\n", encoding="utf-8")
-    (results_root / "2.md").write_text("- 星読み\n無\n", encoding="utf-8")
-    workers = formic_out / "runs" / "run-000001" / "workers"
-    workers.mkdir(parents=True)
-    (workers / "1.md").write_text("不应读取", encoding="utf-8")
-    write_formic_summary(formic_out, planned=2, published=2)
-    candidates = tmp_path / "terms-candidates.json"
-    run_script(
-        TERMINOLOGY_JOB,
-        [
-            "review",
-            "--manual",
-            manual,
-            "--plan",
-            job / "plan.jsonl",
-            "--formic-out",
-            formic_out,
-            "--output",
-            candidates,
-        ],
-    )
-    candidate_data = json.loads(candidates.read_text(encoding="utf-8"))
-    assert [item["term"] for item in candidate_data["candidates"]] == ["星読み"]
-
-    decisions = tmp_path / "terms.json"
-    terminology = tmp_path / "terminology.toml"
-    write_json(decisions, {"terms": [{"term": "星読み", "translation": "观星者"}]})
-    run_script(
-        TERMINOLOGY_JOB,
-        ["finalize", "--input", decisions, "--output", terminology],
-    )
-    assert "translation = '观星者'" in terminology.read_text(encoding="utf-8")
-
-    duplicate = run_script(
-        TERMINOLOGY_JOB,
-        ["finalize", "--input", decisions, "--output", terminology],
-        expected=1,
-    )
-    assert "对象：" in duplicate.stderr
-    assert "原因：" in duplicate.stderr
-    assert "影响：" in duplicate.stderr
-    assert "处理办法：" in duplicate.stderr
-
-
 def test_pytest_imports_do_not_write_skill_bytecode(
     skill_bytecode_at_pytest_start: tuple[tuple[str, int, int], ...],
 ) -> None:
@@ -631,172 +519,6 @@ def test_toml_string_uses_lossless_basic_string_when_literal_is_unsafe(value: st
     assert rendered.startswith('"') and rendered.endswith('"')
     assert "\x7f" not in rendered
     assert tomllib.loads(f"value = {rendered}\n")["value"] == value
-
-
-def test_formic_abnormal_candidates_and_missing_units(tmp_path: Path) -> None:
-    manual = tmp_path / "manual.toml"
-    manual.write_text(
-        """\
-[[translation]]
-id = "Map001.json:event1:page1:dialogue1"
-type = "free"
-source = ["星読みの村"]
-translation = []
-
-[[translation]]
-id = "Map002.json:event1:page1:dialogue1"
-type = "free"
-source = ["星読みが来た"]
-translation = []
-""",
-        encoding="utf-8",
-    )
-    job = tmp_path / "formic-job"
-    run_script(TERMINOLOGY_JOB, ["prepare", "--manual", manual, "--output", job])
-    incomplete_out = tmp_path / "incomplete-out"
-    (incomplete_out / "results").mkdir(parents=True)
-    (incomplete_out / "results" / "1.md").write_text("星読み\n", encoding="utf-8")
-    write_formic_summary(incomplete_out, planned=2, published=1, failed=1)
-    missing_report = tmp_path / "missing-report.json"
-    missing = run_script(
-        TERMINOLOGY_JOB,
-        [
-            "review",
-            "--manual",
-            manual,
-            "--plan",
-            job / "plan.jsonl",
-            "--formic-out",
-            incomplete_out,
-            "--output",
-            missing_report,
-        ],
-        expected=1,
-    )
-    assert_four_field_error(missing)
-    assert "缺失 1 个；首个 2；示例：2" in missing.stderr
-    assert "--resume" in missing.stderr
-    assert not missing_report.exists()
-
-    formic_out = tmp_path / "complete-out"
-    (formic_out / "results").mkdir(parents=True)
-    (formic_out / "results" / "1.md").write_text("星読み\n星読み\n存在しない\n村\n", encoding="utf-8")
-    (formic_out / "results" / "2.md").write_text("- 星読み\n`星読み`\n无\n", encoding="utf-8")
-    write_formic_summary(formic_out, planned=2, published=2)
-    report = tmp_path / "candidate-report.json"
-    run_script(
-        TERMINOLOGY_JOB,
-        [
-            "review",
-            "--manual",
-            manual,
-            "--plan",
-            job / "plan.jsonl",
-            "--formic-out",
-            formic_out,
-            "--output",
-            report,
-        ],
-    )
-    result = json.loads(report.read_text(encoding="utf-8"))
-    assert [item["term"] for item in result["candidates"]] == ["星読み"]
-    assert {item["reason"] for item in result["rejected"]} == {
-        "duplicate_worker_candidate",
-        "not_found_in_corpus",
-        "single_occurrence",
-    }
-
-
-@pytest.mark.parametrize("invalid_name", ["note.txt", "1.json", "unit.md", "0.md"])
-def test_formic_review_rejects_unknown_result_files(tmp_path: Path, invalid_name: str) -> None:
-    manual = tmp_path / "manual.toml"
-    manual.write_text(
-        """[[translation]]
-id = "Map001.json:event1:page1:dialogue1"
-type = "free"
-source = ["星読み"]
-translation = []
-""",
-        encoding="utf-8",
-    )
-    job = tmp_path / "job"
-    run_script(TERMINOLOGY_JOB, ["prepare", "--manual", manual, "--output", job])
-    formic_out = tmp_path / "formic-out"
-    results = formic_out / "results"
-    results.mkdir(parents=True)
-    (results / "1.md").write_text("星読み\n", encoding="utf-8")
-    (results / "output-schema.json").write_text("{}", encoding="utf-8")
-    (results / invalid_name).write_text("unexpected", encoding="utf-8")
-    write_formic_summary(formic_out, planned=1, published=1)
-
-    rejected = run_script(
-        TERMINOLOGY_JOB,
-        [
-            "review",
-            "--manual",
-            manual,
-            "--plan",
-            job / "plan.jsonl",
-            "--formic-out",
-            formic_out,
-            "--output",
-            tmp_path / "report.json",
-        ],
-        expected=1,
-    )
-    assert_four_field_error(rejected)
-    assert "未知扩展" in rejected.stderr
-
-
-def test_formic_review_rejects_result_directories_and_invalid_summary(tmp_path: Path) -> None:
-    manual = tmp_path / "manual.toml"
-    manual.write_text(
-        """[[translation]]
-id = "Map001.json:event1:page1:dialogue1"
-type = "free"
-source = ["星読み"]
-translation = []
-""",
-        encoding="utf-8",
-    )
-    job = tmp_path / "job"
-    run_script(TERMINOLOGY_JOB, ["prepare", "--manual", manual, "--output", job])
-    formic_out = tmp_path / "formic-out"
-    results = formic_out / "results"
-    results.mkdir(parents=True)
-    (results / "1.md").write_text("星読み\n", encoding="utf-8")
-    (results / "unexpected").mkdir()
-    write_formic_summary(formic_out, planned=1, published=1)
-    arguments = [
-        "--manual",
-        manual,
-        "--plan",
-        job / "plan.jsonl",
-        "--formic-out",
-        formic_out,
-        "--output",
-        tmp_path / "report.json",
-    ]
-
-    directory_error = run_script(TERMINOLOGY_JOB, ["review", *arguments], expected=1)
-    assert_four_field_error(directory_error)
-    assert "results 包含目录" in directory_error.stderr
-
-    (results / "unexpected").rmdir()
-    summary = formic_out / "runs" / "run-000001" / "summary.json"
-    summary_data = json.loads(summary.read_text(encoding="utf-8"))
-    summary_data["already_completed"] = 1
-    write_json(summary, summary_data)
-    invariant_error = run_script(TERMINOLOGY_JOB, ["review", *arguments], expected=1)
-    assert_four_field_error(invariant_error)
-    assert "planned = already_completed + started + not_started" in invariant_error.stderr
-
-    summary_data["already_completed"] = 0
-    summary_data["llm_calls_without_provider_usage"] = 1
-    write_json(summary, summary_data)
-    usage_error = run_script(TERMINOLOGY_JOB, ["review", *arguments], expected=1)
-    assert_four_field_error(usage_error)
-    assert "llm_calls = llm_calls_with_provider_usage" in usage_error.stderr
 
 
 def test_atomic_file_failures_preserve_primary_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -898,121 +620,6 @@ def test_atomic_directory_rollback_and_cleanup_state(monkeypatch: pytest.MonkeyP
     assert not invalid_target.exists()
     assert not (tmp_path / ".invalid-job.tmp").exists()
     assert not (tmp_path / "outside.txt").exists()
-
-
-def test_large_formic_grouping_and_single_pass_occurrence_scan() -> None:
-    entries = [
-        term_common.ManualEntry(
-            readable_id=f"story.jsonl:line{index}:unit1:text",
-            translation_type="fixed",
-            source=("星読みと魔法剣",),
-            translation=(),
-        )
-        for index in range(1, 60_001)
-    ]
-    started = time.perf_counter()
-    units = term_grouping.build_formic_units(entries)
-    occurrences = term_common.scan_term_occurrences(
-        ["星読み", "魔法", "魔法剣", "存在しない"],
-        entries,
-    )
-    elapsed = time.perf_counter() - started
-    assert sum(len(unit.entries) for unit in units) == 60_000
-    assert max(len(term_grouping.render_formic_unit(unit)) for unit in units) <= 24_000
-    assert len(units) < 500
-    assert occurrences["星読み"].count == 60_000
-    assert occurrences["魔法"].count == 60_000
-    assert occurrences["魔法剣"].count == 60_000
-    assert occurrences["存在しない"].count == 0
-    assert elapsed < 10.0
-
-
-def test_katalist_equivalent_scopes_pack_to_about_two_hundred_units() -> None:
-    entries = [
-        term_common.ManualEntry(
-            readable_id=f"Map{index // 33 + 1:03d}.json:event{index % 33 + 1}:page1:dialogue1",
-            translation_type="free",
-            source=("A" * 1_300,),
-            translation=(),
-        )
-        for index in range(3_308)
-    ]
-    units = term_grouping.build_formic_units(entries)
-
-    assert 180 <= len(units) <= 220
-    assert sum(len(unit.scopes) for unit in units) == 3_308
-    assert all(len(term_grouping.render_formic_unit(unit)) <= 24_000 for unit in units)
-    assert all(len({scope.source for scope in unit.scopes}) == 1 for unit in units)
-
-
-def test_formic_packing_evidence_uses_the_actual_target() -> None:
-    entries = [
-        term_common.ManualEntry(
-            readable_id=f"Map001.json:event{index}:page1:dialogue1",
-            translation_type="free",
-            source=("A" * 300,),
-            translation=(),
-        )
-        for index in range(1, 8)
-    ]
-    units = term_grouping.build_formic_units(entries, target_characters=1_000)
-    evidence = term_grouping.formic_packing_evidence(units, target_characters=1_000)
-
-    assert evidence["target_rendered_characters"] == 1_000
-    assert all(len(term_grouping.render_formic_unit(unit)) <= 1_000 for unit in units)
-
-
-def test_formic_high_unit_count_prints_boundary_evidence(tmp_path: Path) -> None:
-    manual = tmp_path / "many-sources.toml"
-    manual.write_text(
-        "\n".join(
-            f"""[[translation]]
-id = "Map{number:03d}.json:event1:page1:dialogue1"
-type = "free"
-source = ["Text {number}"]
-translation = []
-"""
-            for number in range(1, 252)
-        ),
-        encoding="utf-8",
-    )
-    job = tmp_path / "many-sources-job"
-    result = run_script(
-        TERMINOLOGY_JOB,
-        ["prepare", "--manual", manual, "--output", job],
-    )
-
-    assert "装箱边界证据" in result.stdout
-    assert "来源连续段 251" in result.stdout
-    assert (job / "plan.jsonl").read_text(encoding="utf-8").count("\n") == 251
-    evidence = json.loads((job / "packing-evidence.json").read_text(encoding="utf-8"))
-    assert evidence["source_runs"] == 251
-    assert evidence["target_rendered_characters"] == 24_000
-    assert evidence["oversized_scope_details"] == []
-
-
-def test_formic_target_does_not_split_or_reject_one_oversized_entry() -> None:
-    entry = term_common.ManualEntry(
-        readable_id="Map001.json:event1:page1:dialogue1",
-        translation_type="free",
-        source=("星" * 25_000,),
-        translation=(),
-    )
-    units = term_grouping.build_formic_units([entry])
-    assert len(units) == 1
-    assert units[0].entries == (entry,)
-    assert len(term_grouping.render_formic_unit(units[0])) > 24_000
-    evidence = term_grouping.formic_packing_evidence(units, target_characters=24_000)
-    assert evidence["oversized_scopes"] == 1
-    assert evidence["oversized_scope_details"] == [
-        {
-            "unit": 1,
-            "scope": "Map001.json:event1",
-            "source": "Map001.json",
-            "file": "000001-Map001.json_event1.md",
-            "rendered_characters": len(term_grouping.render_formic_unit(units[0])),
-        }
-    ]
 
 
 def test_javascript_lexer_and_unbounded_nested_json() -> None:
@@ -1164,48 +771,6 @@ def test_json_looking_player_text_does_not_turn_a_guess_into_source_damage() -> 
                 decode_serialized_at=lambda _path, positions: not positions,
             )
         )
-
-
-def test_terminology_exact_whitespace_and_control_contract(tmp_path: Path) -> None:
-    valid = tmp_path / "valid-terms.json"
-    output = tmp_path / "valid-terms.toml"
-    write_json(
-        valid,
-        {
-            "terms": [
-                {
-                    "term": '星"\\读',
-                    "translation": '观"\\星',
-                    "triggers": ["星\n読み"],
-                }
-            ]
-        },
-    )
-    run_script(TERMINOLOGY_JOB, ["finalize", "--input", valid, "--output", output])
-    parsed = tomllib.loads(output.read_text(encoding="utf-8"))["term"][0]
-    assert parsed["triggers"] == ["星\n読み"]
-
-    invalid_items = [
-        {"term": "   ", "translation": "译"},
-        {"term": " 星", "translation": "译"},
-        {"term": "星", "translation": "译 "},
-        {"term": "星\u202e", "translation": "译"},
-        {"term": "星", "translation": "译", "triggers": ["星\r读"]},
-        {"term": "星", "translation": "译", "triggers": ["星\x00读"]},
-        {"term": "星", "translation": "译", "triggers": ["星\u0085读"]},
-        {"term": "星", "translation": "译", "triggers": ["星\u2028读"]},
-    ]
-    for number, item in enumerate(invalid_items, start=1):
-        reviewed = tmp_path / f"invalid-term-{number}.json"
-        rejected = tmp_path / f"invalid-term-{number}.toml"
-        write_json(reviewed, {"terms": [item]})
-        result = run_script(
-            TERMINOLOGY_JOB,
-            ["finalize", "--input", reviewed, "--output", rejected],
-            expected=1,
-        )
-        assert_four_field_error(result)
-        assert not rejected.exists()
 
 
 def test_safe_walk_rejects_internal_external_and_loop_links(tmp_path: Path) -> None:

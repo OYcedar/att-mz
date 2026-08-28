@@ -146,7 +146,7 @@ ATT 的 MV/MZ 内建控制符由 ATT 默认规则负责。普通未知外形、�
 
 ## Translate 与集中返修
 
-术语使用 `skills/extract-game-terminology/SKILL.md` 和其中唯一入口 `terminology_job.py`。
+术语使用 `skills/extract-game-terminology/SKILL.md`；Agent 可自行处理自然单元，也可用随包 Formic 批量生成候选。
 资源文件名、资源路径、内部键和普通短语不进入术语，也不写入 `allowed_terms`。
 译前检查和术语都定稿后再运行 Translate。Translate 持有项目租约（防止同一项目两个 ATT 命令同时
 改状态的独占锁）；模型等待期间禁止对同一项目运行 export、Manual 或 WriteBack。只做不读写该项目的

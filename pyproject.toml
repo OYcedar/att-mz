@@ -20,7 +20,6 @@ testpaths = ["tests/skill_tools"]
 pythonpath = [
     "skills/_shared",
     "skills/translate-with-att/scripts",
-    "skills/extract-game-terminology/scripts",
 ]
 
 [tool.ruff]
@@ -36,12 +35,10 @@ pythonVersion = "3.11"
 include = [
     "skills/_shared/att_skill_tools",
     "skills/translate-with-att/scripts",
-    "skills/extract-game-terminology/scripts",
     "tests/skill_tools",
 ]
 exclude = ["**/__pycache__"]
 extraPaths = [
     "skills/_shared",
     "skills/translate-with-att/scripts",
-    "skills/extract-game-terminology/scripts",
 ]
