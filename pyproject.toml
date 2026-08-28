@@ -8,19 +8,11 @@ dependencies = []
 [dependency-groups]
 dev = [
     "basedpyright>=1.31.0",
-    "pytest>=8.4.0",
     "ruff>=0.12.0",
 ]
 
 [tool.uv]
 package = false
-
-[tool.pytest.ini_options]
-testpaths = ["tests/skill_tools"]
-pythonpath = [
-    "skills/_shared",
-    "skills/translate-with-att/scripts",
-]
 
 [tool.ruff]
 target-version = "py311"
@@ -35,7 +27,6 @@ pythonVersion = "3.11"
 include = [
     "skills/_shared/att_skill_tools",
     "skills/translate-with-att/scripts",
-    "tests/skill_tools",
 ]
 exclude = ["**/__pycache__"]
 extraPaths = [
