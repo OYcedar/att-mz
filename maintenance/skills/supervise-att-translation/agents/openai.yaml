@@ -1,4 +1,0 @@
-interface:
-  display_name: "ATT 翻译监督"
-  short_description: "监督真实游戏的独立 ATT 翻译任务与实玩返修"
-  default_prompt: "使用 $supervise-att-translation 创建并监督开发者明确指定的真实游戏独立翻译任务，跟进实玩反馈，并只根据该任务过程整理已验证经验和 ATT 改进建议；当前会话不参与游戏汉化。"

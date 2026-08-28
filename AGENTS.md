@@ -326,7 +326,6 @@ channel 呈现时，属于独立的进程呈现失败。任何用户可见诊断
 | 发行内容、发行根、禁止项或完整发行验证 | [发行物规格](docs/runtime/distribution.md) |
 | 修改、执行或诊断发行资源同步 | 先读[发行物规格](docs/runtime/distribution.md)，再检查[发行资源同步脚本](scripts/sync-dist-resources.ps1) |
 | 准备或发布公开 GitHub Release | 先读[发行物规格](docs/runtime/distribution.md)，再读[公开发行指南](maintenance/releasing.md)并检查当前 Release workflow |
-| 开发者明确要求创建并监督、继续跟进或复盘一个使用已打包 ATT 的真实游戏独立翻译任务，或把实玩反馈交回该任务 | [监督 ATT 真实翻译](maintenance/skills/supervise-att-translation/SKILL.md) |
 | RPG Maker Init、Extract、Rules、Translate 或 WriteBack | 对应的 [Init](docs/rpg-maker/init.md)、[Extract](docs/rpg-maker/extraction.md)、[Rules](docs/rpg-maker/rules.md)、[Translate](docs/rpg-maker/translation.md)或[WriteBack](docs/rpg-maker/write-back.md)规格 |
 | Generic JSONL、Init、Extract、Translate 或 WriteBack | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)或[WriteBack](docs/generic/write-back.md)规格 |
 | 原子数据库 Lua | [Lua 规格](docs/lua/README.md) |
@@ -451,42 +450,6 @@ Skill 只组织执行。主入口根据当前事实决定下一步，按需读�
 
 源码与测试、规格与指南、受影响的 Skill 和发行物共同描述一个当前版本，但不逐字复制同一
 事实。任何位置仍描述旧行为、遗漏当前流程、存在冲突、失效链接或过期导航时，任务尚未完成。
-
-### 10.1 真实翻译监督与经验复用
-
-ATT 使用真实游戏翻译持续检查和改进产品。开发者选择具体游戏与已打包发行，独立翻译任务只
-依赖该发行根完成首次译本；监督任务检查执行状态、产物、错误、重复操作和验收证据；开发者实际
-游玩后，把截图、场景和触发步骤交回同一翻译任务继续返修。首次结果不保证覆盖所有运行场景，
-用户反馈后的第二次或后续修复属于正常流程，不在译前穷举尚无运行证据的内容。
-
-开发专用流程由[监督 ATT 真实翻译 Skill](maintenance/skills/supervise-att-translation/SKILL.md)
-组织。该 Skill 位于 `maintenance/`，不进入 ATT 发行包。独立翻译任务仍使用实际发行包中的
-`translate-with-att` Skill，并在首次调查、恢复任务和处理每轮实玩反馈前读取游戏类型经验索引
-与全部适用文件。监督任务不得参与游戏汉化：不运行游戏项目的 ATT 命令，不翻译或修改游戏文本、
-Rules、Manual、术语、Placeholder、Generic 输入、写回脚本或译本，也不启动游戏；任务失败时只
-把证据和纠正要求发送给独立翻译任务，不接手执行。
-
-监督任务可以只读检查翻译日志、项目状态、产物、ATT 源码、规格和调用关系。每轮结束后分别处理：
-
-- 当前游戏的译名、插件实例、路径和专用写回事实留在任务材料；
-- 已经成功、适用特征明确且其他用户 Agent 能直接采用的方法进入可分发游戏类型经验；
-- 执行者的触发、阅读顺序、状态选择或恢复动作变化进入相应 Skill；
-- 可确定执行且已有当前消费者的重复操作进入 Python 工具和测试；
-- ATT 共享规则、接口、状态、CLI 或错误语义缺陷进入规格、Rust 实现和回归测试；
-- 发行资源、同步、默认配置或验收缺口进入发行规格和相应脚本；
-- 未确认的猜测、失败修法和候选设计只进入监督汇报或待审批开发任务，不写入权威经验。
-
-监督任务必须从真实使用过程提出 ATT 改进建议，范围包括源码、CLI、Python 工具、Skill、发行
-资源和验收流程。每项建议说明证据、用户影响、根因和责任位置、全部当前受影响调用方、推荐修改、
-外部行为变化、验证方法和风险。共享根因横向检查全部当前调用方；只属于单个游戏的做法保持专用。
-代码或工具修改才能改善使用结果时，不用文档提醒代替实现建议。ATT 实质修改先向开发者汇报，
-取得明确同意后再实施最小完整改动并同步测试、规格、Skill 和发行资源。
-
-经验只有同时满足以下条件才进入可分发文档：问题、消费者和结果有实际证据；方法已经成功；
-删除游戏名、本机路径和具体译文后仍能准确指导同类项目；能够指出其他 Agent 的读取条件和行动；
-写明未验证范围与重新验证条件；不复制其他权威来源的完整契约。没有新增可复用事实时不修改经验。
-游戏类型经验继续按“一种类型一个 Markdown”保存，由索引按游戏结构导航；相关 ATT 能力变化时
-同一次改动检查经验是否仍成立、已被实现取代或需要重新验证。
 
 ## 11. 每次任务的方向检查
 
