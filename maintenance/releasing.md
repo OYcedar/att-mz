@@ -29,7 +29,23 @@
 `main`，工作树保持当前版本。这样能够保留旧历史，并让远端 `main` 通过快进接收新提交，
 不需要强推。
 
-确认远端 `main` 精确指向待发布提交后，在该提交创建并推送带说明的三段版本标签：
+确认远端 `main` 精确指向待发布提交且本机工作树干净后，在发起发布的 Windows 本机运行本次发布
+唯一一次压力测试：
+
+```powershell
+cargo test --locked --release -p att --features release-stress --lib release_stress_ -- --test-threads=1
+if ($LASTEXITCODE -ne 0) {
+    throw "ATT Release 压力验证失败，退出码 $LASTEXITCODE"
+}
+cargo test --locked --release -p att-json-repair --features release-stress --lib release_stress_ -- --test-threads=1
+if ($LASTEXITCODE -ne 0) {
+    throw "JSON repair Release 压力验证失败，退出码 $LASTEXITCODE"
+}
+```
+
+这两条命令只在公开 GitHub Release 执行阶段运行；普通开发、提交前和 PR 不运行。压力验证失败时
+停止发布，不创建或推送版本标签，也不触发 workflow。通过后，在同一提交创建并推送带说明的三段
+版本标签：
 
 ```powershell
 git tag -a v1.0.0 -m "ATT 1.0"
@@ -81,11 +97,10 @@ do {
 gh run watch $run.databaseId --exit-status
 ```
 
-工作流必须确认标签提交等于远端 `main`，构建静态 `Release`，并在打包前分别运行根 crate 与
-`att-json-repair` crate 的 `release-stress` 测试组；这是该测试组的唯一触发入口。压力验证通过后，
-工作流从托管模板首次创建两份无凭据活动配置，同步其余已审查资源，使用最高级别 Deflate 打包并
-直接创建 Release。格式、Clippy、普通行为测试、第三方许可生成和完整发行检查在标签前完成，
-不在发包时重复运行。发布完成后检查：
+工作流必须确认标签提交等于远端 `main`，并在 GitHub 托管的 `windows-2025` runner 上构建静态
+`Release`。本机压力验证已经在标签前完成，workflow 不再重复。工作流从托管模板首次创建两份
+无凭据活动配置，同步其余已审查资源，使用最高级别 Deflate 打包并直接创建 Release。格式、Clippy、
+普通行为测试、第三方许可生成和完整发行检查同样在标签前完成，不在发包时重复运行。发布完成后检查：
 
 - Release 名称、标签、正文与当前版本一致；
 - `att-v1.0.0-windows-x64.zip` 和 `SHA256SUMS.txt` 都存在；

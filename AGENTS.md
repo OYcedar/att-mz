@@ -109,19 +109,21 @@ ATT 用一个 CLI 聚合多个游戏引擎的翻译能力。统一入口只承�
 | Generic JSONL、Init、Extract、Translate 或 WriteBack | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)或[WriteBack](docs/generic/write-back.md)规格 |
 | 原子数据库 Lua | [Lua 规格](docs/lua/README.md) |
 
-已公开标签和 Release 不移动，也不追溯改写其当时许可。当前版本完成约定验证后，用户要求 push、
-发包或发布即进入发行执行模式：既定提交、版本和标签随即冻结；只执行身份确认、提交与推送、
-创建并推送标签、触发 Release workflow，以及确认公开 Release 和附件。此阶段不得调用子 agent、
-重新审查或重跑验收、修改业务代码或 workflow、扩大范围、改变版本或派生补丁；失败时只报告
-失败动作、具体事实和可重试位置，等待用户决定。
+已公开标签和 Release 不移动，也不追溯改写其当时许可。当前版本完成普通验证并形成既定提交后，
+用户要求发包或发布即进入发行执行模式：既定提交和版本随即冻结；先确认身份、干净工作树和远端
+`main` 精确指向该提交，在发起发布的 Windows 本机运行唯一一次 `release-stress`，成功后只创建并
+推送版本标签、触发 Release workflow，以及确认公开 Release 和附件。普通 push 不进入发行执行模式。
+此阶段不得调用子 agent、重新审查或重跑普通验收、修改业务代码或 workflow、扩大范围、改变版本或
+派生补丁；压力验证或后续动作失败时只报告失败动作、具体事实和可重试位置，等待用户决定。
 
 ## 5. 验证、同步与完成
 
 - 修改 Rust 生产代码时，提交前至少对受影响 crate 或 target 执行格式检查、编译或类型检查、
   Clippy 和按行为影响确定的测试；共享 crate、公共契约或跨引擎能力变化必须覆盖全部受影响调用方。
 - 常规开发、提交前和 PR 门禁只运行普通行为测试，不启用 `release-stress` feature。合成的大容量、
-  超深结构和墙钟性能回归只存在于 `release-stress` 测试组，由 GitHub Release workflow 在完成
-  Release 构建后、打包发布前唯一触发；不得把该组重新并入普通 `cargo test` 或用 ignored 测试代替。
+  超深结构和墙钟性能回归只存在于 `release-stress` 测试组，由发起公开 GitHub Release 的 Windows
+  本机在推送版本标签、触发 workflow 和远端打包前唯一运行；Actions runner 不运行该组。不得把该组
+  重新并入普通 `cargo test` 或用 ignored 测试代替。
 - 本次检查产生的新 warning、当前修改或受影响范围内的 warning 和未分类诊断必须处理；能够证明
   与本次范围无关的既有 warning 可以保留，但交付时明确说明。
 - 任务要求入口到结果时，用最小真实样本通过生产入口验证完整路径。局部测试、单个 crate 编译

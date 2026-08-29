@@ -119,13 +119,14 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 
 标签建立前完成格式、Clippy、普通行为测试、第三方许可重生成、PE 依赖和本规格第 4 节完整检查。
 普通测试不启用 `release-stress` feature；合成的大容量、超深结构和墙钟性能回归不属于提交前或
-PR 门禁。
+PR 门禁。正式发布提交和版本冻结后，由发起发布的 Windows 本机在推送版本标签、触发 workflow
+和远端打包前，分别运行根 crate 与 `att-json-repair` crate 的 `release-stress` 测试组；这是该组
+唯一的执行入口，失败时不得继续发包。
 
-Release workflow 不重复普通检查；它使用锁定工具链和依赖构建静态 `att.exe`，随后分别运行
-根 crate 与 `att-json-repair` crate 的 `release-stress` 测试组。该 workflow 是此测试组的唯一
-触发入口，压力验证失败时不得打包或发布。通过后，workflow 从空的 `dist/` 同步托管资源并首次
-创建两份活动配置，再确认活动配置与各自模板完全相同且不含真实凭据，校验 `att.exe --version`、
-打包并发布。`projects/` 作为空目录进入压缩包。
+Release workflow 不重复普通检查或 `release-stress`。它在 GitHub 托管的 `windows-2025` runner
+上使用锁定工具链和依赖构建静态 `att.exe`，从空的 `dist/` 同步托管资源并首次创建两份活动配置，
+再确认活动配置与各自模板完全相同且不含真实凭据，校验 `att.exe --version`、打包并发布。
+`projects/` 作为空目录进入压缩包。
 
 正式附件固定为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 和 `SHA256SUMS.txt`。ZIP 使用
 兼容 Windows 常用解压工具的标准 Deflate，并采用可用工具的最高压缩级别。同一 job 完成构建、
