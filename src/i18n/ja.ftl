@@ -1,4 +1,5 @@
 app-about = 再利用可能なプロジェクト状態でゲームと構造化テキストを翻訳します
+cli-test-about = 配布設定とすべての LLM Client を確認します
 cli-ui-language-help = ヘルプ、診断、進捗、結果、プロジェクトログの言語: ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko、vi
 cli-mz-about = RPG Maker MZ ゲームを翻訳します
 cli-mv-about = RPG Maker MV ゲームを翻訳します
@@ -109,6 +110,18 @@ result-generic-extract-updated = Generic 入力を更新: { $files } ファイ�
 result-generic-translate-summary = Generic 翻訳: 計画 { $total } タスク、開始 { $started }、未開始 { $not_started }、完全 { $complete }、部分 { $partial }、利用不可 { $unavailable }、失敗 { $failed }、取消 { $cancelled }。計画 Unit { $planned_units }、残り Unit { $remaining_units }（Rejected { $rejected_units }）、クリア { $cleared }、再利用 { $reused }、受理 { $accepted }、書き込み { $written }、競合 { $conflicted }、応答問題 { $problems }
 result-generic-write-back-summary = Generic 書き戻し: 訳文 { $translated } 単位、原文保持 { $original } 単位
 result-run-log = 実行記録：{ $path }
+result-test-configuration = 設定：{ $status ->
+    [passed] 成功
+   *[failed] 失敗
+}
+result-test-client = LLM { $client }：{ $status ->
+    [passed] 成功
+   *[failed] 失敗
+}（{ $protocol }、{ $stream ->
+    [streaming] ストリーミング
+   *[non_streaming] 非ストリーミング
+}）
+result-test-summary = 集計：{ $passed }/{ $total } 成功、{ $failed } 失敗、{ $skipped } 未実行
 translate-incomplete-object = プロジェクト { $project } の今回の Translate
 translate-incomplete-rpg-maker-reason = 部分タスク { $partial }、利用不可タスク { $unavailable }、未開始タスク { $not_started }、プロトコル問題 { $protocol }、要求枯渇 { $exhausted }。要求受付は{
     $admission ->

@@ -1,4 +1,5 @@
 app-about = Translate games and structured text with reusable project state
+cli-test-about = Check the distribution configuration and every LLM Client
 cli-ui-language-help = Language for help, diagnostics, progress, results, and project logs: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko, or vi
 cli-mz-about = Translate an RPG Maker MZ game
 cli-mv-about = Translate an RPG Maker MV game
@@ -109,6 +110,18 @@ result-generic-extract-updated = Generic input updated: { $files } files, { $gro
 result-generic-translate-summary = Generic translation: { $total } planned tasks, { $started } started, { $not_started } not started; { $complete } complete, { $partial } partial, { $unavailable } unavailable, { $failed } failed, { $cancelled } cancelled; { $planned_units } planned units, { $remaining_units } remaining units, including { $rejected_units } rejected, cleared { $cleared }, reused { $reused }, accepted { $accepted }, wrote { $written }, conflicts { $conflicted }, response problems { $problems }
 result-generic-write-back-summary = Generic write-back: { $translated } translated units, { $original } source units retained
 result-run-log = Run log: { $path }
+result-test-configuration = Configuration: { $status ->
+    [passed] passed
+   *[failed] failed
+}
+result-test-client = LLM { $client }: { $status ->
+    [passed] passed
+   *[failed] failed
+} ({ $protocol }, { $stream ->
+    [streaming] streaming
+   *[non_streaming] non-streaming
+})
+result-test-summary = Summary: { $passed }/{ $total } passed, { $failed } failed, { $skipped } not run
 translate-incomplete-object = Translate run for project { $project }
 translate-incomplete-rpg-maker-reason = { $partial } partial tasks, { $unavailable } unavailable tasks, { $not_started } not started, { $protocol } protocol problems, and { $exhausted } exhausted requests; request admission {
     $admission ->

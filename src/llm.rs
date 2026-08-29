@@ -264,6 +264,39 @@ pub(crate) struct ApiKeyRedactor {
     api_key: SecretString,
 }
 
+/// 对一次命令实际选择的全部 Client 统一执行一次 API key 替换。
+///
+/// 所有匹配都来自同一份原始文本；重叠和重复区间合并后再渲染，因此替换标记不会成为
+/// 后续 key 的新输入。
+#[derive(Clone, Default)]
+pub(crate) struct ApiKeyRedactorSet {
+    redactors: Vec<Arc<ApiKeyRedactor>>,
+}
+
+impl ApiKeyRedactorSet {
+    pub(crate) fn insert(&mut self, redactor: Arc<ApiKeyRedactor>) {
+        self.redactors.push(redactor);
+    }
+
+    pub(crate) fn extend(&mut self, redactors: &[Arc<ApiKeyRedactor>]) {
+        self.redactors.extend(redactors.iter().cloned());
+    }
+
+    pub(crate) fn redact(&self, value: &str) -> String {
+        let mut replacements = Vec::new();
+        for redactor in &self.redactors {
+            let api_key = redactor.api_key.expose_secret();
+            if !api_key.is_empty() {
+                replacements.extend(ApiKeyRedactor::literal_source_ranges(value, api_key));
+            }
+        }
+        ApiKeyRedactor::replace_source_ranges(
+            value,
+            ApiKeyRedactor::merge_source_ranges(replacements),
+        )
+    }
+}
+
 /// Translate 在确认本次实际 Client 前暂缓公开文本，确认后统一使用同一替换器。
 ///
 /// Generic 可以从项目状态取得 Profile，因此项目日志可能早于 Client 选择建立。这个门只
@@ -999,6 +1032,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn api_key_redactor_set_merges_overlapping_and_duplicate_original_ranges_once() {
+        let short = Arc::new(ApiKeyRedactor::new(SecretString::from("API")));
+        let long = Arc::new(ApiKeyRedactor::new(SecretString::from("API-SUFFIX")));
+        let mut redactors = ApiKeyRedactorSet::default();
+        redactors.extend(&[short.clone(), long.clone(), long]);
+
+        assert_eq!(
+            redactors.redact("API-SUFFIX API"),
+            "[REDACTED API KEY] [REDACTED API KEY]"
+        );
+
+        let mut single = ApiKeyRedactorSet::default();
+        single.insert(short.clone());
+        assert_eq!(
+            single.redact("before API after"),
+            short.redact("before API after")
+        );
+    }
 
     #[test]
     fn api_key_redactor_covers_json_escaping_and_url_encoding() {

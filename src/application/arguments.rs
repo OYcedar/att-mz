@@ -219,6 +219,9 @@ struct RawAttArguments {
 /// 统一产品入口当前支持的命令域。
 #[derive(Debug, Subcommand)]
 pub(crate) enum ProductCommand {
+    /// 检查配置并逐个验证全部 LLM Client。
+    #[command(name = "test")]
+    Test,
     /// RPG Maker MZ 游戏翻译。
     #[command(name = "mz")]
     Mz {
@@ -747,6 +750,7 @@ fn localized_help_template(command: &Command, localizer: &UiLocalizer) -> String
 fn command_about(command_path: &str, name: &str) -> UiMessage<'static> {
     match name {
         "att" => UiMessage::AppAbout,
+        "test" => UiMessage::CliTestAbout,
         "mz" => UiMessage::CliMzAbout,
         "mv" => UiMessage::CliMvAbout,
         "generic" => UiMessage::CliGenericAbout,
@@ -948,6 +952,13 @@ mod tests {
         let parsed = AttArguments::try_parse_from(["att", "mz", "write-back", "--name", "demo"])
             .expect("配置位置由发行目录确定，不属于命令意图");
         assert!(matches!(expect_mz(parsed.product), MzCommand::WriteBack(_)));
+    }
+
+    #[test]
+    fn root_test_command_has_no_project_or_engine_arguments() {
+        let parsed = AttArguments::try_parse_from(["att", "test"])
+            .expect("根测试命令应直接表达发行配置和 Client 检查");
+        assert!(matches!(parsed.product, ProductCommand::Test));
     }
 
     #[test]
@@ -1512,6 +1523,7 @@ mod tests {
     fn expect_mz(product: ProductCommand) -> MzCommand {
         match product {
             ProductCommand::Mz { command } => command,
+            ProductCommand::Test => panic!("应解析为 MZ 命令"),
             ProductCommand::Mv { .. } => panic!("应解析为 MZ 命令"),
             ProductCommand::Generic { .. } => panic!("应解析为 MZ 命令"),
         }

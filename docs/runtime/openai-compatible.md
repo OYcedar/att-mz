@@ -191,10 +191,22 @@ shutdown 关上入口：新请求不再开始，尚未进入 HTTP 的等待者�
 慢错误正文不会让实际调用数突破错误发生时已经活动的请求窗口。总 deadline 在错误正文读取
 期间到期时，取消安全的决定守卫会解除这次临时门控，后续任务仍按普通总超时语义继续准入。
 
+### 5.1 Client 检查
+
+`att test` 为配置中的每个唯一 Client 分别建立生产 HTTP 根，并发送一组固定的最小 system 与
+user message。请求沿用本规格的协议正文、认证、Endpoint 规范化、代理、PEM、限速、连接/读取/
+总超时、parameters 和成功/失败响应解析。每个 Client 最多产生一次真实 HTTP attempt；
+`retry_delays_ms` 不触发重发。一个 Client 的服务状态只结束该 Client 的检查，下一 Client 使用
+自己的独立 HTTP 根继续执行。
+
+检查结果只存在于本次 stdout/stderr。Assistant 正文用于证明生产响应解析已经完成，随后立即
+释放；输出只呈现 Client ID、协议、流式设置、通过/失败与类型化安全诊断。
+
 ## 6. 敏感信息闭集唯一权威
 
-本节是 ATT 现行敏感信息闭集、替换语义与内容边界的唯一权威。闭集只有一个成员：
-本次实际选中 LLM Client 的 API key 实际值。Prompt、原文、译文、自定义参数、
+本节是 ATT 现行敏感信息闭集、替换语义与内容边界的唯一权威。闭集只包含本次实际选中
+LLM Client 的 API key 实际值：普通模型命令选中一个 Client，`att test` 选中它检查的全部
+Client。Prompt、原文、译文、自定义参数、
 Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处理。这份清单在
 任何模块、日志、诊断、文档、测试或 Skill 中都保持原样，不增不减，也不另行复述。
 

@@ -1,4 +1,5 @@
 app-about = 使用可重用專案狀態翻譯遊戲與結構化文字
+cli-test-about = 檢查發行設定和全部 LLM Client
 cli-ui-language-help = Help、診斷、進度、結果與專案日誌使用的語言：ar、zh-Hans、zh-Hant、en、fr、ru、es、ja、ko 或 vi
 cli-mz-about = 翻譯 RPG Maker MZ 遊戲
 cli-mv-about = 翻譯 RPG Maker MV 遊戲
@@ -109,6 +110,18 @@ result-generic-extract-updated = Generic 輸入已更新：{ $files } 個檔案�
 result-generic-translate-summary = Generic 翻譯：計畫 { $total } 個工作，已開始 { $started }，未開始 { $not_started }；完整 { $complete }，部分 { $partial }，無法使用 { $unavailable }，失敗 { $failed }，取消 { $cancelled }；計畫 Unit { $planned_units }，剩餘 Unit { $remaining_units }，其中 Rejected Unit { $rejected_units }，清除 { $cleared }，重用 { $reused }，接受 { $accepted }，寫入 { $written }，衝突 { $conflicted }，回應問題 { $problems }
 result-generic-write-back-summary = Generic 寫回：套用譯文 { $translated } 個單元，保留原文 { $original } 個單元
 result-run-log = 執行記錄：{ $path }
+result-test-configuration = 設定：{ $status ->
+    [passed] 通過
+   *[failed] 失敗
+}
+result-test-client = LLM { $client }：{ $status ->
+    [passed] 通過
+   *[failed] 失敗
+}（{ $protocol }，{ $stream ->
+    [streaming] 串流
+   *[non_streaming] 非串流
+}）
+result-test-summary = 彙總：{ $passed }/{ $total } 通過，{ $failed } 失敗，{ $skipped } 未執行
 translate-incomplete-object = 專案 { $project } 的本次 Translate
 translate-incomplete-rpg-maker-reason = 部分任務 { $partial }，不可用任務 { $unavailable }，未開始任務 { $not_started }，協定問題 { $protocol }，請求耗盡 { $exhausted }；請求准入{
     $admission ->

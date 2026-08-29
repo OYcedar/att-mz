@@ -1,4 +1,5 @@
 app-about = Перевод игр и структурированного текста с повторно используемым состоянием проекта
+cli-test-about = Проверить конфигурацию дистрибутива и все клиенты LLM
 cli-ui-language-help = Язык справки, диагностики, прогресса, результатов и журналов проекта: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko или vi
 cli-mz-about = Перевести игру RPG Maker MZ
 cli-mv-about = Перевести игру RPG Maker MV
@@ -109,6 +110,18 @@ result-generic-extract-updated = Входные данные Generic обнов�
 result-generic-translate-summary = Перевод Generic: запланировано { $total } задач, начато { $started }, не начато { $not_started }; завершено { $complete }, частично { $partial }, недоступно { $unavailable }, с ошибкой { $failed }, отменено { $cancelled }; запланировано Unit: { $planned_units }, осталось Unit: { $remaining_units }, из них отклонено { $rejected_units }, очищено { $cleared }, повторно использовано { $reused }, принято { $accepted }, записано { $written }, конфликтов { $conflicted }, проблем ответа { $problems }
 result-generic-write-back-summary = Запись Generic: { $translated } переведённых единиц, { $original } исходных сохранено
 result-run-log = Журнал запуска: { $path }
+result-test-configuration = Конфигурация: { $status ->
+    [passed] успешно
+   *[failed] ошибка
+}
+result-test-client = LLM { $client }: { $status ->
+    [passed] успешно
+   *[failed] ошибка
+} ({ $protocol }, { $stream ->
+    [streaming] потоковый режим
+   *[non_streaming] полный ответ
+})
+result-test-summary = Итог: { $passed }/{ $total } успешно, { $failed } с ошибкой, { $skipped } не запущено
 translate-incomplete-object = Запуск Translate для проекта { $project }
 translate-incomplete-rpg-maker-reason = Частичных задач: { $partial }, недоступных: { $unavailable }, не начато: { $not_started }, проблем протокола: { $protocol }, исчерпанных запросов: { $exhausted }; приём запросов {
     $admission ->

@@ -1,4 +1,5 @@
 app-about = Traduce juegos y texto estructurado con un estado de proyecto reutilizable
+cli-test-about = Comprobar la configuración de distribución y todos los clientes LLM
 cli-ui-language-help = Idioma de la ayuda, diagnósticos, progreso, resultados y registros del proyecto: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko o vi
 cli-mz-about = Traduce un juego de RPG Maker MZ
 cli-mv-about = Traduce un juego de RPG Maker MV
@@ -109,6 +110,18 @@ result-generic-extract-updated = Entrada Generic actualizada: { $files } archivo
 result-generic-translate-summary = Traducción Generic: { $total } tareas planificadas, { $started } iniciadas, { $not_started } sin iniciar; { $complete } completas, { $partial } parciales, { $unavailable } no disponibles, { $failed } fallidas, { $cancelled } canceladas; { $planned_units } unidades planificadas, { $remaining_units } restantes, incluidas { $rejected_units } rechazadas, { $cleared } borradas, { $reused } reutilizadas, { $accepted } aceptadas, { $written } escritas, { $conflicted } conflictos, { $problems } problemas de respuesta
 result-generic-write-back-summary = Escritura Generic: { $translated } unidades traducidas, { $original } unidades de origen conservadas
 result-run-log = Registro de ejecución: { $path }
+result-test-configuration = Configuración: { $status ->
+    [passed] correcta
+   *[failed] fallida
+}
+result-test-client = LLM { $client }: { $status ->
+    [passed] correcto
+   *[failed] fallido
+} ({ $protocol }, { $stream ->
+    [streaming] transmisión
+   *[non_streaming] respuesta completa
+})
+result-test-summary = Resumen: { $passed }/{ $total } correctos, { $failed } fallidos, { $skipped } sin ejecutar
 translate-incomplete-object = Ejecución Translate del proyecto { $project }
 translate-incomplete-rpg-maker-reason = { $partial } tareas parciales, { $unavailable } no disponibles, { $not_started } sin iniciar, { $protocol } problemas de protocolo y { $exhausted } solicitudes agotadas; la admisión de solicitudes {
     $admission ->

@@ -1,4 +1,5 @@
 app-about = Dịch trò chơi và văn bản có cấu trúc với trạng thái dự án có thể tái sử dụng
+cli-test-about = Kiểm tra cấu hình bản phân phối và mọi LLM Client
 cli-ui-language-help = Ngôn ngữ cho trợ giúp, chẩn đoán, tiến độ, kết quả và nhật ký dự án: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko hoặc vi
 cli-mz-about = Dịch trò chơi RPG Maker MZ
 cli-mv-about = Dịch trò chơi RPG Maker MV
@@ -109,6 +110,18 @@ result-generic-extract-updated = Đã cập nhật đầu vào Generic: { $files
 result-generic-translate-summary = Dịch Generic: { $total } tác vụ đã lên kế hoạch, { $started } đã bắt đầu, { $not_started } chưa bắt đầu; { $complete } hoàn tất, { $partial } một phần, { $unavailable } không khả dụng, { $failed } thất bại, { $cancelled } đã hủy; { $planned_units } Unit đã lên kế hoạch, còn { $remaining_units } Unit, gồm { $rejected_units } Rejected, xóa { $cleared }, dùng lại { $reused }, chấp nhận { $accepted }, ghi { $written }, xung đột { $conflicted }, lỗi phản hồi { $problems }
 result-generic-write-back-summary = Ghi lại Generic: { $translated } đơn vị dịch, giữ nguyên { $original } đơn vị nguồn
 result-run-log = Nhật ký lần chạy: { $path }
+result-test-configuration = Cấu hình: { $status ->
+    [passed] đạt
+   *[failed] lỗi
+}
+result-test-client = LLM { $client }: { $status ->
+    [passed] đạt
+   *[failed] lỗi
+} ({ $protocol }, { $stream ->
+    [streaming] truyền luồng
+   *[non_streaming] phản hồi đầy đủ
+})
+result-test-summary = Tổng kết: { $passed }/{ $total } đạt, { $failed } lỗi, { $skipped } chưa chạy
 translate-incomplete-object = Lần chạy Translate của dự án { $project }
 translate-incomplete-rpg-maker-reason = { $partial } tác vụ một phần, { $unavailable } tác vụ không khả dụng, { $not_started } chưa bắt đầu, { $protocol } lỗi giao thức và { $exhausted } yêu cầu đã cạn; nhận yêu cầu {
     $admission ->

@@ -416,6 +416,7 @@ fn windows_user_preferred_ui_languages() -> Vec<String> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UiMessage<'a> {
     AppAbout,
+    CliTestAbout,
     CliUiLanguageHelp,
     CliMzAbout,
     CliMvAbout,
@@ -705,6 +706,21 @@ pub(crate) enum UiMessage<'a> {
     ResultRunLog {
         path: &'a str,
     },
+    ResultTestConfiguration {
+        status: &'a str,
+    },
+    ResultTestClient {
+        client: &'a str,
+        status: &'a str,
+        protocol: &'a str,
+        stream: &'a str,
+    },
+    ResultTestSummary {
+        passed: u64,
+        failed: u64,
+        skipped: u64,
+        total: u64,
+    },
     TranslateIncompleteObject {
         project: &'a str,
     },
@@ -835,6 +851,7 @@ impl UiMessage<'_> {
     fn key(self) -> &'static str {
         match self {
             Self::AppAbout => "app-about",
+            Self::CliTestAbout => "cli-test-about",
             Self::CliUiLanguageHelp => "cli-ui-language-help",
             Self::CliMzAbout => "cli-mz-about",
             Self::CliMvAbout => "cli-mv-about",
@@ -967,6 +984,9 @@ impl UiMessage<'_> {
             Self::ResultWriteBackSummary { .. } => "result-write-back-summary",
             Self::ResultGenericWriteBackSummary { .. } => "result-generic-write-back-summary",
             Self::ResultRunLog { .. } => "result-run-log",
+            Self::ResultTestConfiguration { .. } => "result-test-configuration",
+            Self::ResultTestClient { .. } => "result-test-client",
+            Self::ResultTestSummary { .. } => "result-test-summary",
             Self::TranslateIncompleteObject { .. } => "translate-incomplete-object",
             Self::TranslateIncompleteRpgMakerReason { .. } => {
                 "translate-incomplete-rpg-maker-reason"
@@ -1055,6 +1075,31 @@ impl UiMessage<'_> {
             Self::ResultTranslateCompleted { project, profile } => {
                 set_text(&mut arguments, "project", project);
                 set_text(&mut arguments, "profile", profile);
+            }
+            Self::ResultTestConfiguration { status } => {
+                set_text(&mut arguments, "status", status);
+            }
+            Self::ResultTestClient {
+                client,
+                status,
+                protocol,
+                stream,
+            } => {
+                set_text(&mut arguments, "client", client);
+                set_text(&mut arguments, "status", status);
+                set_text(&mut arguments, "protocol", protocol);
+                set_text(&mut arguments, "stream", stream);
+            }
+            Self::ResultTestSummary {
+                passed,
+                failed,
+                skipped,
+                total,
+            } => {
+                set_number(&mut arguments, "passed", passed);
+                set_number(&mut arguments, "failed", failed);
+                set_number(&mut arguments, "skipped", skipped);
+                set_number(&mut arguments, "total", total);
             }
             Self::ResultGenericExtractUnchanged {
                 files,
@@ -1389,6 +1434,7 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "rejected_units", rejected_units);
             }
             Self::AppAbout
+            | Self::CliTestAbout
             | Self::CliUiLanguageHelp
             | Self::CliMzAbout
             | Self::CliMvAbout
@@ -1921,6 +1967,7 @@ mod tests {
     fn all_test_messages() -> Vec<UiMessage<'static>> {
         vec![
             UiMessage::AppAbout,
+            UiMessage::CliTestAbout,
             UiMessage::CliUiLanguageHelp,
             UiMessage::CliMzAbout,
             UiMessage::CliMvAbout,
@@ -2141,6 +2188,19 @@ mod tests {
             },
             UiMessage::ResultRunLog {
                 path: "logs/run-000001.jsonl",
+            },
+            UiMessage::ResultTestConfiguration { status: "passed" },
+            UiMessage::ResultTestClient {
+                client: "primary",
+                status: "passed",
+                protocol: "responses",
+                stream: "streaming",
+            },
+            UiMessage::ResultTestSummary {
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                total: 1,
             },
             UiMessage::TranslateIncompleteObject { project: "demo" },
             UiMessage::TranslateIncompleteRpgMakerReason {

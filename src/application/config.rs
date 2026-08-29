@@ -3,7 +3,7 @@
 //! 原始 TOML 只在本模块存在。结构和字段类型全部通过后，本模块继续建立路径基准、
 //! 语言模块、LLM Client 外部约束与 Profile 唯一性；业务和根适配器只接收受信配置。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -39,6 +39,7 @@ use crate::language::{
     JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguageIdError, LanguageModule,
     LanguageModuleCatalog, LanguageModuleCatalogBuildError, LanguagePolicyConfigurationError,
 };
+use crate::llm::ApiKeyRedactor;
 use crate::manual::{ManualExportSelection, ManualOperation};
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
@@ -155,6 +156,10 @@ pub(crate) fn load_product_configuration(
     let toml_index = Arc::new(ConfigurationTomlIndex::build(source, &configuration_path)?);
     toml_index.validate_complete_field_set(source, &configuration_path)?;
     match product {
+        ProductCommand::Test => {
+            ConfiguredTestCommand::build(&configuration_path, source, toml_index.as_ref())
+                .map(ConfiguredProductCommand::Test)
+        }
         ProductCommand::Mz { command } => ConfiguredRpgMakerCommand::build(
             &configuration_path,
             distribution,
@@ -205,17 +210,105 @@ fn load_configuration(
     load_product_configuration(&distribution, ProductCommand::Mz { command }).map(|configured| {
         match configured {
             ConfiguredProductCommand::RpgMaker { command, .. } => command,
+            ConfiguredProductCommand::Test(_) => unreachable!("测试传入 MZ 命令"),
             ConfiguredProductCommand::Generic(_) => unreachable!("测试传入 MZ 命令"),
         }
     })
 }
 
 pub(crate) enum ConfiguredProductCommand {
+    Test(ConfiguredTestCommand),
     RpgMaker {
         layout: RpgMakerLayout,
         command: ConfiguredRpgMakerCommand,
     },
     Generic(ConfiguredGenericCommand),
+}
+
+/// 根测试命令已经完成严格配置校验后的全部唯一 Client。
+pub(crate) struct ConfiguredTestCommand {
+    clients: Vec<ConfiguredTestClient>,
+}
+
+impl ConfiguredTestCommand {
+    fn build(
+        configuration_path: &Path,
+        source: &str,
+        toml_index: &ConfigurationTomlIndex,
+    ) -> Result<Self, ConfigurationLoadError> {
+        let raw: RawTestSelection = parse_selected(
+            source,
+            configuration_path,
+            toml_index,
+            ConfigurationSelection::NoAdditionalFields,
+        )?;
+        let configuration_directory = configuration_path.parent().expect("配置文件必须拥有父目录");
+        if raw.llm.clients.is_empty() {
+            return Err(ConfigurationLoadError::InvalidValue(invalid(
+                "llm.clients",
+                ConfigurationValueRule::ValueBlank,
+            )));
+        }
+        let mut clients = Vec::with_capacity(raw.llm.clients.len());
+        for (id, raw_client) in raw.llm.clients {
+            validate_exact_identifier("llm client id", &id)
+                .map_err(ConfigurationLoadError::InvalidValue)?;
+            let protocol = OpenAiProtocol::from(raw_client.protocol);
+            let stream = raw_client.stream;
+            let built = build_llm_client(
+                format!("llm.clients.{id}").as_str(),
+                configuration_directory,
+                raw_client,
+            )
+            .map_err(ConfigurationLoadError::InvalidValue)?;
+            clients.push(ConfiguredTestClient {
+                id,
+                protocol,
+                stream,
+                executor: built.executor,
+                client: built.client,
+            });
+        }
+        Ok(Self { clients })
+    }
+
+    pub(crate) fn clients(&self) -> &[ConfiguredTestClient] {
+        &self.clients
+    }
+}
+
+pub(crate) struct ConfiguredTestClient {
+    id: String,
+    protocol: OpenAiProtocol,
+    stream: bool,
+    executor: SelectedLlmExecutorConfiguration,
+    client: OpenAiCompatibleClient,
+}
+
+impl ConfiguredTestClient {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) const fn protocol(&self) -> OpenAiProtocol {
+        self.protocol
+    }
+
+    pub(crate) const fn stream(&self) -> bool {
+        self.stream
+    }
+
+    pub(crate) const fn executor(&self) -> &SelectedLlmExecutorConfiguration {
+        &self.executor
+    }
+
+    pub(crate) const fn client(&self) -> &OpenAiCompatibleClient {
+        &self.client
+    }
+
+    pub(crate) fn api_key_redactor(&self) -> Arc<ApiKeyRedactor> {
+        self.client.api_key_redactor()
+    }
 }
 
 fn normalize_mv_command(command: MvCommand) -> (RpgMakerCommandArguments, Option<PathBuf>) {
@@ -4295,6 +4388,26 @@ struct RawInitSelection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawTestSelection {
+    llm: RawTestLlmConfiguration,
+    #[serde(default, rename = "prompts")]
+    _prompts: Option<IgnoredAny>,
+    #[serde(default, rename = "languages")]
+    _languages: Option<IgnoredAny>,
+    #[serde(default, rename = "translation")]
+    _translation: Option<IgnoredAny>,
+    #[serde(default, rename = "write_back")]
+    _write_back: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestLlmConfiguration {
+    clients: BTreeMap<String, RawLlmClientConfiguration>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExtractSelection {
     #[serde(default, rename = "llm")]
     _llm: Option<IgnoredAny>,
@@ -5831,6 +5944,7 @@ api_key = "{API_KEY}" "invalid"
         let parsed = AttArguments::try_parse_from(arguments).expect("测试命令应合法");
         match parsed.product {
             ProductCommand::Mz { command } => command,
+            ProductCommand::Test => panic!("配置测试只应构造 MZ 命令"),
             ProductCommand::Mv { .. } => panic!("配置测试只应构造 MZ 命令"),
             ProductCommand::Generic { .. } => panic!("配置测试只应构造 MZ 命令"),
         }

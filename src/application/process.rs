@@ -11,7 +11,7 @@ use std::sync::{Arc, Once};
 use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
 
 use super::TranslationTerminalSummary;
-use super::arguments::AttArguments;
+use super::arguments::{AttArguments, ProductCommand};
 use super::command::{
     CommandPanicBoundary, CommandResultRenderer, CommandRunResult, ProductionCommandError,
     ProductionCommandRunReport, ProductionRpgMakerCommandRunner,
@@ -26,17 +26,19 @@ use super::generic_command::{
 };
 use super::project_log::{PendingProjectLog, ProjectLogWarning};
 use super::termination::TerminationSignals;
+use super::test_command::{TestCommandReport, run_test_command};
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, IoFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation,
     RuntimePanicBoundary, StateEffect, public_path, render_diagnostic_report,
     render_state_effect_impact,
 };
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
-use crate::llm::ApiKeyRedactor;
+use crate::llm::{ApiKeyRedactor, ApiKeyRedactorSet};
 use crate::manual::{render_manual_command_error, render_manual_command_summary};
 use crate::runtime::project_log::TranslationEngineSummary;
 
 enum ProductCommandRunReport {
+    Test(TestCommandReport),
     RpgMaker(ProductionCommandRunReport),
     Generic(GenericCommandRunReport),
 }
@@ -78,7 +80,7 @@ struct StreamPresentation<'a> {
     stream: ProcessStream,
     output: &'a mut dyn Write,
     unconfirmed: Vec<u8>,
-    api_key_redactor: Option<Arc<ApiKeyRedactor>>,
+    api_key_redactors: ApiKeyRedactorSet,
     write_failure: Option<IoFailure>,
     flush_failure: Option<IoFailure>,
     write_in_progress: bool,
@@ -92,7 +94,7 @@ impl<'a> StreamPresentation<'a> {
             stream,
             output,
             unconfirmed: Vec::new(),
-            api_key_redactor: None,
+            api_key_redactors: ApiKeyRedactorSet::default(),
             write_failure: None,
             flush_failure: None,
             write_in_progress: false,
@@ -150,16 +152,17 @@ impl<'a> StreamPresentation<'a> {
 
     fn select_api_key_redactor(&mut self, redactor: Option<Arc<ApiKeyRedactor>>) {
         if let Some(redactor) = redactor {
-            self.api_key_redactor = Some(redactor);
+            self.api_key_redactors.insert(redactor);
         }
+    }
+
+    fn select_api_key_redactors(&mut self, redactors: &[Arc<ApiKeyRedactor>]) {
+        self.api_key_redactors.extend(redactors);
     }
 
     fn bytes_for_output(&self, bytes: &[u8]) -> Vec<u8> {
         let text = String::from_utf8_lossy(bytes);
-        match self.api_key_redactor.as_ref() {
-            Some(redactor) => redactor.redact(&text).into_bytes(),
-            None => text.into_owned().into_bytes(),
-        }
+        self.api_key_redactors.redact(&text).into_bytes()
     }
 
     /// 日常呈现和首次 flush 已结束后，只允许调用方执行一次有界后续写入。
@@ -517,6 +520,7 @@ fn run_after_cli_parsing(
     stdout: &mut StreamPresentation<'_>,
     stderr: &mut StreamPresentation<'_>,
 ) -> ProcessOutputState {
+    let is_test_command = matches!(&arguments.product, ProductCommand::Test);
     let distribution = match DistributionLayout::from_current_executable() {
         Ok(distribution) => distribution,
         Err(error) => {
@@ -528,6 +532,16 @@ fn run_after_cli_parsing(
     let configuration = match load_product_configuration(&distribution, arguments.product) {
         Ok(configuration) => configuration,
         Err(error) => {
+            if is_test_command
+                && writeln!(
+                    stdout,
+                    "{}",
+                    localizer.format(UiMessage::ResultTestConfiguration { status: "failed" })
+                )
+                .is_err()
+            {
+                return ProcessOutputState::NeedsFlush(ExitCode::FAILURE);
+            }
             return ProcessOutputState::NeedsFlush(render_configuration_load_error(
                 localizer, &error, stderr,
             ));
@@ -580,6 +594,9 @@ fn run_after_cli_parsing(
     let command_run = Box::pin(async move {
         let mut termination_signals = TerminationSignals::new();
         let report = match configuration {
+            ConfiguredProductCommand::Test(command) => ProductCommandRunReport::Test(
+                run_test_command(command, &mut termination_signals).await,
+            ),
             ConfiguredProductCommand::RpgMaker { layout, command } => {
                 ProductCommandRunReport::RpgMaker(
                     ProductionRpgMakerCommandRunner::new(layout, locale)
@@ -599,6 +616,13 @@ fn run_after_cli_parsing(
     // 信号订阅与 Runtime 保持到最终结果输出结束；各业务根已经在 report 返回前显式 shutdown。
 
     let report = match report {
+        ProductCommandRunReport::Test(report) => {
+            stdout.select_api_key_redactors(&report.redactors);
+            stderr.select_api_key_redactors(&report.redactors);
+            return ProcessOutputState::NeedsFlush(render_test_command_report(
+                report, localizer, stdout, stderr,
+            ));
+        }
         ProductCommandRunReport::RpgMaker(report) => report,
         ProductCommandRunReport::Generic(report) => {
             return ProcessOutputState::Flushed(render_generic_command_report(
@@ -1861,6 +1885,82 @@ fn render_primary_error(
         localizer.format(UiMessage::DiagnosticErrorHeading)
     )?;
     writeln!(stderr, "{}", render_diagnostic_report(report, localizer))
+}
+
+fn render_test_command_report(
+    report: TestCommandReport,
+    localizer: &UiLocalizer,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let business_exit = if report.interrupted {
+        ExitCode::from(130)
+    } else if report.succeeded() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
+    let rendered = (|| -> io::Result<()> {
+        writeln!(
+            stdout,
+            "{}",
+            localizer.format(UiMessage::ResultTestConfiguration { status: "passed" })
+        )?;
+        for client in &report.clients {
+            let status = if client.diagnostic.is_some() {
+                "failed"
+            } else {
+                "passed"
+            };
+            let protocol = match client.protocol {
+                crate::runtime::llm::OpenAiProtocol::ChatCompletions => "chat_completions",
+                crate::runtime::llm::OpenAiProtocol::Responses => "responses",
+            };
+            let stream = if client.stream {
+                "streaming"
+            } else {
+                "non_streaming"
+            };
+            writeln!(
+                stdout,
+                "{}",
+                localizer.format(UiMessage::ResultTestClient {
+                    client: &client.id,
+                    status,
+                    protocol,
+                    stream,
+                })
+            )?;
+            if let Some(diagnostic) = &client.diagnostic {
+                render_primary_error(diagnostic, localizer, stderr)?;
+            }
+        }
+        for diagnostic in &report.command_diagnostics {
+            render_primary_error(diagnostic, localizer, stderr)?;
+        }
+        writeln!(
+            stdout,
+            "{}",
+            localizer.format(UiMessage::ResultTestSummary {
+                passed: u64::try_from(report.passed_clients())
+                    .expect("Client 数量必须能用 u64 表达"),
+                failed: u64::try_from(report.failed_clients())
+                    .expect("Client 数量必须能用 u64 表达"),
+                skipped: u64::try_from(report.skipped_clients())
+                    .expect("Client 数量必须能用 u64 表达"),
+                total: u64::try_from(report.total_clients).expect("Client 数量必须能用 u64 表达"),
+            })
+        )?;
+        if report.interrupted {
+            writeln!(stderr, "{}", localizer.format(UiMessage::ResultCancelled))?;
+        }
+        Ok(())
+    })();
+    if rendered.is_err() {
+        ExitCode::FAILURE
+    } else {
+        business_exit
+    }
 }
 
 fn render_generic_shutdown_errors(
@@ -3234,6 +3334,41 @@ mod tests {
         assert!(
             stdout.contains('\u{fffd}'),
             "无效字节必须以 UTF-8 replacement 呈现"
+        );
+    }
+
+    #[test]
+    fn multiple_api_keys_use_one_combined_pass_without_changing_single_key_output() {
+        let short = Arc::new(ApiKeyRedactor::new(SecretString::from("secret")));
+        let long = Arc::new(ApiKeyRedactor::new(SecretString::from("secret-suffix")));
+        let mut multiple_output = FlushCountingOutput::default();
+        {
+            let mut presentation =
+                StreamPresentation::new(ProcessStream::Stdout, &mut multiple_output);
+            presentation.select_api_key_redactors(&[short.clone(), long]);
+            presentation
+                .write_all(b"secret-suffix secret")
+                .expect("正文应进入逻辑缓冲");
+            presentation.flush().expect("多 key 输出应完成 flush");
+        }
+        assert_eq!(
+            String::from_utf8(multiple_output.bytes).expect("输出应为 UTF-8"),
+            "[REDACTED API KEY] [REDACTED API KEY]"
+        );
+
+        let mut single_output = FlushCountingOutput::default();
+        {
+            let mut presentation =
+                StreamPresentation::new(ProcessStream::Stdout, &mut single_output);
+            presentation.select_api_key_redactor(Some(short));
+            presentation
+                .write_all(b"before secret after")
+                .expect("正文应进入逻辑缓冲");
+            presentation.flush().expect("单 key 输出应完成 flush");
+        }
+        assert_eq!(
+            String::from_utf8(single_output.bytes).expect("输出应为 UTF-8"),
+            "before [REDACTED API KEY] after"
         );
     }
 

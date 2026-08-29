@@ -3,16 +3,19 @@
 ## 1. 统一入口
 
 ```text
+att [--ui-language LANG] test
 att [--ui-language LANG] ENGINE COMMAND ...
 ```
 
-`ENGINE` 取 `mv`、`mz` 或 `generic`。Help 与 Version 开箱即用；其余命令读取实际运行的
-`att.exe` 同目录下固定 `config.toml`，并要求显式给出引擎、命令和项目名。CLI 不提供配置
-路径参数。
+`test` 是发行根配置与 LLM Client 的只读检查。`ENGINE` 取 `mv`、`mz` 或 `generic`。
+Help 与 Version 开箱即用；其余命令读取实际运行的 `att.exe` 同目录下固定 `config.toml`。
+项目命令显式给出引擎、命令和项目名。CLI 不提供配置路径参数。
 
 当前命令：
 
 ```text
+att test
+
 att mv|mz init --name NAME [--path GAME_ROOT]
   [--source-language LANG] [--target-language LANG]
 
@@ -116,6 +119,13 @@ Manual、Lua、Init、Extract 与 WriteBack 不构造模型 Client；Manual chec
 模型 Task 只在第一次真实外部 HTTP attempt 开始时计为 started。请求构造失败、准入前
 取消或服务停发门拒绝都不得伪造 started、attempt 或任务记录。
 
+`att test` 先严格检查发行配置结构和全部 LLM Client，再按 Client ID 的稳定顺序逐个检查全部唯一
+`[llm.clients.*]`。每项使用该 Client 的协议、流式设置、Endpoint、认证、代理、PEM、超时、
+限速、parameters 和生产响应解析发送一次最小请求；Profile 与重试列表不参与选择或重发。
+一项失败后继续下一项。Ctrl-C 等待当前已发请求取得明确结果并停止后续项，退出 `130`。
+该命令只读取发行配置和 PEM 并访问配置的模型服务，不建立项目、数据库、RunId、项目日志或
+任务记录。
+
 文件解析与相互独立的工作默认并行；要求确定顺序的结果仍按自然顺序合并和提交。处理窗口
 装满时上游等待，不把合法项目总量变成容量错误。
 
@@ -198,6 +208,10 @@ SQLite code、查询文本、供应商请求 ID 或指纹差异。
 
 警告使用同样四项，只把首行改为 `警告：`。相关失败在同一主块之后使用本地化的关系标题，
 不重复显示第二个主错误标题。
+
+`att test` 在 stdout 依次输出配置预检、每个 Client 的结果和汇总；Client 失败的类型化安全
+诊断写入 stderr。配置无效时输出配置失败并结束；运行期 Client 失败不阻止其余 Client 接受
+检查。全部配置与 Client 通过时退出 `0`，任一失败时退出 `1`。
 
 项目日志仍可写时，警告和错误以同样的可读四字段保存；日志无法建立或继续写入时，stderr
 直接显示这四项。相关清理、回滚、候选丢弃、收尾、关闭和结果记录失败还要说明彼此关系。

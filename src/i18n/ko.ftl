@@ -1,4 +1,5 @@
 app-about = 재사용 가능한 프로젝트 상태로 게임과 구조화된 텍스트를 번역합니다
+cli-test-about = 배포 구성과 모든 LLM Client를 확인합니다
 cli-ui-language-help = 도움말, 진단, 진행률, 결과 및 프로젝트 로그의 언어: ar, zh-Hans, zh-Hant, en, fr, ru, es, ja, ko 또는 vi
 cli-mz-about = RPG Maker MZ 게임 번역
 cli-mv-about = RPG Maker MV 게임 번역
@@ -109,6 +110,18 @@ result-generic-extract-updated = Generic 입력 갱신: 파일 { $files }개, �
 result-generic-translate-summary = Generic 번역: 계획 작업 { $total }개, 시작 { $started }개, 미시작 { $not_started }개, 완료 { $complete }개, 부분 { $partial }개, 사용 불가 { $unavailable }개, 실패 { $failed }개, 취소 { $cancelled }개; 계획 Unit { $planned_units }개, 남은 Unit { $remaining_units }개(Rejected { $rejected_units }개), 초기화 { $cleared }, 재사용 { $reused }, 수락 { $accepted }, 기록 { $written }, 충돌 { $conflicted }, 응답 문제 { $problems }
 result-generic-write-back-summary = Generic 쓰기: 번역 { $translated }단위, 원문 유지 { $original }단위
 result-run-log = 실행 기록: { $path }
+result-test-configuration = 구성: { $status ->
+    [passed] 통과
+   *[failed] 실패
+}
+result-test-client = LLM { $client }: { $status ->
+    [passed] 통과
+   *[failed] 실패
+} ({ $protocol }, { $stream ->
+    [streaming] 스트리밍
+   *[non_streaming] 비스트리밍
+})
+result-test-summary = 요약: { $passed }/{ $total } 통과, { $failed } 실패, { $skipped } 미실행
 translate-incomplete-object = 프로젝트 { $project }의 이번 Translate
 translate-incomplete-rpg-maker-reason = 부분 작업 { $partial }개, 사용 불가 작업 { $unavailable }개, 미시작 작업 { $not_started }개, 프로토콜 문제 { $protocol }개, 요청 소진 { $exhausted }개, 요청 접수 {
     $admission ->

@@ -1,4 +1,5 @@
 app-about = ترجمة الألعاب والنصوص المنظّمة باستخدام حالة مشروع قابلة لإعادة الاستخدام
+cli-test-about = فحص إعداد التوزيعة وجميع عملاء LLM
 cli-ui-language-help = لغة المساعدة والتشخيص والتقدم والنتائج وسجلات المشروع: ar وzh-Hans وzh-Hant وen وfr وru وes وja وko وvi
 cli-mz-about = ترجمة لعبة RPG Maker MZ
 cli-mv-about = ترجمة لعبة RPG Maker MV
@@ -109,6 +110,18 @@ result-generic-extract-updated = حُدثت مدخلات Generic: ‏{ $files } 
 result-generic-translate-summary = ترجمة Generic: خُطط لـ { $total } مهمة، وبدأت { $started }، ولم تبدأ { $not_started }؛ مكتملة { $complete }، جزئية { $partial }، غير متاحة { $unavailable }، فاشلة { $failed }، ملغاة { $cancelled }؛ وحدات مخططة { $planned_units }، ومتبقية { $remaining_units }، منها { $rejected_units } مرفوضة، ومُسحت { $cleared }، وأُعيد استخدام { $reused }، وقُبل { $accepted }، وكُتب { $written }، والتعارضات { $conflicted }، ومشكلات الاستجابة { $problems }
 result-generic-write-back-summary = كتابة Generic: ‏{ $translated } وحدة مترجمة مع الاحتفاظ بـ { $original } وحدة مصدر
 result-run-log = سجل التشغيل: { $path }
+result-test-configuration = الإعداد: { $status ->
+    [passed] ناجح
+   *[failed] فشل
+}
+result-test-client = LLM { $client }: { $status ->
+    [passed] ناجح
+   *[failed] فشل
+} ({ $protocol }، { $stream ->
+    [streaming] تدفق
+   *[non_streaming] استجابة كاملة
+})
+result-test-summary = الملخص: نجح { $passed }/{ $total }، فشل { $failed }، لم يُشغّل { $skipped }
 translate-incomplete-object = تشغيل Translate للمشروع { $project }
 translate-incomplete-rpg-maker-reason = مهام جزئية: { $partial }، وغير متاحة: { $unavailable }، ولم تبدأ: { $not_started }، ومشكلات بروتوكول: { $protocol }، وطلبات مستنفدة: { $exhausted }؛ قبول الطلبات {
     $admission ->
