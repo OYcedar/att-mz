@@ -1,0 +1,4 @@
+interface:
+  display_name: "MV 玻璃姓名牌"
+  short_description: "为 MV 汉化游戏识别姓名来源并接入玻璃胶囊人物姓名牌"
+  default_prompt: "使用 $mv-nameplate-glass，为当前 RPG Maker MV 汉化项目接入玻璃胶囊人物姓名牌，并交付封包与人工实机检查项。"
