@@ -44,8 +44,9 @@ pattern = '<msg>(?<text>.*?)</msg>'
   kind，并额外保护该规格列出的引擎控制符；
 - Generic 把 `scopes` 与 JSONL 的 `kind` 原值精确比较，没有内置控制符。
 
-两者的规则不同：给 MZ 项目使用的 Placeholder 文件不能因为语法相同就直接当作
-Generic 项目规则。
+Generic 项目使用与 JSONL `kind` 原值精确对应的 `scopes`。从 MZ Placeholder 文件迁移规则时，
+逐项复核或改写 `scopes`，并作为独立 Generic 规则随 Translate 加载；两类文件共享 TOML 语法，
+scope 语义分别由各自引擎负责。
 
 ATT 把匹配片段替换成临时 ATT token，再把模型结果中的 token 恢复为原片段。token 的
 字符、大小写、编号、数量、顺序和允许位置必须保持；缺失、重复、改写或跨不允许边界移动

@@ -103,9 +103,9 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
 `apply` 每次都按当前游戏和字体输入重新扫描、生成计划并验证，不依赖之前的 `inspect` 结果。它先建立
 包含每项替换前后完整字节和摘要的 `state`，再原子写入。`--translations` 必须是 ATT 当前
 `translation export`：工具严格校验自然 ID、状态和字段组合，并按 WriteBack 行为投影字符——
-current 使用译文，pending/rejected 使用仍会写回的原文。这只能证明该导出自身的字符投影；字体
-工具没有同时消费同源 Survey、finalize coverage、实际 WriteBack 和运行副本，不能据此证明项目
-全部字体消费者范围。
+current 使用译文，pending/rejected 使用仍会写回的原文。完整字体消费者范围由操作者联合核对
+同源 Survey、finalize coverage、实际 WriteBack 和隔离运行副本；`--translations` 提供其中的
+ATT 写回字符投影证据。
 `--coverage-text` 只是已知额外玩家文本，可以重复传入；它的覆盖结论只适用于所给文本，不能因
 含有任意一个已覆盖字符而把项目报告提升为 `clean`。选中字体缺少任一已检查字符只会进入 Review，
 不会阻止安全的已证明引用替换。未提供 Translation export、其投影没有非空字符、没有已证明引用、

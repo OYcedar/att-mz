@@ -5,14 +5,15 @@ att mv write-back --name NAME [--layout-rules FILE]
 att mz write-back --name NAME [--layout-rules FILE]
 ```
 
-WriteBack 不使用 Lua，也不构造模型 Client、读取 Prompt/Profile 或发出模型请求。它只读取
-冻结来源、当前提取资产和译文，在项目工作区生成：
+WriteBack 读取冻结来源、当前提取资产和译文，执行确定性 recipe 物化，并在项目工作区生成：
 
 ```text
 <att-dir>/projects/<mv|mz>/<name>/write_back/
 ```
 
 原游戏与冻结来源在整个过程中保持原样。
+模型译文由 [Translate](translation.md) 生成，特殊数据库脚本由[项目数据库 Lua](../lua/README.md)执行；
+WriteBack 使用已经提交的当前正文完成候选构建和发布。
 
 ## 1. 候选构建
 
@@ -69,7 +70,9 @@ WriteBack 不使用 Init 中的统一宽度，也不扫描全部文本猜测可�
 
 候选必须重新解析，并证明改动只落在受管范围内。新增 `401/405` 时事件列表作为完整结构
 重建，并按每个输出行的原始母行复制 indent 和未知字段；不是在正向遍历数组时原地插入。
-WriteBack 不执行脚本，也没有发布后回调。
+WriteBack 的生命周期在完整候选验证、发布并记录唯一终态后结束；操作者随后按第 3 节部署内容树
+并完成实际加载验收。发布终态直接交还操作者，所需脚本由操作者在命令返回后从外部启动；
+WriteBack 不注册或触发发布后回调。
 
 ## 3. 一次发布
 

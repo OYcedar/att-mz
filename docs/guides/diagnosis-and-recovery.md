@@ -166,7 +166,9 @@ Extract 不删除人工译文表。原文或实际结构变化会让对应人工
 - 无法确认正确译文：停止并报告缺少的上下文或领域事实。
 
 Manual 默认流程为 export、填写、apply。apply 已执行与 check 相同的结构和 Placeholder 检查；
-只在需要事先试检或单独诊断 TOML 时先运行 check。两者都不检查残留英文、译文等于原文、术语偏好或翻译质量。
+只在需要事先试检或单独诊断 TOML 时先运行 check。Manual 负责 TOML 结构与 Placeholder 验收；
+apply 后按[翻译验收指南](acceptance.md)继续检查残留英文、译文等于原文、术语偏好和翻译质量，
+需要复核数据库全部当前正文时重新执行 `translation export`。
 
 #### Unavailable
 

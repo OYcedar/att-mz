@@ -8,9 +8,10 @@ att mz translate --name NAME [PROFILE_ID] \
   [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML] [--retry-rejected]
 ```
 
-Translate 本身不运行 Lua。Profile 来自公共 `[translation].profiles`；省略时复用项目最近
-一次成功保存的 Profile。术语和 Placeholder 分别保存在当前 MV/MZ 项目。少量局部补译使用
-[Manual TOML](../manual/README.md)，不属于 Translate。
+Translate 读取 Extract 建立的语义资产，使用选定 Profile、术语和 Placeholder 构造模型任务，
+验收响应并把适用译文提交到当前 MV/MZ 项目。Profile 来自公共 `[translation].profiles`；省略时
+复用项目最近一次成功保存的 Profile。术语和 Placeholder 分别保存在当前项目。少量局部补译使用
+[Manual TOML](../manual/README.md)，批量上下文处理或特殊数据库修改使用[项目数据库 Lua](../lua/README.md)。
 
 ## 1. 准备与当前译文
 

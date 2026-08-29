@@ -70,8 +70,9 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | 译后 QA、WriteBack 候选或发布问题 | [诊断与恢复指南的 WriteBack 分支](guides/diagnosis-and-recovery.md#66-writeback-与目录发布) |
 | 日志、任务记录或终端呈现失败 | [项目日志](runtime/project-log.md)与[诊断与恢复指南](guides/diagnosis-and-recovery.md#67-sqlite-与可观测性) |
 
-退出码 `0`、输出目录存在、日志写有成功、某次 Translate Complete 或某个项目完成，都不能
-单独证明整个游戏翻译已经完成。
+整个游戏翻译完成需共同确认声明的文本范围、全部项目业务结果、最终组合输出和译后验收结果。
+按[翻译验收指南](guides/acceptance.md)检查输出差异、源语残留、布局风险和实际加载；退出码 `0`、
+输出目录、成功日志、Translate Complete 和单个项目完成分别作为对应阶段的证据。
 
 ## 5. 完整规格索引
 
