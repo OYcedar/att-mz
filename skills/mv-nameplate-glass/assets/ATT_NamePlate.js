@@ -42,8 +42,33 @@
  * @min 0
  * @default 4
  *
+ * @param BackgroundTop
+ * @text 背景渐变上色
+ * @type string
+ *
+ * @param BackgroundBottom
+ * @text 背景渐变下色
+ * @type string
+ *
+ * @param BorderColor
+ * @text 边框颜色
+ * @type string
+ *
+ * @param HighlightColor
+ * @text 内层高光颜色
+ * @type string
+ *
+ * @param TextColor
+ * @text 姓名文字颜色
+ * @type string
+ *
+ * @param OutlineColor
+ * @text 姓名描边颜色
+ * @type string
+ *
  * @help
  * 把本插件放在当前消息插件之后。
+ * 接入时在 plugins.js 中填写全部颜色参数；颜色值使用 Canvas 支持的 CSS 格式。
  *
  * 自定义消息系统在加入正文前调用：
  *   $gameMessage.setATTNamePlate('茵斯蒂');
@@ -75,6 +100,14 @@ Imported.ATT_NamePlate = true;
     function offsetParameter(name, fallback) {
         var value = Number(parameters[name]);
         return isFinite(value) ? value : fallback;
+    }
+
+    function requiredColorParameter(name) {
+        var value = String(parameters[name] || '').trim();
+        if (!value) {
+            throw new Error(pluginName + ' 需要在 plugins.js 中设置颜色参数：' + name);
+        }
+        return value;
     }
 
     function clamp(value, minimum, maximum) {
@@ -160,6 +193,12 @@ Imported.ATT_NamePlate = true;
     var plateHeight = numberParameter('PlateHeight', 58, 44);
     var offsetX = offsetParameter('OffsetX', 72);
     var gap = numberParameter('Gap', 4, 0);
+    var backgroundTop = requiredColorParameter('BackgroundTop');
+    var backgroundBottom = requiredColorParameter('BackgroundBottom');
+    var borderColor = requiredColorParameter('BorderColor');
+    var highlightColor = requiredColorParameter('HighlightColor');
+    var textColor = requiredColorParameter('TextColor');
+    var outlineColor = requiredColorParameter('OutlineColor');
 
     var _Game_Message_clear = Game_Message.prototype.clear;
     Game_Message.prototype.clear = function() {
@@ -243,20 +282,20 @@ Imported.ATT_NamePlate = true;
         var innerWidth = width - inset * 2;
         var innerHeight = height - inset * 2;
         var gradient = context.createLinearGradient(0, inset, 0, height - inset);
-        gradient.addColorStop(0, 'rgba(83, 57, 106, 0.94)');
-        gradient.addColorStop(1, 'rgba(35, 21, 55, 0.90)');
+        gradient.addColorStop(0, backgroundTop);
+        gradient.addColorStop(1, backgroundBottom);
 
         context.save();
         drawRoundedPath(context, inset, inset, innerWidth, innerHeight, 13);
         context.fillStyle = gradient;
         context.fill();
         context.lineWidth = 2;
-        context.strokeStyle = 'rgba(218, 187, 239, 0.96)';
+        context.strokeStyle = borderColor;
         context.stroke();
 
         drawRoundedPath(context, inset + 3, inset + 3, innerWidth - 6, innerHeight - 6, 10);
         context.lineWidth = 1;
-        context.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+        context.strokeStyle = highlightColor;
         context.stroke();
         context.restore();
         bitmap._setDirty();
@@ -286,8 +325,8 @@ Imported.ATT_NamePlate = true;
 
         this.contents.clear();
         this.resetFontSettings();
-        this.contents.textColor = '#fff7ff';
-        this.contents.outlineColor = 'rgba(42, 24, 58, 0.96)';
+        this.contents.textColor = textColor;
+        this.contents.outlineColor = outlineColor;
         this.contents.outlineWidth = 4;
         this.drawText(name, 0, 0, this.contentsWidth(), 'center');
     };
