@@ -121,7 +121,8 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 普通测试不启用 `release-stress` feature；合成的大容量、超深结构和墙钟性能回归不属于提交前或
 PR 门禁。正式发布提交和版本冻结后，由发起发布的 Windows 本机在推送版本标签、触发 workflow
 和远端打包前，分别运行根 crate 与 `att-json-repair` crate 的 `release-stress` 测试组；这是该组
-唯一的执行入口，失败时不得继续发包。
+唯一的执行入口。通过压力验证的候选才可创建版本标签并进入远端发包；失败候选保持无标签状态。
+修复完成相称的普通验证，形成并推送新提交到远端 `main` 后成为新的发布候选，重新执行同一压力门禁。
 
 Release workflow 不重复普通检查或 `release-stress`。它在 GitHub 托管的 `windows-2025` runner
 上使用锁定工具链和依赖构建静态 `att.exe`，从空的 `dist/` 同步托管资源并首次创建两份活动配置，
