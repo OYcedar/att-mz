@@ -3,7 +3,7 @@
 //! 本模块只编排 Generic 纵向流程。JSONL、动态 Extract、去重、译文状态和往返验证
 //! 由 `generic` 领域负责；文件、CPU、LLM、租约和目录发布使用公共运行能力。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -17,11 +17,9 @@ use std::time::Duration;
 
 use futures_util::stream::FuturesOrdered;
 use futures_util::{FutureExt, StreamExt};
-use rayon::prelude::*;
 use rusqlite::Connection;
 
 use super::TranslationTerminalSummary;
-use super::command::TerminationSignals;
 use super::config::{
     ConfigurationLoadError, ConfiguredGenericCommand, ConfiguredGenericWriteBackCommand,
     ConfiguredManualCommand, ConfiguredProjectLuaCommand, ConfiguredTranslateCommand,
@@ -30,6 +28,7 @@ use super::project_log::{
     ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
     start_command_log,
 };
+use super::termination::{TerminationOutcome, TerminationSignals, drive_with_termination};
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError,
     assemble_translation_system_prompt_with_cancellation,
@@ -41,12 +40,10 @@ use crate::diagnostic::{
     ByteRange, Diagnostic, DiagnosticReport, FileSystemDiagnosticContext,
     FileSystemDiagnosticStage, FileSystemIssue, FileSystemOperation, FileSystemPathViolation,
     FileSystemProblem, GenericDiagnosticStage, GenericIssue, GenericJsonErrorCategory,
-    GenericLanguageProjectionProblem, GenericPlaceholderMultisetProblem, GenericProblem,
-    GenericResponseDestinationProblem, GenericResponseReviewFinding,
-    GenericTaskResponseJsonCategory, GenericTaskResponseProblem, GenericTaskUnavailableReason,
-    GenericTranslationPreparationProblem, GenericUnitLocator as DiagnosticGenericUnitLocator,
-    GenericWriteBackTextSide, GenericWriteBackUnitProblem, IoFailure, Pcre2Failure,
-    Pcre2FailureKind, PlaceholderIssue,
+    GenericProblem, GenericResponseReviewFinding, GenericTaskResponseJsonCategory,
+    GenericTaskResponseProblem, GenericTaskUnavailableReason, GenericTranslationPreparationProblem,
+    GenericUnitLocator as DiagnosticGenericUnitLocator, GenericWriteBackTextSide,
+    GenericWriteBackUnitProblem, IoFailure, Pcre2Failure, Pcre2FailureKind, PlaceholderIssue,
     PlaceholderMatchRangeViolation as DiagnosticMatchRangeViolation,
     PlaceholderRuleOrigin as DiagnosticPlaceholderRuleOrigin,
     PlaceholderRuleSource as DiagnosticPlaceholderRuleSource,
@@ -60,32 +57,34 @@ use crate::diagnostic::{
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::llm_request::{
-    AsyncDelay, LlmRequestExecutionOutcome, LlmRequestRetryPolicy,
+    LlmRequestExecutionOutcome, LlmRequestRetryPolicy, TokioAsyncDelay,
     execute_llm_request_with_retry_observed,
 };
 use crate::fingerprint::Sha256Fingerprint;
 #[cfg(test)]
 use crate::generic::build_write_back_candidate;
 use crate::generic::{
-    CancellableTextMap, CommitTranslationResultsOutcome, CommitTranslationsOutcome, ExtractOutcome,
-    GenericCompiledPlaceholderRules, GenericCurrentTranslation, GenericInitRequest,
-    GenericPlaceholderService, GenericPlanningError, GenericPlanningUnitLocator, GenericProject,
-    GenericProjectError, GenericProjectStore, GenericProtectedText, GenericStoredSnapshot,
-    GenericTaskRecordDocument, GenericTaskRecordState, GenericUnitKey, GenericUnitMap,
-    GenericWriteBackCandidate, GenericWriteBackError, GenericWriteBackTextOptions, PlannedTask,
-    PlanningUnit, RejectedTranslationWrite, ResponseProblem, TranslationAcceptance,
-    TranslationOrigin, TranslationPlan, TranslationReview, TranslationWrite, ValidatedReuse,
-    accept_parsed_response_with_cancellation, build_write_back_candidate_with_cancellation,
-    compile_generic_layout_rules, current_translation_for_stored_with_cancellation,
-    ensure_input_fingerprints_current_with_cancellation,
-    plan_translation_with_validator_and_cancellation,
-    validate_materialized_write_back_file_with_cancellation,
+    CommitTranslationResultsOutcome, CommitTranslationsOutcome, ExtractOutcome,
+    GenericCompiledPlaceholderRules, GenericInitRequest, GenericPlaceholderRuleSource,
+    GenericPlaceholderService, GenericPlanningError, GenericPlanningUnitLocator,
+    GenericPreparationError, GenericProject, GenericProjectError, GenericProjectStore,
+    GenericTaskRecordDocument, GenericTaskRecordState, GenericUnitLocator, GenericUnitMap,
+    GenericValidationFact, GenericWriteBackCandidate, GenericWriteBackError,
+    GenericWriteBackTextOptions, PlannedTask, PreparedGenericTranslation, RejectedTranslationWrite,
+    ResponseProblem, TranslationReview, TranslationWrite,
+    accept_generic_response_with_cancellation, build_write_back_candidate_with_cancellation,
+    clone_generic_cpu_text, collect_generic_current_translations, compile_generic_layout_rules,
+    ensure_generic_cpu_running, ensure_generic_response_processing_running,
+    ensure_input_fingerprints_current_with_cancellation, generic_cpu_text_equal,
+    generic_language_projection_problem, generic_placeholder_multiset_problem,
+    prepare_generic_translation, validate_materialized_write_back_file_with_cancellation,
 };
+#[cfg(test)]
+use crate::generic::{GenericCurrentTranslation, GenericUnitKey};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
-use crate::language::{
-    LanguageAnalysis, LanguageId, LanguageModule, LanguageModuleCatalogError,
-    LanguageOperationCancelled, LanguageText, LanguageTextSegment,
-};
+#[cfg(test)]
+use crate::language::{LanguageAnalysis, LanguageText};
+use crate::language::{LanguageId, LanguageModule, LanguageModuleCatalogError};
 use crate::llm::ApiKeyRedactor;
 use crate::llm::{
     ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmFinishReason, LlmRequestFailure,
@@ -128,18 +127,13 @@ use crate::storage::file_system::{
     DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
     DirectoryStageRequestError, FileReader, ReadFileError, RecoverableDirectoryPublisher,
 };
-use crate::translation::candidate_validation::{
-    ProvenInvariantViolation, ReviewFinding, ValidatedCandidate,
-    validate_reflowed_candidate_text_with_cancellation,
-};
+use crate::translation::candidate_validation::ReviewFinding;
 use crate::translation::layout_rules::{LayoutRuleSet, LayoutRulesError};
 use crate::translation::placeholder::{
     PlaceholderMatchRangeViolation, PlaceholderPcre2ErrorKind, PlaceholderProtectionError,
     PlaceholderRestoreError, PlaceholderRuleOrigin, PlaceholderWorkerOperation,
 };
-use crate::translation::placeholder_projection::{
-    LanguageTextProjectionError, PlaceholderMultisetError,
-};
+#[cfg(test)]
 use crate::translation::placeholder_token;
 use crate::translation::planning_resource::{
     CompiledTerminology, TranslationPlanningResourceReader,
@@ -149,7 +143,9 @@ use crate::translation::planning_resource::{
 use crate::translation::planning_resource::{
     PlaceholderDefinitionError, TerminologyDefinitionError,
 };
-use crate::translation::task_planning::{TaskId, TaskPlanningError};
+#[cfg(test)]
+use crate::translation::task_planning::TaskId;
+use crate::translation::task_planning::TaskPlanningError;
 use crate::translation::task_record::{
     ConfiguredTranslationTaskRecordSink, MarkdownTranslationTaskRecordSink,
     TaskRecordDiagnosticRecorder,
@@ -158,10 +154,8 @@ use crate::translation::user_message::{
     TranslationReturnType, TranslationUserGroup, TranslationUserMessage,
     TranslationUserTerminology, TranslationUserUnit, render_translation_user_message,
 };
-#[cfg(test)]
-use crate::translation_protocol::parse_translation_response;
 use crate::translation_protocol::{
-    ParsedTranslationResponse, TranslationResponseMode, TranslationTaskResponseJsonErrorCategory,
+    TranslationResponseMode, TranslationTaskResponseJsonErrorCategory,
     TranslationTaskResponseParseError, TranslationTaskResponseParseErrorKind,
     parse_translation_response_with_cancellation,
 };
@@ -973,6 +967,7 @@ impl ProductionGenericCommandRunner {
                 let cancellation_file_system = file_system.clone();
                 let operation_project_log = Arc::clone(&project_log);
                 let operation_panic_context = self.panic_context().clone();
+                let operation_performance = Arc::clone(&performance);
                 let locale = self.locale;
                 let operation = async move {
                     ensure_generic_operation_running(&operation_cancellation)?;
@@ -1001,6 +996,7 @@ impl ProductionGenericCommandRunner {
                             GenericProjectStore::initialize_with_cancellation(
                                 request,
                                 init_cancellation,
+                                operation_performance,
                             )
                         },
                     )
@@ -1084,6 +1080,7 @@ impl ProductionGenericCommandRunner {
                 let store = GenericProjectStore::for_workspace_with_cancellation(
                     generic_workspace(common.projects_root(), &project_name),
                     cancellation.clone(),
+                    Arc::clone(&performance),
                 );
                 let lease_provider = ProjectCommandLeaseService::new(
                     common.projects_root().to_path_buf(),
@@ -1282,6 +1279,7 @@ impl ProductionGenericCommandRunner {
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),
             cancellation.clone(),
+            Arc::clone(&performance),
         );
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
@@ -1471,6 +1469,7 @@ impl ProductionGenericCommandRunner {
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),
             cancellation.clone(),
+            Arc::clone(&performance),
         );
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
@@ -1685,7 +1684,7 @@ impl ProductionGenericCommandRunner {
                 .profile()
                 .target_task_user_message_characters();
             let retry_rejected = command.retry_rejected();
-            let prepared = operation_cpu
+            let prepared: PreparedGenericTranslation = operation_cpu
                 .execute(move || {
                     ensure_generic_cpu_running(&planning_cancellation)?;
                     prepare_generic_translation(
@@ -1703,7 +1702,7 @@ impl ProductionGenericCommandRunner {
                 .map_err(generic_cpu_execution_failure)?
                 .map_err(generic_preparation_failure)?;
 
-            let PreparedGenericTranslation { plan, facts } = prepared;
+            let (plan, facts) = prepared.into_parts();
             let (invalidations, reused, tasks, planned_units, initial_rejected_units) =
                 plan.into_parts();
             let transformation_cancellation = operation_cancellation.clone();
@@ -2065,6 +2064,7 @@ impl ProductionGenericCommandRunner {
         let store = GenericProjectStore::for_workspace_with_cancellation(
             generic_workspace(command.common().projects_root(), &project_name),
             cancellation.clone(),
+            Arc::clone(&performance),
         );
         let lease_provider = ProjectCommandLeaseService::new(
             command.common().projects_root().to_path_buf(),
@@ -2524,122 +2524,6 @@ fn ensure_generic_prompt_preparation_running(
     }
 }
 
-#[derive(Clone)]
-struct GenericValidationFact {
-    locator: GenericUnitLocator,
-    kind: String,
-    protected: GenericProtectedText,
-    analysis: LanguageAnalysis,
-}
-
-struct PreparedGenericTranslation {
-    plan: TranslationPlan,
-    facts: GenericUnitMap<GenericValidationFact>,
-}
-
-struct PreparedGenericGroup {
-    planning_units: Vec<PlanningUnit>,
-    facts: Vec<(GenericUnitKey, GenericValidationFact)>,
-}
-
-#[derive(Debug)]
-enum GenericPreparationError {
-    Cancelled,
-    Placeholder {
-        rule_source: GenericPlaceholderRuleSource,
-        source: crate::generic::GenericPlaceholderError,
-    },
-    PlaceholderProtection {
-        rule_source: GenericPlaceholderRuleSource,
-        locator: GenericUnitLocator,
-        source: PlaceholderProtectionError,
-    },
-    LanguageProjection {
-        locator: GenericUnitLocator,
-        source: LanguageTextProjectionError,
-    },
-    Planning(GenericPlanningError),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum GenericPlaceholderRuleSource {
-    ExternalFile(PathBuf),
-    ProjectSnapshot,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GenericUnitLocator {
-    relative_path: PathBuf,
-    group_id: String,
-    unit_id: String,
-    role: String,
-    line: usize,
-    unit: usize,
-}
-
-impl GenericUnitLocator {
-    fn readable_id(&self) -> String {
-        crate::generic::readable_generic_unit_id(&self.relative_path, self.line, self.unit)
-    }
-}
-
-impl fmt::Display for GenericPreparationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cancelled => formatter.write_str("Generic CPU 工作已取消"),
-            Self::Placeholder { source, .. } => source.fmt(formatter),
-            Self::PlaceholderProtection { source, .. } => source.fmt(formatter),
-            Self::LanguageProjection { source, .. } => source.fmt(formatter),
-            Self::Planning(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl Error for GenericPreparationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Cancelled => None,
-            Self::Placeholder { source, .. } => Some(source),
-            Self::PlaceholderProtection { source, .. } => Some(source),
-            Self::LanguageProjection { source, .. } => Some(source),
-            Self::Planning(source) => Some(source),
-        }
-    }
-}
-
-impl From<GenericPlanningError> for GenericPreparationError {
-    fn from(source: GenericPlanningError) -> Self {
-        Self::Planning(source)
-    }
-}
-
-fn generic_placeholder_protection_failure(
-    source: crate::generic::GenericPlaceholderError,
-    rule_source: &GenericPlaceholderRuleSource,
-    locator: &GenericUnitLocator,
-) -> GenericPreparationError {
-    match source {
-        crate::generic::GenericPlaceholderError::Protection(source) => {
-            GenericPreparationError::PlaceholderProtection {
-                rule_source: rule_source.clone(),
-                locator: locator.clone(),
-                source,
-            }
-        }
-        source => GenericPreparationError::Placeholder {
-            rule_source: rule_source.clone(),
-            source,
-        },
-    }
-}
-
-impl GenericPreparationError {
-    const fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
-            || matches!(self, Self::Planning(source) if source.is_cancelled())
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct GenericOperationCancelled;
 
@@ -2946,155 +2830,14 @@ fn generic_preparation_report_at(
 }
 
 fn diagnostic_generic_unit_locator(locator: &GenericUnitLocator) -> DiagnosticGenericUnitLocator {
+    let (line, unit) = locator.natural_position();
     DiagnosticGenericUnitLocator::new(
-        &locator.relative_path,
-        &locator.group_id,
-        &locator.unit_id,
-        Some(&locator.role),
+        locator.relative_path(),
+        locator.group_id(),
+        locator.unit_id(),
+        Some(locator.role()),
     )
-    .with_natural_position(locator.line, locator.unit)
-}
-
-const fn generic_language_projection_problem(
-    source: &LanguageTextProjectionError,
-) -> GenericLanguageProjectionProblem {
-    match source {
-        LanguageTextProjectionError::TokenIndexConstruction => {
-            GenericLanguageProjectionProblem::TokenIndexConstruction
-        }
-        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
-        LanguageTextProjectionError::MissingToken { .. } => {
-            GenericLanguageProjectionProblem::MissingToken
-        }
-        LanguageTextProjectionError::RepeatedToken { .. } => {
-            GenericLanguageProjectionProblem::RepeatedToken
-        }
-        LanguageTextProjectionError::OverlappingToken { .. } => {
-            GenericLanguageProjectionProblem::OverlappingToken
-        }
-        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
-            GenericLanguageProjectionProblem::ChangedTokenOrder {
-                position: *position,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
-            GenericLanguageProjectionProblem::ChangedSegmentCount {
-                expected: *expected,
-                actual: *actual,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
-            GenericLanguageProjectionProblem::ChangedSegmentKind {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
-            GenericLanguageProjectionProblem::MissingOrderedToken {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::UnusedOrderedToken => {
-            GenericLanguageProjectionProblem::UnusedOrderedToken
-        }
-    }
-}
-
-const fn generic_placeholder_multiset_problem(
-    source: &PlaceholderMultisetError,
-) -> GenericPlaceholderMultisetProblem {
-    match source {
-        PlaceholderMultisetError::Mismatch { .. } => GenericPlaceholderMultisetProblem::Mismatch,
-        PlaceholderMultisetError::Unexpected { .. } => {
-            GenericPlaceholderMultisetProblem::Unexpected
-        }
-        PlaceholderMultisetError::OrderMismatch { .. } => {
-            GenericPlaceholderMultisetProblem::OrderMismatch
-        }
-        PlaceholderMultisetError::WrapperTopologyChanged { .. } => {
-            GenericPlaceholderMultisetProblem::OrderMismatch
-        }
-    }
-}
-
-fn generic_response_restore_problem(
-    source: &PlaceholderRestoreError,
-) -> GenericResponseDestinationProblem {
-    match source {
-        PlaceholderRestoreError::Projection(source) => {
-            GenericResponseDestinationProblem::PlaceholderRestoreProjection {
-                problem: generic_language_projection_problem(source),
-            }
-        }
-        PlaceholderRestoreError::Multiset(source) => {
-            GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
-                problem: generic_placeholder_multiset_problem(source),
-            }
-        }
-    }
-}
-
-fn generic_response_placeholder_problem(
-    source: &crate::generic::GenericPlaceholderError,
-) -> GenericResponseDestinationProblem {
-    match source {
-        crate::generic::GenericPlaceholderError::InvalidResourceSnapshot(source) => {
-            GenericResponseDestinationProblem::InvalidPlaceholderSnapshot {
-                category: GenericJsonErrorCategory::from(
-                    crate::json_diagnostic::JsonErrorCategory::from(source),
-                ),
-                line: source.line(),
-                column: source.column(),
-            }
-        }
-        crate::generic::GenericPlaceholderError::Compilation(source) => {
-            GenericResponseDestinationProblem::PlaceholderCompilation {
-                problem: source.diagnostic_problem(),
-            }
-        }
-        crate::generic::GenericPlaceholderError::Protection(source) => {
-            GenericResponseDestinationProblem::PlaceholderProtection {
-                problem: source.diagnostic_issue(),
-            }
-        }
-        crate::generic::GenericPlaceholderError::Restore(source) => {
-            generic_response_restore_problem(source)
-        }
-        crate::generic::GenericPlaceholderError::ManualTranslationMismatch => {
-            GenericResponseDestinationProblem::PlaceholderBindingMismatch
-        }
-    }
-}
-
-fn generic_candidate_placeholder_problem(
-    source: crate::generic::GenericPlaceholderError,
-    rule_source: &GenericPlaceholderRuleSource,
-    locator: &GenericUnitLocator,
-) -> Result<GenericResponseDestinationProblem, GenericPreparationError> {
-    match source {
-        crate::generic::GenericPlaceholderError::Protection(
-            source @ (PlaceholderProtectionError::StartWorker { .. }
-            | PlaceholderProtectionError::Match { .. }),
-        ) => Err(GenericPreparationError::PlaceholderProtection {
-            rule_source: rule_source.clone(),
-            locator: locator.clone(),
-            source,
-        }),
-        source => Ok(generic_response_placeholder_problem(&source)),
-    }
-}
-
-fn generic_current_translation_protection_result(
-    protected: Result<GenericProtectedText, crate::generic::GenericPlaceholderError>,
-    rule_source: &GenericPlaceholderRuleSource,
-    locator: &GenericUnitLocator,
-) -> Result<Option<GenericProtectedText>, GenericPreparationError> {
-    match protected {
-        Ok(protected) => Ok(Some(protected)),
-        Err(source) => match generic_candidate_placeholder_problem(source, rule_source, locator) {
-            Ok(_) => Ok(None),
-            Err(source) => Err(source),
-        },
-    }
+    .with_natural_position(line, unit)
 }
 
 fn generic_planning_report(source: &GenericPlanningError) -> DiagnosticReport {
@@ -3209,13 +2952,14 @@ fn generic_placeholder_protection_report(
             DiagnosticPlaceholderRuleSource::ProjectSnapshot
         }
     };
+    let (line, unit) = locator.natural_position();
     let unit = DiagnosticGenericUnitLocator::new(
-        &locator.relative_path,
-        &locator.group_id,
-        &locator.unit_id,
-        Some(&locator.role),
+        locator.relative_path(),
+        locator.group_id(),
+        locator.unit_id(),
+        Some(locator.role()),
     )
-    .with_natural_position(locator.line, locator.unit);
+    .with_natural_position(line, unit);
     let problem = placeholder_protection_issue(source);
     if stage == GenericDiagnosticStage::WriteBack {
         return Some(DiagnosticReport::new(
@@ -3396,361 +3140,6 @@ fn generic_write_back_candidate_failure(source: GenericWriteBackError) -> Generi
     }
 }
 
-// 这是翻译规划边界：每项参数都有独立的所有权和取消语义，合并为可变上下文会掩盖它们。
-#[allow(clippy::too_many_arguments)]
-fn prepare_generic_translation(
-    snapshot: &GenericStoredSnapshot,
-    terminology: Arc<CompiledTerminology>,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    placeholder_rule_source: &GenericPlaceholderRuleSource,
-    source_language: Arc<dyn LanguageModule>,
-    target_task_characters: std::num::NonZeroUsize,
-    retry_rejected: bool,
-    cancellation: &CooperativeCancellation,
-) -> Result<PreparedGenericTranslation, GenericPreparationError> {
-    ensure_generic_cpu_running(cancellation)?;
-    let mut groups = Vec::new();
-    for file in snapshot.files() {
-        ensure_generic_cpu_running(cancellation)?;
-        for (group_ordinal, group) in file.groups().iter().enumerate() {
-            ensure_generic_cpu_running(cancellation)?;
-            groups.push((file.relative_path(), group_ordinal, group));
-        }
-    }
-    let prepared_groups = groups
-        .par_iter()
-        .map(|(relative_path, group_ordinal, group)| {
-            ensure_generic_cpu_running(cancellation)?;
-            let service = GenericPlaceholderService::default();
-            let mut prepared_units = Vec::with_capacity(group.units().len());
-            for (unit_ordinal, unit) in group.units().iter().enumerate() {
-                ensure_generic_cpu_running(cancellation)?;
-                let locator = GenericUnitLocator {
-                    relative_path: relative_path.to_path_buf(),
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    role: group.kind().to_owned(),
-                    line: group_ordinal + 1,
-                    unit: unit_ordinal + 1,
-                };
-                let target_id = locator.readable_id();
-                let protected = service
-                    .protect_target_with_cancellation(
-                        &target_id,
-                        group.kind(),
-                        unit.source_text(),
-                        placeholder_rules,
-                        || ensure_generic_cpu_running(cancellation),
-                    )?
-                    .map_err(|source| {
-                        generic_placeholder_protection_failure(
-                            source,
-                            placeholder_rule_source,
-                            &locator,
-                        )
-                    })?;
-                let language_text = protected
-                    .language_text_with_cancellation(|| ensure_generic_cpu_running(cancellation))?
-                    .map_err(|source| GenericPreparationError::LanguageProjection {
-                        locator: locator.clone(),
-                        source,
-                    })?;
-                let analysis = source_language
-                    .analyze_source_with_cancellation(&language_text, &mut || {
-                        ensure_generic_language_running(cancellation)
-                    })
-                    .map_err(|LanguageOperationCancelled| GenericPreparationError::Cancelled)?;
-                ensure_generic_cpu_running(cancellation)?;
-                prepared_units.push((unit, locator, protected, language_text, analysis));
-            }
-            ensure_generic_cpu_running(cancellation)?;
-            let term_indices = terminology.triggered_indices_with_cancellation(
-                prepared_units
-                    .iter()
-                    .flat_map(|(_, _, _, language_text, _)| natural_segments(language_text)),
-                || ensure_generic_cpu_running(cancellation),
-            )?;
-            let mut planning_units = Vec::with_capacity(prepared_units.len());
-            let mut facts = Vec::with_capacity(prepared_units.len());
-            for (unit, locator, protected, language_text, analysis) in prepared_units {
-                ensure_generic_cpu_running(cancellation)?;
-                let mut planning = PlanningUnit::from_stored_with_cancellation(
-                    relative_path,
-                    snapshot.project(),
-                    group,
-                    unit,
-                    &protected,
-                    clone_generic_cpu_indices(&term_indices, cancellation)?,
-                    generic_language_text_has_non_whitespace_natural_text(
-                        &language_text,
-                        cancellation,
-                    )? && analysis.needs_translation(),
-                    retry_rejected,
-                    cancellation,
-                )
-                .map_err(GenericPreparationError::Planning)?;
-                if let Some(current_translation) = planning.current_translation() {
-                    let text_violation = validate_reflowed_candidate_text_with_cancellation(
-                        current_translation,
-                        || ensure_generic_cpu_running(cancellation),
-                    )?
-                    .err();
-                    let current_protected = if text_violation.is_none() {
-                        generic_current_translation_protection_result(
-                            service.protect_target_with_cancellation(
-                                &locator.readable_id(),
-                                group.kind(),
-                                current_translation,
-                                placeholder_rules,
-                                || ensure_generic_cpu_running(cancellation),
-                            )?,
-                            placeholder_rule_source,
-                            &locator,
-                        )?
-                    } else {
-                        None
-                    };
-                    if let Some(current_protected) = current_protected
-                        && current_protected.binding_fingerprint()
-                            == protected.binding_fingerprint()
-                    {
-                        planning.install_current_target_context(clone_generic_cpu_text(
-                            current_protected.text(),
-                            cancellation,
-                        )?);
-                    } else {
-                        planning.reject_invalid_current(
-                            text_violation.unwrap_or(ProvenInvariantViolation::PlaceholderMismatch),
-                        );
-                    }
-                }
-                if planning.needs_candidate() {
-                    facts.push((
-                        clone_generic_unit_key(planning.key(), cancellation)?,
-                        GenericValidationFact {
-                            locator,
-                            kind: clone_generic_cpu_text(group.kind(), cancellation)?,
-                            protected,
-                            analysis,
-                        },
-                    ));
-                }
-                planning_units.push(planning);
-            }
-            ensure_generic_cpu_running(cancellation)?;
-            Ok::<_, GenericPreparationError>(PreparedGenericGroup {
-                planning_units,
-                facts,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let mut planning_units = Vec::new();
-    let mut facts = GenericUnitMap::new();
-    // 并行完成顺序不参与领域语义；按自然 Group 顺序处理结果，保证规划和错误稳定。
-    for prepared_group in prepared_groups {
-        ensure_generic_cpu_running(cancellation)?;
-        let prepared_group = prepared_group?;
-        for planning_unit in prepared_group.planning_units {
-            ensure_generic_cpu_running(cancellation)?;
-            planning_units.push(planning_unit);
-        }
-        for (key, fact) in prepared_group.facts {
-            ensure_generic_cpu_running(cancellation)?;
-            let previous = facts
-                .insert_with_cancellation(key, fact, || ensure_generic_cpu_running(cancellation))?;
-            debug_assert!(previous.is_none());
-        }
-    }
-    ensure_generic_cpu_running(cancellation)?;
-    let plan = plan_translation_with_validator_and_cancellation(
-        snapshot,
-        &planning_units,
-        target_task_characters,
-        |key, candidate| {
-            validate_generic_reuse_with_cancellation(
-                key,
-                candidate,
-                &facts,
-                placeholder_rules,
-                placeholder_rule_source,
-                source_language.as_ref(),
-                cancellation,
-            )
-        },
-        cancellation,
-    )?;
-    Ok(PreparedGenericTranslation { plan, facts })
-}
-
-fn collect_generic_current_translations(
-    snapshot: &GenericStoredSnapshot,
-    cancellation: &CooperativeCancellation,
-) -> Result<GenericUnitMap<GenericCurrentTranslation>, GenericPreparationError> {
-    ensure_generic_cpu_running(cancellation)?;
-    let mut current = GenericUnitMap::new();
-    for file in snapshot.files() {
-        ensure_generic_cpu_running(cancellation)?;
-        for group in file.groups() {
-            ensure_generic_cpu_running(cancellation)?;
-            for unit in group.units() {
-                ensure_generic_cpu_running(cancellation)?;
-                if let Some(translation) = current_translation_for_stored_with_cancellation(
-                    snapshot.project(),
-                    group,
-                    unit,
-                    cancellation,
-                )
-                .map_err(GenericPreparationError::Planning)?
-                {
-                    let key = GenericUnitKey::new(
-                        clone_generic_cpu_text(group.id(), cancellation)?,
-                        clone_generic_cpu_text(unit.id(), cancellation)?,
-                    );
-                    let translation = GenericCurrentTranslation::new(
-                        translation,
-                        unit.translation()
-                            .is_some_and(|stored| stored.origin() == TranslationOrigin::Manual),
-                    );
-                    let previous = current.insert_with_cancellation(key, translation, || {
-                        ensure_generic_cpu_running(cancellation)
-                    })?;
-                    debug_assert!(previous.is_none());
-                }
-            }
-        }
-    }
-    ensure_generic_cpu_running(cancellation)?;
-    Ok(current)
-}
-
-fn ensure_generic_cpu_running(
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPreparationError> {
-    if cancellation.is_requested() {
-        Err(GenericPreparationError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_generic_language_running(
-    cancellation: &CooperativeCancellation,
-) -> Result<(), LanguageOperationCancelled> {
-    if cancellation.is_requested() {
-        Err(LanguageOperationCancelled)
-    } else {
-        Ok(())
-    }
-}
-
-fn clone_generic_cpu_text(
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<String, GenericPreparationError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut output = String::with_capacity(text.len());
-    let mut start = 0_usize;
-    while start < text.len() {
-        ensure_generic_cpu_running(cancellation)?;
-        let mut end = start
-            .saturating_add(CANCELLATION_CHECK_BYTES)
-            .min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&text[start..end]);
-        start = end;
-    }
-    ensure_generic_cpu_running(cancellation)?;
-    Ok(output)
-}
-
-fn clone_generic_cpu_indices(
-    indices: &[usize],
-    cancellation: &CooperativeCancellation,
-) -> Result<Vec<usize>, GenericPreparationError> {
-    const CANCELLATION_CHECK_ITEMS: usize = 1024;
-
-    let mut output = Vec::with_capacity(indices.len());
-    for chunk in indices.chunks(CANCELLATION_CHECK_ITEMS) {
-        ensure_generic_cpu_running(cancellation)?;
-        output.extend_from_slice(chunk);
-    }
-    ensure_generic_cpu_running(cancellation)?;
-    Ok(output)
-}
-
-fn clone_generic_unit_key(
-    key: &GenericUnitKey,
-    cancellation: &CooperativeCancellation,
-) -> Result<GenericUnitKey, GenericPreparationError> {
-    Ok(GenericUnitKey::new(
-        clone_generic_cpu_text(key.group_id(), cancellation)?,
-        clone_generic_cpu_text(key.unit_id(), cancellation)?,
-    ))
-}
-
-fn generic_cpu_text_equal(
-    left: &str,
-    right: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<bool, GenericPreparationError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    ensure_generic_cpu_running(cancellation)?;
-    if left.len() != right.len() {
-        return Ok(false);
-    }
-    for (left, right) in left
-        .as_bytes()
-        .chunks(CANCELLATION_CHECK_BYTES)
-        .zip(right.as_bytes().chunks(CANCELLATION_CHECK_BYTES))
-    {
-        ensure_generic_cpu_running(cancellation)?;
-        if left != right {
-            return Ok(false);
-        }
-    }
-    ensure_generic_cpu_running(cancellation)?;
-    Ok(true)
-}
-
-fn generic_language_text_has_non_whitespace_natural_text(
-    text: &LanguageText,
-    cancellation: &CooperativeCancellation,
-) -> Result<bool, GenericPreparationError> {
-    const CANCELLATION_CHECK_CHARACTERS: usize = 16 * 1024;
-
-    for segment in text.segments() {
-        ensure_generic_cpu_running(cancellation)?;
-        let LanguageTextSegment::NaturalText(text) = segment else {
-            continue;
-        };
-        for (index, character) in text.chars().enumerate() {
-            if index.is_multiple_of(CANCELLATION_CHECK_CHARACTERS) {
-                ensure_generic_cpu_running(cancellation)?;
-            }
-            if !character.is_whitespace() {
-                return Ok(true);
-            }
-        }
-    }
-    ensure_generic_cpu_running(cancellation)?;
-    Ok(false)
-}
-
-fn natural_segments(language_text: &LanguageText) -> impl Iterator<Item = &str> {
-    language_text
-        .segments()
-        .iter()
-        .filter_map(|segment| match segment {
-            LanguageTextSegment::NaturalText(text) => Some(text.as_str()),
-            LanguageTextSegment::OpaqueBoundary => None,
-        })
-}
-
 fn generic_task_response_diagnostic(
     task_index: usize,
     total_tasks: usize,
@@ -3815,8 +3204,7 @@ fn generic_response_parse_diagnostic(
     error: TranslationTaskResponseParseError,
 ) -> DiagnosticReport {
     let problem = match error.kind() {
-        TranslationTaskResponseParseErrorKind::Json(category)
-        | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
+        TranslationTaskResponseParseErrorKind::Json(category) => {
             GenericTaskResponseProblem::InvalidJson {
                 category: match category {
                     TranslationTaskResponseJsonErrorCategory::Io => {
@@ -4807,7 +4195,7 @@ async fn execute_generic_task(
         client,
         &messages,
         LlmRequestRetryPolicy::new(retry_delays, max_retry_after),
-        &TokioDelay,
+        &TokioAsyncDelay,
         &cancellation,
         move || project_log.started(task_index),
     )
@@ -5087,430 +4475,6 @@ fn ensure_message_render_running(
     }
 }
 
-#[cfg(test)]
-fn accept_generic_response_with(
-    task: PlannedTask,
-    parsed: &ParsedTranslationResponse,
-    facts: &GenericUnitMap<GenericValidationFact>,
-    mut validator: impl FnMut(
-        &GenericValidationFact,
-        &str,
-    ) -> Result<String, GenericResponseDestinationProblem>,
-) -> TranslationAcceptance {
-    accept_generic_response_with_validator_and_cancellation(
-        task,
-        parsed,
-        facts,
-        |fact, candidate| {
-            Ok::<_, GenericPreparationError>(
-                validator(fact, candidate).map(ValidatedCandidate::clean),
-            )
-        },
-        &CooperativeCancellation::default(),
-    )
-    .expect("不取消的受信 Generic 响应必须完成验收")
-}
-
-fn accept_generic_response_with_cancellation(
-    task: PlannedTask,
-    parsed: &ParsedTranslationResponse,
-    facts: &GenericUnitMap<GenericValidationFact>,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    placeholder_rule_source: &GenericPlaceholderRuleSource,
-    language_module: &dyn LanguageModule,
-    cancellation: &CooperativeCancellation,
-) -> Result<TranslationAcceptance, GenericPreparationError> {
-    accept_generic_response_with_validator_and_cancellation(
-        task,
-        parsed,
-        facts,
-        |fact, candidate| {
-            validate_generic_candidate_fact_with_cancellation(
-                fact,
-                candidate,
-                placeholder_rules,
-                placeholder_rule_source,
-                language_module,
-                cancellation,
-            )
-        },
-        cancellation,
-    )
-}
-
-fn accept_generic_response_with_validator_and_cancellation(
-    task: PlannedTask,
-    parsed: &ParsedTranslationResponse,
-    facts: &GenericUnitMap<GenericValidationFact>,
-    mut validator: impl FnMut(
-        &GenericValidationFact,
-        &str,
-    ) -> Result<
-        Result<ValidatedCandidate<String>, GenericResponseDestinationProblem>,
-        GenericPreparationError,
-    >,
-    cancellation: &CooperativeCancellation,
-) -> Result<TranslationAcceptance, GenericPreparationError> {
-    let mut cache = HashMap::<
-        TaskId,
-        CancellableTextMap<
-            &str,
-            Result<ValidatedCandidate<String>, GenericResponseDestinationProblem>,
-        >,
-    >::new();
-    let mut reviews = Vec::new();
-    let mut acceptance =
-        accept_parsed_response_with_cancellation(
-            task,
-            parsed,
-            |output_id,
-             key,
-             candidate|
-             -> Result<
-                Result<String, GenericResponseDestinationProblem>,
-                GenericPreparationError,
-            > {
-                ensure_generic_response_processing_running(cancellation)?;
-                let Some(fact) = facts.get_with_cancellation(key, || {
-                    ensure_generic_response_processing_running(cancellation)
-                })?
-                else {
-                    return Ok(Err(GenericResponseDestinationProblem::MissingPlanningFact));
-                };
-                let output_cache = cache
-                    .entry(output_id)
-                    .or_insert_with(|| CancellableTextMap::with_capacity(1));
-                let validated = if let Some(cached) = output_cache
-                    .get_with_cancellation(fact.kind.as_str(), || {
-                        ensure_generic_response_processing_running(cancellation)
-                    })? {
-                    clone_generic_validation_result(cached, cancellation)?
-                } else {
-                    // 一个 output_id 只对应一个全局去重族；同族的原文、保护后文本和实际
-                    // Placeholder 绑定相同。kind 仍会改变 scope，因此必须分别验收。
-                    let validated = validator(fact, candidate)?;
-                    let returned = clone_generic_validation_result(&validated, cancellation)?;
-                    let previous = output_cache.insert_with_cancellation(
-                        fact.kind.as_str(),
-                        validated,
-                        || ensure_generic_response_processing_running(cancellation),
-                    )?;
-                    debug_assert!(previous.is_none());
-                    returned
-                };
-                match validated {
-                    Ok(validated) => {
-                        let (translation, findings) = validated.into_parts();
-                        for finding in findings {
-                            reviews.push(TranslationReview::new(
-                                output_id,
-                                GenericPlanningUnitLocator::new(
-                                    &fact.locator.relative_path,
-                                    fact.locator.group_id.clone(),
-                                    fact.locator.unit_id.clone(),
-                                    fact.locator.role.clone(),
-                                )
-                                .with_natural_position(fact.locator.line, fact.locator.unit),
-                                finding,
-                            ));
-                        }
-                        Ok(Ok(translation))
-                    }
-                    Err(problem) => Ok(Err(problem)),
-                }
-            },
-            || cancellation.is_requested(),
-        )?;
-    acceptance.append_reviews(&mut reviews);
-    Ok(acceptance)
-}
-
-#[cfg(test)]
-fn validate_generic_candidate(
-    key: &GenericUnitKey,
-    candidate: &str,
-    facts: &GenericUnitMap<GenericValidationFact>,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    language_module: &dyn LanguageModule,
-) -> Result<ValidatedCandidate<String>, GenericResponseDestinationProblem> {
-    let fact = facts
-        .get_with_cancellation(key, || Ok::<_, std::convert::Infallible>(()))
-        .unwrap_or_else(|never| match never {})
-        .ok_or(GenericResponseDestinationProblem::MissingPlanningFact)?;
-    validate_generic_candidate_fact(fact, candidate, placeholder_rules, language_module)
-}
-
-fn validate_generic_reuse_with_cancellation(
-    key: &GenericUnitKey,
-    candidate: &str,
-    facts: &GenericUnitMap<GenericValidationFact>,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    placeholder_rule_source: &GenericPlaceholderRuleSource,
-    language_module: &dyn LanguageModule,
-    cancellation: &CooperativeCancellation,
-) -> Result<Result<ValidatedReuse, GenericResponseDestinationProblem>, GenericPreparationError> {
-    ensure_generic_response_processing_running(cancellation)?;
-    let Some(fact) = facts.get_with_cancellation(key, || {
-        ensure_generic_response_processing_running(cancellation)
-    })?
-    else {
-        return Ok(Err(GenericResponseDestinationProblem::MissingPlanningFact));
-    };
-    let final_translation = match validate_generic_candidate_fact_with_cancellation(
-        fact,
-        candidate,
-        placeholder_rules,
-        placeholder_rule_source,
-        language_module,
-        cancellation,
-    )? {
-        Ok(translation) => translation.into_parts().0,
-        Err(problem) => return Ok(Err(problem)),
-    };
-    let service = GenericPlaceholderService::default();
-    let target_id = fact.locator.readable_id();
-    let context = match service.bind_target_candidate_with_cancellation(
-        &fact.protected,
-        &target_id,
-        &fact.kind,
-        &final_translation,
-        placeholder_rules,
-        || ensure_generic_response_processing_running(cancellation),
-    )? {
-        Ok(context) => context,
-        Err(source) => {
-            return Ok(Err(generic_candidate_placeholder_problem(
-                source.into(),
-                placeholder_rule_source,
-                &fact.locator,
-            )?));
-        }
-    };
-    let context_binding = context.binding_fingerprint_with_cancellation(|| {
-        ensure_generic_response_processing_running(cancellation)
-    })?;
-    let expected_binding = fact.protected.binding_fingerprint_with_cancellation(|| {
-        ensure_generic_response_processing_running(cancellation)
-    })?;
-    if context_binding != expected_binding {
-        return Ok(Err(
-            GenericResponseDestinationProblem::PlaceholderBindingMismatch,
-        ));
-    }
-    let mut context_text = String::with_capacity(context.text().len());
-    append_generic_response_text(&mut context_text, context.text(), cancellation)?;
-    Ok(Ok(ValidatedReuse::new(final_translation, context_text)))
-}
-
-#[cfg(test)]
-fn validate_generic_candidate_fact(
-    fact: &GenericValidationFact,
-    candidate: &str,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    language_module: &dyn LanguageModule,
-) -> Result<ValidatedCandidate<String>, GenericResponseDestinationProblem> {
-    validate_generic_candidate_fact_with_cancellation(
-        fact,
-        candidate,
-        placeholder_rules,
-        &GenericPlaceholderRuleSource::ProjectSnapshot,
-        language_module,
-        &CooperativeCancellation::default(),
-    )
-    .expect("不取消的候选验收必须完成")
-}
-
-fn validate_generic_candidate_fact_with_cancellation(
-    fact: &GenericValidationFact,
-    candidate: &str,
-    placeholder_rules: &GenericCompiledPlaceholderRules,
-    placeholder_rule_source: &GenericPlaceholderRuleSource,
-    language_module: &dyn LanguageModule,
-    cancellation: &CooperativeCancellation,
-) -> Result<
-    Result<ValidatedCandidate<String>, GenericResponseDestinationProblem>,
-    GenericPreparationError,
-> {
-    ensure_generic_response_processing_running(cancellation)?;
-    let service = GenericPlaceholderService::default();
-    let restored = match service.restore_with_cancellation(&fact.protected, candidate, || {
-        ensure_generic_response_processing_running(cancellation)
-    })? {
-        Ok(restored) => restored,
-        Err(source) => return Ok(Err(generic_response_placeholder_problem(&source))),
-    };
-    let target_id = fact.locator.readable_id();
-    let candidate_protected = match service.bind_target_candidate_with_cancellation(
-        &fact.protected,
-        &target_id,
-        &fact.kind,
-        &restored,
-        placeholder_rules,
-        || ensure_generic_response_processing_running(cancellation),
-    )? {
-        Ok(protected) => protected,
-        Err(source) => {
-            return Ok(Err(generic_candidate_placeholder_problem(
-                source.into(),
-                placeholder_rule_source,
-                &fact.locator,
-            )?));
-        }
-    };
-    let language_text = match candidate_protected.language_text_with_cancellation(|| {
-        ensure_generic_response_processing_running(cancellation)
-    })? {
-        Ok(text) => text,
-        Err(source) => {
-            return Ok(Err(GenericResponseDestinationProblem::LanguageProjection {
-                problem: generic_language_projection_problem(&source),
-            }));
-        }
-    };
-    let residual = match language_module.find_source_residual_with_cancellation(
-        &fact.analysis,
-        &language_text,
-        &mut || ensure_generic_language_running(cancellation),
-    ) {
-        Ok(Ok(residual)) => residual,
-        Ok(Err(_)) => {
-            return Ok(Err(
-                GenericResponseDestinationProblem::LanguageAnalysisMismatch,
-            ));
-        }
-        Err(LanguageOperationCancelled) => {
-            return Err(GenericPlanningError::Cancelled.into());
-        }
-    };
-    let review = residual.is_some().then_some(ReviewFinding::SourceResidual);
-    ensure_generic_response_processing_running(cancellation)?;
-    let final_translation = match rebuild_original_placeholders_with_cancellation(
-        &candidate_protected,
-        &language_text,
-        cancellation,
-    )? {
-        Ok(translation) => translation,
-        Err(problem) => return Ok(Err(problem)),
-    };
-    if contains_reserved_prefix_with_cancellation(&final_translation, cancellation)? {
-        return Ok(Err(GenericResponseDestinationProblem::ReservedToken));
-    }
-    ensure_generic_response_processing_running(cancellation)?;
-    Ok(Ok(match review {
-        Some(finding) => ValidatedCandidate::with_review(final_translation, finding),
-        None => ValidatedCandidate::clean(final_translation),
-    }))
-}
-
-fn rebuild_original_placeholders_with_cancellation(
-    protected: &GenericProtectedText,
-    repaired: &LanguageText,
-    cancellation: &CooperativeCancellation,
-) -> Result<Result<String, GenericResponseDestinationProblem>, GenericPlanningError> {
-    ensure_generic_response_processing_running(cancellation)?;
-    let mut output = String::new();
-    let mut placeholders = protected.placeholders().iter();
-    for segment in repaired.segments() {
-        ensure_generic_response_processing_running(cancellation)?;
-        match segment {
-            LanguageTextSegment::NaturalText(text) => {
-                append_generic_response_text(&mut output, text, cancellation)?;
-            }
-            LanguageTextSegment::OpaqueBoundary => {
-                let Some(placeholder) = placeholders.next() else {
-                    return Ok(Err(
-                        GenericResponseDestinationProblem::PlaceholderBoundaryAdded,
-                    ));
-                };
-                append_generic_response_text(&mut output, placeholder.original(), cancellation)?;
-            }
-        }
-    }
-    ensure_generic_response_processing_running(cancellation)?;
-    if placeholders.next().is_some() {
-        return Ok(Err(
-            GenericResponseDestinationProblem::PlaceholderBoundaryRemoved,
-        ));
-    }
-    Ok(Ok(output))
-}
-
-fn ensure_generic_response_processing_running(
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPlanningError> {
-    if cancellation.is_requested() {
-        Err(GenericPlanningError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
-fn append_generic_response_text(
-    output: &mut String,
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<(), GenericPlanningError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-
-    let mut start = 0_usize;
-    while start < text.len() {
-        ensure_generic_response_processing_running(cancellation)?;
-        let mut end = start
-            .saturating_add(CANCELLATION_CHECK_BYTES)
-            .min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&text[start..end]);
-        start = end;
-    }
-    ensure_generic_response_processing_running(cancellation)
-}
-
-fn clone_generic_validation_result(
-    result: &Result<ValidatedCandidate<String>, GenericResponseDestinationProblem>,
-    cancellation: &CooperativeCancellation,
-) -> Result<
-    Result<ValidatedCandidate<String>, GenericResponseDestinationProblem>,
-    GenericPlanningError,
-> {
-    let mut cloned = String::new();
-    match result {
-        Ok(value) => {
-            append_generic_response_text(&mut cloned, value.value(), cancellation)?;
-            let cloned = match value.reviews() {
-                [] => ValidatedCandidate::clean(cloned),
-                [finding] => ValidatedCandidate::with_review(cloned, finding.clone()),
-                _ => unreachable!("当前候选验收每个目标最多产生一个 Review"),
-            };
-            Ok(Ok(cloned))
-        }
-        Err(problem) => {
-            ensure_generic_response_processing_running(cancellation)?;
-            Ok(Err(problem.clone()))
-        }
-    }
-}
-
-fn contains_reserved_prefix_with_cancellation(
-    text: &str,
-    cancellation: &CooperativeCancellation,
-) -> Result<bool, GenericPlanningError> {
-    const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-    let prefix = placeholder_token::PREFIX.as_bytes();
-
-    for (index, window) in text.as_bytes().windows(prefix.len()).enumerate() {
-        if index.is_multiple_of(CANCELLATION_CHECK_BYTES) {
-            ensure_generic_response_processing_running(cancellation)?;
-        }
-        if window == prefix {
-            return Ok(true);
-        }
-    }
-    ensure_generic_response_processing_running(cancellation)?;
-    Ok(false)
-}
-
 fn add_commit_outcome(
     summary: &mut GenericTranslationSummary,
     outcome: &CommitTranslationsOutcome,
@@ -5582,15 +4546,6 @@ async fn load_additional_pem_roots(
         roots.push(file.into_bytes());
     }
     Ok(roots)
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct TokioDelay;
-
-impl AsyncDelay for TokioDelay {
-    async fn wait(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
-    }
 }
 
 fn start_file_system(
@@ -6588,23 +5543,12 @@ async fn drive<T>(
     termination_signals: &mut TerminationSignals,
     cancel: impl FnOnce(),
 ) -> Driven<T> {
-    tokio::pin!(future);
-    tokio::select! {
-        biased;
-        signal = termination_signals.recv() => match signal {
-            Ok(()) => {
-                cancel();
-                Driven::Interrupted(future.await)
-            }
-            Err(source) => {
-                cancel();
-                Driven::SignalFailed {
-                    source,
-                    result: future.await,
-                }
-            }
-        },
-        result = &mut future => Driven::Finished(result),
+    match drive_with_termination(future, termination_signals, cancel, || {}).await {
+        TerminationOutcome::Finished(result) => Driven::Finished(result),
+        TerminationOutcome::Interrupted(result) => Driven::Interrupted(result),
+        TerminationOutcome::SignalFailed { source, result } => {
+            Driven::SignalFailed { source, result }
+        }
     }
 }
 
@@ -7967,102 +6911,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_candidate_worker_failure_is_not_a_partial_response_problem() {
-        let locator = GenericUnitLocator {
-            relative_path: PathBuf::from("story.jsonl"),
-            group_id: "story".to_owned(),
-            unit_id: "line".to_owned(),
-            role: "dialogue".to_owned(),
-            line: 1,
-            unit: 1,
-        };
-        let error = generic_candidate_placeholder_problem(
-            crate::generic::GenericPlaceholderError::Protection(
-                PlaceholderProtectionError::StartWorker {
-                    operation: PlaceholderWorkerOperation::MatchText,
-                    source: io::Error::other("worker unavailable"),
-                },
-            ),
-            &GenericPlaceholderRuleSource::ProjectSnapshot,
-            &locator,
-        )
-        .expect_err("worker 启动失败必须离开普通候选不合格分支");
-
-        assert!(matches!(
-            &error,
-            GenericPreparationError::PlaceholderProtection {
-                source: PlaceholderProtectionError::StartWorker { .. },
-                ..
-            }
-        ));
-        let report = generic_preparation_report_at(&error, GenericDiagnosticStage::Translate);
-        assert_eq!(
-            report.primary().code(),
-            "translation.placeholder.worker_start"
-        );
-
-        let ordinary = generic_candidate_placeholder_problem(
-            crate::generic::GenericPlaceholderError::ManualTranslationMismatch,
-            &GenericPlaceholderRuleSource::ProjectSnapshot,
-            &locator,
-        )
-        .expect("候选 Placeholder 绑定不匹配仍应成为逐目标问题");
-        assert_eq!(
-            ordinary,
-            GenericResponseDestinationProblem::PlaceholderBindingMismatch
-        );
-    }
-
-    #[test]
-    fn generic_current_translation_technical_placeholder_failure_is_not_source_fallback() {
-        let locator = GenericUnitLocator {
-            relative_path: PathBuf::from("story.jsonl"),
-            group_id: "story".to_owned(),
-            unit_id: "line".to_owned(),
-            role: "dialogue".to_owned(),
-            line: 1,
-            unit: 1,
-        };
-        let error = generic_current_translation_protection_result(
-            Err(crate::generic::GenericPlaceholderError::Protection(
-                PlaceholderProtectionError::StartWorker {
-                    operation: PlaceholderWorkerOperation::MatchText,
-                    source: io::Error::other("worker unavailable"),
-                },
-            )),
-            &GenericPlaceholderRuleSource::ProjectSnapshot,
-            &locator,
-        )
-        .expect_err("已有译文的 worker 启动失败必须终止规划");
-        assert!(matches!(
-            &error,
-            GenericPreparationError::PlaceholderProtection {
-                source: PlaceholderProtectionError::StartWorker { .. },
-                ..
-            }
-        ));
-        assert_eq!(
-            generic_preparation_report_at(&error, GenericDiagnosticStage::Translate)
-                .primary()
-                .code(),
-            "translation.placeholder.worker_start"
-        );
-
-        let ordinary = generic_current_translation_protection_result(
-            Err(crate::generic::GenericPlaceholderError::Protection(
-                PlaceholderProtectionError::ReservedTokenNamespace {
-                    start_byte: 0,
-                    end_byte: 8,
-                },
-            )),
-            &GenericPlaceholderRuleSource::ProjectSnapshot,
-            &locator,
-        )
-        .expect("已有译文的数据不合格仍应使用保护后原文");
-        assert!(ordinary.is_none());
-    }
-
-    #[test]
     fn generic_translate_log_state_keeps_saved_progress_summary() {
         let state = generic_translate_project_log_state();
         let initial = GenericTranslationSummary {
@@ -8525,10 +7373,10 @@ mod tests {
                         },
                 } => {
                     assert_eq!(rule_source, expected_rule_source);
-                    assert_eq!(locator.relative_path, Path::new("a.jsonl"));
-                    assert_eq!(locator.group_id, "group-a");
-                    assert_eq!(locator.unit_id, "unit-a");
-                    assert_eq!(locator.role, "dialogue");
+                    assert_eq!(locator.relative_path(), Path::new("a.jsonl"));
+                    assert_eq!(locator.group_id(), "group-a");
+                    assert_eq!(locator.unit_id(), "unit-a");
+                    assert_eq!(locator.role(), "dialogue");
                     assert_eq!(rule_number, 1);
                     assert_eq!(whole_match_start_byte, "甲".len());
                     assert_eq!(whole_match_end_byte, "甲触发缺组".len());
@@ -9377,7 +8225,8 @@ mod tests {
             &CooperativeCancellation::default(),
         )
         .expect("翻译任务应该可规划");
-        let message = render_generic_user_message(&prepared.plan.tasks()[0], terminology.as_ref());
+        let message =
+            render_generic_user_message(&prepared.plan().tasks()[0], terminology.as_ref());
         let wire = compact_json(&message);
 
         assert!(wire.contains("\"source\":\"魔王\",\"translation\":\"魔王（Demon King）\""));
@@ -9393,7 +8242,7 @@ mod tests {
         assert!(wire.contains("\"id\":\"0\""));
         assert!(wire.contains("\"id\":\"1\""));
         assert!(
-            prepared.plan.reused().is_empty(),
+            prepared.plan().reused().is_empty(),
             "只供阅读的源文回退不能成为重复 Unit 的复用译文"
         );
         assert!(!message.contains("损坏的已有译文"));
@@ -9482,14 +8331,14 @@ mod tests {
         )
         .expect("翻译任务应该可规划");
 
-        assert_eq!(prepared.plan.reused().len(), 1);
-        assert_eq!(prepared.plan.reused()[0].key().group_id(), "reuse");
+        assert_eq!(prepared.plan().reused().len(), 1);
+        assert_eq!(prepared.plan().reused()[0].key().group_id(), "reuse");
         assert_eq!(
-            prepared.plan.reused()[0].translation(),
+            prepared.plan().reused()[0].translation(),
             "“你好 {name}”",
             "Translate 验收不得改写合格译文的引号风格"
         );
-        let task = &prepared.plan.tasks()[0];
+        let task = &prepared.plan().tasks()[0];
         assert_eq!(task.groups().len(), 3);
         let current_context = task.groups()[0].units()[0].text();
         let reuse_context = task.groups()[1].units()[0].text();
@@ -9581,17 +8430,17 @@ mod tests {
         )
         .expect("翻译任务应该可规划");
 
-        assert!(prepared.plan.tasks().len() > 2);
+        assert!(prepared.plan().tasks().len() > 2);
         assert!(
             prepared
-                .plan
+                .plan()
                 .tasks()
                 .iter()
                 .any(|task| task.groups().len() > 1),
             "除超大 Group 外，目标大小应允许多个 Group 同处一个 Task"
         );
         let rendered = prepared
-            .plan
+            .plan()
             .tasks()
             .iter()
             .map(|task| render_generic_user_message(task, terminology.as_ref()))
@@ -10020,231 +8869,6 @@ mod tests {
             .shutdown()
             .await
             .expect("文件运行能力应该可终结");
-    }
-
-    #[test]
-    fn cross_kind_dedup_validates_reuse_and_model_output_for_each_target() {
-        let temporary = tempfile::tempdir().expect("应该可建立临时目录");
-        let source_root = temporary.path().join("source");
-        fs::create_dir_all(&source_root).expect("应该可建立输入目录");
-        fs::write(
-            source_root.join("scene.jsonl"),
-            concat!(
-                r#"{"id":"source","kind":"dialogue","units":[{"id":"unit","text":"こんにちは"}]}"#,
-                "\n",
-                r#"{"id":"source-2","kind":"dialogue","units":[{"id":"unit","text":"こんにちは"}]}"#,
-                "\n",
-                r#"{"id":"target","kind":"name","units":[{"id":"unit","text":"こんにちは"}]}"#,
-                "\n"
-            ),
-        )
-        .expect("应该可写入 Generic 输入");
-        let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
-            project_name: "cross-kind-test".parse().expect("项目名应该合法"),
-            workspace_root: temporary.path().join("project"),
-            source_root: Some(source_root),
-            source_language: Some(LanguageId::parse("ja").expect("源语言应该合法")),
-            target_language: Some(LanguageId::parse("zh-Hans").expect("目标语言应该合法")),
-        })
-        .expect("Generic 项目应该可初始化");
-        store.extract().expect("Generic 输入应该可提取");
-        let rules = GenericPlaceholderService::default()
-            .compile(vec![GenericPlaceholderRuleDefinition::new(
-                Some(vec!["name".to_owned()]),
-                r"\{[^}]+\}",
-            )])
-            .expect("Placeholder 规则应该合法");
-        let terminology = Arc::new(CompiledTerminology::empty());
-        let language_module: Arc<dyn LanguageModule> = Arc::new(JapaneseLanguageModule::new(
-            JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
-                .expect("日文残留策略应该合法"),
-        ));
-        let snapshot = store.load_snapshot().expect("应该可读取 Generic 快照");
-        let prepared = prepare_generic_translation(
-            &snapshot,
-            Arc::clone(&terminology),
-            &rules,
-            &GenericPlaceholderRuleSource::ProjectSnapshot,
-            Arc::clone(&language_module),
-            NonZeroUsize::new(10_000).expect("常量应该非零"),
-            false,
-            &CooperativeCancellation::default(),
-        )
-        .expect("同文应该合并为一个模型输出");
-        assert_eq!(prepared.plan.tasks().len(), 1);
-        let task = &prepared.plan.tasks()[0];
-        assert_eq!(
-            task.expected_output_ids()
-                .map(TaskId::get)
-                .collect::<Vec<_>>(),
-            [0]
-        );
-        let parsed = parse_translation_response(
-            r#"{"0":["你好 {invented}"]}"#,
-            TranslationResponseMode::new(false, false),
-        )
-        .expect("响应应该可解析");
-        let mut validation_counts = HashMap::<String, usize>::new();
-        let acceptance = accept_generic_response_with(
-            task.clone(),
-            &parsed,
-            &prepared.facts,
-            |fact, candidate| {
-                *validation_counts.entry(fact.kind.clone()).or_default() += 1;
-                validate_generic_candidate_fact(fact, candidate, &rules, language_module.as_ref())
-                    .map(|validated| validated.into_parts().0)
-            },
-        );
-
-        assert_eq!(acceptance.accepted().len(), 2, "同 kind 的合法目标都应保存");
-        assert_eq!(
-            validation_counts,
-            HashMap::from([("dialogue".to_owned(), 1), ("name".to_owned(), 1)]),
-            "同一 output_id 只需为每种 kind 完整验收一次"
-        );
-        assert_eq!(acceptance.accepted_output_count(), 1);
-        assert!(acceptance.problems().iter().any(|problem| {
-            matches!(
-                problem,
-                crate::generic::ResponseProblem::InvalidDestination {
-                    output_id,
-                    destination,
-                    ..
-                } if *output_id == 0
-                    && destination.group_id.as_ref().is_some_and(|id| id.to_string() == "target")
-                    && destination.unit_id.as_ref().is_some_and(|id| id.to_string() == "unit")
-            )
-        }));
-
-        let source_group = &snapshot.files()[0].groups()[0];
-        let source_unit = &source_group.units()[0];
-        let protected = GenericPlaceholderService::default()
-            .protect(source_group.kind(), source_unit.source_text(), &rules)
-            .expect("源文没有命中 Placeholder");
-        assert!(protected.placeholders().is_empty());
-        apply_test_manual_translation(
-            &store,
-            TestManualTranslation {
-                id: "scene.jsonl:line1:unit1:text",
-                relative_path: "scene.jsonl",
-                group_id: source_group.id(),
-                unit_id: source_unit.id(),
-                kind: source_group.kind(),
-                source: source_unit.source_text(),
-                translation: "你好 {invented}",
-            },
-        );
-        let snapshot = store.load_snapshot().expect("应该可重读 Generic 快照");
-        let prepared = prepare_generic_translation(
-            &snapshot,
-            terminology,
-            &rules,
-            &GenericPlaceholderRuleSource::ProjectSnapshot,
-            language_module,
-            NonZeroUsize::new(10_000).expect("常量应该非零"),
-            false,
-            &CooperativeCancellation::default(),
-        )
-        .expect("复用失败的目标应该改为请求模型");
-
-        assert_eq!(prepared.plan.reused().len(), 1);
-        assert_eq!(
-            prepared.plan.reused()[0].key().group_id(),
-            "source-2",
-            "同 kind 目标仍应复用 Current"
-        );
-        assert_eq!(prepared.plan.tasks().len(), 1);
-        assert_eq!(prepared.plan.tasks()[0].groups().len(), 3);
-        assert_eq!(prepared.plan.tasks()[0].groups()[2].kind(), "name");
-        assert_eq!(
-            prepared.plan.tasks()[0]
-                .expected_output_ids()
-                .map(TaskId::get)
-                .collect::<Vec<_>>(),
-            [0],
-            "复用失败的目标不能从同一次 Translate 消失"
-        );
-    }
-
-    #[test]
-    fn candidate_validation_restores_placeholders_and_allows_free_line_breaks() {
-        let service = GenericPlaceholderService::default();
-        let rules = service
-            .compile(vec![GenericPlaceholderRuleDefinition::new(
-                Some(vec!["dialogue".to_owned()]),
-                r"\{[^}]+\}",
-            )])
-            .expect("Placeholder 规则应该合法");
-        let protected = service
-            .protect("dialogue", "こんにちは {name}", &rules)
-            .expect("原文应该可保护");
-        let token = protected.placeholders()[0].token().to_owned();
-        let language_text = protected.language_text().expect("保护文本应该可投影");
-        let language_module = JapaneseLanguageModule::new(
-            JapaneseResidualPolicy::new(NonZeroUsize::MIN, Vec::new())
-                .expect("日文残留策略应该合法"),
-        );
-        let key = GenericUnitKey::new("group".to_owned(), "unit".to_owned());
-        let mut facts = GenericUnitMap::new();
-        let previous = facts
-            .insert_with_cancellation(
-                key.clone(),
-                GenericValidationFact {
-                    locator: GenericUnitLocator {
-                        relative_path: PathBuf::from("scene.jsonl"),
-                        group_id: "group".to_owned(),
-                        unit_id: "unit".to_owned(),
-                        role: "dialogue".to_owned(),
-                        line: 1,
-                        unit: 1,
-                    },
-                    kind: "dialogue".to_owned(),
-                    analysis: language_module.analyze_source(&language_text),
-                    protected,
-                },
-                || Ok::<_, std::convert::Infallible>(()),
-            )
-            .unwrap_or_else(|never| match never {});
-        assert!(previous.is_none());
-
-        assert_eq!(
-            validate_generic_candidate(
-                &key,
-                &format!("你好\n世界 {token}"),
-                &facts,
-                &rules,
-                &language_module,
-            )
-            .expect("合法译文应该通过验收")
-            .into_parts()
-            .0,
-            "你好\n世界 {name}"
-        );
-        assert!(
-            validate_generic_candidate(&key, "你好", &facts, &rules, &language_module).is_err(),
-            "丢失 Placeholder 的译文必须被拒绝"
-        );
-        assert!(
-            validate_generic_candidate(
-                &key,
-                &format!("你好 {token} {{invented}}"),
-                &facts,
-                &rules,
-                &language_module,
-            )
-            .is_err(),
-            "新增原文不存在的 Placeholder 必须被拒绝"
-        );
-        let residual = validate_generic_candidate(
-            &key,
-            &format!("こんにちは {token}"),
-            &facts,
-            &rules,
-            &language_module,
-        )
-        .expect("源语言残留只进入 Review，不应丢弃合法候选");
-        assert_eq!(residual.value(), "こんにちは {name}");
-        assert_eq!(residual.reviews(), &[ReviewFinding::SourceResidual]);
     }
 
     #[test]

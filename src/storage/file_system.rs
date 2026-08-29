@@ -2393,8 +2393,9 @@ mod directory_stage_tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn stage_request_accepts_many_disjoint_overlays_without_pairwise_scanning() {
+    fn release_stress_stage_request_accepts_many_disjoint_overlays_without_pairwise_scanning() {
         let overlays = (0..10_000)
             .map(|ordinal| overlay(&format!("assets/file-{ordinal:05}.json")))
             .collect();
@@ -2409,8 +2410,9 @@ mod directory_stage_tests {
         assert_eq!(request.overlays().len(), 10_000);
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn path_index_drops_deep_declarations_without_recursive_rust_stack_use() {
+    fn release_stress_path_index_drops_deep_declarations_without_recursive_rust_stack_use() {
         let mut deep = PathBuf::new();
         for _ in 0..20_000 {
             deep.push("d");

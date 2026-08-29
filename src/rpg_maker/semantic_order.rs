@@ -135,7 +135,7 @@ impl RpgMakerSemanticOrderKey {
         &self.physical_path
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     pub(crate) const fn fragment(&self) -> u64 {
         self.fragment
     }

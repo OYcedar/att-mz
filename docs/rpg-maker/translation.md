@@ -19,10 +19,10 @@ ATT 从项目数据库读取 Extract 已经明确整理的 Semantic Scope、Grou
 Placeholder 与内置控制符，为每个 Unit 判定去向：Current、需要模型、可以复用，或不能
 处理。
 
-自动译文的 V2 状态必须与当前原文、完整实际 Group 来源语境、项目语言对、位置、角色和
+自动译文的当前适用性指纹必须与当前原文、完整实际 Group 来源语境、项目语言对、位置、角色和
 写回结构精确匹配；随后 Translate 再独立执行当前 Placeholder 强验收，两项都成立才是
 Current。术语、Prompt、Profile、Client、模型参数和语言检查阈值只影响后续请求，不改变
-既有正文的 V2 身份。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
+既有正文的适用性。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
 模型提交也不能覆盖它。
 
 人工译文只在内部位置、Group kind、Unit 角色、写回 recipe、正文形状、原文或项目语言对
@@ -32,9 +32,9 @@ Current。术语、Prompt、Profile、Client、模型参数和语言检查阈值
 不匹配当前语言对或 Group 来源语境的自动正文和状态保留但不再是 Current，不参与模型语境、去重复用或
 WriteBack。Translate 不在请求模型之前删除它；替代候选通过验收后，按当前来源、Unit、
 Group 语境和旧译文状态执行 CAS 原子覆盖。请求失败、取消、额度不足、Partial 或提交冲突
-都保留读取时的正文；绑定事实恢复后，原 V2 状态可以重新匹配。
+都保留读取时的正文；绑定事实恢复后，原状态可以重新匹配。
 
-Rejected 候选使用自己的 V2 适用性，不复用自动正文状态。候选原文、来源上下文、项目
+Rejected 候选与自动正文共用同一当前适用性指纹。候选原文、来源上下文、项目
 语言对、Unit 位置/角色/recipe 和完整 Group 来源语境必须仍匹配，Manual、Lua 与 Translate
 才把它视为当前；`readable_id` 仅展示。语言或 Extract 事实变化不删除同一自然 Unit 的候选，
 但旧候选不会预填给新目标语言；相关事实恢复后可以再次使用。改变 Client、Prompt、术语或

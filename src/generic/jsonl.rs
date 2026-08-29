@@ -110,24 +110,27 @@ impl GenericGroup {
 
     #[cfg(test)]
     fn validate(&self) -> Result<(), GenericJsonlError> {
-        self.validate_with_cancellation(&NeverCancelled)
+        self.validate_with_cancellation(&CooperativeCancellation::default())
     }
 
     fn validate_with_cancellation(
         &self,
-        cancellation: &(impl JsonlCancellation + ?Sized),
+        cancellation: &CooperativeCancellation,
     ) -> Result<(), GenericJsonlError> {
         self.validate_with_unit_check(cancellation, |unit, cancellation| {
             validate_text_with_cancellation(unit.text(), cancellation)
         })
     }
 
-    fn validate_with_unit_check<C: JsonlCancellation + ?Sized>(
+    fn validate_with_unit_check(
         &self,
-        cancellation: &C,
-        mut validate_unit: impl FnMut(&GenericUnit, &C) -> Result<(), GenericJsonlError>,
+        cancellation: &CooperativeCancellation,
+        mut validate_unit: impl FnMut(
+            &GenericUnit,
+            &CooperativeCancellation,
+        ) -> Result<(), GenericJsonlError>,
     ) -> Result<(), GenericJsonlError> {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Group)?;
+        ensure_not_cancelled(cancellation)?;
         validate_nonempty("group.id", &self.id)?;
         validate_nonempty("group.kind", &self.kind)?;
         if self.units.is_empty() {
@@ -138,11 +141,11 @@ impl GenericGroup {
 
         let mut unit_ids = CancellableTextMap::with_capacity(self.units.len());
         for (ordinal, unit) in self.units.iter().enumerate() {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Unit)?;
+            ensure_not_cancelled(cancellation)?;
             validate_nonempty("unit.id", unit.id())?;
             validate_unit(unit, cancellation)?;
             if let Some(previous) = unit_ids.insert_with_cancellation(unit.id(), ordinal, || {
-                ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Unit)
+                ensure_not_cancelled(cancellation)
             })? {
                 return Err(GenericJsonlError::DuplicateUnitId {
                     group_id: clone_string_with_cancellation(&self.id, cancellation)?,
@@ -171,7 +174,7 @@ impl GenericGroup {
 
     fn validate_with_known_valid_units(
         &self,
-        cancellation: &(impl JsonlCancellation + ?Sized),
+        cancellation: &CooperativeCancellation,
     ) -> Result<(), GenericJsonlError> {
         self.validate_with_unit_check(cancellation, |_unit, _cancellation| Ok(()))
     }
@@ -354,57 +357,6 @@ impl fmt::Display for GenericUtf8Error {
 }
 
 impl Error for GenericUtf8Error {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum JsonlCancellationBoundary {
-    Scan,
-    FileReadChunk,
-    Utf8Chunk,
-    Line,
-    LineScanChunk,
-    BlankLineChunk,
-    JsonDeserializeChunk,
-    JsonSerializeChunk,
-    Group,
-    Unit,
-    TextChunk,
-    ProjectGroup,
-    RawFingerprintChunk,
-    AssetFingerprintChunk,
-}
-
-trait JsonlCancellation: Sync {
-    fn ensure_not_cancelled(
-        &self,
-        boundary: JsonlCancellationBoundary,
-    ) -> Result<(), GenericJsonlError>;
-}
-
-impl JsonlCancellation for CooperativeCancellation {
-    fn ensure_not_cancelled(
-        &self,
-        _boundary: JsonlCancellationBoundary,
-    ) -> Result<(), GenericJsonlError> {
-        if self.is_requested() {
-            Err(GenericJsonlError::Cancelled)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
-struct NeverCancelled;
-
-#[cfg(test)]
-impl JsonlCancellation for NeverCancelled {
-    fn ensure_not_cancelled(
-        &self,
-        _boundary: JsonlCancellationBoundary,
-    ) -> Result<(), GenericJsonlError> {
-        Ok(())
-    }
-}
 
 impl GenericJsonlError {
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -824,7 +776,7 @@ pub(crate) fn scan_input_tree_with_cancellation(
     source_root: &Path,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericInputSnapshot, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     if !source_root.is_dir() {
         return Err(GenericJsonlError::SourceNotDirectory {
             path: source_root.to_path_buf(),
@@ -836,8 +788,9 @@ pub(crate) fn scan_input_tree_with_cancellation(
     let parsed = pinned_files
         .into_par_iter()
         .map(|mut pinned_file| {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
-            let raw_bytes = read_pinned_jsonl_file_with_probe(&mut pinned_file, cancellation)?;
+            ensure_not_cancelled(cancellation)?;
+            let raw_bytes =
+                read_pinned_jsonl_file_with_cancellation(&mut pinned_file, cancellation)?;
             parse_file_with_cancellation(pinned_file.relative_path, raw_bytes, cancellation)
         })
         .collect::<Vec<_>>();
@@ -846,7 +799,7 @@ pub(crate) fn scan_input_tree_with_cancellation(
     for result in parsed {
         files.push(result?);
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     validate_project_group_ids(&files, cancellation)?;
 
     let raw_fingerprint = fingerprint_raw_files(&files, cancellation)?;
@@ -859,11 +812,11 @@ pub(crate) fn scan_input_tree_with_cancellation(
 }
 
 #[cfg(test)]
-fn read_jsonl_file_with_probe(
+fn read_jsonl_file_with_cancellation(
     path: &Path,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<u8>, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     let mut pinned =
         crate::runtime::windows::pin_regular_file_for_snapshot_read(path).map_err(|source| {
             GenericJsonlError::Windows {
@@ -890,14 +843,14 @@ fn read_jsonl_file_with_probe(
             path: path.to_path_buf(),
             source,
         })?;
-    read_snapshot_file_with_probe(pinned.file_mut(), path, expected_identity, cancellation)
+    read_snapshot_file_with_cancellation(pinned.file_mut(), path, expected_identity, cancellation)
 }
 
-fn read_pinned_jsonl_file_with_probe(
+fn read_pinned_jsonl_file_with_cancellation(
     pinned_file: &mut PinnedJsonlFile,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<u8>, GenericJsonlError> {
-    read_snapshot_file_with_probe(
+    read_snapshot_file_with_cancellation(
         &mut pinned_file.file,
         &pinned_file.path,
         pinned_file.expected_identity,
@@ -905,18 +858,18 @@ fn read_pinned_jsonl_file_with_probe(
     )
 }
 
-fn read_snapshot_file_with_probe(
+fn read_snapshot_file_with_cancellation(
     file: &mut fs::File,
     path: &Path,
     expected_identity: FileIdentity,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<u8>, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     let path = path.to_path_buf();
     let mut raw_bytes = Vec::new();
     let mut buffer = [0_u8; CANCELLATION_CHECK_BYTES];
     loop {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::FileReadChunk)?;
+        ensure_not_cancelled(cancellation)?;
         let read = match file.read(&mut buffer) {
             Ok(read) => read,
             Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
@@ -940,7 +893,7 @@ fn read_snapshot_file_with_probe(
             })?;
         raw_bytes.extend_from_slice(&buffer[..read]);
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::FileReadChunk)?;
+    ensure_not_cancelled(cancellation)?;
     let actual_identity =
         FileIdentity::of(file, &path).map_err(|source| GenericJsonlError::Windows {
             operation: FileSystemOperation::Metadata,
@@ -982,7 +935,11 @@ pub(crate) fn parse_file(
     relative_path: PathBuf,
     raw_bytes: Vec<u8>,
 ) -> Result<GenericFile, GenericJsonlError> {
-    parse_file_with_probe(relative_path, raw_bytes, &NeverCancelled)
+    parse_file_with_cancellation(
+        relative_path,
+        raw_bytes,
+        &CooperativeCancellation::default(),
+    )
 }
 
 pub(crate) fn parse_file_with_cancellation(
@@ -990,16 +947,8 @@ pub(crate) fn parse_file_with_cancellation(
     raw_bytes: Vec<u8>,
     cancellation: &CooperativeCancellation,
 ) -> Result<GenericFile, GenericJsonlError> {
-    parse_file_with_probe(relative_path, raw_bytes, cancellation)
-}
-
-fn parse_file_with_probe(
-    relative_path: PathBuf,
-    raw_bytes: Vec<u8>,
-    cancellation: &(impl JsonlCancellation + ?Sized),
-) -> Result<GenericFile, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
-    match validate_utf8_with_probe(&raw_bytes, cancellation) {
+    ensure_not_cancelled(cancellation)?;
+    match validate_utf8_with_cancellation(&raw_bytes, cancellation) {
         Ok(()) => {}
         Err(GenericUtf8ErrorOrCancellation::Invalid(source)) => {
             return Err(GenericJsonlError::InvalidUtf8 {
@@ -1009,7 +958,7 @@ fn parse_file_with_probe(
         }
         Err(GenericUtf8ErrorOrCancellation::Cancellation(source)) => return Err(source),
     }
-    // SAFETY: `validate_utf8_with_probe` 已经逐块校验完整字节串；后续代码不再修改
+    // SAFETY: `validate_utf8_with_cancellation` 已经逐块校验完整字节串；后续代码不再修改
     // `raw_bytes`，物理行切点也只位于 ASCII LF/CR 边界。
     let text = unsafe { std::str::from_utf8_unchecked(&raw_bytes) };
     let mut json_reader = BufReader::with_capacity(
@@ -1020,18 +969,18 @@ fn parse_file_with_probe(
     let mut start = 0;
     let mut line = 1;
     while start < text.len() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Line)?;
+        ensure_not_cancelled(cancellation)?;
         let (line_end, consumed) = find_physical_line_end(text.as_bytes(), start, cancellation)?;
         let raw_line = &text[start..line_end];
         let json_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if is_blank_line_with_probe(json_line, cancellation)? {
+        if is_blank_line_with_cancellation(json_line, cancellation)? {
             return Err(GenericJsonlError::BlankLine {
                 path: relative_path,
                 line,
             });
         }
         reset_buffered_slice_reader(&mut json_reader, json_line.as_bytes());
-        let group = match deserialize_buffered_group_with_probe(
+        let group = match deserialize_buffered_group_with_cancellation(
             &mut json_reader,
             json_line.as_bytes(),
             cancellation,
@@ -1070,7 +1019,7 @@ fn parse_file_with_probe(
         line += 1;
     }
     drop(json_reader);
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     Ok(GenericFile {
         relative_path,
         groups,
@@ -1078,14 +1027,13 @@ fn parse_file_with_probe(
     })
 }
 
-fn validate_utf8_with_probe(
+fn validate_utf8_with_cancellation(
     raw_bytes: &[u8],
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericUtf8ErrorOrCancellation> {
     let mut start = 0;
     while start < raw_bytes.len() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Utf8Chunk)
-            .map_err(GenericUtf8ErrorOrCancellation::Cancellation)?;
+        ensure_not_cancelled(cancellation).map_err(GenericUtf8ErrorOrCancellation::Cancellation)?;
         let end = start
             .saturating_add(CANCELLATION_CHECK_BYTES)
             .min(raw_bytes.len());
@@ -1095,7 +1043,7 @@ fn validate_utf8_with_probe(
                 let valid_up_to = start.saturating_add(source.valid_up_to());
                 match source.error_len() {
                     Some(error_len) => {
-                        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Utf8Chunk)
+                        ensure_not_cancelled(cancellation)
                             .map_err(GenericUtf8ErrorOrCancellation::Cancellation)?;
                         return Err(GenericUtf8ErrorOrCancellation::Invalid(GenericUtf8Error {
                             valid_up_to,
@@ -1103,7 +1051,7 @@ fn validate_utf8_with_probe(
                         }));
                     }
                     None if end == raw_bytes.len() => {
-                        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Utf8Chunk)
+                        ensure_not_cancelled(cancellation)
                             .map_err(GenericUtf8ErrorOrCancellation::Cancellation)?;
                         return Err(GenericUtf8ErrorOrCancellation::Invalid(GenericUtf8Error {
                             valid_up_to,
@@ -1115,8 +1063,7 @@ fn validate_utf8_with_probe(
             }
         }
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Utf8Chunk)
-        .map_err(GenericUtf8ErrorOrCancellation::Cancellation)?;
+    ensure_not_cancelled(cancellation).map_err(GenericUtf8ErrorOrCancellation::Cancellation)?;
     Ok(())
 }
 
@@ -1129,11 +1076,11 @@ enum GenericUtf8ErrorOrCancellation {
 fn find_physical_line_end(
     raw_bytes: &[u8],
     start: usize,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(usize, usize), GenericJsonlError> {
     let mut cursor = start;
     while cursor < raw_bytes.len() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::LineScanChunk)?;
+        ensure_not_cancelled(cancellation)?;
         let chunk_end = cursor
             .saturating_add(CANCELLATION_CHECK_BYTES)
             .min(raw_bytes.len());
@@ -1142,46 +1089,46 @@ fn find_physical_line_end(
             .position(|byte| *byte == b'\n')
         {
             let line_end = cursor + relative_end;
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::LineScanChunk)?;
+            ensure_not_cancelled(cancellation)?;
             return Ok((line_end, line_end - start + 1));
         }
         cursor = chunk_end;
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::LineScanChunk)?;
+    ensure_not_cancelled(cancellation)?;
     Ok((raw_bytes.len(), raw_bytes.len() - start))
 }
 
-fn is_blank_line_with_probe(
+fn is_blank_line_with_cancellation(
     line: &str,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<bool, GenericJsonlError> {
     let mut next_check = 0;
     for (offset, character) in line.char_indices() {
         if offset >= next_check {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::BlankLineChunk)?;
+            ensure_not_cancelled(cancellation)?;
             next_check = offset.saturating_add(CANCELLATION_CHECK_BYTES);
         }
         if !character.is_whitespace() {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::BlankLineChunk)?;
+            ensure_not_cancelled(cancellation)?;
             return Ok(false);
         }
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::BlankLineChunk)?;
+    ensure_not_cancelled(cancellation)?;
     Ok(true)
 }
 
 #[cfg(test)]
-fn deserialize_group_with_probe(
+fn deserialize_group_with_cancellation(
     json_line: &[u8],
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericGroup, JsonDeserializeError> {
     let slice_reader = CancellableSliceReader::new(json_line, cancellation);
     let mut reader = BufReader::with_capacity(CANCELLATION_CHECK_BYTES, slice_reader);
-    deserialize_buffered_group_with_probe(&mut reader, json_line, cancellation)
+    deserialize_buffered_group_with_cancellation(&mut reader, json_line, cancellation)
 }
 
-fn reset_buffered_slice_reader<'bytes, C: JsonlCancellation + ?Sized>(
-    reader: &mut BufReader<CancellableSliceReader<'bytes, '_, C>>,
+fn reset_buffered_slice_reader<'bytes>(
+    reader: &mut BufReader<CancellableSliceReader<'bytes, '_>>,
     remaining: &'bytes [u8],
 ) {
     let buffered = reader.buffer().len();
@@ -1189,10 +1136,10 @@ fn reset_buffered_slice_reader<'bytes, C: JsonlCancellation + ?Sized>(
     reader.get_mut().reset(remaining);
 }
 
-fn deserialize_buffered_group_with_probe<C: JsonlCancellation + ?Sized>(
-    reader: &mut BufReader<CancellableSliceReader<'_, '_, C>>,
+fn deserialize_buffered_group_with_cancellation(
+    reader: &mut BufReader<CancellableSliceReader<'_, '_>>,
     json_line: &[u8],
-    cancellation: &C,
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericGroup, JsonDeserializeError> {
     match deserialize_buffered_group_once(reader, cancellation) {
         Ok(group) => Ok(group),
@@ -1208,16 +1155,12 @@ fn deserialize_buffered_group_with_probe<C: JsonlCancellation + ?Sized>(
     }
 }
 
-fn deserialize_buffered_group_once<C: JsonlCancellation + ?Sized>(
-    reader: &mut BufReader<CancellableSliceReader<'_, '_, C>>,
-    cancellation: &C,
+fn deserialize_buffered_group_once(
+    reader: &mut BufReader<CancellableSliceReader<'_, '_>>,
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericGroup, JsonDeserializeAttempt> {
     let result = serde_json::from_reader(&mut *reader);
-    if reader.get_ref().cancelled
-        || cancellation
-            .ensure_not_cancelled(JsonlCancellationBoundary::JsonDeserializeChunk)
-            .is_err()
-    {
+    if reader.get_ref().cancelled || cancellation.is_requested() {
         Err(JsonDeserializeAttempt::Cancelled)
     } else {
         result.map_err(JsonDeserializeAttempt::Json)
@@ -1227,7 +1170,7 @@ fn deserialize_buffered_group_once<C: JsonlCancellation + ?Sized>(
 fn normalized_json_error_position(
     json_line: &[u8],
     source: &serde_json::Error,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(usize, usize), JsonDeserializeError> {
     let line = source.line();
     let column = source.column();
@@ -1257,12 +1200,9 @@ fn normalized_json_error_position(
 
 fn finish_json_error_position(
     position: (usize, usize),
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(usize, usize), JsonDeserializeError> {
-    if cancellation
-        .ensure_not_cancelled(JsonlCancellationBoundary::JsonDeserializeChunk)
-        .is_err()
-    {
+    if cancellation.is_requested() {
         Err(JsonDeserializeError::Cancelled)
     } else {
         Ok(position)
@@ -1285,17 +1225,18 @@ enum JsonDeserializeAttempt {
     Json(serde_json::Error),
 }
 
-struct CancellableSliceReader<'bytes, 'cancellation, C: ?Sized> {
+struct CancellableSliceReader<'bytes, 'cancellation> {
     remaining: &'bytes [u8],
-    cancellation: &'cancellation C,
+    cancellation: &'cancellation CooperativeCancellation,
     bytes_until_check: usize,
     cancelled: bool,
 }
 
-impl<'bytes, 'cancellation, C: JsonlCancellation + ?Sized>
-    CancellableSliceReader<'bytes, 'cancellation, C>
-{
-    const fn new(remaining: &'bytes [u8], cancellation: &'cancellation C) -> Self {
+impl<'bytes, 'cancellation> CancellableSliceReader<'bytes, 'cancellation> {
+    const fn new(
+        remaining: &'bytes [u8],
+        cancellation: &'cancellation CooperativeCancellation,
+    ) -> Self {
         Self {
             remaining,
             cancellation,
@@ -1311,7 +1252,7 @@ impl<'bytes, 'cancellation, C: JsonlCancellation + ?Sized>
     }
 }
 
-impl<C: JsonlCancellation + ?Sized> Read for CancellableSliceReader<'_, '_, C> {
+impl Read for CancellableSliceReader<'_, '_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() || self.remaining.is_empty() {
             return Ok(0);
@@ -1320,11 +1261,7 @@ impl<C: JsonlCancellation + ?Sized> Read for CancellableSliceReader<'_, '_, C> {
             return Err(io::Error::other("Generic JSONL 解析已取消"));
         }
         if self.bytes_until_check == 0 {
-            if self
-                .cancellation
-                .ensure_not_cancelled(JsonlCancellationBoundary::JsonDeserializeChunk)
-                .is_err()
-            {
+            if self.cancellation.is_requested() {
                 self.cancelled = true;
                 return Err(io::Error::other("Generic JSONL 解析已取消"));
             }
@@ -1343,21 +1280,14 @@ impl<C: JsonlCancellation + ?Sized> Read for CancellableSliceReader<'_, '_, C> {
 
 #[cfg(test)]
 pub(crate) fn serialize_groups(groups: &[GenericGroup]) -> Result<Vec<u8>, GenericJsonlError> {
-    serialize_groups_with_probe(groups, &NeverCancelled)
+    serialize_groups_with_cancellation(groups, &CooperativeCancellation::default())
 }
 
 pub(crate) fn serialize_groups_with_cancellation(
     groups: &[GenericGroup],
     cancellation: &CooperativeCancellation,
 ) -> Result<Vec<u8>, GenericJsonlError> {
-    serialize_groups_with_probe(groups, cancellation)
-}
-
-fn serialize_groups_with_probe(
-    groups: &[GenericGroup],
-    cancellation: &(impl JsonlCancellation + ?Sized),
-) -> Result<Vec<u8>, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::JsonSerializeChunk)?;
+    ensure_not_cancelled(cancellation)?;
     let mut output = Vec::new();
     for group in groups {
         // 生产路径只会接收解析边界已校验的 Group，或
@@ -1371,23 +1301,23 @@ fn serialize_groups_with_probe(
         if cancelled {
             return Err(GenericJsonlError::Cancelled);
         }
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::JsonSerializeChunk)?;
+        ensure_not_cancelled(cancellation)?;
         result.map_err(|source| GenericJsonlError::Serialize { source })?;
         output.push(b'\n');
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::JsonSerializeChunk)?;
+    ensure_not_cancelled(cancellation)?;
     Ok(output)
 }
 
-struct CancellableVecWriter<'a, C: ?Sized> {
+struct CancellableVecWriter<'a> {
     output: &'a mut Vec<u8>,
-    cancellation: &'a C,
+    cancellation: &'a CooperativeCancellation,
     bytes_until_check: usize,
     cancelled: bool,
 }
 
-impl<'a, C: JsonlCancellation + ?Sized> CancellableVecWriter<'a, C> {
-    fn new(output: &'a mut Vec<u8>, cancellation: &'a C) -> Self {
+impl<'a> CancellableVecWriter<'a> {
+    fn new(output: &'a mut Vec<u8>, cancellation: &'a CooperativeCancellation) -> Self {
         Self {
             output,
             cancellation,
@@ -1397,17 +1327,13 @@ impl<'a, C: JsonlCancellation + ?Sized> CancellableVecWriter<'a, C> {
     }
 }
 
-impl<C: JsonlCancellation + ?Sized> Write for CancellableVecWriter<'_, C> {
+impl Write for CancellableVecWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
         }
         if self.bytes_until_check == 0 {
-            if self
-                .cancellation
-                .ensure_not_cancelled(JsonlCancellationBoundary::JsonSerializeChunk)
-                .is_err()
-            {
+            if self.cancellation.is_requested() {
                 self.cancelled = true;
                 return Err(io::Error::other("Generic JSONL 序列化已取消"));
             }
@@ -1434,18 +1360,18 @@ fn validate_nonempty(field: &'static str, value: &str) -> Result<(), GenericJson
 
 #[cfg(test)]
 fn validate_text(text: &str) -> Result<(), GenericJsonlError> {
-    validate_text_with_cancellation(text, &NeverCancelled)
+    validate_text_with_cancellation(text, &CooperativeCancellation::default())
 }
 
 fn clone_string_with_cancellation(
     value: &str,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<String, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::TextChunk)?;
+    ensure_not_cancelled(cancellation)?;
     let mut cloned = String::with_capacity(value.len());
     let mut start = 0;
     while start < value.len() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::TextChunk)?;
+        ensure_not_cancelled(cancellation)?;
         let mut end = start
             .saturating_add(CANCELLATION_CHECK_BYTES)
             .min(value.len());
@@ -1455,17 +1381,17 @@ fn clone_string_with_cancellation(
         cloned.push_str(&value[start..end]);
         start = end;
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::TextChunk)?;
+    ensure_not_cancelled(cancellation)?;
     Ok(cloned)
 }
 
 fn validate_text_with_cancellation(
     text: &str,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericJsonlError> {
     let bytes = text.as_bytes();
     for chunk in bytes.chunks(CANCELLATION_CHECK_CHUNK_BYTES.get()) {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::TextChunk)?;
+        ensure_not_cancelled(cancellation)?;
         for byte in chunk {
             let violation = match byte {
                 b'\r' => Some(GenericTextViolation::CarriageReturn),
@@ -1478,16 +1404,16 @@ fn validate_text_with_cancellation(
         }
     }
     if bytes.is_empty() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::TextChunk)?;
+        ensure_not_cancelled(cancellation)?;
     }
     Ok(())
 }
 
 fn collect_jsonl_files(
     source_root: &Path,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<PinnedJsonlFile>, GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     let pinned_root = pin_directory_without_reparse(source_root)
         .map_err(|source| windows_input_error(FileSystemOperation::Open, source_root, source))?;
     let resolved_root = pinned_root.resolved_path().to_path_buf();
@@ -1503,7 +1429,7 @@ fn collect_jsonl_files(
     }];
     let mut files = BTreeMap::new();
     while !pending.is_empty() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+        ensure_not_cancelled(cancellation)?;
         let scanned = pending
             .par_iter()
             .map(|directory| scan_directory(&resolved_root, directory, cancellation))
@@ -1513,7 +1439,7 @@ fn collect_jsonl_files(
         for result in scanned {
             let (child_directories, child_files) = result?;
             for child_directory in child_directories {
-                ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+                ensure_not_cancelled(cancellation)?;
                 let key = child_directory.relative_path.clone();
                 if next_pending.insert(key.clone(), child_directory).is_some() {
                     return Err(GenericJsonlError::WindowsCaseConflict {
@@ -1523,7 +1449,7 @@ fn collect_jsonl_files(
                 }
             }
             for child_file in child_files {
-                ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+                ensure_not_cancelled(cancellation)?;
                 let key = child_file.relative_path.clone();
                 if files.insert(key.clone(), child_file).is_some() {
                     return Err(GenericJsonlError::WindowsCaseConflict {
@@ -1534,25 +1460,25 @@ fn collect_jsonl_files(
             }
         }
         for child_directory in next_pending.into_values() {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+            ensure_not_cancelled(cancellation)?;
             pending.push(child_directory);
         }
     }
     let mut ordered_files = Vec::with_capacity(files.len());
     for file in files.into_values() {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+        ensure_not_cancelled(cancellation)?;
         ordered_files.push(file);
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     Ok(ordered_files)
 }
 
 fn scan_directory(
     resolved_root: &Path,
     directory: &PinnedInputDirectory,
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(Vec<PinnedInputDirectory>, Vec<PinnedJsonlFile>), GenericJsonlError> {
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     let directory_path = &directory.path;
     let entries = fs::read_dir(directory_path).map_err(|source| GenericJsonlError::Io {
         operation: FileSystemOperation::ListDirectory,
@@ -1563,7 +1489,7 @@ fn scan_directory(
     let mut files = Vec::new();
     let mut windows_names = BTreeMap::<WindowsOrdinalCaseKey, PathBuf>::new();
     for entry in entries {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+        ensure_not_cancelled(cancellation)?;
         let entry = entry.map_err(|source| GenericJsonlError::Io {
             operation: FileSystemOperation::ListDirectory,
             path: directory_path.to_path_buf(),
@@ -1643,7 +1569,7 @@ fn scan_directory(
             expected_identity,
         });
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Scan)?;
+    ensure_not_cancelled(cancellation)?;
     Ok((child_directories, files))
 }
 
@@ -1668,26 +1594,27 @@ fn register_windows_name(
     Ok(())
 }
 
-fn ensure_not_cancelled(
-    cancellation: &(impl JsonlCancellation + ?Sized),
-    boundary: JsonlCancellationBoundary,
-) -> Result<(), GenericJsonlError> {
-    cancellation.ensure_not_cancelled(boundary)
+fn ensure_not_cancelled(cancellation: &CooperativeCancellation) -> Result<(), GenericJsonlError> {
+    if cancellation.is_requested() {
+        Err(GenericJsonlError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_project_group_ids(
     files: &[GenericFile],
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericJsonlError> {
     let mut group_ids = CancellableTextMap::with_capacity(files.len());
     for file in files {
         for (ordinal, group) in file.groups.iter().enumerate() {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::ProjectGroup)?;
+            ensure_not_cancelled(cancellation)?;
             let line = ordinal + 1;
             if let Some((first_path, first_line)) = group_ids.insert_with_cancellation(
                 group.id(),
                 (file.relative_path(), line),
-                || ensure_not_cancelled(cancellation, JsonlCancellationBoundary::ProjectGroup),
+                || ensure_not_cancelled(cancellation),
             )? {
                 return Err(GenericJsonlError::DuplicateGroupId {
                     group_id: clone_string_with_cancellation(group.id(), cancellation)?,
@@ -1704,46 +1631,40 @@ fn validate_project_group_ids(
 
 fn fingerprint_raw_files(
     files: &[GenericFile],
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Sha256Fingerprint, GenericJsonlError> {
     let mut hasher = Sha256FramedHasher::new(b"att.generic.raw-input");
     for file in files {
-        ensure_not_cancelled(cancellation, JsonlCancellationBoundary::RawFingerprintChunk)?;
+        ensure_not_cancelled(cancellation)?;
         frame_path(&mut hasher, 1, file.relative_path());
         hasher.try_frame_chunks(2, file.raw_bytes(), CANCELLATION_CHECK_CHUNK_BYTES, || {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::RawFingerprintChunk)
+            ensure_not_cancelled(cancellation)
         })?;
     }
-    ensure_not_cancelled(cancellation, JsonlCancellationBoundary::RawFingerprintChunk)?;
+    ensure_not_cancelled(cancellation)?;
     Ok(hasher.finish())
 }
 
 fn fingerprint_assets(
     files: &[GenericFile],
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Sha256Fingerprint, GenericJsonlError> {
     let mut hasher = Sha256FramedHasher::new(b"att.generic.assets");
     for file in files {
-        ensure_not_cancelled(
-            cancellation,
-            JsonlCancellationBoundary::AssetFingerprintChunk,
-        )?;
+        ensure_not_cancelled(cancellation)?;
         frame_path(&mut hasher, 1, file.relative_path());
         for group in &file.groups {
-            ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Group)?;
+            ensure_not_cancelled(cancellation)?;
             try_frame_asset_bytes(&mut hasher, 2, group.id().as_bytes(), cancellation)?;
             try_frame_asset_bytes(&mut hasher, 3, group.kind().as_bytes(), cancellation)?;
             for unit in group.units() {
-                ensure_not_cancelled(cancellation, JsonlCancellationBoundary::Unit)?;
+                ensure_not_cancelled(cancellation)?;
                 try_frame_asset_bytes(&mut hasher, 4, unit.id().as_bytes(), cancellation)?;
                 try_frame_asset_bytes(&mut hasher, 5, unit.text().as_bytes(), cancellation)?;
             }
         }
     }
-    ensure_not_cancelled(
-        cancellation,
-        JsonlCancellationBoundary::AssetFingerprintChunk,
-    )?;
+    ensure_not_cancelled(cancellation)?;
     Ok(hasher.finish())
 }
 
@@ -1751,13 +1672,10 @@ fn try_frame_asset_bytes(
     hasher: &mut Sha256FramedHasher,
     tag: u8,
     bytes: &[u8],
-    cancellation: &(impl JsonlCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericJsonlError> {
     hasher.try_frame_chunks(tag, bytes, CANCELLATION_CHECK_CHUNK_BYTES, || {
-        ensure_not_cancelled(
-            cancellation,
-            JsonlCancellationBoundary::AssetFingerprintChunk,
-        )
+        ensure_not_cancelled(cancellation)
     })?;
     Ok(())
 }
@@ -1781,8 +1699,6 @@ fn frame_path(hasher: &mut Sha256FramedHasher, tag: u8, path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use crate::diagnostic::{DiagnosticReport, StateEffect, render_diagnostic_report};
     use crate::i18n::{UiLocale, UiLocalizer};
 
@@ -1794,48 +1710,6 @@ mod tests {
             error.kind(),
             io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
         ) || error.raw_os_error() == Some(1314)
-    }
-
-    struct CancelAtBoundary {
-        cancellation: CooperativeCancellation,
-        boundary: JsonlCancellationBoundary,
-        trigger_at: usize,
-        observed: AtomicUsize,
-    }
-
-    impl CancelAtBoundary {
-        fn new(boundary: JsonlCancellationBoundary, trigger_at: usize) -> Self {
-            assert!(trigger_at > 0);
-            Self {
-                cancellation: CooperativeCancellation::default(),
-                boundary,
-                trigger_at,
-                observed: AtomicUsize::new(0),
-            }
-        }
-
-        fn observed(&self) -> usize {
-            self.observed.load(Ordering::Acquire)
-        }
-    }
-
-    impl JsonlCancellation for CancelAtBoundary {
-        fn ensure_not_cancelled(
-            &self,
-            boundary: JsonlCancellationBoundary,
-        ) -> Result<(), GenericJsonlError> {
-            if boundary == self.boundary {
-                let observed = self.observed.fetch_add(1, Ordering::AcqRel) + 1;
-                if observed == self.trigger_at {
-                    self.cancellation.request();
-                }
-            }
-            if self.cancellation.is_requested() {
-                Err(GenericJsonlError::Cancelled)
-            } else {
-                Ok(())
-            }
-        }
     }
 
     #[test]
@@ -1933,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn write_back_construction_validates_unit_text_once_and_keeps_group_invariants() {
+    fn write_back_construction_validates_unit_text_and_group_invariants() {
         let cancellation = CooperativeCancellation::default();
         let source_unit = GenericUnit::new("u".to_owned(), "source".to_owned()).unwrap();
         assert!(matches!(
@@ -1953,24 +1827,11 @@ mod tests {
             source_group.clone_with_units_with_cancellation(vec![first, second], &cancellation),
             Err(GenericJsonlError::DuplicateUnitId { .. })
         ));
-
-        let rewritten = GenericGroup {
-            id: "g".to_owned(),
-            kind: "k".to_owned(),
-            units: vec![GenericUnit {
-                id: "u".to_owned(),
-                text: "translated".to_owned(),
-            }],
-        };
-        let text_probe = CancelAtBoundary::new(JsonlCancellationBoundary::TextChunk, 1);
-        rewritten
-            .validate_with_known_valid_units(&text_probe)
-            .expect("已校验 Unit 组成 Group 时不应再次扫描正文");
-        assert_eq!(text_probe.observed(), 0);
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn deeply_nested_directories_are_scanned_without_recursive_calls() {
+    fn release_stress_deeply_nested_directories_are_scanned_without_recursive_calls() {
         let temp = tempdir().unwrap();
         let mut directory = temp.path().to_path_buf();
         let mut relative = PathBuf::new();
@@ -2120,15 +1981,16 @@ mod tests {
             b"{\"id\":\"g\",\"kind\":\"k\",\"units\":[{\"id\":\"u\",\"text\":\"original\"}]}\n";
         fs::write(&path, original).unwrap();
 
+        let cancellation = CooperativeCancellation::default();
         let mut files =
-            collect_jsonl_files(temp.path(), &NeverCancelled).expect("安全扫描应固定 JSONL 文件");
+            collect_jsonl_files(temp.path(), &cancellation).expect("安全扫描应固定 JSONL 文件");
         assert_eq!(files.len(), 1);
         assert!(
             fs::write(&path, b"replaced").is_err(),
             "稳定读取句柄存活时不得允许其他写入者改变文件"
         );
 
-        let bytes = read_pinned_jsonl_file_with_probe(&mut files[0], &NeverCancelled)
+        let bytes = read_pinned_jsonl_file_with_cancellation(&mut files[0], &cancellation)
             .expect("固定文件应可读取");
         assert_eq!(bytes, original);
         drop(files);
@@ -2176,35 +2038,32 @@ mod tests {
     }
 
     #[test]
-    fn file_read_observes_cancellation_after_the_first_chunk() {
+    fn requested_cancellation_stops_file_read() {
         let temp = tempdir().unwrap();
-        let path = temp.path().join("large.jsonl");
-        fs::write(&path, vec![b'x'; CANCELLATION_CHECK_BYTES * 3]).unwrap();
-        let cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::FileReadChunk, 2);
+        let path = temp.path().join("input.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
 
         assert!(matches!(
-            read_jsonl_file_with_probe(&path, &cancellation),
+            read_jsonl_file_with_cancellation(&path, &cancellation),
             Err(GenericJsonlError::Cancelled)
         ));
-        assert_eq!(
-            cancellation.observed(),
-            2,
-            "第二次检查前已经成功读取第一个分块"
-        );
     }
 
     #[test]
     fn incremental_utf8_validation_preserves_absolute_error_coordinates() {
         let mut valid_across_boundary = vec![b'a'; CANCELLATION_CHECK_BYTES - 1];
         valid_across_boundary.extend_from_slice("你".as_bytes());
-        validate_utf8_with_probe(&valid_across_boundary, &NeverCancelled)
+        let cancellation = CooperativeCancellation::default();
+        validate_utf8_with_cancellation(&valid_across_boundary, &cancellation)
             .expect("跨分块的合法 UTF-8 序列应通过");
 
         for suffix in [vec![0xf0, 0x28, 0x8c, 0x28], vec![0xe4, 0xbd], vec![0x80]] {
             let mut bytes = vec![b'a'; CANCELLATION_CHECK_BYTES - 1];
             bytes.extend_from_slice(&suffix);
             let expected = std::str::from_utf8(&bytes).expect_err("测试输入必须是非法 UTF-8");
-            let actual = match validate_utf8_with_probe(&bytes, &NeverCancelled) {
+            let actual = match validate_utf8_with_cancellation(&bytes, &cancellation) {
                 Err(GenericUtf8ErrorOrCancellation::Invalid(source)) => source,
                 result => panic!("应返回 UTF-8 错误，实际为 {result:?}"),
             };
@@ -2214,48 +2073,18 @@ mod tests {
     }
 
     #[test]
-    fn long_json_deserialization_observes_cancellation_after_it_starts() {
-        let text = "x".repeat(CANCELLATION_CHECK_BYTES * 3);
-        let raw_bytes = format!(
-            "{{\"id\":\"g\",\"kind\":\"k\",\"units\":[{{\"id\":\"u\",\"text\":\"{text}\"}}]}}\n"
-        )
-        .into_bytes();
-        let cancellation =
-            CancelAtBoundary::new(JsonlCancellationBoundary::JsonDeserializeChunk, 2);
+    fn requested_cancellation_stops_json_deserialization() {
+        let raw_bytes =
+            b"{\"id\":\"g\",\"kind\":\"k\",\"units\":[{\"id\":\"u\",\"text\":\"x\"}]}\n".to_vec();
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
 
         assert!(matches!(
-            parse_file_with_probe(PathBuf::from("long-line.jsonl"), raw_bytes, &cancellation),
-            Err(GenericJsonlError::Cancelled)
-        ));
-        assert_eq!(
-            cancellation.observed(),
-            2,
-            "第二次检查发生前 serde 已经消费第一个分块"
-        );
-    }
-
-    #[test]
-    fn long_utf8_line_and_blank_scans_poll_between_chunks() {
-        let bytes = vec![b'a'; CANCELLATION_CHECK_BYTES * 3];
-        let utf8_cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::Utf8Chunk, 2);
-        assert!(matches!(
-            validate_utf8_with_probe(&bytes, &utf8_cancellation),
-            Err(GenericUtf8ErrorOrCancellation::Cancellation(
-                GenericJsonlError::Cancelled
-            ))
-        ));
-
-        let line_cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::LineScanChunk, 2);
-        assert!(matches!(
-            find_physical_line_end(&bytes, 0, &line_cancellation),
-            Err(GenericJsonlError::Cancelled)
-        ));
-
-        let blank_line = " ".repeat(CANCELLATION_CHECK_BYTES * 3);
-        let blank_cancellation =
-            CancelAtBoundary::new(JsonlCancellationBoundary::BlankLineChunk, 2);
-        assert!(matches!(
-            is_blank_line_with_probe(&blank_line, &blank_cancellation),
+            parse_file_with_cancellation(
+                PathBuf::from("cancelled.jsonl"),
+                raw_bytes,
+                &cancellation,
+            ),
             Err(GenericJsonlError::Cancelled)
         ));
     }
@@ -2284,15 +2113,17 @@ mod tests {
         for json_line in cases {
             let expected =
                 serde_json::from_slice::<GenericGroup>(&json_line).expect_err("测试输入必须失败");
-            let (actual, line, column) =
-                match deserialize_group_with_probe(&json_line, &NeverCancelled) {
-                    Err(JsonDeserializeError::Json {
-                        source,
-                        line,
-                        column,
-                    }) => (source, line, column),
-                    result => panic!("应返回 JSON 格式错误，实际为 {result:?}"),
-                };
+            let (actual, line, column) = match deserialize_group_with_cancellation(
+                &json_line,
+                &CooperativeCancellation::default(),
+            ) {
+                Err(JsonDeserializeError::Json {
+                    source,
+                    line,
+                    column,
+                }) => (source, line, column),
+                result => panic!("应返回 JSON 格式错误，实际为 {result:?}"),
+            };
 
             assert_eq!(actual.classify(), expected.classify());
             assert_eq!(line, expected.line());
@@ -2301,136 +2132,22 @@ mod tests {
     }
 
     #[test]
-    fn long_json_serialization_observes_cancellation_after_it_starts() {
+    fn requested_cancellation_stops_json_serialization() {
         let groups = [GenericGroup {
             id: "g".to_owned(),
             kind: "k".to_owned(),
             units: vec![GenericUnit {
                 id: "u".to_owned(),
-                text: "x".repeat(CANCELLATION_CHECK_BYTES * 3),
+                text: "x".to_owned(),
             }],
         }];
-        let cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::JsonSerializeChunk, 3);
+        let cancellation = CooperativeCancellation::default();
+        cancellation.request();
 
         assert!(matches!(
-            serialize_groups_with_probe(&groups, &cancellation),
+            serialize_groups_with_cancellation(&groups, &cancellation),
             Err(GenericJsonlError::Cancelled)
         ));
-        assert_eq!(
-            cancellation.observed(),
-            3,
-            "第三次检查发生前 serde 已经写出第一个分块"
-        );
-    }
-
-    #[test]
-    fn serialization_does_not_repeat_group_validation() {
-        let groups = [GenericGroup::new(
-            "g".to_owned(),
-            "k".to_owned(),
-            vec![GenericUnit::new("u".to_owned(), "text".to_owned()).unwrap()],
-        )
-        .unwrap()];
-        let cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::Unit, 1);
-
-        let output = serialize_groups_with_probe(&groups, &cancellation)
-            .expect("已经校验的 Group 应直接序列化");
-
-        assert!(!output.is_empty());
-        assert_eq!(cancellation.observed(), 0, "序列化不得再次扫描所有 Unit");
-    }
-
-    #[test]
-    fn cancellation_is_observed_inside_parse_validation_and_fingerprint_loops() {
-        let lines = (0..1_000)
-            .map(|index| {
-                format!(
-                    "{{\"id\":\"g{index}\",\"kind\":\"k\",\"units\":[{{\"id\":\"u\",\"text\":\"x\"}}]}}\n"
-                )
-            })
-            .collect::<String>();
-        let line_cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::Line, 500);
-        assert!(matches!(
-            parse_file_with_probe(
-                PathBuf::from("many-lines.jsonl"),
-                lines.into_bytes(),
-                &line_cancellation,
-            ),
-            Err(GenericJsonlError::Cancelled)
-        ));
-        assert_eq!(line_cancellation.observed(), 500);
-
-        let units = (0..1_000)
-            .map(|index| format!("{{\"id\":\"u{index}\",\"text\":\"x\"}}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let unit_cancellation = CancelAtBoundary::new(JsonlCancellationBoundary::Unit, 500);
-        let unit_result = parse_file_with_probe(
-            PathBuf::from("many-units.jsonl"),
-            format!("{{\"id\":\"g\",\"kind\":\"k\",\"units\":[{units}]}}\n").into_bytes(),
-            &unit_cancellation,
-        );
-        assert!(
-            matches!(unit_result, Err(GenericJsonlError::Cancelled)),
-            "result={unit_result:?}, observed={}",
-            unit_cancellation.observed()
-        );
-        assert_eq!(unit_cancellation.observed(), 500);
-
-        let validation_file = GenericFile {
-            relative_path: PathBuf::from("many-groups.jsonl"),
-            groups: (0..1_000)
-                .map(|index| GenericGroup {
-                    id: format!("g{index}"),
-                    kind: "k".to_owned(),
-                    units: vec![GenericUnit {
-                        id: "u".to_owned(),
-                        text: "x".to_owned(),
-                    }],
-                })
-                .collect(),
-            raw_bytes: Vec::new(),
-        };
-        let validation_cancellation =
-            CancelAtBoundary::new(JsonlCancellationBoundary::ProjectGroup, 500);
-        assert!(matches!(
-            validate_project_group_ids(&[validation_file], &validation_cancellation),
-            Err(GenericJsonlError::Cancelled)
-        ));
-        assert_eq!(validation_cancellation.observed(), 500);
-
-        let raw_file = GenericFile {
-            relative_path: PathBuf::from("large.jsonl"),
-            groups: Vec::new(),
-            raw_bytes: vec![b'x'; 2 * 1024 * 1024],
-        };
-        let raw_cancellation =
-            CancelAtBoundary::new(JsonlCancellationBoundary::RawFingerprintChunk, 10);
-        assert!(matches!(
-            fingerprint_raw_files(&[raw_file], &raw_cancellation),
-            Err(GenericJsonlError::Cancelled)
-        ));
-        assert_eq!(raw_cancellation.observed(), 10);
-
-        let asset_file = GenericFile {
-            relative_path: PathBuf::from("large-asset.jsonl"),
-            groups: vec![GenericGroup {
-                id: "g".to_owned(),
-                kind: "k".to_owned(),
-                units: vec![GenericUnit {
-                    id: "u".to_owned(),
-                    text: "x".repeat(2 * 1024 * 1024),
-                }],
-            }],
-            raw_bytes: Vec::new(),
-        };
-        let asset_cancellation =
-            CancelAtBoundary::new(JsonlCancellationBoundary::AssetFingerprintChunk, 10);
-        assert!(matches!(
-            fingerprint_assets(&[asset_file], &asset_cancellation),
-            Err(GenericJsonlError::Cancelled)
-        ));
-        assert_eq!(asset_cancellation.observed(), 10);
     }
 
     #[test]

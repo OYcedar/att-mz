@@ -2988,8 +2988,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn deeply_nested_choices_keep_preorder_without_rescanning_parent_intervals() {
+    fn release_stress_deeply_nested_choices_keep_preorder_without_rescanning_parent_intervals() {
         const DEPTH: usize = 512;
 
         let mut list = Vec::with_capacity(DEPTH * 3 + 1);

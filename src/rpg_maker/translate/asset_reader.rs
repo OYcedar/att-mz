@@ -6,12 +6,11 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, RpgMakerComputeFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
-    RpgMakerJsonFailureKind, RpgMakerProjectProblem, RpgMakerSemanticOrderLevel,
-    RpgMakerTranslationAssetComputeOperation, RpgMakerTranslationAssetProblem,
-    RpgMakerTranslationResourceKind, RpgMakerTranslationSnapshotViolation, SafeIdentifier,
-    SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteOperation,
-    SqliteTransactionState, StateEffect,
+    Diagnostic, DiagnosticReport, RpgMakerDiagnosticStage, RpgMakerIssue, RpgMakerJsonFailureKind,
+    RpgMakerProjectProblem, RpgMakerSemanticOrderLevel, RpgMakerTranslationAssetComputeOperation,
+    RpgMakerTranslationAssetProblem, RpgMakerTranslationResourceKind,
+    RpgMakerTranslationSnapshotViolation, SafeIdentifier, SafePath, SqliteDiagnosticContext,
+    SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
@@ -451,16 +450,7 @@ fn translation_asset_compute_report(
     operation: RpgMakerTranslationAssetComputeOperation,
     source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
 ) -> DiagnosticReport {
-    let failure = match source {
-        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
-            RpgMakerComputeFailure::ExecutorClosed
-        }
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
-            RpgMakerComputeFailure::StatePoisoned
-        }
-        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
-    };
+    let failure = crate::rpg_maker::compute_failure(source);
     translation_asset_report(
         database_path,
         RpgMakerTranslationAssetProblem::Compute { operation, failure },
@@ -734,13 +724,7 @@ impl TranslationSnapshotSemanticOrderLevel {
 }
 
 fn asset_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
-    }
+    JsonErrorCategory::from(source).into()
 }
 
 #[derive(Debug)]

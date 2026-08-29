@@ -1571,7 +1571,7 @@ fn process_response(
             }
             validated_propagation_indices.push(index);
         }
-        let translation_state = expected.state_context().finish(&translation);
+        let translation_state = expected.state_context().applicability();
         let mut propagation_targets = Vec::with_capacity(validated_propagation_indices.len());
         for index in validated_propagation_indices {
             if let Err(ResponseProcessingCancelled) = ensure_running() {
@@ -2140,9 +2140,7 @@ fn unresolved_unit_with_rejected_candidate(
     let mut targets = Vec::with_capacity(1 + expected.propagation_targets().len());
     targets.push(RejectedTranslationTarget::with_rejected_state(
         expected.identity().clone(),
-        expected
-            .state_context()
-            .rejection_planning_state(expected.identity().source_content()),
+        expected.state_context().applicability(),
         expected
             .expected_previous()
             .map(|(translation, state)| (translation.clone(), state)),
@@ -2157,7 +2155,7 @@ fn unresolved_unit_with_rejected_candidate(
     {
         targets.push(RejectedTranslationTarget::with_rejected_state(
             identity.clone(),
-            state_context.rejection_planning_state(identity.source_content()),
+            state_context.applicability(),
             expected_previous.clone(),
             *was_current_rejected,
         ));
@@ -2193,7 +2191,7 @@ fn unresolved_propagation_target_with_rejected_candidate(
             violation,
             vec![RejectedTranslationTarget::with_rejected_state(
                 identity.clone(),
-                state_context.rejection_planning_state(identity.source_content()),
+                state_context.applicability(),
                 expected_previous,
                 was_current_rejected,
             )],
@@ -3654,8 +3652,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn deeply_nested_per_id_values_keep_exact_rpg_shape_errors_and_drop_safely() {
+    fn release_stress_deeply_nested_per_id_values_keep_exact_rpg_shape_errors_and_drop_safely() {
         const DEPTH: usize = 10_000;
         let mode = TranslationResponseMode::new(false, false);
 
@@ -4518,8 +4517,9 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn ten_thousand_deep_wrong_value_rejects_only_its_id_as_partial() {
+    async fn release_stress_ten_thousand_deep_wrong_value_rejects_only_its_id_as_partial() {
         const DEPTH: usize = 10_000;
 
         let deep_value = format!("{}0{}", "[".repeat(DEPTH), "]".repeat(DEPTH));

@@ -3243,7 +3243,11 @@ mod tests {
         assert!(parse_provider_error(br#"{"message":"top-level"}"#).is_none());
         assert!(parse_provider_error(br#"{"error":"plain text"}"#).is_none());
         assert!(parse_provider_error(b"not-json").is_none());
+    }
 
+    #[cfg(feature = "release-stress")]
+    #[test]
+    fn release_stress_provider_error_projection_keeps_a_long_standard_message() {
         let long_message = "x".repeat(20_000);
         let body = serde_json::json!({"error":{"message":long_message.clone()}}).to_string();
         let projection = parse_provider_error(body.as_bytes()).expect("长标准消息应可解析");

@@ -18,7 +18,6 @@ use crate::diagnostic::{
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::language::{LanguageId, LanguagePair};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
-use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::project_database::{
@@ -149,7 +148,7 @@ pub(crate) trait ProjectWorkspaceConverger: Send + Sync {
     > + Send;
 }
 
-/// 项目工作区收敛服务；持有项目租约直到候选被发布或明确丢弃。
+/// 在上层项目租约保护下收敛项目工作区，直到候选被发布或明确丢弃。
 pub(crate) struct ProjectWorkspaceConvergenceService<D, S, R, F, A> {
     projects_root: PathBuf,
     rpg_maker_layout: RpgMakerLayout,
@@ -1473,47 +1472,32 @@ where
 }
 
 /// 只负责验证初始化意图并交给工作区收敛边界。
-pub(crate) struct InitService<W, P> {
+pub(crate) struct InitService<W> {
     workspace_converger: W,
-    project_lease: P,
     cancellation: CooperativeCancellation,
 }
 
-impl<W, P> InitService<W, P> {
-    pub(crate) fn new(
-        workspace_converger: W,
-        project_lease: P,
-        cancellation: CooperativeCancellation,
-    ) -> Self {
+impl<W> InitService<W> {
+    pub(crate) fn new(workspace_converger: W, cancellation: CooperativeCancellation) -> Self {
         Self {
             workspace_converger,
-            project_lease,
             cancellation,
         }
     }
 }
 
-impl<W, P> InitService<W, P>
+impl<W> InitService<W>
 where
     W: ProjectWorkspaceConverger,
-    P: ProjectCommandLeaseProvider,
 {
     pub(crate) async fn execute(
         &self,
         input: InitInput,
-    ) -> Result<OperationCompletion<InitOutput>, InitServiceError<W::Error, P::Error>> {
+    ) -> Result<OperationCompletion<InitOutput>, W::Error> {
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
         let output_name = input.name.clone();
-        let _lease = self
-            .project_lease
-            .acquire(&input.name)
-            .await
-            .map_err(InitServiceError::ProjectLease)?;
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
         let outcome = self
             .workspace_converger
             .converge(ProjectWorkspaceConvergenceRequest::new(
@@ -1522,8 +1506,7 @@ where
                 input.source_language,
                 input.target_language,
             ))
-            .await
-            .map_err(InitServiceError::Workspace)?;
+            .await?;
         let OperationCompletion::Completed(outcome) = outcome else {
             return Ok(OperationCompletion::Cancelled);
         };
@@ -1547,39 +1530,6 @@ impl From<RpgMakerAssetOwner> for InitStaleOwner {
         match owner {
             RpgMakerAssetOwner::Builtin => Self::Builtin,
             RpgMakerAssetOwner::Rules => Self::Rules,
-        }
-    }
-}
-
-/// 初始化编排在本职责边界内能够产生的错误。
-#[derive(Debug)]
-pub(crate) enum InitServiceError<W, P> {
-    ProjectLease(ProjectCommandLeaseError<P>),
-    Workspace(W),
-}
-
-impl<W, P> fmt::Display for InitServiceError<W, P>
-where
-    W: Error,
-    P: Error,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ProjectLease(error) => error.fmt(formatter),
-            Self::Workspace(error) => write!(formatter, "无法收敛项目工作区：{error}"),
-        }
-    }
-}
-
-impl<W, P> Error for InitServiceError<W, P>
-where
-    W: Error + 'static,
-    P: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::ProjectLease(error) => Some(error),
-            Self::Workspace(error) => Some(error),
         }
     }
 }
@@ -3649,24 +3599,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct FakeProjectLease;
-
-    impl ProjectCommandLeaseProvider for FakeProjectLease {
-        type Error = FakeError;
-        type LeaseState = ();
-
-        async fn acquire(
-            &self,
-            _: &ProjectName,
-        ) -> Result<
-            crate::project_lease::ProjectCommandLease<Self::LeaseState>,
-            ProjectCommandLeaseError<Self::Error>,
-        > {
-            Ok(crate::project_lease::ProjectCommandLease::for_test(()))
-        }
-    }
-
     fn init_input() -> InitInput {
         InitInput {
             name: "game".parse().expect("项目名应合法"),
@@ -3686,11 +3618,7 @@ mod tests {
                 }),
             )]))),
         };
-        let service = InitService::new(
-            converger,
-            FakeProjectLease,
-            CooperativeCancellation::default(),
-        );
+        let service = InitService::new(converger, CooperativeCancellation::default());
 
         let output = service
             .execute(init_input())
@@ -3747,7 +3675,6 @@ mod tests {
                     OperationCompletion::Completed(ProjectWorkspaceConvergence::Created),
                 )]))),
             },
-            FakeProjectLease,
             CooperativeCancellation::default(),
         );
         assert_send(init.execute(init_input()));

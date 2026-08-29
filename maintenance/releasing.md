@@ -18,8 +18,9 @@
    两份活动配置与各自模板完全相同且不含真实凭据。
 5. 检查 `git status` 和差异，只提交本次发布范围；不得把本机 `dist/`、项目状态、密钥、
    构建目录或临时文件纳入提交。
-6. 在本机执行能够运行的格式、Clippy、测试与完整 Release 检查。正式制品仍由 GitHub
-   Actions 从干净 checkout 重新构建，本机制品不得上传。
+6. 在本机执行能够运行的格式、Clippy、普通行为测试与完整 Release 检查；不要启用
+   `release-stress` feature。正式制品仍由 GitHub Actions 从干净 checkout 重新构建，
+   本机制品不得上传。
 
 ## 2. 主分支与标签
 
@@ -80,9 +81,11 @@ do {
 gh run watch $run.databaseId --exit-status
 ```
 
-工作流必须确认标签提交等于远端 `main`，构建静态 `Release`，从托管模板首次创建两份无凭据
-活动配置，同步其余已审查资源，使用最高级别 Deflate 打包并直接创建 Release。格式、Clippy、
-测试、第三方许可生成和完整发行检查在标签前完成，不在发包时重复运行。发布完成后检查：
+工作流必须确认标签提交等于远端 `main`，构建静态 `Release`，并在打包前分别运行根 crate 与
+`att-json-repair` crate 的 `release-stress` 测试组；这是该测试组的唯一触发入口。压力验证通过后，
+工作流从托管模板首次创建两份无凭据活动配置，同步其余已审查资源，使用最高级别 Deflate 打包并
+直接创建 Release。格式、Clippy、普通行为测试、第三方许可生成和完整发行检查在标签前完成，
+不在发包时重复运行。发布完成后检查：
 
 - Release 名称、标签、正文与当前版本一致；
 - `att-v1.0.0-windows-x64.zip` 和 `SHA256SUMS.txt` 都存在；

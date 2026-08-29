@@ -5,7 +5,7 @@
 .DESCRIPTION
 管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts、skills
 和随包 Formic。ATT 与 Formic 的 config.toml 都是使用者的活动配置：已有文件保持原字节
-不变，缺失时才从各自的 config.example.toml 初始化。
+不变，缺失时才从各自的 config.example.toml 初始化。Formic 目录收敛到当前托管集合。
 不修改 att.exe。
 
 .PARAMETER Check
@@ -70,9 +70,6 @@ $formicFileMappings = @(
 )
 $formicDirectoryMappings = @(
     'docs'
-)
-$retiredFormicFiles = @(
-    'VCRUNTIME140.dll'
 )
 
 $directoryMappings = @(
@@ -247,7 +244,7 @@ function Test-SynchronizedResources {
         ) | Sort-Object
         $actualFormicItems = @(Get-ChildItem -LiteralPath $formicDestination -Force)
         $actualFormicNames = @($actualFormicItems | ForEach-Object Name | Sort-Object)
-        if (($expectedFormicItems -join "`n") -cne ($actualFormicNames -join "`n")) {
+        if (($expectedFormicItems -join "`n") -ne ($actualFormicNames -join "`n")) {
             $failures.Add("Formic 发行目录文件集合不正确：$formicDestination")
         }
         foreach ($name in $formicFileMappings) {
@@ -413,14 +410,19 @@ try {
     if (-not (Test-Path -LiteralPath $formicDestination -PathType Container)) {
         New-Item -ItemType Directory -Path $formicDestination | Out-Null
     }
-    foreach ($name in $retiredFormicFiles) {
-        $retired = Join-Path $formicDestination $name
-        Assert-DistributionChild -Path $retired
-        if (Test-Path -LiteralPath $retired) {
-            if (-not (Test-Path -LiteralPath $retired -PathType Leaf)) {
-                throw "Formic 已停用发行文件不是普通文件：$retired"
+    $currentFormicItems = @(
+        $formicFileMappings + $formicDirectoryMappings + 'config.toml'
+    )
+    foreach ($item in Get-ChildItem -LiteralPath $formicDestination -Force) {
+        if ($item.Name -notin $currentFormicItems) {
+            Assert-DistributionChild -Path $item.FullName
+            if ($item.PSIsContainer) {
+                Assert-NoReparsePoint -Path $item.FullName -Recurse
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force
             }
-            Remove-Item -LiteralPath $retired -Force
+            else {
+                Remove-Item -LiteralPath $item.FullName -Force
+            }
         }
     }
     foreach ($name in $formicFileMappings) {

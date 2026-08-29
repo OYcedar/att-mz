@@ -318,7 +318,7 @@ fn plan_reuse_family(
             candidate.identity.clone(),
             candidate.translation.clone(),
             candidate.translation_state,
-            candidate.state_context.finish(seed_translation),
+            candidate.state_context.applicability(),
         ));
         outcomes[index] = Some(TranslationDeduplicationOutcome::Virtual {
             reason: TranslationVirtualReason::Reused {
@@ -640,7 +640,7 @@ mod tests {
         let seed_context = state_context(1);
         let target_context = state_context(2);
         let translation = value("<Help:Save>");
-        let seed_state = seed_context.finish(&translation);
+        let seed_state = seed_context.applicability();
         let seed = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
         let target = scalar_identity(StandardDataFile::Items, 2, "name", "保存");
         let result = deduplicate_translation_candidates(vec![
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(reuses[0].targets()[0].expected_translation(), None);
         assert_eq!(
             reuses[0].targets()[0].replacement_translation_state(),
-            target_context.finish(&translation)
+            target_context.applicability()
         );
         assert!(matches!(
             &outcomes[0],
@@ -704,7 +704,7 @@ mod tests {
                 Vec::new(),
                 Some(StoredTranslation::new(
                     translation.clone(),
-                    earliest_context.finish(&translation),
+                    earliest_context.applicability(),
                 )),
                 earliest_context,
                 false,
@@ -715,7 +715,7 @@ mod tests {
                 Vec::new(),
                 Some(StoredTranslation::new(
                     translation.clone(),
-                    later_context.finish(&translation),
+                    later_context.applicability(),
                 )),
                 later_context,
                 false,
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(reuses[0].targets()[0].identity(), &target);
         assert_eq!(
             reuses[0].targets()[0].replacement_translation_state(),
-            target_context.finish(&translation)
+            target_context.applicability()
         );
         assert!(matches!(
             outcomes[0],
@@ -767,7 +767,7 @@ mod tests {
         let stale_translation = value("旧译文");
         let current_translation = value("保存");
         let stale_state = fingerprint(91);
-        let current_state = current_context.finish(&current_translation);
+        let current_state = current_context.applicability();
         let stale_target = scalar_identity(StandardDataFile::Items, 1, "name", "保存");
         let current_seed = scalar_identity(StandardDataFile::Items, 2, "name", "保存");
         let result = deduplicate_translation_candidates(vec![
@@ -812,7 +812,7 @@ mod tests {
         );
         assert_eq!(
             reuses[0].targets()[0].replacement_translation_state(),
-            stale_context.finish(&current_translation)
+            stale_context.applicability()
         );
         assert!(matches!(
             &outcomes[0],
@@ -841,7 +841,7 @@ mod tests {
                 Vec::new(),
                 Some(StoredTranslation::new(
                     first_translation.clone(),
-                    first_context.finish(&first_translation),
+                    first_context.applicability(),
                 )),
                 first_context,
                 false,
@@ -852,7 +852,7 @@ mod tests {
                 Vec::new(),
                 Some(StoredTranslation::new(
                     second_translation.clone(),
-                    second_context.finish(&second_translation),
+                    second_context.applicability(),
                 )),
                 second_context,
                 false,
@@ -870,8 +870,9 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn many_different_current_translations_coexist_without_quadratic_comparison() {
+    fn release_stress_many_different_current_translations_coexist_without_quadratic_comparison() {
         const CURRENT_COUNT: usize = 4_096;
 
         let candidates = (0..CURRENT_COUNT)
@@ -884,7 +885,7 @@ mod tests {
                     Vec::new(),
                     Some(StoredTranslation::new(
                         translation.clone(),
-                        context.finish(&translation),
+                        context.applicability(),
                     )),
                     context,
                     false,
@@ -922,7 +923,7 @@ mod tests {
                 Vec::new(),
                 Some(StoredTranslation::new(
                     first_translation.clone(),
-                    first_context.finish(&first_translation),
+                    first_context.applicability(),
                 )),
                 first_context,
                 false,
@@ -933,7 +934,7 @@ mod tests {
                 Vec::new(),
                 Some(StoredTranslation::new(
                     second_translation.clone(),
-                    second_context.finish(&second_translation),
+                    second_context.applicability(),
                 )),
                 second_context,
                 false,

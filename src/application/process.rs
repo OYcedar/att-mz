@@ -14,7 +14,7 @@ use super::TranslationTerminalSummary;
 use super::arguments::AttArguments;
 use super::command::{
     CommandPanicBoundary, CommandResultRenderer, CommandRunResult, ProductionCommandError,
-    ProductionCommandRunReport, ProductionRpgMakerCommandRunner, TerminationSignals,
+    ProductionCommandRunReport, ProductionRpgMakerCommandRunner,
 };
 use super::config::{
     ConfigurationLoadError, ConfiguredProductCommand, DistributionLayout, DistributionLayoutError,
@@ -25,6 +25,7 @@ use super::generic_command::{
     ProductionGenericCommandRunner, generic_command_error_report,
 };
 use super::project_log::{PendingProjectLog, ProjectLogWarning};
+use super::termination::TerminationSignals;
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, IoFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation,
     RuntimePanicBoundary, StateEffect, public_path, render_diagnostic_report,

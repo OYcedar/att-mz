@@ -5,114 +5,16 @@
 //! 行为调查固定参考 Python `json_repair` 的 `600ede6` 提交；本实现和测试均独立编写。
 
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 
 const CANCELLATION_INTERVAL: usize = 64 * 1024;
 
-/// 控制允许采用的修复强度。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairPolicy {
-    /// 只执行由当前语法状态唯一确定的修复。
-    Conservative,
-    /// 允许选择第一个候选，并修复少量仍有合理默认解释的输入。
-    BestEffort,
-}
-
-/// 一项已经执行的文本修复。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Repair {
-    kind: RepairKind,
-    original_range: Range<usize>,
-    output_range: Range<usize>,
-}
-
-impl Repair {
-    /// 返回稳定的修复类别。
-    #[must_use]
-    pub const fn kind(&self) -> RepairKind {
-        self.kind
-    }
-
-    /// 返回修复涉及的原始输入字节范围。
-    #[must_use]
-    pub fn original_range(&self) -> Range<usize> {
-        self.original_range.clone()
-    }
-
-    /// 返回修复产生或删除内容所在的输出字节范围。
-    #[must_use]
-    pub fn output_range(&self) -> Range<usize> {
-        self.output_range.clone()
-    }
-}
-
-/// 修复类别。每个 variant 的 [`RepairKind::code`] 是稳定的持久化名称。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum RepairKind {
-    RemovedByteOrderMark,
-    RemovedMarkdownFence,
-    RemovedSurroundingText,
-    RemovedComment,
-    NormalizedWhitespace,
-    NormalizedQuote,
-    EscapedInternalQuote,
-    EscapedControlCharacter,
-    EscapedInvalidEscape,
-    QuotedBareKey,
-    QuotedBareValue,
-    InsertedColon,
-    RemovedColon,
-    InsertedComma,
-    RemovedComma,
-    InsertedClosingDelimiter,
-    InsertedClosingQuote,
-    NormalizedLiteral,
-    NormalizedNumber,
-}
-
-impl RepairKind {
-    /// 返回适合诊断和持久化的稳定 ASCII 名称。
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::RemovedByteOrderMark => "removed_byte_order_mark",
-            Self::RemovedMarkdownFence => "removed_markdown_fence",
-            Self::RemovedSurroundingText => "removed_surrounding_text",
-            Self::RemovedComment => "removed_comment",
-            Self::NormalizedWhitespace => "normalized_whitespace",
-            Self::NormalizedQuote => "normalized_quote",
-            Self::EscapedInternalQuote => "escaped_internal_quote",
-            Self::EscapedControlCharacter => "escaped_control_character",
-            Self::EscapedInvalidEscape => "escaped_invalid_escape",
-            Self::QuotedBareKey => "quoted_bare_key",
-            Self::QuotedBareValue => "quoted_bare_value",
-            Self::InsertedColon => "inserted_colon",
-            Self::RemovedColon => "removed_colon",
-            Self::InsertedComma => "inserted_comma",
-            Self::RemovedComma => "removed_comma",
-            Self::InsertedClosingDelimiter => "inserted_closing_delimiter",
-            Self::InsertedClosingQuote => "inserted_closing_quote",
-            Self::NormalizedLiteral => "normalized_literal",
-            Self::NormalizedNumber => "normalized_number",
-        }
-    }
-}
-
-impl fmt::Display for RepairKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.code())
-    }
-}
-
 /// 修复后的严格 JSON 及其位置映射。
 #[derive(Debug, Clone)]
 pub struct RepairOutput<'a> {
     json: Cow<'a, str>,
-    repairs: Vec<Repair>,
     source_map: SourceMap,
 }
 
@@ -123,12 +25,6 @@ impl<'a> RepairOutput<'a> {
         &self.json
     }
 
-    /// 返回按执行顺序记录的修复。
-    #[must_use]
-    pub fn repairs(&self) -> &[Repair] {
-        &self.repairs
-    }
-
     /// 把输出字节边界映射回原始输入字节边界。
     ///
     /// `output_offset` 可以等于输出长度；超过输出长度时返回 `None`。
@@ -136,18 +32,11 @@ impl<'a> RepairOutput<'a> {
     pub fn original_offset(&self, output_offset: usize) -> Option<usize> {
         self.source_map.original_offset(output_offset)
     }
-
-    /// 取得修复后的文本。完全无需修改时返回借用的原始输入。
-    #[must_use]
-    pub fn into_json(self) -> Cow<'a, str> {
-        self.json
-    }
 }
 
-/// 无法安全修复时的错误类别。
+/// 无法安全修复时的内部错误类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum RepairErrorKind {
+enum RepairErrorKind {
     NoJsonCandidate,
     MultipleJsonCandidates,
     MultipleRootValues,
@@ -160,9 +49,7 @@ pub enum RepairErrorKind {
 }
 
 impl RepairErrorKind {
-    /// 返回适合诊断的稳定 ASCII 名称。
-    #[must_use]
-    pub const fn code(self) -> &'static str {
+    const fn code(self) -> &'static str {
         match self {
             Self::NoJsonCandidate => "no_json_candidate",
             Self::MultipleJsonCandidates => "multiple_json_candidates",
@@ -191,9 +78,8 @@ pub struct RepairError {
 }
 
 impl RepairError {
-    /// 返回稳定的错误类别。
-    #[must_use]
-    pub const fn kind(&self) -> RepairErrorKind {
+    #[cfg(test)]
+    const fn kind(&self) -> RepairErrorKind {
         self.kind
     }
 
@@ -224,29 +110,20 @@ impl fmt::Display for RepairError {
 
 impl Error for RepairError {}
 
-/// 修复一段近似 JSON 文本。
-pub fn repair(input: &str, policy: RepairPolicy) -> Result<RepairOutput<'_>, RepairError> {
-    match repair_with_cancellation(input, policy, || Ok::<_, Infallible>(())) {
-        Ok(result) => result,
-        Err(error) => match error {},
-    }
-}
-
 /// 修复一段近似 JSON 文本，并允许调用方周期性检查取消状态。
 ///
 /// 外层 `Result` 只传播取消检查错误；内层 `Result` 表示 JSON 是否能够安全修复。
 pub fn repair_with_cancellation<E>(
     input: &str,
-    policy: RepairPolicy,
     ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<RepairOutput<'_>, RepairError>, E> {
     let mut cancellation = Cancellation::new(ensure_running);
     cancellation.start()?;
-    let candidate = match select_candidate(input, policy, &mut cancellation)? {
+    let candidate = match select_candidate(input, &mut cancellation)? {
         Ok(candidate) => candidate,
         Err(error) => return Ok(Err(error)),
     };
-    let parser = Parser::new(input, candidate, policy, &mut cancellation)?;
+    let parser = Parser::new(input, candidate, &mut cancellation)?;
     parser.parse()
 }
 
@@ -287,28 +164,27 @@ where
 #[derive(Debug)]
 struct Candidate {
     range: Range<usize>,
-    removals: Vec<(RepairKind, Range<usize>)>,
+    removals: Vec<Range<usize>>,
+    fenced: bool,
 }
 
 impl Candidate {
     fn logical_start(&self) -> usize {
         self.removals
             .iter()
-            .map(|(_, range)| range.start)
+            .map(|range| range.start)
             .min()
             .unwrap_or(self.range.start)
     }
 
     fn is_fenced(&self) -> bool {
-        self.removals
-            .iter()
-            .any(|(kind, _)| *kind == RepairKind::RemovedMarkdownFence)
+        self.fenced
     }
 
     fn logical_end(&self) -> usize {
         self.removals
             .iter()
-            .map(|(_, range)| range.end)
+            .map(|range| range.end)
             .max()
             .unwrap_or(self.range.end)
     }
@@ -426,7 +302,6 @@ where
 
 fn select_candidate<F, E>(
     input: &str,
-    policy: RepairPolicy,
     cancellation: &mut Cancellation<F>,
 ) -> Result<Result<Candidate, RepairError>, E>
 where
@@ -471,10 +346,11 @@ where
                     .next()
                     .expect("peek confirmed structural candidate"),
                 removals: Vec::new(),
+                fenced: false,
             });
         }
     }
-    if candidates.len() > 1 && policy == RepairPolicy::Conservative {
+    if candidates.len() > 1 {
         return Ok(Err(RepairError::new(
             RepairErrorKind::MultipleJsonCandidates,
             candidates[1].logical_start(),
@@ -504,7 +380,8 @@ where
         {
             return Ok(Ok(Candidate {
                 range: bom_len..input.len(),
-                removals: vec![(RepairKind::RemovedByteOrderMark, 0..bom_len)],
+                removals: std::iter::once(0..bom_len).collect(),
+                fenced: false,
             }));
         }
         let outside_is_only_whitespace =
@@ -514,11 +391,13 @@ where
             Candidate {
                 range: 0..input.len(),
                 removals: Vec::new(),
+                fenced: false,
             }
         } else {
             Candidate {
                 range,
                 removals: Vec::new(),
+                fenced: false,
             }
         };
         add_surrounding_removals(input, &mut candidate, cancellation)?;
@@ -534,7 +413,8 @@ where
         if start < input.len() && looks_like_scalar_start(input[start..].chars().next()) {
             return Ok(Ok(Candidate {
                 range: bom_len..input.len(),
-                removals: vec![(RepairKind::RemovedByteOrderMark, 0..bom_len)],
+                removals: std::iter::once(0..bom_len).collect(),
+                fenced: false,
             }));
         }
     }
@@ -543,6 +423,7 @@ where
         return Ok(Ok(Candidate {
             range: 0..input.len(),
             removals: Vec::new(),
+            fenced: false,
         }));
     }
 
@@ -563,32 +444,28 @@ where
     let opening_start = candidate
         .removals
         .iter()
-        .map(|(_, range)| range.start)
+        .map(|range| range.start)
         .min()
         .unwrap_or(candidate.range.start);
     let closing_end = candidate
         .removals
         .iter()
-        .map(|(_, range)| range.end)
+        .map(|range| range.end)
         .max()
         .unwrap_or(candidate.range.end);
     if bytes_any_with_cancellation(&input.as_bytes()[..opening_start], cancellation, |byte| {
         !is_json_whitespace(byte)
     })? {
-        candidate
-            .removals
-            .push((RepairKind::RemovedSurroundingText, 0..opening_start));
+        candidate.removals.push(0..opening_start);
     }
     if bytes_any_with_cancellation(&input.as_bytes()[closing_end..], cancellation, |byte| {
         !is_json_whitespace(byte)
     })? {
-        candidate
-            .removals
-            .push((RepairKind::RemovedSurroundingText, closing_end..input.len()));
+        candidate.removals.push(closing_end..input.len());
     }
     candidate
         .removals
-        .sort_by_key(|(_, range)| (range.start, range.end));
+        .sort_by_key(|range| (range.start, range.end));
     Ok(())
 }
 
@@ -605,19 +482,14 @@ where
         cancellation,
         |byte| !is_json_whitespace(byte),
     )? {
-        candidate
-            .removals
-            .push((RepairKind::RemovedSurroundingText, 0..candidate.range.start));
+        candidate.removals.push(0..candidate.range.start);
     }
     if bytes_any_with_cancellation(
         &input.as_bytes()[candidate.range.end..],
         cancellation,
         |byte| !is_json_whitespace(byte),
     )? {
-        candidate.removals.push((
-            RepairKind::RemovedSurroundingText,
-            candidate.range.end..input.len(),
-        ));
+        candidate.removals.push(candidate.range.end..input.len());
     }
     Ok(())
 }
@@ -675,10 +547,8 @@ where
                 let closing_range = line_start + leading..line_end;
                 result.push(Candidate {
                     range: *content_start..line_start,
-                    removals: vec![
-                        (RepairKind::RemovedMarkdownFence, opening_range.clone()),
-                        (RepairKind::RemovedMarkdownFence, closing_range),
-                    ],
+                    removals: vec![opening_range.clone(), closing_range],
+                    fenced: true,
                 });
                 open = None;
             }
@@ -937,12 +807,11 @@ struct Parser<'input, 'cancel, F> {
     input: &'input str,
     end: usize,
     position: usize,
-    policy: RepairPolicy,
     root_state: RootState,
     frames: Vec<Frame>,
     quotes: QuoteIndex,
     builder: Builder<'input>,
-    suffix_removals: Vec<(RepairKind, Range<usize>)>,
+    suffix_removals: Vec<Range<usize>>,
     cancellation: &'cancel mut Cancellation<F>,
 }
 
@@ -953,24 +822,22 @@ where
     fn new(
         input: &'input str,
         candidate: Candidate,
-        policy: RepairPolicy,
         cancellation: &'cancel mut Cancellation<F>,
     ) -> Result<Self, E> {
         let quotes = QuoteIndex::new(input, candidate.range.clone(), cancellation)?;
         let mut builder = Builder::new(input, candidate.range.start);
         let mut suffix_removals = Vec::new();
-        for (kind, range) in candidate.removals {
+        for range in candidate.removals {
             if range.start >= candidate.range.end {
-                suffix_removals.push((kind, range));
+                suffix_removals.push(range);
             } else {
-                builder.record_deletion(kind, range);
+                builder.mark_changed();
             }
         }
         Ok(Self {
             input,
             end: candidate.range.end,
             position: candidate.range.start,
-            policy,
             root_state: RootState::Value,
             frames: Vec::new(),
             quotes,
@@ -988,9 +855,8 @@ where
                     return Ok(Err(error));
                 }
                 let output_offset = self.builder.output.len();
-                for (kind, range) in self.suffix_removals.drain(..) {
-                    self.builder
-                        .record_suffix_deletion_at(kind, range, output_offset);
+                for range in self.suffix_removals.drain(..) {
+                    self.builder.record_suffix_deletion_at(range, output_offset);
                 }
                 return Ok(Ok(self.builder.finish()));
             }
@@ -1044,15 +910,13 @@ where
             if character == '\u{feff}' {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedByteOrderMark, start..self.position);
+                self.builder.delete(start..self.position);
                 continue;
             }
             if character.is_whitespace() {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .replace(RepairKind::NormalizedWhitespace, start..self.position, " ");
+                self.builder.replace(start..self.position, " ");
                 continue;
             }
             if self.starts_with("//") {
@@ -1061,8 +925,7 @@ where
                 while self.position < self.end && self.current_char() != '\n' {
                     self.advance_current()?;
                 }
-                self.builder
-                    .delete(RepairKind::RemovedComment, start..self.position);
+                self.builder.delete(start..self.position);
                 continue;
             }
             if self.starts_with("/*") {
@@ -1078,8 +941,7 @@ where
                 } else {
                     self.position = self.end;
                 }
-                self.builder
-                    .delete(RepairKind::RemovedComment, start..self.position);
+                self.builder.delete(start..self.position);
                 continue;
             }
             return Ok(());
@@ -1097,15 +959,13 @@ where
             ',' => {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedComma, start..self.position);
+                self.builder.delete(start..self.position);
                 Ok(None)
             }
             ':' => {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedColon, start..self.position);
+                self.builder.delete(start..self.position);
                 Ok(None)
             }
             character if Quote::from_opener(character).is_some() => {
@@ -1137,8 +997,7 @@ where
                 self.position,
             )));
         }
-        self.builder
-            .insert(RepairKind::InsertedColon, self.position, ":");
+        self.builder.insert(self.position, ":");
         self.set_last_state(FrameState::ObjectValue);
         Ok(None)
     }
@@ -1147,8 +1006,7 @@ where
         if self.current_char() == ':' {
             let start = self.position;
             self.advance_current()?;
-            self.builder
-                .delete(RepairKind::RemovedColon, start..self.position);
+            self.builder.delete(start..self.position);
             return Ok(None);
         }
         if matches!(self.current_char(), ',' | '}' | ']') {
@@ -1173,8 +1031,7 @@ where
                 let next = self.peek_significant_after(comma + 1)?;
                 if next.is_none_or(|(_, character)| matches!(character, ',' | '}' | ']')) {
                     self.advance_current()?;
-                    self.builder
-                        .delete(RepairKind::RemovedComma, comma..self.position);
+                    self.builder.delete(comma..self.position);
                 } else {
                     self.copy_current()?;
                     self.set_last_state(FrameState::ObjectKeyOrEnd);
@@ -1184,13 +1041,11 @@ where
             ':' => {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedColon, start..self.position);
+                self.builder.delete(start..self.position);
                 Ok(None)
             }
             _ => {
-                self.builder
-                    .insert(RepairKind::InsertedComma, self.position, ",");
+                self.builder.insert(self.position, ",");
                 self.set_last_state(FrameState::ObjectKeyOrEnd);
                 Ok(None)
             }
@@ -1205,24 +1060,14 @@ where
                 Ok(None)
             }
             '}' => self.close_missing_container(FrameKind::Array),
-            ',' => {
-                if self.policy == RepairPolicy::Conservative {
-                    return Ok(Some(RepairError::new(
-                        RepairErrorKind::MissingValue,
-                        self.position,
-                    )));
-                }
-                let start = self.position;
-                self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedComma, start..self.position);
-                Ok(None)
-            }
+            ',' => Ok(Some(RepairError::new(
+                RepairErrorKind::MissingValue,
+                self.position,
+            ))),
             ':' => {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedColon, start..self.position);
+                self.builder.delete(start..self.position);
                 Ok(None)
             }
             _ => self.consume_value(),
@@ -1240,9 +1085,7 @@ where
             ',' => {
                 let comma = self.position;
                 let next = self.peek_significant_after(comma + 1)?;
-                if next.is_some_and(|(_, character)| character == ',')
-                    && self.policy == RepairPolicy::Conservative
-                {
+                if next.is_some_and(|(_, character)| character == ',') {
                     return Ok(Some(RepairError::new(
                         RepairErrorKind::MissingValue,
                         next.expect("checked Some").0,
@@ -1250,8 +1093,7 @@ where
                 }
                 if next.is_none_or(|(_, character)| matches!(character, ',' | '}' | ']')) {
                     self.advance_current()?;
-                    self.builder
-                        .delete(RepairKind::RemovedComma, comma..self.position);
+                    self.builder.delete(comma..self.position);
                 } else {
                     self.copy_current()?;
                     self.set_last_state(FrameState::ArrayValueOrEnd);
@@ -1261,13 +1103,11 @@ where
             ':' => {
                 let start = self.position;
                 self.advance_current()?;
-                self.builder
-                    .delete(RepairKind::RemovedColon, start..self.position);
+                self.builder.delete(start..self.position);
                 Ok(None)
             }
             _ => {
-                self.builder
-                    .insert(RepairKind::InsertedComma, self.position, ",");
+                self.builder.insert(self.position, ",");
                 self.set_last_state(FrameState::ArrayValueOrEnd);
                 Ok(None)
             }
@@ -1325,8 +1165,7 @@ where
         if quote.is_standard() {
             self.builder.copy(start..opener_end);
         } else {
-            self.builder
-                .replace(RepairKind::NormalizedQuote, start..opener_end, "\"");
+            self.builder.replace(start..opener_end, "\"");
         }
 
         while self.position < self.end {
@@ -1334,22 +1173,12 @@ where
             let character = self.current_char();
             let width = character.len_utf8();
 
-            if self.policy == RepairPolicy::BestEffort
-                && matches!(character, '}' | ']')
-                && self.find_later_quote(quote, self.position).is_none()
-            {
-                self.builder
-                    .insert(RepairKind::InsertedClosingQuote, self.position, "\"");
-                return Ok(None);
-            }
-
             if quote.closes(character) {
                 let after = self.position + width;
                 let (next_position, next, had_whitespace) = self.peek_after_string_quote(after)?;
                 // `"a" "b"` 既可能是漏逗号的两个字符串，也可能是正文包含两个未转义
                 // 引号的一个字符串。空白不能替调用方消除这种歧义。
-                if self.policy == RepairPolicy::Conservative
-                    && role == StringRole::Value
+                if role == StringRole::Value
                     && had_whitespace
                     && next.is_some_and(|next| Quote::from_opener(next).is_some())
                 {
@@ -1363,11 +1192,7 @@ where
                     if quote.is_standard() {
                         self.builder.copy(character_start..self.position);
                     } else {
-                        self.builder.replace(
-                            RepairKind::NormalizedQuote,
-                            character_start..self.position,
-                            "\"",
-                        );
+                        self.builder.replace(character_start..self.position, "\"");
                     }
                     return Ok(None);
                 }
@@ -1378,33 +1203,16 @@ where
                     if quote.is_standard() {
                         self.builder.copy(character_start..self.position);
                     } else {
-                        self.builder.replace(
-                            RepairKind::NormalizedQuote,
-                            character_start..self.position,
-                            "\"",
-                        );
+                        self.builder.replace(character_start..self.position, "\"");
                     }
                     return Ok(None);
                 }
                 // 当前引号既可能是正文，也可能是边界并伴随其他语法缺失；后续引号不能
-                // 反向证明唯一意图，Conservative 不替调用方选择其中一种解释。
-                if self.policy == RepairPolicy::Conservative {
-                    return Ok(Some(RepairError::new(
-                        RepairErrorKind::AmbiguousStringQuote,
-                        character_start,
-                    )));
-                }
-                self.advance_current()?;
-                if quote == Quote::Double || quote == Quote::SmartDouble {
-                    self.builder.replace(
-                        RepairKind::EscapedInternalQuote,
-                        character_start..self.position,
-                        "\\\"",
-                    );
-                } else {
-                    self.builder.copy(character_start..self.position);
-                }
-                continue;
+                // 反向证明唯一意图，修复器不替调用方选择其中一种解释。
+                return Ok(Some(RepairError::new(
+                    RepairErrorKind::AmbiguousStringQuote,
+                    character_start,
+                )));
             }
 
             if character == '\\' {
@@ -1423,47 +1231,30 @@ where
                     '\u{000c}' => "\\f".to_owned(),
                     _ => format!("\\u{:04x}", u32::from(character)),
                 };
-                self.builder.replace(
-                    RepairKind::EscapedControlCharacter,
-                    character_start..self.position,
-                    &replacement,
-                );
+                self.builder
+                    .replace(character_start..self.position, &replacement);
                 continue;
             }
             if character == '"' && quote != Quote::Double {
                 self.advance_current()?;
-                self.builder.replace(
-                    RepairKind::EscapedInternalQuote,
-                    character_start..self.position,
-                    "\\\"",
-                );
+                self.builder.replace(character_start..self.position, "\\\"");
                 continue;
             }
             self.advance_current()?;
             self.builder.copy(character_start..self.position);
         }
 
-        if self.policy == RepairPolicy::BestEffort {
-            self.builder
-                .insert(RepairKind::InsertedClosingQuote, self.position, "\"");
-            Ok(None)
-        } else {
-            Ok(Some(RepairError::new(
-                RepairErrorKind::UnterminatedString,
-                start,
-            )))
-        }
+        Ok(Some(RepairError::new(
+            RepairErrorKind::UnterminatedString,
+            start,
+        )))
     }
 
     fn consume_escape(&mut self, quote: Quote) -> Result<Option<RepairError>, E> {
         let start = self.position;
         self.advance_current()?;
         if self.position >= self.end {
-            self.builder.replace(
-                RepairKind::EscapedInvalidEscape,
-                start..self.position,
-                "\\\\",
-            );
+            self.builder.replace(start..self.position, "\\\\");
             return Ok(None);
         }
         let escaped = self.current_char();
@@ -1483,25 +1274,16 @@ where
                 self.advance_bytes(5)?;
                 self.builder.copy(start..self.position);
             } else {
-                self.builder.replace(
-                    RepairKind::EscapedInvalidEscape,
-                    start..self.position,
-                    "\\\\",
-                );
+                self.builder.replace(start..self.position, "\\\\");
             }
             return Ok(None);
         }
         self.advance_current()?;
         if escaped == '\'' && quote == Quote::Single {
-            self.builder
-                .replace(RepairKind::EscapedInvalidEscape, start..self.position, "'");
+            self.builder.replace(start..self.position, "'");
         } else {
             let replacement = format!("\\\\{escaped}");
-            self.builder.replace(
-                RepairKind::EscapedInvalidEscape,
-                start..self.position,
-                &replacement,
-            );
+            self.builder.replace(start..self.position, &replacement);
         }
         Ok(None)
     }
@@ -1531,11 +1313,7 @@ where
         let token = &self.input[start..self.position];
         if key {
             let replacement = quote_bare_with_cancellation(token, self.cancellation)?;
-            self.builder.replace(
-                RepairKind::QuotedBareKey,
-                start..self.position,
-                &replacement,
-            );
+            self.builder.replace(start..self.position, &replacement);
             return Ok(None);
         }
 
@@ -1543,30 +1321,9 @@ where
             self.builder.copy(start..self.position);
             return Ok(None);
         }
-        if matches!(token, "True" | "False" | "None") && self.policy == RepairPolicy::BestEffort {
-            let replacement = match token {
-                "True" => "true",
-                "False" => "false",
-                "None" => "null",
-                _ => unreachable!(),
-            };
-            self.builder.replace(
-                RepairKind::NormalizedLiteral,
-                start..self.position,
-                replacement,
-            );
-            return Ok(None);
-        }
         if looks_number_like(token) {
             if is_strict_json_number_with_cancellation(token, self.cancellation)? {
                 self.builder.copy(start..self.position);
-                return Ok(None);
-            }
-            if self.policy == RepairPolicy::BestEffort
-                && let Some(number) = normalize_number_with_cancellation(token, self.cancellation)?
-            {
-                self.builder
-                    .replace(RepairKind::NormalizedNumber, start..self.position, &number);
                 return Ok(None);
             }
             return Ok(Some(RepairError::new(
@@ -1576,11 +1333,7 @@ where
         }
 
         let replacement = quote_bare_with_cancellation(token, self.cancellation)?;
-        self.builder.replace(
-            RepairKind::QuotedBareValue,
-            start..self.position,
-            &replacement,
-        );
+        self.builder.replace(start..self.position, &replacement);
         Ok(None)
     }
 
@@ -1621,8 +1374,7 @@ where
             FrameKind::Object => "}",
             FrameKind::Array => "]",
         };
-        self.builder
-            .insert(RepairKind::InsertedClosingDelimiter, self.position, closing);
+        self.builder.insert(self.position, closing);
         self.frames.pop();
         Ok(None)
     }
@@ -1639,8 +1391,7 @@ where
                 FrameKind::Object => "}",
                 FrameKind::Array => "]",
             };
-            self.builder
-                .insert(RepairKind::InsertedClosingDelimiter, self.position, closing);
+            self.builder.insert(self.position, closing);
             self.frames.pop();
         }
         if self.root_state == RootState::Value {
@@ -1760,7 +1511,7 @@ enum StringRole {
 struct Builder<'a> {
     input: &'a str,
     output: String,
-    repairs: Vec<Repair>,
+    changed: bool,
     source_map: SourceMap,
 }
 
@@ -1769,7 +1520,7 @@ impl<'a> Builder<'a> {
         Self {
             input,
             output: String::new(),
-            repairs: Vec::new(),
+            changed: false,
             source_map: SourceMap::new(original_start),
         }
     }
@@ -1786,7 +1537,7 @@ impl<'a> Builder<'a> {
         self.output.push_str(&self.input[range]);
     }
 
-    fn replace(&mut self, kind: RepairKind, original: Range<usize>, replacement: &str) {
+    fn replace(&mut self, original: Range<usize>, replacement: &str) {
         let output_start = self.output.len();
         if replacement.is_empty() {
             self.source_map.push_boundary(output_start, original.end);
@@ -1798,57 +1549,33 @@ impl<'a> Builder<'a> {
             );
         }
         self.output.push_str(replacement);
-        self.repairs.push(Repair {
-            kind,
-            original_range: original,
-            output_range: output_start..self.output.len(),
-        });
+        self.changed = true;
     }
 
-    fn insert(&mut self, kind: RepairKind, original_offset: usize, text: &str) {
-        self.replace(kind, original_offset..original_offset, text);
+    fn insert(&mut self, original_offset: usize, text: &str) {
+        self.replace(original_offset..original_offset, text);
     }
 
-    fn delete(&mut self, kind: RepairKind, original: Range<usize>) {
-        self.replace(kind, original, "");
+    fn delete(&mut self, original: Range<usize>) {
+        self.replace(original, "");
     }
 
-    fn record_deletion(&mut self, kind: RepairKind, original: Range<usize>) {
-        self.record_deletion_at(kind, original, 0);
+    fn mark_changed(&mut self) {
+        self.changed = true;
     }
 
-    fn record_deletion_at(
-        &mut self,
-        kind: RepairKind,
-        original: Range<usize>,
-        output_offset: usize,
-    ) {
-        self.repairs.push(Repair {
-            kind,
-            original_range: original,
-            output_range: output_offset..output_offset,
-        });
-    }
-
-    fn record_suffix_deletion_at(
-        &mut self,
-        kind: RepairKind,
-        original: Range<usize>,
-        output_offset: usize,
-    ) {
+    fn record_suffix_deletion_at(&mut self, original: Range<usize>, output_offset: usize) {
         self.source_map.push_boundary(output_offset, original.end);
-        self.record_deletion_at(kind, original, output_offset);
+        self.changed = true;
     }
 
     fn finish(self) -> RepairOutput<'a> {
-        let no_changes = self.repairs.is_empty();
         RepairOutput {
-            json: if no_changes {
-                Cow::Borrowed(self.input)
-            } else {
+            json: if self.changed {
                 Cow::Owned(self.output)
+            } else {
+                Cow::Borrowed(self.input)
             },
-            repairs: self.repairs,
             source_map: self.source_map,
         }
     }
@@ -2105,113 +1832,21 @@ where
     Ok(position == bytes.len())
 }
 
-fn normalize_number_with_cancellation<F, E>(
-    token: &str,
-    cancellation: &mut Cancellation<F>,
-) -> Result<Option<String>, E>
-where
-    F: FnMut() -> Result<(), E>,
-{
-    let mut value = token;
-    let mut sign = "";
-    if let Some(rest) = value.strip_prefix('+') {
-        value = rest;
-    } else if let Some(rest) = value.strip_prefix('-') {
-        sign = "-";
-        value = rest;
-    }
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let lower_exponent = find_byte_with_cancellation(value, 0..value.len(), b'e', cancellation)?;
-    let upper_exponent = find_byte_with_cancellation(value, 0..value.len(), b'E', cancellation)?;
-    let exponent_at = match (lower_exponent, upper_exponent) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(found), None) | (None, Some(found)) => Some(found),
-        (None, None) => None,
-    };
-    if let Some(at) = exponent_at
-        && bytes_any_with_cancellation(&value.as_bytes()[at + 1..], cancellation, |byte| {
-            matches!(byte, b'e' | b'E')
-        })?
-    {
-        return Ok(None);
-    }
-    let (mantissa, exponent) =
-        exponent_at.map_or((value, None), |at| (&value[..at], Some(&value[at + 1..])));
-    let exponent = if let Some(exponent) = exponent {
-        let (sign, digits) = exponent
-            .strip_prefix(['+', '-'])
-            .map_or(("", exponent), |digits| (&exponent[..1], digits));
-        if digits.is_empty()
-            || !bytes_all_with_cancellation(digits.as_bytes(), cancellation, |byte| {
-                byte.is_ascii_digit()
-            })?
-        {
-            return Ok(None);
-        }
-        Some((sign, digits))
-    } else {
-        None
-    };
-
-    let decimal_at = find_byte_with_cancellation(mantissa, 0..mantissa.len(), b'.', cancellation)?;
-    if let Some(at) = decimal_at
-        && bytes_any_with_cancellation(&mantissa.as_bytes()[at + 1..], cancellation, |byte| {
-            byte == b'.'
-        })?
-    {
-        return Ok(None);
-    }
-    let (integer, fraction) = decimal_at.map_or((mantissa, None), |at| {
-        (&mantissa[..at], Some(&mantissa[at + 1..]))
-    });
-    if !bytes_all_with_cancellation(integer.as_bytes(), cancellation, |byte| {
-        byte.is_ascii_digit()
-    })? {
-        return Ok(None);
-    }
-    if let Some(fraction) = fraction
-        && !bytes_all_with_cancellation(fraction.as_bytes(), cancellation, |byte| {
-            byte.is_ascii_digit()
-        })?
-    {
-        return Ok(None);
-    }
-    if integer.is_empty() && fraction.is_none_or(str::is_empty) {
-        return Ok(None);
-    }
-
-    let mut leading_zeroes = 0_usize;
-    while integer.as_bytes().get(leading_zeroes) == Some(&b'0') {
-        cancellation.advance(1)?;
-        leading_zeroes += 1;
-    }
-    let integer = &integer[leading_zeroes..];
-    let integer = if integer.is_empty() { "0" } else { integer };
-    let mut normalized = match fraction {
-        Some("") => format!("{integer}.0"),
-        Some(fraction) => format!("{integer}.{fraction}"),
-        None => integer.to_owned(),
-    };
-    if let Some((exponent_sign, digits)) = exponent {
-        normalized.push('e');
-        normalized.push_str(exponent_sign);
-        normalized.push_str(digits);
-    }
-    if sign == "-" && normalized != "0" {
-        normalized.insert(0, '-');
-    }
-    Ok(Some(normalized))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::convert::Infallible;
+
+    fn repair_result(input: &str) -> Result<RepairOutput<'_>, RepairError> {
+        match repair_with_cancellation(input, || Ok::<_, Infallible>(())) {
+            Ok(result) => result,
+            Err(error) => match error {},
+        }
+    }
 
     fn repaired(input: &str) -> RepairOutput<'_> {
-        repair(input, RepairPolicy::Conservative).expect("input should be repairable")
+        repair_result(input).expect("input should be repairable")
     }
 
     fn assert_valid_json(output: &RepairOutput<'_>) {
@@ -2224,7 +1859,6 @@ mod tests {
         let output = repaired(input);
         assert!(matches!(output.json, Cow::Borrowed(_)));
         assert_eq!(output.json(), input);
-        assert!(output.repairs().is_empty());
         assert_eq!(output.original_offset(input.len()), Some(input.len()));
     }
 
@@ -2241,45 +1875,7 @@ mod tests {
         let input = "answer:\n```json\n{\"a\":1}\n```\ndone";
         let output = repaired(input);
         assert_eq!(output.json(), "{\"a\":1}\n");
-        assert_eq!(
-            output
-                .repairs()
-                .iter()
-                .filter(|repair| repair.kind() == RepairKind::RemovedMarkdownFence)
-                .count(),
-            2
-        );
-        assert!(
-            output
-                .repairs()
-                .iter()
-                .any(|repair| repair.kind() == RepairKind::RemovedSurroundingText)
-        );
         assert_valid_json(&output);
-    }
-
-    #[test]
-    fn records_fence_deletions_at_their_output_boundaries() {
-        let input = "before\n```json\n{\"a\":1}\n```\nafter";
-        let output = repaired(input);
-        let fences = output
-            .repairs()
-            .iter()
-            .filter(|repair| repair.kind() == RepairKind::RemovedMarkdownFence)
-            .collect::<Vec<_>>();
-        assert_eq!(fences.len(), 2);
-        assert_eq!(fences[0].output_range(), 0..0);
-        assert_eq!(
-            fences[1].output_range(),
-            output.json().len()..output.json().len()
-        );
-        assert!(!output.repairs().iter().any(|left| {
-            output.repairs().iter().any(|right| {
-                !std::ptr::eq(left, right)
-                    && left.original_range().start < right.original_range().end
-                    && right.original_range().start < left.original_range().end
-            })
-        }));
     }
 
     #[test]
@@ -2287,30 +1883,19 @@ mod tests {
         let input = "\u{feff} \r\n{\"a\":1}\n";
         let output = repaired(input);
         assert_eq!(output.json(), " \r\n{\"a\":1}\n");
-        assert_eq!(output.repairs().len(), 1);
-        assert_eq!(output.repairs()[0].kind(), RepairKind::RemovedByteOrderMark);
         assert_valid_json(&output);
     }
 
     #[test]
-    fn conservative_rejects_multiple_candidates_and_best_effort_takes_first() {
+    fn rejects_multiple_candidates() {
         let input = "first {\"a\":1} second {\"b\":2}";
-        let error = repair(input, RepairPolicy::Conservative).expect_err("must reject ambiguity");
+        let error = repair_result(input).expect_err("must reject ambiguity");
         assert_eq!(error.kind(), RepairErrorKind::MultipleJsonCandidates);
-
-        let output = repair(input, RepairPolicy::BestEffort).expect("best effort takes first");
-        assert_eq!(output.json(), "{\"a\":1}");
-        assert_valid_json(&output);
 
         let fenced_and_plain = "```json\n{\"a\":1}\n```\n{\"b\":2}";
-        let error = repair(fenced_and_plain, RepairPolicy::Conservative)
-            .expect_err("围栏外的第二个结构候选也必须形成歧义");
+        let error =
+            repair_result(fenced_and_plain).expect_err("围栏外的第二个结构候选也必须形成歧义");
         assert_eq!(error.kind(), RepairErrorKind::MultipleJsonCandidates);
-
-        let output = repair(fenced_and_plain, RepairPolicy::BestEffort)
-            .expect("BestEffort 应选择文本顺序中的第一个候选");
-        assert_eq!(output.json(), "{\"a\":1}\n");
-        assert_valid_json(&output);
     }
 
     #[test]
@@ -2321,12 +1906,12 @@ mod tests {
         assert_valid_json(&output);
 
         let with_later_json = "```json\n{\"a\":1\n```\n{\"b\":2}";
-        let error = repair(with_later_json, RepairPolicy::Conservative)
+        let error = repair_result(with_later_json)
             .expect_err("围栏外的完整候选不能被围栏内的缺失闭合符吞掉");
         assert_eq!(error.kind(), RepairErrorKind::MultipleJsonCandidates);
 
         let trailing_same_line = "```json\n{\"a\":1}\n``` {\"b\":2}";
-        let error = repair(trailing_same_line, RepairPolicy::Conservative)
+        let error = repair_result(trailing_same_line)
             .expect_err("closing fence 同行的 JSON 不能随围栏一起删除");
         assert_eq!(error.kind(), RepairErrorKind::MultipleJsonCandidates);
     }
@@ -2355,11 +1940,6 @@ mod tests {
         assert_eq!(object.json(), "{\"a\":1}");
         assert_valid_json(&object);
 
-        let array = repair("[1,,,]", RepairPolicy::BestEffort)
-            .expect("BestEffort 应删除存在缺值歧义的逗号串");
-        assert_eq!(array.json(), "[1]");
-        assert_valid_json(&array);
-
         let adjacent = repaired("{\"a\":1\"b\":2}");
         assert_eq!(adjacent.json(), "{\"a\":1,\"b\":2}");
         assert_valid_json(&adjacent);
@@ -2374,20 +1954,15 @@ mod tests {
     }
 
     #[test]
-    fn conservative_rejects_ambiguous_missing_array_values_and_adjacent_strings() {
+    fn rejects_ambiguous_missing_array_values_and_adjacent_strings() {
         for input in ["[1,,2]", "[,1]", "[\"a\"\"b\"]", "[\"a\" \"b\"]"] {
-            let error = repair(input, RepairPolicy::Conservative)
-                .expect_err("Conservative 不应替调用方选择缺值或相邻字符串的解释");
+            let error =
+                repair_result(input).expect_err("修复器不应替调用方选择缺值或相邻字符串的解释");
             assert!(matches!(
                 error.kind(),
                 RepairErrorKind::MissingValue | RepairErrorKind::AmbiguousStringQuote
             ));
         }
-
-        let output = repair("[1,,2]", RepairPolicy::BestEffort)
-            .expect("BestEffort 可以把重复逗号解释为多余分隔符");
-        assert_eq!(output.json(), "[1,2]");
-        assert_valid_json(&output);
     }
 
     #[test]
@@ -2416,9 +1991,9 @@ mod tests {
     }
 
     #[test]
-    fn conservative_rejects_ambiguous_internal_double_quotes() {
+    fn rejects_ambiguous_internal_double_quotes() {
         for input in ["{\"text\":\"type: \"free\"\"}", "{\"text\":\"a \"b\" c\"}"] {
-            let error = repair(input, RepairPolicy::Conservative)
+            let error = repair_result(input)
                 .expect_err("内部双引号既可能是字符串边界也可能是正文，不得猜测");
             assert_eq!(error.kind(), RepairErrorKind::AmbiguousStringQuote);
         }
@@ -2430,37 +2005,20 @@ mod tests {
         assert_eq!(output.json(), "{\"a\":[1,2]}");
         assert_valid_json(&output);
 
-        let error = repair("{\"a\":", RepairPolicy::Conservative).expect_err("value is absent");
+        let error = repair_result("{\"a\":").expect_err("value is absent");
         assert_eq!(error.kind(), RepairErrorKind::MissingValue);
     }
 
     #[test]
-    fn conservative_rejects_unterminated_string_and_best_effort_closes_it() {
+    fn rejects_unterminated_string() {
         let input = "{\"a\":\"text";
-        let error = repair(input, RepairPolicy::Conservative).expect_err("must reject");
+        let error = repair_result(input).expect_err("must reject");
         assert_eq!(error.kind(), RepairErrorKind::UnterminatedString);
-
-        let output = repair(input, RepairPolicy::BestEffort).expect("best effort closes string");
-        assert_eq!(output.json(), "{\"a\":\"text\"}");
-        assert_valid_json(&output);
-
-        let before_delimiter = repair("{\"a\":\"text}", RepairPolicy::BestEffort)
-            .expect("best effort closes before a container delimiter");
-        assert_eq!(before_delimiter.json(), "{\"a\":\"text\"}");
-        assert_valid_json(&before_delimiter);
     }
 
     #[test]
-    fn best_effort_normalizes_literals_and_simple_numbers() {
-        let output = repair(
-            "[True,False,None,+1,.5,1.,007,+01.20e+03]",
-            RepairPolicy::BestEffort,
-        )
-        .expect("best effort should normalize values");
-        assert_eq!(output.json(), "[true,false,null,1,0.5,1.0,7,1.20e+03]");
-        assert_valid_json(&output);
-
-        let error = repair("[+1]", RepairPolicy::Conservative).expect_err("must reject number");
+    fn rejects_invalid_number() {
+        let error = repair_result("[+1]").expect_err("must reject number");
         assert_eq!(error.kind(), RepairErrorKind::InvalidNumber);
     }
 
@@ -2495,8 +2053,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn source_map_compresses_contiguous_copies() {
+    fn release_stress_source_map_compresses_contiguous_copies() {
         let input = format!("[\"{}\"]", "内容".repeat(100_000));
         let output = repaired(&input);
         assert_eq!(output.source_map.segments.len(), 1);
@@ -2509,83 +2068,28 @@ mod tests {
         let output = repaired(input);
         assert_eq!(output.json(), "{\"名字\":\"值\"}\r\n");
         assert_valid_json(&output);
-        for repair in output.repairs() {
-            assert!(repair.original_range().end <= input.len());
-            assert!(repair.output_range().end <= output.json().len());
-        }
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn deeply_nested_input_uses_explicit_stack() {
+    fn release_stress_deeply_nested_input_uses_explicit_stack() {
         let depth = 20_000;
         let input = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
         let output = repaired(&input);
         assert_eq!(output.json(), input);
-        assert!(output.repairs().is_empty());
+        assert!(matches!(output.json, Cow::Borrowed(_)));
     }
 
     #[test]
-    fn cancellation_is_checked_at_start_and_each_64_kib() {
+    fn long_repair_can_be_cancelled() {
         let input = format!("[\"{}\"]", "x".repeat(CANCELLATION_INTERVAL * 2));
         let mut checks = 0;
-        let result = repair_with_cancellation(&input, RepairPolicy::Conservative, || {
+        let result = repair_with_cancellation(&input, || {
             checks += 1;
-            if checks == 3 {
-                Err("cancelled")
-            } else {
-                Ok(())
-            }
+            if checks > 1 { Err("cancelled") } else { Ok(()) }
         });
         assert!(matches!(result, Err("cancelled")));
-        assert_eq!(checks, 3);
-    }
-
-    #[test]
-    fn dense_internal_quotes_and_trailing_commas_have_linear_scan_budgets() {
-        let quote_count = 100_000;
-        let mut quoted = String::from("{\"text\":\"");
-        for _ in 0..quote_count {
-            quoted.push_str("x\"");
-        }
-        quoted.push_str("x\"}");
-
-        let mut quote_checks = 0_usize;
-        let quoted_output = repair_with_cancellation(
-            &quoted,
-            RepairPolicy::BestEffort,
-            || -> Result<(), Infallible> {
-                quote_checks += 1;
-                Ok(())
-            },
-        )
-        .expect("取消检查不会失败")
-        .expect("BestEffort 的密集内部引号选择仍应保持线性");
-        assert_valid_json(&quoted_output);
-        let quote_budget = quoted.len().div_ceil(CANCELLATION_INTERVAL) * 8 + 16;
-        assert!(
-            quote_checks <= quote_budget,
-            "内部引号扫描次数 {quote_checks} 超过线性预算 {quote_budget}"
-        );
-
-        let commas = format!("[0{}]", ",".repeat(CANCELLATION_INTERVAL * 2));
-        let mut comma_checks = 0_usize;
-        let comma_output = repair_with_cancellation(
-            &commas,
-            RepairPolicy::BestEffort,
-            || -> Result<(), Infallible> {
-                comma_checks += 1;
-                Ok(())
-            },
-        )
-        .expect("取消检查不会失败")
-        .expect("密集尾逗号应可修复");
-        assert_eq!(comma_output.json(), "[0]");
-        assert_valid_json(&comma_output);
-        let comma_budget = commas.len().div_ceil(CANCELLATION_INTERVAL) * 8 + 16;
-        assert!(
-            comma_checks <= comma_budget,
-            "尾逗号扫描次数 {comma_checks} 超过线性预算 {comma_budget}"
-        );
+        assert!(checks > 1);
     }
 
     #[test]

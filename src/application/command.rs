@@ -1,6 +1,5 @@
 //! 生产命令装配与最终结果呈现。
 
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -9,7 +8,6 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use futures_util::FutureExt;
 use rusqlite::{Connection, OpenFlags};
@@ -18,6 +16,9 @@ use super::TranslationTerminalSummary;
 use super::project_log::{
     ActiveProjectLog, CommandLogStart, PendingProjectLog, ProjectLogHandle, ProjectLogLuaPrintSink,
     start_command_log,
+};
+use super::termination::{
+    TerminationOutcome as DrivenCommand, TerminationSignals, drive_with_termination,
 };
 use super::translation_prompt::{
     PromptResourceLoadError, PromptTemplateError,
@@ -35,16 +36,19 @@ use crate::application::config::{
     ConfiguredManualCommand, ConfiguredProjectLuaCommand, ConfiguredRpgMakerCommand,
     ConfiguredTranslateCommand, ConfiguredWriteBackCommand, TranslateConfiguration,
 };
+#[cfg(test)]
+use crate::diagnostic::DiagnosticStage;
 use crate::diagnostic::{
-    BoxedError, Diagnostic, DiagnosticIssue, DiagnosticReport, DiagnosticStage, IoFailure,
-    PromptProblem, RelatedFailureRelation, ReportedFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
-    RpgMakerProjectProblem, RuntimeBoundaryOperation, RuntimeComponent, RuntimeEngine,
-    RuntimeIssue, RuntimeOperation, RuntimePanicBoundary, SafeIdentifier, SafePath,
-    SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue,
-    SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect, TranslationIssue,
-    public_path, render_diagnostic_report, render_state_effect_impact,
+    BoxedError, Diagnostic, DiagnosticIssue, DiagnosticReport, IoFailure, PromptProblem,
+    RelatedFailureRelation, ReportedFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
+    RpgMakerProjectProblem, RuntimeComponent, RuntimeEngine, RuntimeIssue, RuntimeOperation,
+    RuntimePanicBoundary, SafeIdentifier, SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage,
+    SqliteDriverFailure, SqliteIssue, SqliteOperation, SqliteProblem, SqliteTransactionState,
+    StateEffect, TranslationIssue, public_path, render_diagnostic_report,
+    render_state_effect_impact,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
+use crate::execution::llm_request::TokioAsyncDelay;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::language::LanguageModuleCatalogError;
@@ -58,8 +62,8 @@ use crate::progress::{
     TerminalProgressObserver,
 };
 use crate::project_lease::{
-    AlreadyHeldProjectCommandLeaseProvider, ProjectCommandLease, ProjectCommandLeaseError,
-    ProjectCommandLeaseProvider, ProjectCommandLeaseService,
+    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
+    ProjectCommandLeaseService,
 };
 use crate::project_lua::{
     ProjectLuaCancellation, ProjectLuaFailure, ProjectLuaProgram, ProjectLuaProject,
@@ -84,10 +88,10 @@ use crate::rpg_maker::extract::rules::{
 use crate::rpg_maker::extract::service::ExtractService;
 use crate::rpg_maker::extract::service::ExtractServiceError;
 use crate::rpg_maker::extract::store::asset_store::RpgMakerExtractionAssetStore;
-use crate::rpg_maker::extract::{ExtractInput, ExtractOutput, ExtractProgressPhase, SelectedRules};
+use crate::rpg_maker::extract::{ExtractOutput, ExtractProgressPhase, SelectedRules};
 use crate::rpg_maker::init::{
-    InitInput, InitOutcome, InitOutput, InitProgressPhase, InitService, InitServiceError,
-    InitStaleOwner, ProjectWorkspaceConvergenceError, ProjectWorkspaceConvergenceService,
+    InitInput, InitOutcome, InitOutput, InitProgressPhase, InitService, InitStaleOwner,
+    ProjectWorkspaceConvergenceError, ProjectWorkspaceConvergenceService,
 };
 use crate::rpg_maker::project::{
     ExistingProjectOpener, ExistingProjectOpeningError, ExistingProjectOpeningService,
@@ -106,7 +110,7 @@ use crate::rpg_maker::translate::TranslateInput;
 use crate::rpg_maker::translate::TranslateOutput;
 use crate::rpg_maker::translate::asset_reader::RpgMakerTranslationAssetReadingService;
 use crate::rpg_maker::translate::executor::{
-    AsyncDelay, RpgMakerTranslationTaskExecutionError, RpgMakerTranslationTaskExecutionService,
+    RpgMakerTranslationTaskExecutionError, RpgMakerTranslationTaskExecutionService,
     TranslationTaskResponseProcessingService,
 };
 use crate::rpg_maker::translate::pipeline::{
@@ -145,9 +149,8 @@ use crate::rpg_maker::write_back::rewriter::{
     RpgMakerWriteBackDocumentRewritingError, RpgMakerWriteBackDocumentRewritingService,
 };
 use crate::rpg_maker::write_back::{
-    WriteBackInput, WriteBackLog, WriteBackLogEvent, WriteBackLogPublicationOutcome,
-    WriteBackOutput, WriteBackProgressPhase, WriteBackPublishingDiagnostic, WriteBackService,
-    WriteBackServiceError,
+    WriteBackLog, WriteBackLogEvent, WriteBackLogPublicationOutcome, WriteBackOutput,
+    WriteBackProgressPhase, WriteBackPublishingDiagnostic, WriteBackService, WriteBackServiceError,
 };
 use crate::runtime::cpu::{
     CpuExecutorConfig, CpuExecutorShutdownError, CpuExecutorStartError, CpuExecutorUnavailable,
@@ -186,9 +189,6 @@ use crate::translation::planning_resource::TranslationPlanningResourceReadingSer
 use crate::translation::task_record::TaskRecordDiagnosticRecorder;
 use crate::translation_protocol::TranslationResponseMode;
 
-#[derive(Clone, Copy, Debug, Default)]
-struct TokioAsyncDelay;
-
 /// Translate 终端只解释本纵向切片拥有的阶段；任务计数来自已提交终态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TranslateProgressPhase {
@@ -199,31 +199,6 @@ enum TranslateProgressPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectLuaProgressPhase {
     Running,
-}
-
-impl AsyncDelay for TokioAsyncDelay {
-    async fn wait(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
-    }
-}
-
-#[cfg(test)]
-mod async_delay_tests {
-    use std::time::Instant;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn waits_for_requested_duration() {
-        let started = Instant::now();
-        TokioAsyncDelay.wait(Duration::from_millis(5)).await;
-        assert!(started.elapsed() >= Duration::from_millis(5));
-    }
-}
-
-#[derive(Clone)]
-struct PreopenedProject {
-    project: OpenedProject,
 }
 
 type ProductionProjectOpeningError = ExistingProjectOpeningError<
@@ -241,24 +216,6 @@ type ProductionWorkspaceConvergenceError = ProjectWorkspaceConvergenceError<
     Box<SystemFileSystemError>,
     Box<SystemFileSystemError>,
 >;
-
-impl PreopenedProject {
-    fn new(project: OpenedProject) -> Self {
-        Self { project }
-    }
-}
-
-impl ExistingProjectOpener for PreopenedProject {
-    type Error = Infallible;
-
-    async fn open(
-        &self,
-        name: &crate::project_name::ProjectName,
-    ) -> Result<OpenedProject, Self::Error> {
-        debug_assert_eq!(self.project.name(), name);
-        Ok(self.project.clone())
-    }
-}
 
 /// 一个 RPG Maker 命令成功完成后的类型化结果。
 pub(crate) enum RpgMakerCommandOutput {
@@ -1568,7 +1525,7 @@ impl ProductionRpgMakerCommandRunner {
         .await
         .map(
             |result: Result<DirectoryRecoveryOutcome, ProductionWorkspaceConvergenceError>| {
-                result.map_err(|source| map_init_error(InitServiceError::Workspace(source)))
+                result.map_err(map_init_error)
             },
         );
         match recovery {
@@ -1674,11 +1631,7 @@ impl ProductionRpgMakerCommandRunner {
             cancellation.clone(),
         )
         .with_progress(progress_observer.clone());
-        let service = InitService::new(
-            workspace,
-            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
-            cancellation.clone(),
-        );
+        let service = InitService::new(workspace, cancellation.clone());
         let input = InitInput {
             name: project_name,
             game_root: resolved_game_root.clone(),
@@ -2139,7 +2092,6 @@ impl ProductionRpgMakerCommandRunner {
                 ExtractOwnerSelection::new(builtin_enabled, rules_enabled),
             ),
         });
-        let opener = PreopenedProject::new(opened_project);
         let document_config = command.rpg_maker().document();
         let document_reader =
             CommandScopedRpgMakerDocumentReader::new(RpgMakerProjectDocumentReadingService::new(
@@ -2174,20 +2126,11 @@ impl ProductionRpgMakerCommandRunner {
                 )
             }
         });
-        let service = ExtractService::new(
-            opener,
-            builtin,
-            selected_rules,
-            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
-            cancellation.clone(),
-        )
-        .with_progress(progress_observer.clone());
-        let input = ExtractInput {
-            name: command.project_name().clone(),
-        };
+        let service = ExtractService::new(builtin, selected_rules, cancellation.clone())
+            .with_progress(progress_observer.clone());
         let safe_stopping = progress_safe_stopping(self.locale);
         let mut execution = drive_command(
-            service.execute(input),
+            service.execute(&opened_project),
             termination_signals,
             || {
                 cancellation.request();
@@ -2531,7 +2474,6 @@ impl ProductionRpgMakerCommandRunner {
                     return observed_construction_failure(project_log, error, shutdown).await;
                 }
             };
-        let opener = PreopenedProject::new(opened_project);
         let business_log =
             ProductionBusinessLog::for_translation(&project_log, progress_observer.clone());
         let (task_records, record_translation_tasks) =
@@ -2584,14 +2526,8 @@ impl ProductionRpgMakerCommandRunner {
             record_translation_tasks,
             cancellation: cancellation.clone(),
         };
-        let service = TranslateService::new(
-            opener,
-            builder,
-            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
-            cancellation.clone(),
-        );
+        let service = TranslateService::new(builder, cancellation.clone());
         let input = TranslateInput {
-            name: command.project_name().clone(),
             terminology_path: command.terminology_path().map(Path::to_path_buf),
             placeholder_rules_path: command.placeholder_rules_path().map(Path::to_path_buf),
             retry_rejected: command.retry_rejected(),
@@ -2602,7 +2538,7 @@ impl ProductionRpgMakerCommandRunner {
         let safe_stopping = progress_safe_stopping(self.locale);
         let translation_execution = async {
             drive_command(
-                service.execute(input),
+                service.execute(&opened_project, input),
                 termination_signals,
                 || {
                     cancellation.request();
@@ -2849,7 +2785,6 @@ impl ProductionRpgMakerCommandRunner {
             write_back_phase_code,
         );
         let directory_publisher = file_system.directory_publisher(command.publisher().clone());
-        let opener = PreopenedProject::new(opened_project);
         let layout_rules_input = match command.layout_rules_path() {
             Some(path) => match file_system.read_file(path.to_path_buf()).await {
                 Ok(file) => Some(RpgMakerWriteBackLayoutRulesInput::new(
@@ -2899,20 +2834,15 @@ impl ProductionRpgMakerCommandRunner {
         let publisher = RpgMakerWriteBackPublishingService::new(directory_publisher.clone());
         let business_log = ProductionBusinessLog::from_active(&project_log);
         let service = WriteBackService::new(
-            opener,
             write_back,
             publisher,
             business_log.clone(),
-            AlreadyHeldProjectCommandLeaseProvider::new(&project_lease_guard),
             cancellation.clone(),
         )
         .with_progress(progress_observer.clone());
-        let input = WriteBackInput {
-            name: command.project_name().clone(),
-        };
         let safe_stopping = progress_safe_stopping(self.locale);
         let execution = drive_command(
-            service.execute(input),
+            service.execute(&opened_project),
             termination_signals,
             || {
                 cancellation.request();
@@ -5707,25 +5637,6 @@ async fn load_additional_pem_roots(
     Ok(roots)
 }
 
-enum DrivenCommand<T> {
-    Finished(T),
-    Interrupted(T),
-    SignalFailed { source: io::Error, result: T },
-}
-
-impl<T> DrivenCommand<T> {
-    fn map<U>(self, map: impl FnOnce(T) -> U) -> DrivenCommand<U> {
-        match self {
-            Self::Finished(value) => DrivenCommand::Finished(map(value)),
-            Self::Interrupted(value) => DrivenCommand::Interrupted(map(value)),
-            Self::SignalFailed { source, result } => DrivenCommand::SignalFailed {
-                source,
-                result: map(result),
-            },
-        }
-    }
-}
-
 async fn drive_project_lease<P>(
     provider: &P,
     project: &crate::project_name::ProjectName,
@@ -5790,86 +5701,13 @@ async fn drive_existing_project_opening(
     .map(|result| result.map_err(ProductionCommandError::existing_project_opening))
 }
 
-/// 在整个命令生命周期保留 Windows 控制信号订阅，避免业务 future 先完成时
-/// 接收器被提前丢弃并触发 Windows 默认终止处理器。
-pub(crate) struct TerminationSignals {
-    state: TerminationSignalState,
-}
-
-enum TerminationSignalState {
-    Listening {
-        ctrl_c: tokio::signal::windows::CtrlC,
-        ctrl_break: tokio::signal::windows::CtrlBreak,
-    },
-    RegistrationFailed(Option<io::Error>),
-}
-
-impl TerminationSignals {
-    pub(crate) fn new() -> Self {
-        let state = match tokio::signal::windows::ctrl_c() {
-            Ok(ctrl_c) => match tokio::signal::windows::ctrl_break() {
-                Ok(ctrl_break) => TerminationSignalState::Listening { ctrl_c, ctrl_break },
-                Err(error) => TerminationSignalState::RegistrationFailed(Some(error)),
-            },
-            Err(error) => TerminationSignalState::RegistrationFailed(Some(error)),
-        };
-        Self { state }
-    }
-
-    pub(crate) async fn recv(&mut self) -> io::Result<()> {
-        match &mut self.state {
-            TerminationSignalState::Listening { ctrl_c, ctrl_break } => {
-                tokio::select! {
-                    signal = ctrl_c.recv() => signal.ok_or_else(|| io::Error::other("Ctrl-C 信号源意外关闭")),
-                    signal = ctrl_break.recv() => signal.ok_or_else(|| io::Error::other("Ctrl-Break 信号源意外关闭")),
-                }
-            }
-            TerminationSignalState::RegistrationFailed(error) => Err(error
-                .take()
-                .unwrap_or_else(|| io::Error::other("Windows 控制信号源不可用"))),
-        }
-    }
-}
-
 async fn drive_command<T>(
     future: impl Future<Output = T>,
     termination_signals: &mut TerminationSignals,
     cancel_waits: impl FnOnce(),
     on_cancellation: impl FnOnce(),
 ) -> DrivenCommand<T> {
-    drive_with_signal(
-        future,
-        termination_signals.recv(),
-        cancel_waits,
-        on_cancellation,
-    )
-    .await
-}
-
-async fn drive_with_signal<T>(
-    future: impl Future<Output = T>,
-    signal: impl Future<Output = io::Result<()>>,
-    cancel_waits: impl FnOnce(),
-    on_cancellation: impl FnOnce(),
-) -> DrivenCommand<T> {
-    tokio::pin!(future);
-    tokio::pin!(signal);
-    tokio::select! {
-        biased;
-        signal = &mut signal => match signal {
-            Ok(()) => {
-                cancel_waits();
-                on_cancellation();
-                DrivenCommand::Interrupted(future.await)
-            }
-            Err(error) => {
-                cancel_waits();
-                let result = future.await;
-                DrivenCommand::SignalFailed { source: error, result }
-            }
-        },
-        result = &mut future => DrivenCommand::Finished(result),
-    }
+    drive_with_termination(future, termination_signals, cancel_waits, on_cancellation).await
 }
 
 fn interrupted_non_cancellation_error<T>(
@@ -6060,36 +5898,23 @@ enum InitFailureClass {
     Internal,
 }
 
-fn map_init_error(
-    error: InitServiceError<ProductionWorkspaceConvergenceError, Infallible>,
-) -> ProductionCommandError {
-    match error {
-        error @ InitServiceError::ProjectLease(_) => ProductionCommandError::prevalidated_boundary(
-            error,
-            DiagnosticStage::Init,
-            RuntimeBoundaryOperation::InitProjectLeaseAlreadyHeld,
-        ),
-        InitServiceError::Workspace(source) => {
-            let (class, report) = init_workspace_failure_report(source);
-            match class {
-                InitFailureClass::ConfigurationOrInput => {
-                    ProductionCommandError::ConfigurationOrInput(Box::new(report))
-                }
-                InitFailureClass::ProjectState => {
-                    ProductionCommandError::ProjectState(Box::new(report))
-                }
-                InitFailureClass::StateAppliedFinalizationFailed => {
-                    ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
-                }
-                InitFailureClass::RecoveryRequired => {
-                    ProductionCommandError::RecoveryRequired(Box::new(report))
-                }
-                InitFailureClass::OutcomeUnknown => {
-                    ProductionCommandError::OutcomeUnknown(Box::new(report))
-                }
-                InitFailureClass::Internal => ProductionCommandError::Internal(Box::new(report)),
-            }
+fn map_init_error(source: ProductionWorkspaceConvergenceError) -> ProductionCommandError {
+    let (class, report) = init_workspace_failure_report(source);
+    match class {
+        InitFailureClass::ConfigurationOrInput => {
+            ProductionCommandError::ConfigurationOrInput(Box::new(report))
         }
+        InitFailureClass::ProjectState => ProductionCommandError::ProjectState(Box::new(report)),
+        InitFailureClass::StateAppliedFinalizationFailed => {
+            ProductionCommandError::StateAppliedButFinalizationFailed(Box::new(report))
+        }
+        InitFailureClass::RecoveryRequired => {
+            ProductionCommandError::RecoveryRequired(Box::new(report))
+        }
+        InitFailureClass::OutcomeUnknown => {
+            ProductionCommandError::OutcomeUnknown(Box::new(report))
+        }
+        InitFailureClass::Internal => ProductionCommandError::Internal(Box::new(report)),
     }
 }
 
@@ -6165,30 +5990,12 @@ where
     }
 }
 
-fn map_extract_error<OE, BE, RE, PE>(
-    error: ExtractServiceError<OE, BE, RE, PE>,
-) -> ProductionCommandError
+fn map_extract_error<BE, RE>(error: ExtractServiceError<BE, RE>) -> ProductionCommandError
 where
-    OE: Error + Send + Sync + 'static,
     BE: BuiltInExtractDiagnostic,
     RE: RulesExtractDiagnostic,
-    PE: Error + Send + Sync + 'static,
 {
     match error {
-        error @ ExtractServiceError::ProjectLease(_) => {
-            ProductionCommandError::prevalidated_boundary(
-                error,
-                DiagnosticStage::Extract,
-                RuntimeBoundaryOperation::ExtractProjectLeaseAlreadyHeld,
-            )
-        }
-        error @ ExtractServiceError::OpenProject(_) => {
-            ProductionCommandError::prevalidated_boundary(
-                error,
-                DiagnosticStage::Extract,
-                RuntimeBoundaryOperation::ExtractProjectAlreadyOpened,
-            )
-        }
         ExtractServiceError::BuiltIn(source) => {
             map_project_failure_report(source.into_extract_diagnostic())
         }
@@ -6380,29 +6187,13 @@ fn map_project_failure_report(report: ReportedFailure) -> ProductionCommandError
     }
 }
 
-fn map_translate_error<RE, TE, PE>(
-    error: TranslateServiceError<RE, ProductionTranslationExecutionBuildError, TE, PE>,
+fn map_translate_error<TE>(
+    error: TranslateServiceError<ProductionTranslationExecutionBuildError, TE>,
 ) -> ProductionCommandError
 where
-    RE: Error + Send + Sync + 'static,
     TE: ProductionExternalModelFailure,
-    PE: Error + Send + Sync + 'static,
 {
     match error {
-        error @ TranslateServiceError::ProjectLease(_) => {
-            ProductionCommandError::prevalidated_boundary(
-                error,
-                DiagnosticStage::Translate,
-                RuntimeBoundaryOperation::TranslateProjectLeaseAlreadyHeld,
-            )
-        }
-        error @ TranslateServiceError::ReadProject { .. } => {
-            ProductionCommandError::prevalidated_boundary(
-                error,
-                DiagnosticStage::Translate,
-                RuntimeBoundaryOperation::TranslateProjectAlreadyOpened,
-            )
-        }
         TranslateServiceError::BuildExecution(source) => {
             ProductionCommandError::translation_execution_build(source)
         }
@@ -6470,36 +6261,18 @@ where
     }
 }
 
-fn map_write_back_error<OE, SE, PE, KE>(
-    error: WriteBackServiceError<OE, SE, PE, KE>,
-) -> ProductionCommandError
+fn map_write_back_error<SE, PE>(error: WriteBackServiceError<SE, PE>) -> ProductionCommandError
 where
-    OE: Error + Send + Sync + 'static,
     SE: ProductionWriteBackPreparationFailure,
     PE: Error + WriteBackPublishingDiagnostic + Send + Sync + 'static,
-    KE: Error + Send + Sync + 'static,
 {
     match error {
-        error @ WriteBackServiceError::ProjectLease(_) => {
-            ProductionCommandError::prevalidated_boundary(
-                error,
-                DiagnosticStage::WriteBack,
-                RuntimeBoundaryOperation::WriteBackProjectLeaseAlreadyHeld,
-            )
-        }
         WriteBackServiceError::CancellationDiscard {
             candidate_root: _,
             discard,
         } => {
             let report = discard.into_write_back_failure_report();
             map_project_failure_report(report)
-        }
-        error @ WriteBackServiceError::OpenProject(_) => {
-            ProductionCommandError::prevalidated_boundary(
-                error,
-                DiagnosticStage::WriteBack,
-                RuntimeBoundaryOperation::WriteBackProjectAlreadyOpened,
-            )
         }
         WriteBackServiceError::Prepare(source) => {
             map_project_failure_report(source.into_write_back_preparation_failure())
@@ -6679,22 +6452,6 @@ impl ProductionCommandError {
         let diagnostic =
             source.diagnostic_report_at(crate::diagnostic::FileSystemDiagnosticStage::Project);
         Self::ProjectUnavailable(Box::new(Self::report_diagnostic(source, diagnostic)))
-    }
-
-    fn prevalidated_boundary(
-        source: impl Error + Send + Sync + 'static,
-        stage: DiagnosticStage,
-        operation: RuntimeBoundaryOperation,
-    ) -> Self {
-        let report = DiagnosticReport::new(
-            StateEffect::Unchanged,
-            Diagnostic::runtime(RuntimeIssue::InternalInvariant {
-                stage,
-                component: RuntimeComponent::Process,
-                operation,
-            }),
-        );
-        Self::Internal(Box::new(Self::report_diagnostic(source, report)))
     }
 
     fn existing_project_opening(source: ProductionProjectOpeningError) -> Self {
@@ -7647,12 +7404,12 @@ mod command_result_renderer_tests {
                 StateEffect::OutcomeUnknown,
             ),
         ] {
-            let mapped = map_init_error(InitServiceError::Workspace(
-                ProjectWorkspaceConvergenceError::Prepare(DirectoryPrepareError::NotPrepared {
+            let mapped = map_init_error(ProjectWorkspaceConvergenceError::Prepare(
+                DirectoryPrepareError::NotPrepared {
                     target_root: PathBuf::from("C:/project/workspace"),
                     source: Box::new(source),
                     cleanup_failure: None,
-                }),
+                },
             ));
             assert_eq!(mapped.failure_report().report().effect(), expected);
             assert!(matches!(
@@ -7697,7 +7454,7 @@ mod command_result_renderer_tests {
                     PathBuf::from("C:/project/workspace"),
                     Box::new(source),
                 ));
-            let mapped = map_init_error(InitServiceError::Workspace(workspace_error));
+            let mapped = map_init_error(workspace_error);
             assert_eq!(mapped.failure_report().report().effect(), expected);
             assert!(matches!(
                 (expected, mapped),
@@ -7714,12 +7471,7 @@ mod command_result_renderer_tests {
 
     #[test]
     fn write_back_preparation_and_discard_preserve_strongest_impact() {
-        type Error = WriteBackServiceError<
-            SystemFileSystemError,
-            TestPreparationFailure,
-            TestPublishingFailure,
-            SystemFileSystemError,
-        >;
+        type Error = WriteBackServiceError<TestPreparationFailure, TestPublishingFailure>;
 
         let prepared = map_write_back_error(Error::PrepareCandidate(TestPublishingFailure {
             effect: StateEffect::OutcomeUnknown,
@@ -7763,7 +7515,7 @@ mod command_result_renderer_tests {
     }
 
     fn assert_init_recovery_required(error: ProductionWorkspaceConvergenceError) {
-        let mapped = map_init_error(InitServiceError::Workspace(error));
+        let mapped = map_init_error(error);
         let ProductionCommandError::RecoveryRequired(report) = mapped else {
             panic!("Init 清理失败必须映射为 RecoveryRequired");
         };
@@ -7796,15 +7548,15 @@ mod command_result_renderer_tests {
 
     #[test]
     fn init_publish_cleanup_failure_preserves_publication_recovery_diagnostic() {
-        let mapped = map_init_error(InitServiceError::Workspace(
-            ProjectWorkspaceConvergenceError::Publish(DirectoryPublishError::NotPublished {
+        let mapped = map_init_error(ProjectWorkspaceConvergenceError::Publish(
+            DirectoryPublishError::NotPublished {
                 target_root: PathBuf::from("C:/project/workspace"),
                 source: Box::new(SystemFileSystemError::Closed),
                 cleanup_failure: Some(StagingCleanupFailure::new(
                     PathBuf::from("C:/project/.publish-residual"),
                     Box::new(SystemFileSystemError::Closed),
                 )),
-            }),
+            },
         ));
         let ProductionCommandError::RecoveryRequired(report) = mapped else {
             panic!("Init 发布清理失败必须映射为 RecoveryRequired");

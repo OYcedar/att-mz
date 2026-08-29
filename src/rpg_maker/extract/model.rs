@@ -1006,8 +1006,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn normalization_rebuilds_only_truly_duplicated_locations_in_a_large_snapshot() {
+    fn release_stress_large_snapshot_rebuilds_only_duplicate_locations() {
         const UNIQUE_GROUPS: usize = 20_000;
 
         let source = RpgMakerSource::data(StandardDataFile::Items);

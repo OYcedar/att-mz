@@ -1330,8 +1330,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn wide_json_string_maps_an_escaped_key_to_its_exact_source_interval() {
+    fn release_stress_wide_json_string_maps_an_escaped_key_to_its_exact_source_interval() {
         const API_KEY: &str = "a\"\\😀z";
         const PADDING_LEN: usize = 1 << 20;
         let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
@@ -1415,8 +1416,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn many_json_markers_and_keys_are_redacted_in_one_ordered_scan() {
+    fn release_stress_many_json_markers_and_keys_are_redacted_in_one_ordered_scan() {
         const ITEMS: usize = 4_096;
         let redactor = ApiKeyRedactor::new(SecretString::from("API"));
         let values = vec![format!("API {} API", ApiKeyRedactor::REPLACEMENT); ITEMS];
@@ -1485,8 +1487,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn url_redaction_handles_a_degenerate_long_key_and_component_linearly() {
+    fn release_stress_url_redaction_handles_a_degenerate_long_key_and_component_linearly() {
         const KEY_PREFIX_LEN: usize = 32 * 1024;
         const COMPONENT_LEN: usize = 256 * 1024;
         let api_key = format!("{}b", "a".repeat(KEY_PREFIX_LEN));

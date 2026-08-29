@@ -81,6 +81,18 @@ jobs:
         shell: pwsh
         run: cargo build --locked --release --bin att
 
+      - name: Run Release stress validation
+        shell: pwsh
+        run: |
+          cargo test --locked --release -p att --features release-stress --lib release_stress_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "ATT Release 压力验证失败，退出码 $LASTEXITCODE"
+          }
+          cargo test --locked --release -p att-json-repair --features release-stress --lib release_stress_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "JSON repair Release 压力验证失败，退出码 $LASTEXITCODE"
+          }
+
       - name: Package maximum-compression ZIP
         id: package
         shell: pwsh

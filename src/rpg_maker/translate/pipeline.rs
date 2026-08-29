@@ -1407,45 +1407,21 @@ impl GroupContextFingerprint {
     }
 }
 
-/// 一个语义单元的请求规划状态与自动正文适用性。
+/// 一个语义单元的当前译文适用性。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TranslationStateContext {
-    rejected_applicability: Sha256Fingerprint,
-    automatic_applicability: Sha256Fingerprint,
-}
+pub(crate) struct TranslationStateContext(Sha256Fingerprint);
 
 impl TranslationStateContext {
-    #[cfg(test)]
     pub(crate) const fn new(fingerprint: Sha256Fingerprint) -> Self {
-        Self {
-            rejected_applicability: fingerprint,
-            automatic_applicability: fingerprint,
-        }
+        Self(fingerprint)
     }
 
-    pub(crate) const fn from_applicabilities(
-        rejected_applicability: Sha256Fingerprint,
-        automatic_applicability: Sha256Fingerprint,
-    ) -> Self {
-        Self {
-            rejected_applicability,
-            automatic_applicability,
-        }
+    pub(crate) const fn applicability(self) -> Sha256Fingerprint {
+        self.0
     }
 
-    pub(crate) fn finish(self, _translation: &TextUnitContent) -> Sha256Fingerprint {
-        self.automatic_applicability
-    }
-
-    pub(crate) fn rejection_planning_state(self, _source: &TextUnitContent) -> Sha256Fingerprint {
-        self.rejected_applicability
-    }
-
-    pub(crate) fn rejected_applicability_is_current(self, stored: Sha256Fingerprint) -> bool {
-        crate::translation::rpg_maker_rejected_applicability_is_current(
-            stored,
-            self.rejected_applicability,
-        )
+    pub(crate) fn is_current(self, stored: Sha256Fingerprint) -> bool {
+        stored == self.0
     }
 }
 
@@ -2863,8 +2839,7 @@ fn task_response_parse_problem(
     error: TranslationTaskResponseParseError,
 ) -> RpgMakerTaskResponseProblem {
     match error.kind() {
-        TranslationTaskResponseParseErrorKind::Json(category)
-        | TranslationTaskResponseParseErrorKind::JsonRepair { category, .. } => {
+        TranslationTaskResponseParseErrorKind::Json(category) => {
             RpgMakerTaskResponseProblem::InvalidJson {
                 category: match category {
                     TranslationTaskResponseJsonErrorCategory::Io => {
@@ -4766,18 +4741,6 @@ mod tests {
                 Vec::new(),
             )],
         );
-    }
-
-    #[test]
-    fn translation_state_depends_on_semantic_context_not_target_text_shape() {
-        let context = test_state_context(7);
-        let value = TextUnitContent::Value("甲\n乙".to_owned());
-        let two_lines = TextUnitContent::Lines(vec!["甲".to_owned(), "乙".to_owned()]);
-        let one_line = TextUnitContent::Lines(vec!["甲乙".to_owned()]);
-
-        assert_eq!(context.finish(&value), context.finish(&two_lines));
-        assert_eq!(context.finish(&two_lines), context.finish(&one_line));
-        assert_ne!(context.finish(&value), test_state_context(8).finish(&value));
     }
 
     #[derive(Clone, Copy)]
@@ -6690,7 +6653,7 @@ mod tests {
             let identity = translation_identity();
             let target = RejectedTranslationTarget::with_rejected_state(
                 identity.clone(),
-                test_state_context(9).rejection_planning_state(identity.source_content()),
+                test_state_context(9).applicability(),
                 None,
                 was_current_rejected,
             );
@@ -6744,7 +6707,7 @@ mod tests {
                     identity,
                     Vec::new(),
                     translation,
-                    test_state_context(10).finish(&TextUnitContent::Value("译文".to_owned())),
+                    test_state_context(10).applicability(),
                     None,
                     true,
                 ),
@@ -6847,7 +6810,7 @@ mod tests {
                     output.identity().clone(),
                     propagation_targets,
                     translation.clone(),
-                    output.state_context().finish(&translation),
+                    output.state_context().applicability(),
                     None,
                     output.was_current_rejected(),
                 ),

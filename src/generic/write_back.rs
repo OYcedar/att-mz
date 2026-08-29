@@ -8,10 +8,9 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue,
-    GenericLanguageProjectionProblem, GenericProblem, GenericUnitLocator,
-    GenericWriteBackSnapshotProblem, GenericWriteBackTextSide, GenericWriteBackUnitProblem,
-    SafeIdentifier, SafePath, StateEffect,
+    Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue, GenericProblem,
+    GenericUnitLocator, GenericWriteBackSnapshotProblem, GenericWriteBackTextSide,
+    GenericWriteBackUnitProblem, SafeIdentifier, SafePath, StateEffect,
 };
 use crate::execution::CooperativeCancellation;
 use crate::translation::candidate_validation::{
@@ -38,8 +37,7 @@ use super::placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderService, GenericSourceBoundPlaceholderError,
 };
 use super::project::GenericStoredSnapshot;
-use super::translate::GenericUnitKey;
-use super::translate::GenericUnitMap;
+use super::translate::{GenericUnitKey, GenericUnitMap, generic_language_projection_problem};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenericCurrentTranslation {
@@ -351,50 +349,6 @@ pub(crate) fn compile_generic_layout_rules(
         );
     }
     Ok(GenericCompiledLayoutRules { widths })
-}
-
-const fn generic_language_projection_problem(
-    source: &LanguageTextProjectionError,
-) -> GenericLanguageProjectionProblem {
-    match source {
-        LanguageTextProjectionError::TokenIndexConstruction => {
-            GenericLanguageProjectionProblem::TokenIndexConstruction
-        }
-        LanguageTextProjectionError::EmptyToken => GenericLanguageProjectionProblem::EmptyToken,
-        LanguageTextProjectionError::MissingToken { .. } => {
-            GenericLanguageProjectionProblem::MissingToken
-        }
-        LanguageTextProjectionError::RepeatedToken { .. } => {
-            GenericLanguageProjectionProblem::RepeatedToken
-        }
-        LanguageTextProjectionError::OverlappingToken { .. } => {
-            GenericLanguageProjectionProblem::OverlappingToken
-        }
-        LanguageTextProjectionError::ChangedTokenOrder { position, .. } => {
-            GenericLanguageProjectionProblem::ChangedTokenOrder {
-                position: *position,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentCount { expected, actual } => {
-            GenericLanguageProjectionProblem::ChangedSegmentCount {
-                expected: *expected,
-                actual: *actual,
-            }
-        }
-        LanguageTextProjectionError::ChangedSegmentKind { segment_index } => {
-            GenericLanguageProjectionProblem::ChangedSegmentKind {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::MissingOrderedToken { segment_index } => {
-            GenericLanguageProjectionProblem::MissingOrderedToken {
-                segment_index: *segment_index,
-            }
-        }
-        LanguageTextProjectionError::UnusedOrderedToken => {
-            GenericLanguageProjectionProblem::UnusedOrderedToken
-        }
-    }
 }
 
 impl From<GenericJsonlError> for GenericWriteBackError {

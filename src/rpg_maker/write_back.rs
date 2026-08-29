@@ -7,11 +7,10 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::project::{ExistingProjectOpener, OpenedProject};
+use super::project::OpenedProject;
 use crate::diagnostic::ReportedFailure;
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::{NoopProgressObserver, ProgressObserver, ProgressSnapshot};
-use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::storage::file_system::ScopedDirectoryScope;
@@ -27,12 +26,6 @@ fn rpg_maker_output_scope(layout: RpgMakerLayout) -> ScopedDirectoryScope {
         None => vec![OsString::from("data"), OsString::from("js")],
     };
     ScopedDirectoryScope::new(roots).expect("固定 RPG Maker 写回顶层目录必须能建立候选编辑范围")
-}
-
-/// 写回指定 RPG Maker 项目所需的输入。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WriteBackInput {
-    pub name: ProjectName,
 }
 
 /// WriteBack 当前可被真实观测的业务阶段；只有存在权威分母的阶段才发布数量进度。
@@ -210,33 +203,27 @@ pub(crate) trait WriteBackPublishingDiagnostic: Sized {
 
 /// 按固定业务顺序编排一次 RPG Maker 文本写回。
 ///
-/// 用例只打开一次项目，准备并验证完整候选，最后只发布一次。发布根接管 token 后，
+/// Application 交入已经打开且持有排他租约的项目；本服务准备并验证完整候选，最后只发布一次。发布根接管 token 后，
 /// 上层不再清理。
-pub(crate) struct WriteBackService<O, S, P, J, K> {
-    project_opener: O,
+pub(crate) struct WriteBackService<S, P, J> {
     rpg_maker_write_back: S,
     publisher: P,
     event_log: J,
-    project_lease: K,
     cancellation: CooperativeCancellation,
     progress: Arc<dyn ProgressObserver<WriteBackProgressPhase>>,
 }
 
-impl<O, S, P, J, K> WriteBackService<O, S, P, J, K> {
+impl<S, P, J> WriteBackService<S, P, J> {
     pub(crate) fn new(
-        project_opener: O,
         rpg_maker_write_back: S,
         publisher: P,
         event_log: J,
-        project_lease: K,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
-            project_opener,
             rpg_maker_write_back,
             publisher,
             event_log,
-            project_lease,
             cancellation,
             progress: Arc::new(NoopProgressObserver),
         }
@@ -262,45 +249,24 @@ impl<O, S, P, J, K> WriteBackService<O, S, P, J, K> {
     }
 }
 
-impl<O, S, P, J, K> WriteBackService<O, S, P, J, K>
+impl<S, P, J> WriteBackService<S, P, J>
 where
-    O: ExistingProjectOpener,
     S: RpgMakerWriteBack,
     P: RpgMakerWriteBackPublisher<S::Documents>,
     J: WriteBackLog,
-    K: ProjectCommandLeaseProvider,
 {
     pub(crate) async fn execute(
         &self,
-        input: WriteBackInput,
-    ) -> Result<
-        OperationCompletion<WriteBackOutput>,
-        WriteBackServiceError<O::Error, S::Error, P::Error, K::Error>,
-    > {
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let WriteBackInput { name } = input;
-        let _lease = self
-            .project_lease
-            .acquire(&name)
-            .await
-            .map_err(WriteBackServiceError::ProjectLease)?;
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let project = self
-            .project_opener
-            .open(&name)
-            .await
-            .map_err(WriteBackServiceError::OpenProject)?;
+        project: &OpenedProject,
+    ) -> Result<OperationCompletion<WriteBackOutput>, WriteBackServiceError<S::Error, P::Error>>
+    {
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
 
         let preparation = self
             .rpg_maker_write_back
-            .prepare(&project)
+            .prepare(project)
             .await
             .map_err(WriteBackServiceError::Prepare)?;
         let OperationCompletion::Completed(preparation) = preparation else {
@@ -314,7 +280,7 @@ where
         self.start_phase(WriteBackProgressPhase::PreparingCandidate);
         let candidate = self
             .publisher
-            .prepare(&project, documents)
+            .prepare(project, documents)
             .await
             .map_err(WriteBackServiceError::PrepareCandidate)?;
         self.complete_phase(WriteBackProgressPhase::PreparingCandidate);
@@ -412,15 +378,13 @@ where
     }
 }
 
-/// WriteBack 顶层用例在打开、准备与候选终结边界遇到的阶段失败。
+/// WriteBack 顶层用例在准备与候选终结边界遇到的阶段失败。
 #[derive(Debug)]
-pub(crate) enum WriteBackServiceError<OE, SE, PE, KE> {
-    ProjectLease(ProjectCommandLeaseError<KE>),
+pub(crate) enum WriteBackServiceError<SE, PE> {
     CancellationDiscard {
         candidate_root: PathBuf,
         discard: PE,
     },
-    OpenProject(OE),
     Prepare(SE),
     PrepareCandidate(PE),
     ValidateCandidate {
@@ -438,16 +402,13 @@ pub(crate) enum WriteBackServiceError<OE, SE, PE, KE> {
     },
 }
 
-impl<OE, SE, PE, KE> fmt::Display for WriteBackServiceError<OE, SE, PE, KE>
+impl<SE, PE> fmt::Display for WriteBackServiceError<SE, PE>
 where
-    OE: Error,
     SE: Error,
     PE: Error,
-    KE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ProjectLease(error) => error.fmt(formatter),
             Self::CancellationDiscard {
                 candidate_root,
                 discard,
@@ -456,7 +417,6 @@ where
                 "取消后无法丢弃写回候选 {}：{discard}",
                 candidate_root.display()
             ),
-            Self::OpenProject(source) => write!(formatter, "打开项目失败：{source}"),
             Self::Prepare(source) => write!(formatter, "准备 RPG Maker 写回失败：{source}"),
             Self::PrepareCandidate(source) => write!(formatter, "准备完整写回候选失败：{source}"),
             Self::ValidateCandidate {
@@ -486,18 +446,14 @@ where
     }
 }
 
-impl<OE, SE, PE, KE> Error for WriteBackServiceError<OE, SE, PE, KE>
+impl<SE, PE> Error for WriteBackServiceError<SE, PE>
 where
-    OE: Error + 'static,
     SE: Error + 'static,
     PE: Error + 'static,
-    KE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ProjectLease(error) => Some(error),
             Self::CancellationDiscard { discard, .. } => Some(discard),
-            Self::OpenProject(source) => Some(source),
             Self::Prepare(source) => Some(source),
             Self::PrepareCandidate(source)
             | Self::ValidateCandidate { source, .. }
@@ -513,7 +469,6 @@ mod tests {
 
     use super::*;
     use crate::progress::ProgressAmount;
-    use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FakeError;
@@ -549,40 +504,6 @@ mod tests {
                 .lock()
                 .expect("进度记录锁不应中毒")
                 .push(snapshot);
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeLeaseProvider {
-        events: Events,
-    }
-
-    impl ProjectCommandLeaseProvider for FakeLeaseProvider {
-        type Error = FakeError;
-        type LeaseState = ();
-
-        async fn acquire(
-            &self,
-            _project: &ProjectName,
-        ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>>
-        {
-            record(&self.events, "lease");
-            Ok(ProjectCommandLease::for_test(()))
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeProjectOpener {
-        project: OpenedProject,
-        events: Events,
-    }
-
-    impl ExistingProjectOpener for FakeProjectOpener {
-        type Error = FakeError;
-
-        async fn open(&self, _name: &ProjectName) -> Result<OpenedProject, Self::Error> {
-            record(&self.events, "open");
-            Ok(self.project.clone())
         }
     }
 
@@ -690,18 +611,12 @@ mod tests {
     fn service(
         events: Events,
         cancellation: CooperativeCancellation,
-    ) -> WriteBackService<FakeProjectOpener, FakeWriteBack, FakePublisher, FakeLog, FakeLeaseProvider>
-    {
-        let project = project();
+    ) -> WriteBackService<FakeWriteBack, FakePublisher, FakeLog> {
         let summary = RpgMakerWriteBackSummary {
             translated_units: 2,
             original_units: 1,
         };
         WriteBackService::new(
-            FakeProjectOpener {
-                project,
-                events: Arc::clone(&events),
-            },
             FakeWriteBack {
                 events: Arc::clone(&events),
                 summary,
@@ -712,9 +627,6 @@ mod tests {
             FakeLog {
                 events: Arc::clone(&events),
             },
-            FakeLeaseProvider {
-                events: Arc::clone(&events),
-            },
             cancellation,
         )
     }
@@ -722,10 +634,9 @@ mod tests {
     #[tokio::test]
     async fn prepares_validates_and_publishes_one_rpg_maker_candidate() {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let project = project();
         let completion = service(Arc::clone(&events), CooperativeCancellation::default())
-            .execute(WriteBackInput {
-                name: "demo".parse().expect("项目名应合法"),
-            })
+            .execute(&project)
             .await
             .expect("写回应成功");
         let OperationCompletion::Completed(output) = completion else {
@@ -737,8 +648,6 @@ mod tests {
         assert_eq!(
             events.lock().expect("事件记录锁不应中毒").as_slice(),
             [
-                "lease",
-                "open",
                 "prepare",
                 "prepare_candidate",
                 "validate",
@@ -753,12 +662,11 @@ mod tests {
     async fn candidate_lifecycle_phases_have_explicit_start_and_completion() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let progress = RecordingProgress::default();
+        let project = project();
 
         service(Arc::clone(&events), CooperativeCancellation::default())
             .with_progress(progress.clone())
-            .execute(WriteBackInput {
-                name: "demo".parse().expect("项目名应合法"),
-            })
+            .execute(&project)
             .await
             .expect("写回应成功");
 
@@ -826,15 +734,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_before_acquiring_a_project_leaves_everything_untouched() {
+    async fn cancellation_before_preparation_leaves_everything_untouched() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let cancellation = CooperativeCancellation::default();
         cancellation.request();
+        let project = project();
 
         let completion = service(Arc::clone(&events), cancellation)
-            .execute(WriteBackInput {
-                name: "demo".parse().expect("项目名应合法"),
-            })
+            .execute(&project)
             .await
             .expect("预先取消应返回正常结果");
 

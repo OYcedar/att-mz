@@ -1464,8 +1464,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn dense_punctuation_sequence_repairs_without_an_artificial_capacity_limit() {
+    fn release_stress_dense_punctuation_sequence_repairs_without_an_artificial_capacity_limit() {
         const SYMBOLS: usize = 1_024;
         let source = natural(&",".repeat(SYMBOLS));
         let translation = natural(&"、".repeat(SYMBOLS));

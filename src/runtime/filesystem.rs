@@ -7255,8 +7255,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn overlay_source_has_no_att_size_cap_and_still_rejects_hardlinks() {
+    fn release_stress_overlay_source_has_no_att_size_cap() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let oversized_source = temporary.path().join("oversized-source");
         let oversized_stage = temporary.path().join("oversized-stage");
@@ -7285,7 +7286,11 @@ mod tests {
             &cancellation,
         )
         .expect("ATT 不应按来源文件大小提前拒绝覆盖 manifest");
+    }
 
+    #[test]
+    fn overlay_source_rejects_hardlinks() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let hardlink_source = temporary.path().join("hardlink-source");
         let hardlink_stage = temporary.path().join("hardlink-stage");
         fs::create_dir(&hardlink_source).expect("应该可建立硬链接来源目录");
@@ -7298,6 +7303,11 @@ mod tests {
             DirectorySourceMapping::new(hardlink_source, PathBuf::from("content"))
                 .expect("测试来源映射应合法"),
         ];
+        let overlays = vec![
+            DirectoryFileOverlay::new(PathBuf::from("content/catalog.json"), vec![1])
+                .expect("测试覆盖应合法"),
+        ];
+        let cancellation = AtomicBool::new(true);
         let error = build_candidate_manifest(
             &hardlink_stage,
             &temporary.path().join("hardlink-target"),
@@ -7835,8 +7845,9 @@ mod tests {
         root.shutdown().await.expect("文件系统根应该可终结");
     }
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn scoped_write_accepts_growth_without_an_att_tree_budget() {
+    async fn release_stress_scoped_write_accepts_growth_without_an_att_tree_budget() {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         fs::create_dir_all(source.join("assets")).expect("应该可建立资源来源");
@@ -7933,8 +7944,7 @@ mod tests {
         root.shutdown().await.expect("文件系统根应该可终结");
     }
 
-    #[tokio::test]
-    async fn publish_revalidates_and_accepts_large_files_added_after_prepare() {
+    async fn assert_publish_revalidates_added_file(contents: Vec<u8>) {
         let temporary = tempfile::tempdir().expect("应该可创建临时目录");
         let source = temporary.path().join("source");
         fs::create_dir(&source).expect("应该可创建来源目录");
@@ -7950,23 +7960,31 @@ mod tests {
             .await
             .expect("候选应可准备");
         let staging_root = staged.staging_root().to_path_buf();
-        fs::write(
-            staging_root.join("oversized.db"),
-            vec![0_u8; 512 * 1024 + 1],
-        )
-        .expect("非根服务应可在候选中新增文件");
+        let expected_len = u64::try_from(contents.len()).expect("测试文件长度应可表示为 u64");
+        fs::write(staging_root.join("added.db"), contents).expect("非根服务应可在候选中新增文件");
 
         root.publish(staged)
             .await
-            .expect("完整复核不应按文件大小提前拒绝候选");
+            .expect("完整复核应接受新增的普通文件");
         assert_eq!(
-            fs::metadata(target.join("oversized.db"))
-                .expect("大文件应随候选发布")
+            fs::metadata(target.join("added.db"))
+                .expect("新增文件应随候选发布")
                 .len(),
-            512 * 1024 + 1
+            expected_len
         );
         assert!(!staging_root.exists(), "发布后候选路径应被目录交换移走");
         root.shutdown().await.expect("文件系统根应可终结");
+    }
+
+    #[tokio::test]
+    async fn publish_revalidates_files_added_after_prepare() {
+        assert_publish_revalidates_added_file(b"added after prepare".to_vec()).await;
+    }
+
+    #[cfg(feature = "release-stress")]
+    #[tokio::test]
+    async fn release_stress_publish_revalidates_and_accepts_large_files_added_after_prepare() {
+        assert_publish_revalidates_added_file(vec![0_u8; 512 * 1024 + 1]).await;
     }
 
     #[tokio::test]

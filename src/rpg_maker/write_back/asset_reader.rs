@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, ReportedFailure, RpgMakerClaimSummaryMismatchDetails,
-    RpgMakerClaimSummaryMismatchKind, RpgMakerComputeFailure, RpgMakerIssue,
-    RpgMakerJsonFailureKind, RpgMakerLogicalUnitLocator, RpgMakerMutationAccess,
-    RpgMakerSemanticOrderLevel, RpgMakerWriteBackAssetComputeOperation,
-    RpgMakerWriteBackAssetProblem, RpgMakerWriteBackAssetSnapshotViolation,
-    RpgMakerWriteBackModelViolation, SafeIdentifier, SafePath, SqliteDiagnosticContext,
-    SqliteDiagnosticStage, SqliteOperation, SqliteTransactionState, StateEffect, TranslationIssue,
-    TranslationJsonFailureKind, TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
+    RpgMakerClaimSummaryMismatchKind, RpgMakerIssue, RpgMakerJsonFailureKind,
+    RpgMakerLogicalUnitLocator, RpgMakerMutationAccess, RpgMakerSemanticOrderLevel,
+    RpgMakerWriteBackAssetComputeOperation, RpgMakerWriteBackAssetProblem,
+    RpgMakerWriteBackAssetSnapshotViolation, RpgMakerWriteBackModelViolation, SafeIdentifier,
+    SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteOperation,
+    SqliteTransactionState, StateEffect, TranslationIssue, TranslationJsonFailureKind,
+    TranslationPlanningResourceKind, TranslationPlanningResourceOrigin,
     TranslationPlanningResourceProblem,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -842,16 +842,7 @@ fn write_back_asset_compute_report(
     operation: RpgMakerWriteBackAssetComputeOperation,
     source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
 ) -> DiagnosticReport {
-    let failure = match source {
-        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
-            RpgMakerComputeFailure::ExecutorClosed
-        }
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
-            RpgMakerComputeFailure::StatePoisoned
-        }
-        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
-    };
+    let failure = crate::rpg_maker::compute_failure(source);
     write_back_asset_report(
         database_path,
         RpgMakerWriteBackAssetProblem::Compute { operation, failure },
@@ -1199,13 +1190,7 @@ const fn diagnostic_mutation_access(access: MutationResourceAccess) -> RpgMakerM
 }
 
 fn write_back_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
-    }
+    JsonErrorCategory::from(source).into()
 }
 
 fn write_back_model_violation(
@@ -1945,7 +1930,7 @@ fn logical_group_source_contexts(groups: &[GroupBuilder]) -> HashMap<String, Sha
                         .expect("已经从规范持久编码解出的 Unit 顺序键必须能重新编码")
                 })
                 .collect::<Vec<_>>();
-            let context = crate::translation::rpg_maker_group_source_context_v2(
+            let context = crate::translation::rpg_maker_group_source_context(
                 &definition.group_kind_raw,
                 units.iter().zip(&encoded_unit_orders).map(|(unit, order)| {
                     (
@@ -2207,7 +2192,7 @@ fn assemble_snapshot(
             .units
             .into_iter()
             .map(|unit| {
-                let expected = crate::translation::rpg_maker_automatic_applicability_v2(
+                let expected = crate::translation::rpg_maker_applicability(
                     source_language,
                     target_language,
                     owner.storage_name(),
@@ -2219,12 +2204,9 @@ fn assemble_snapshot(
                     &unit.source_context_json,
                     group_source_context,
                 );
-                let automatic = unit.automatic_translation.and_then(|(translation, state)| {
-                    crate::translation::rpg_maker_automatic_applicability_is_current(
-                        state, expected,
-                    )
-                    .then_some(translation)
-                });
+                let automatic = unit
+                    .automatic_translation
+                    .and_then(|(translation, state)| (state == expected).then_some(translation));
                 let created = if let Some(manual) = unit.manual_translation {
                     RpgMakerWriteBackUnit::new_manual(unit.role, unit.source_content, manual)
                 } else {

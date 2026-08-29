@@ -1143,7 +1143,7 @@ struct OriginalPlaceholderOccurrences {
 
 struct OriginalPlaceholderOccurrenceIndex {
     by_group: Vec<OriginalPlaceholderOccurrences>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     scanned_lines: usize,
 }
 
@@ -1164,7 +1164,7 @@ fn index_original_placeholder_occurrences_with_cancellation<E>(
     if groups_requiring_scan.is_empty() {
         return Ok(Ok(OriginalPlaceholderOccurrenceIndex {
             by_group,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "release-stress"))]
             scanned_lines: 0,
         }));
     }
@@ -1200,11 +1200,11 @@ fn index_original_placeholder_occurrences_with_cancellation<E>(
         Ok(matcher) => matcher,
         Err(source) => return Ok(Err(source)),
     };
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     let mut scanned_lines = 0_usize;
     for (line_index, (line, scan)) in lines.iter().zip(scans).enumerate() {
         ensure_running()?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "release-stress"))]
         {
             scanned_lines += 1;
         }
@@ -1246,7 +1246,7 @@ fn index_original_placeholder_occurrences_with_cancellation<E>(
     ensure_running()?;
     Ok(Ok(OriginalPlaceholderOccurrenceIndex {
         by_group,
-        #[cfg(test)]
+        #[cfg(all(test, feature = "release-stress"))]
         scanned_lines,
     }))
 }
@@ -1283,11 +1283,11 @@ fn index_single_original_placeholder_occurrences_with_cancellation<E>(
         prefix_lengths.push(matched);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     let mut scanned_lines = 0_usize;
     for (line_index, (line, scan)) in lines.iter().zip(scans).enumerate() {
         ensure_running()?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "release-stress"))]
         {
             scanned_lines += 1;
         }
@@ -1321,7 +1321,7 @@ fn index_single_original_placeholder_occurrences_with_cancellation<E>(
     ensure_running()?;
     Ok(Ok(OriginalPlaceholderOccurrenceIndex {
         by_group,
-        #[cfg(test)]
+        #[cfg(all(test, feature = "release-stress"))]
         scanned_lines,
     }))
 }
@@ -2120,8 +2120,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn validation_projection_and_restoration_share_one_large_token_scan() {
+    fn release_stress_validation_projection_and_restoration_share_one_large_token_scan() {
         let placeholders = (0..8_192)
             .map(|index| {
                 applied_with_original(
@@ -2156,8 +2157,9 @@ mod tests {
         assert!(restored.contains("<原片段8191>"));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn many_line_token_queries_scale_with_actual_matches() {
+    fn release_stress_many_line_token_queries_scale_with_actual_matches() {
         const PLACEHOLDER_COUNT: usize = 2_048;
 
         let placeholders = (0..PLACEHOLDER_COUNT)
@@ -2323,8 +2325,9 @@ mod tests {
         assert_eq!(lines, [format!("{token} protected")]);
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn source_original_matcher_scans_each_candidate_line_once() {
+    fn release_stress_source_original_matcher_scans_each_candidate_line_once() {
         const PLACEHOLDER_COUNT: usize = 512;
         let placeholders = (0..PLACEHOLDER_COUNT)
             .map(|index| {

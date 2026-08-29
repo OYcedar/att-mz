@@ -1,10 +1,8 @@
 //! 翻译项目命令与通用排他文件租约之间的唯一映射边界。
 
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use crate::diagnostic::{
@@ -24,55 +22,7 @@ const PROJECT_LOCK_DIRECTORY: &str = "projects";
 /// 持有同一翻译项目的跨进程排他权直到完整命令结束。
 #[must_use = "项目命令租约必须存活到完整命令及运行方案最终提交结束"]
 pub(crate) struct ProjectCommandLease<T> {
-    _lease: Option<ExclusiveFileLease<T>>,
-}
-
-#[cfg(test)]
-impl<T> ProjectCommandLease<T> {
-    pub(crate) fn for_test(state: T) -> Self {
-        Self {
-            _lease: Some(ExclusiveFileLease::new(state)),
-        }
-    }
-}
-
-impl ProjectCommandLease<()> {
-    /// 建立一个只用于下层既有服务签名的租约见证。
-    ///
-    /// 组合根必须同时持有由真实 `ProjectCommandLeaseService` 返回的租约。该见证本身
-    /// 不拥有任何锁，只避免下层服务再次获取同一把不可重入的项目锁。
-    const fn already_held() -> Self {
-        Self { _lease: None }
-    }
-}
-
-/// 组合根已经持有真实项目租约时，向既有纵向服务提供的无二次加锁见证。
-///
-/// 本类型只能从仍存活的真实租约借用构造；不提供 `Default` 或无参构造，因而下层服务
-/// 无法在组合根未持锁时伪造“已经持有”状态。
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AlreadyHeldProjectCommandLeaseProvider<'lease> {
-    _lease: PhantomData<&'lease ()>,
-}
-
-impl<'lease> AlreadyHeldProjectCommandLeaseProvider<'lease> {
-    pub(crate) const fn new<T>(_lease: &'lease ProjectCommandLease<T>) -> Self {
-        Self {
-            _lease: PhantomData,
-        }
-    }
-}
-
-impl ProjectCommandLeaseProvider for AlreadyHeldProjectCommandLeaseProvider<'_> {
-    type Error = Infallible;
-    type LeaseState = ();
-
-    async fn acquire(
-        &self,
-        _project: &ProjectName,
-    ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>> {
-        Ok(ProjectCommandLease::already_held())
-    }
+    _lease: ExclusiveFileLease<T>,
 }
 
 /// 为同一引擎内的同名项目串行化命令。
@@ -139,9 +89,7 @@ where
                     }
                 }
             })?;
-        Ok(ProjectCommandLease {
-            _lease: Some(lease),
-        })
+        Ok(ProjectCommandLease { _lease: lease })
     }
 }
 
@@ -243,20 +191,5 @@ mod tests {
         );
         assert_eq!(requests[0].identity(), std::ffi::OsStr::new("游戏 One"));
         drop(lease);
-    }
-
-    #[tokio::test]
-    async fn already_held_provider_is_borrowed_from_a_live_real_lease() {
-        let real_lease = ProjectCommandLease::for_test(());
-        let provider = AlreadyHeldProjectCommandLeaseProvider::new(&real_lease);
-        let project = "借用见证".parse().expect("测试项目名应该合法");
-
-        let nested_witness = provider
-            .acquire(&project)
-            .await
-            .expect("存活的真实租约应可建立下层见证");
-
-        drop(nested_witness);
-        drop(real_lease);
     }
 }

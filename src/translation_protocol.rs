@@ -9,9 +9,7 @@ use std::fmt;
 use std::io::{self, BufReader, Read};
 use std::num::NonZeroUsize;
 
-use att_json_repair::{
-    RepairError, RepairErrorKind, RepairOutput, RepairPolicy, repair_with_cancellation,
-};
+use att_json_repair::{RepairError, RepairOutput, repair_with_cancellation};
 use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
@@ -56,10 +54,6 @@ pub(crate) enum TranslationTaskResponseJsonErrorCategory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TranslationTaskResponseParseErrorKind {
     Json(TranslationTaskResponseJsonErrorCategory),
-    JsonRepair {
-        category: TranslationTaskResponseJsonErrorCategory,
-        repair: RepairErrorKind,
-    },
     ThinkingEmpty,
 }
 
@@ -67,7 +61,7 @@ pub(crate) enum TranslationTaskResponseParseErrorKind {
 impl TranslationTaskResponseParseErrorKind {
     pub(crate) const fn code(self) -> &'static str {
         match self {
-            Self::Json(_) | Self::JsonRepair { .. } => "json",
+            Self::Json(_) => "json",
             Self::ThinkingEmpty => "thinking_empty",
         }
     }
@@ -406,11 +400,7 @@ pub(crate) fn parse_translation_response_with_cancellation<E>(
         )?));
     }
 
-    let repaired = match repair_with_cancellation(
-        value.value,
-        RepairPolicy::Conservative,
-        &mut ensure_running,
-    )? {
+    let repaired = match repair_with_cancellation(value.value, &mut ensure_running)? {
         Ok(repaired) => repaired,
         Err(repair_error) => {
             return Ok(Err(translation_response_repair_error_with_cancellation(
@@ -691,10 +681,7 @@ fn translation_response_repair_error_with_cancellation<E>(
     let (line, column) =
         original.location_at_with_cancellation(repair_error.original_offset(), ensure_running)?;
     Ok(TranslationTaskResponseParseError::new(
-        TranslationTaskResponseParseErrorKind::JsonRepair {
-            category,
-            repair: repair_error.kind(),
-        },
+        TranslationTaskResponseParseErrorKind::Json(category),
         line,
         column,
     ))
@@ -1370,8 +1357,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn keeps_each_id_raw_value_without_recursing_into_wrong_shapes() {
+    fn release_stress_keeps_each_id_raw_value_without_recursing_into_wrong_shapes() {
         const DEPTH: usize = 10_000;
 
         let deep_value = format!("{}0{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
@@ -1594,20 +1582,18 @@ mod tests {
         .expect_err("多个 JSON 围栏必须保持为歧义响应");
         assert_eq!(
             multiple_fences.kind(),
-            TranslationTaskResponseParseErrorKind::JsonRepair {
-                category: TranslationTaskResponseJsonErrorCategory::Syntax,
-                repair: RepairErrorKind::MultipleJsonCandidates,
-            }
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::Syntax
+            )
         );
 
         let quoted = parse_translation_response(r#"{"0":["type: "free""]}"#, mode(false, false))
             .expect_err("内部双引号存在多种合理解释时必须拒绝整份响应");
         assert_eq!(
             quoted.kind(),
-            TranslationTaskResponseParseErrorKind::JsonRepair {
-                category: TranslationTaskResponseJsonErrorCategory::Syntax,
-                repair: RepairErrorKind::AmbiguousStringQuote,
-            }
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::Syntax
+            )
         );
 
         let adjacent =
@@ -1615,20 +1601,18 @@ mod tests {
                 .expect_err("空白分隔的相邻引号也不能被猜成两个译文数组项");
         assert_eq!(
             adjacent.kind(),
-            TranslationTaskResponseParseErrorKind::JsonRepair {
-                category: TranslationTaskResponseJsonErrorCategory::Syntax,
-                repair: RepairErrorKind::AmbiguousStringQuote,
-            }
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::Syntax
+            )
         );
 
         let unterminated = parse_translation_response("{\"0\":[\"unfinished]}", mode(false, false))
             .expect_err("未结束字符串不能由保守修复器补造结束引号");
         assert_eq!(
             unterminated.kind(),
-            TranslationTaskResponseParseErrorKind::JsonRepair {
-                category: TranslationTaskResponseJsonErrorCategory::UnexpectedEof,
-                repair: RepairErrorKind::UnterminatedString,
-            }
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::UnexpectedEof
+            )
         );
 
         let repaired_shape = parse_translation_response(
@@ -1652,10 +1636,9 @@ mod tests {
         .expect_err("多个 JSON 候选必须由 Conservative 拒绝");
         assert_eq!(
             repair_rejection.kind(),
-            TranslationTaskResponseParseErrorKind::JsonRepair {
-                category: TranslationTaskResponseJsonErrorCategory::Syntax,
-                repair: RepairErrorKind::MultipleJsonCandidates,
-            }
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::Syntax
+            )
         );
         assert_eq!(repair_rejection.line().get(), 2);
         assert_eq!(repair_rejection.column().get(), 1);

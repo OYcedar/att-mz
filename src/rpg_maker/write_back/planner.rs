@@ -9,10 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use super::{RpgMakerWriteBack, RpgMakerWriteBackSummary, WriteBackProgressPhase};
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, PlaceholderRuleSource, RpgMakerComputeFailure, RpgMakerIssue,
-    RpgMakerUnitLocator, RpgMakerWriteBackChoicesPlanViolation,
-    RpgMakerWriteBackDialoguePlanViolation, RpgMakerWriteBackMutationPlanViolation,
-    RpgMakerWriteBackPlanningProblem, StateEffect,
+    Diagnostic, DiagnosticReport, PlaceholderRuleSource, RpgMakerIssue, RpgMakerUnitLocator,
+    RpgMakerWriteBackChoicesPlanViolation, RpgMakerWriteBackDialoguePlanViolation,
+    RpgMakerWriteBackMutationPlanViolation, RpgMakerWriteBackPlanningProblem, StateEffect,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
@@ -1130,9 +1129,9 @@ fn validate_line_references(
 struct ExpectedRawCursor<'a> {
     expected_raw: &'a [u8],
     offset: Option<usize>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     visited_segments: usize,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     visited_segment_bytes: usize,
 }
 
@@ -1141,15 +1140,15 @@ impl<'a> ExpectedRawCursor<'a> {
         Self {
             expected_raw: expected_raw.as_bytes(),
             offset: Some(0),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "release-stress"))]
             visited_segments: 0,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "release-stress"))]
             visited_segment_bytes: 0,
         }
     }
 
     fn consume(&mut self, segment: &str) {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "release-stress"))]
         {
             self.visited_segments += 1;
             self.visited_segment_bytes += segment.len();
@@ -1170,7 +1169,7 @@ impl<'a> ExpectedRawCursor<'a> {
         self.offset == Some(self.expected_raw.len())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     fn work(&self) -> (usize, usize) {
         (self.visited_segments, self.visited_segment_bytes)
     }
@@ -3184,16 +3183,7 @@ where
 pub(crate) fn write_back_planning_compute_report(
     source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
 ) -> DiagnosticReport {
-    let failure = match source {
-        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
-            RpgMakerComputeFailure::ExecutorClosed
-        }
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
-            RpgMakerComputeFailure::StatePoisoned
-        }
-        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
-    };
+    let failure = crate::rpg_maker::compute_failure(source);
     DiagnosticReport::new(
         StateEffect::Unchanged,
         Diagnostic::rpg_maker(RpgMakerIssue::write_back_planning(
@@ -3205,6 +3195,7 @@ pub(crate) fn write_back_planning_compute_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "release-stress")]
     use crate::progress::ProgressAmount;
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
@@ -3212,9 +3203,11 @@ mod tests {
     };
     use crate::rpg_maker::text::{RpgMakerLocationStep, RpgMakerSource, StandardDataFile};
 
+    #[cfg(feature = "release-stress")]
     #[derive(Clone, Default)]
     struct RecordingPlanningProgress(Arc<Mutex<Vec<ProgressSnapshot<WriteBackProgressPhase>>>>);
 
+    #[cfg(feature = "release-stress")]
     impl ProgressObserver<WriteBackProgressPhase> for RecordingPlanningProgress {
         fn observe(&self, snapshot: ProgressSnapshot<WriteBackProgressPhase>) {
             self.0
@@ -3280,8 +3273,9 @@ mod tests {
         assert_eq!(result, OperationCompletion::Completed(()));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn large_parallel_planning_coalesces_progress_and_keeps_the_exact_final_count() {
+    fn release_stress_large_parallel_planning_coalesces_progress() {
         const TOTAL: u64 = 217_000;
         const WORKERS: usize = 8;
 
@@ -3637,8 +3631,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn large_expected_raw_cursor_has_linear_borrowed_segment_work() {
+    fn release_stress_large_expected_raw_cursor_has_linear_borrowed_segment_work() {
         const SEGMENTS: usize = 262_144;
         const SEGMENT: &str = "片段🙂世界🌏";
 

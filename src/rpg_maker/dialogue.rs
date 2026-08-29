@@ -949,13 +949,7 @@ fn json_error_classification(source: &serde_json::Error) -> &'static str {
 }
 
 fn dialogue_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
-    }
+    JsonErrorCategory::from(source).into()
 }
 
 fn dialogue_pcre2_failure(source: &pcre2::Error) -> Pcre2Failure {

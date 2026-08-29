@@ -17,7 +17,6 @@ pub(crate) mod task_record;
 /// 翻译指定 RPG Maker 游戏所需的输入。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranslateInput {
-    pub name: ProjectName,
     /// 本次翻译使用的外部术语表；`None` 不表示权威空术语表。
     pub terminology_path: Option<PathBuf>,
     /// 本次补充的占位符规则；`None` 不关闭 RPG Maker 内置保护规格。

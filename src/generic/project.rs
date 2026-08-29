@@ -27,10 +27,13 @@ use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{SHA256_FINGERPRINT_BYTES, Sha256Fingerprint, Sha256FramedHasher};
 use crate::language::{LanguageId, LanguageIdError, LanguagePair};
 use crate::project_name::ProjectName;
+use crate::runtime::performance::{
+    RunPerformanceCounters, SqliteTransactionControl, SqliteTransactionScope,
+};
 use crate::runtime::sqlite::{
     AttSqliteCancellableConnection, AttSqliteCancellationHandle,
     apply_att_sqlite_cancellable_read_write_policy, apply_att_sqlite_new_database_page_policy,
-    suspend_att_sqlite_cancellation,
+    begin_cancellable_transaction, execute_transaction_control, suspend_att_sqlite_cancellation,
 };
 use crate::translation::TranslationOrigin;
 use crate::translation::candidate_validation::ProvenInvariantViolation;
@@ -681,6 +684,7 @@ pub(crate) struct GenericProjectStore {
     workspace_root: PathBuf,
     database_path: PathBuf,
     cancellation: CooperativeCancellation,
+    performance: Arc<RunPerformanceCounters>,
 }
 
 impl fmt::Debug for GenericProjectStore {
@@ -697,18 +701,24 @@ impl fmt::Debug for GenericProjectStore {
 impl GenericProjectStore {
     #[cfg(test)]
     pub(crate) fn for_workspace(workspace_root: PathBuf) -> Self {
-        Self::for_workspace_with_cancellation(workspace_root, CooperativeCancellation::default())
+        Self::for_workspace_with_cancellation(
+            workspace_root,
+            CooperativeCancellation::default(),
+            Arc::new(RunPerformanceCounters::default()),
+        )
     }
 
     pub(crate) fn for_workspace_with_cancellation(
         workspace_root: PathBuf,
         cancellation: CooperativeCancellation,
+        performance: Arc<RunPerformanceCounters>,
     ) -> Self {
         let database_path = workspace_root.join(DATABASE_FILE_NAME);
         Self {
             workspace_root,
             database_path,
             cancellation,
+            performance,
         }
     }
 
@@ -720,20 +730,28 @@ impl GenericProjectStore {
     pub(crate) fn initialize(
         request: GenericInitRequest,
     ) -> Result<(Self, GenericProject), GenericProjectError> {
-        Self::initialize_with_cancellation(request, CooperativeCancellation::default())
+        Self::initialize_with_cancellation(
+            request,
+            CooperativeCancellation::default(),
+            Arc::new(RunPerformanceCounters::default()),
+        )
     }
 
     pub(crate) fn initialize_with_cancellation(
         request: GenericInitRequest,
         cancellation: CooperativeCancellation,
+        performance: Arc<RunPerformanceCounters>,
     ) -> Result<(Self, GenericProject), GenericProjectError> {
         if request.workspace_root.exists() && !request.workspace_root.is_dir() {
             return Err(GenericProjectError::WorkspaceNotDirectory {
                 path: request.workspace_root,
             });
         }
-        let store =
-            Self::for_workspace_with_cancellation(request.workspace_root.clone(), cancellation);
+        let store = Self::for_workspace_with_cancellation(
+            request.workspace_root.clone(),
+            cancellation,
+            performance,
+        );
         let project = store.finish_cancellable(store.initialize_inner(request))?;
         Ok((store, project))
     }
@@ -776,6 +794,8 @@ impl GenericProjectStore {
             run_cancellable_transaction(
                 &mut connection,
                 &self.cancellation,
+                self.performance.as_ref(),
+                SqliteTransactionScope::DatabaseInitialization,
                 "开始 Generic Init 事务",
                 "提交 Generic Init",
                 "回滚 Generic Init",
@@ -898,6 +918,7 @@ impl GenericProjectStore {
                 source_language,
                 target_language,
                 &self.cancellation,
+                self.performance.as_ref(),
             )?;
             validate_schema_with_cancellation(&connection, &self.cancellation)?;
             publish_initial_database_candidate(
@@ -959,6 +980,8 @@ impl GenericProjectStore {
         let reconciled = run_cancellable_transaction(
             &mut connection,
             &self.cancellation,
+            self.performance.as_ref(),
+            SqliteTransactionScope::WritePlan,
             "开始 Generic Extract 事务",
             "提交 Generic Extract",
             "回滚 Generic Extract",
@@ -1173,6 +1196,8 @@ impl GenericProjectStore {
         run_cancellable_transaction(
             &mut connection,
             &self.cancellation,
+            self.performance.as_ref(),
+            SqliteTransactionScope::WritePlan,
             "开始 Generic 译文提交事务",
             "完成 Generic 译文提交",
             "回滚 Generic 译文提交",
@@ -1462,6 +1487,8 @@ impl GenericProjectStore {
         run_cancellable_transaction(
             &mut connection,
             &self.cancellation,
+            self.performance.as_ref(),
+            SqliteTransactionScope::WritePlan,
             "开始保存 Generic 最近 Profile",
             "提交 Generic 最近 Profile",
             "回滚 Generic 最近 Profile",
@@ -1537,6 +1564,8 @@ impl GenericProjectStore {
         run_cancellable_transaction(
             &mut connection,
             &self.cancellation,
+            self.performance.as_ref(),
+            SqliteTransactionScope::WritePlan,
             "开始保存 Generic 排版规则",
             "提交 Generic 排版规则",
             "回滚 Generic 排版规则",
@@ -1635,6 +1664,8 @@ impl GenericProjectStore {
         run_cancellable_transaction(
             &mut connection,
             &self.cancellation,
+            self.performance.as_ref(),
+            SqliteTransactionScope::WritePlan,
             "开始保存 Generic 翻译资源",
             "提交 Generic 翻译资源",
             "回滚 Generic 翻译资源",
@@ -1990,9 +2021,15 @@ impl Error for GenericTransactionFinalizationFailure {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "事务连接、取消、计数范围、三条终态诊断和业务体都是本边界的直接输入"
+)]
 fn run_cancellable_transaction<T>(
     connection: &mut AttSqliteCancellableConnection,
     cancellation: &CooperativeCancellation,
+    performance: &RunPerformanceCounters,
+    scope: SqliteTransactionScope,
     begin_operation: &'static str,
     commit_operation: &'static str,
     rollback_operation: &'static str,
@@ -2000,12 +2037,12 @@ fn run_cancellable_transaction<T>(
 ) -> Result<T, GenericProjectError> {
     let cancellation_handle = connection.cancellation_handle();
     let mut transaction =
-        connection
-            .transaction()
-            .map_err(|source| GenericProjectError::Sqlite {
+        begin_cancellable_transaction(connection, performance, scope).map_err(|source| {
+            GenericProjectError::Sqlite {
                 operation: begin_operation,
                 source,
-            })?;
+            }
+        })?;
     let body_result = body(&transaction);
 
     // 从这里开始只允许本函数显式确定终态，不能再让 Transaction::drop 吞掉回滚错误。
@@ -2014,18 +2051,24 @@ fn run_cancellable_transaction<T>(
         Err(primary) => Err(rollback_generic_transaction(
             &transaction,
             &cancellation_handle,
+            performance,
+            scope,
             primary,
             rollback_operation,
         )),
         Ok(_) if cancellation.is_requested() => Err(rollback_generic_transaction(
             &transaction,
             &cancellation_handle,
+            performance,
+            scope,
             GenericProjectError::Cancelled,
             rollback_operation,
         )),
         Ok(value) => commit_generic_transaction(
             &transaction,
             &cancellation_handle,
+            performance,
+            scope,
             commit_operation,
             rollback_operation,
         )
@@ -2038,6 +2081,8 @@ fn run_cancellable_transaction<T>(
 fn rollback_generic_transaction(
     transaction: &Transaction<'_>,
     cancellation: &AttSqliteCancellationHandle,
+    performance: &RunPerformanceCounters,
+    scope: SqliteTransactionScope,
     primary: GenericProjectError,
     rollback_operation: &'static str,
 ) -> GenericProjectError {
@@ -2046,7 +2091,13 @@ fn rollback_generic_transaction(
     }
 
     let suspension = suspend_att_sqlite_cancellation(cancellation);
-    let rollback = transaction.execute_batch("ROLLBACK");
+    let rollback = execute_transaction_control(
+        transaction,
+        performance,
+        scope,
+        SqliteTransactionControl::Rollback,
+        "ROLLBACK",
+    );
     let is_autocommit = transaction.is_autocommit();
     drop(suspension);
 
@@ -2074,12 +2125,20 @@ fn rollback_generic_transaction(
 fn commit_generic_transaction(
     transaction: &Transaction<'_>,
     cancellation: &AttSqliteCancellationHandle,
+    performance: &RunPerformanceCounters,
+    scope: SqliteTransactionScope,
     commit_operation: &'static str,
     rollback_operation: &'static str,
 ) -> Result<(), GenericProjectError> {
     let suspension = suspend_att_sqlite_cancellation(cancellation);
 
-    let commit = transaction.execute_batch("COMMIT");
+    let commit = execute_transaction_control(
+        transaction,
+        performance,
+        scope,
+        SqliteTransactionControl::Commit,
+        "COMMIT",
+    );
     let is_autocommit = transaction.is_autocommit();
     let result = match commit {
         Ok(()) if is_autocommit => Ok(()),
@@ -2103,7 +2162,13 @@ fn commit_generic_transaction(
             },
         }),
         Err(source) => {
-            let rollback = transaction.execute_batch("ROLLBACK");
+            let rollback = execute_transaction_control(
+                transaction,
+                performance,
+                scope,
+                SqliteTransactionControl::Rollback,
+                "ROLLBACK",
+            );
             let rollback_autocommit = transaction.is_autocommit();
             match rollback {
                 Ok(()) if rollback_autocommit => {
@@ -2855,11 +2920,7 @@ fn sqlite_error_is_interrupted(source: &rusqlite::Error) -> bool {
     )
 }
 
-fn cancellable_sqlite_error(
-    operation: &'static str,
-    source: rusqlite::Error,
-    _cancellation: &(impl GenericOperationCancellation + ?Sized),
-) -> GenericProjectError {
+fn sqlite_operation_error(operation: &'static str, source: rusqlite::Error) -> GenericProjectError {
     if sqlite_error_is_interrupted(&source) {
         GenericProjectError::Cancelled
     } else {
@@ -2891,24 +2952,24 @@ struct GenericProjectRow {
 
 fn load_generic_project_row_with_cancellation(
     connection: &Connection,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericProjectRow, GenericProjectError> {
     const OPERATION: &str = "读取 Generic 项目记录";
 
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let mut statement = connection
         .prepare(
             "SELECT project_name, source_root, source_language, target_language,
                     extracted_raw_fingerprint, extracted_asset_fingerprint, last_profile_id
              FROM main.generic_project WHERE singleton = 1",
         )
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?;
     let mut rows = statement
         .query([])
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?;
     let Some(row) = rows
         .next()
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?
     else {
         return Err(invalid_database(
             GenericProjectDatabaseProblem::MissingProjectRow,
@@ -2950,7 +3011,7 @@ fn load_generic_project_row_with_cancellation(
     };
     drop(rows);
     drop(statement);
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(project)
 }
 
@@ -2964,7 +3025,7 @@ fn clone_sqlite_text_column_with_cancellation(
     row: &Row<'_>,
     index: usize,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<String, GenericProjectError> {
     let value = row
         .get_ref(index)
@@ -2985,7 +3046,7 @@ fn clone_optional_sqlite_text_column_with_cancellation(
     row: &Row<'_>,
     index: usize,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Option<String>, GenericProjectError> {
     let value = row
         .get_ref(index)
@@ -3007,7 +3068,7 @@ fn clone_sqlite_text_value_with_cancellation(
     bytes: &[u8],
     index: usize,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<String, GenericProjectError> {
     let bytes = clone_sqlite_bytes_with_cancellation(bytes, cancellation)?;
     validate_sqlite_utf8_with_cancellation(&bytes, index, operation, cancellation)?;
@@ -3020,7 +3081,7 @@ fn clone_sqlite_blob_column_with_cancellation(
     row: &Row<'_>,
     index: usize,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<u8>, GenericProjectError> {
     let value = row
         .get_ref(index)
@@ -3038,7 +3099,7 @@ fn clone_optional_sqlite_blob_column_with_cancellation(
     row: &Row<'_>,
     index: usize,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Option<Vec<u8>>, GenericProjectError> {
     let value = row
         .get_ref(index)
@@ -3066,27 +3127,27 @@ fn invalid_sqlite_column_type(row: &Row<'_>, index: usize, value: ValueRef<'_>) 
 
 fn clone_sqlite_bytes_with_cancellation(
     bytes: &[u8],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<u8>, GenericProjectError> {
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let mut cloned = Vec::with_capacity(bytes.len());
     for chunk in bytes.chunks(RESOURCE_CANCELLATION_CHECK_BYTES) {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         cloned.extend_from_slice(chunk);
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(cloned)
 }
 
 fn append_text_with_cancellation(
     output: &mut String,
     text: &str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let mut start = 0_usize;
     while start < text.len() {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let mut end = start
             .saturating_add(RESOURCE_CANCELLATION_CHECK_BYTES)
             .min(text.len());
@@ -3096,14 +3157,14 @@ fn append_text_with_cancellation(
         output.push_str(&text[start..end]);
         start = end;
     }
-    cancellation.ensure_running()
+    ensure_generic_operation_not_cancelled(cancellation)
 }
 
 fn validate_sqlite_utf8_with_cancellation(
     bytes: &[u8],
     index: usize,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
     match validate_utf8_bytes_with_cancellation(bytes, cancellation)? {
         Ok(()) => Ok(()),
@@ -3124,11 +3185,11 @@ struct InvalidUtf8Facts {
 
 fn validate_utf8_bytes_with_cancellation(
     bytes: &[u8],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Result<(), InvalidUtf8Facts>, GenericProjectError> {
     let mut start = 0_usize;
     while start < bytes.len() {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let end = start
             .saturating_add(RESOURCE_CANCELLATION_CHECK_BYTES)
             .min(bytes.len());
@@ -3138,14 +3199,14 @@ fn validate_utf8_bytes_with_cancellation(
                 let valid_end = start.saturating_add(source.valid_up_to());
                 match source.error_len() {
                     Some(error_len) => {
-                        cancellation.ensure_running()?;
+                        ensure_generic_operation_not_cancelled(cancellation)?;
                         return Ok(Err(InvalidUtf8Facts {
                             valid_up_to: valid_end,
                             error_len: Some(error_len),
                         }));
                     }
                     None if end == bytes.len() => {
-                        cancellation.ensure_running()?;
+                        ensure_generic_operation_not_cancelled(cancellation)?;
                         return Ok(Err(InvalidUtf8Facts {
                             valid_up_to: valid_end,
                             error_len: None,
@@ -3159,7 +3220,7 @@ fn validate_utf8_bytes_with_cancellation(
             }
         }
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(Ok(()))
 }
 
@@ -3387,14 +3448,14 @@ fn find_previous_group_with_cancellation<'a>(
 
 fn lookup_text_fingerprint_with_cancellation(
     value: &str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Sha256Fingerprint, GenericProjectError> {
     let mut hasher = Sha256FramedHasher::new(b"att.generic.lookup-text");
     hasher.try_frame_chunks(
         1,
         value.as_bytes(),
         FINGERPRINT_CANCELLATION_CHECK_BYTES,
-        || cancellation.ensure_running(),
+        || ensure_generic_operation_not_cancelled(cancellation),
     )?;
     Ok(hasher.finish())
 }
@@ -3741,7 +3802,7 @@ fn ensure_generic_operation_not_cancelled(
 
 fn load_translation_resources_rows_with_cancellation(
     connection: &Connection,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<TranslationResources, GenericProjectError> {
     Ok(TranslationResources {
         terminology_json: load_translation_resource_row_with_cancellation(
@@ -3760,23 +3821,23 @@ fn load_translation_resources_rows_with_cancellation(
 fn load_translation_resource_row_with_cancellation(
     connection: &Connection,
     kind: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<String, GenericProjectError> {
     const OPERATION: &str = "读取 Generic 翻译资源";
 
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let mut statement = connection
         .prepare(
             "SELECT canonical_json FROM main.translation_resource
              WHERE resource_kind = ?1",
         )
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?;
     let mut rows = statement
         .query([kind])
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?;
     let row = rows
         .next()
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?
         .ok_or(GenericProjectError::Sqlite {
             operation: OPERATION,
             source: rusqlite::Error::QueryReturnedNoRows,
@@ -3785,7 +3846,7 @@ fn load_translation_resource_row_with_cancellation(
         clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?;
     drop(rows);
     drop(statement);
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(canonical_json)
 }
 
@@ -3793,18 +3854,18 @@ fn query_optional_first_text_with_cancellation(
     connection: &Connection,
     query: &'static str,
     operation: &'static str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Option<String>, GenericProjectError> {
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let mut statement = connection
         .prepare(query)
-        .map_err(|source| cancellable_sqlite_error(operation, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(operation, source))?;
     let mut rows = statement
         .query([])
-        .map_err(|source| cancellable_sqlite_error(operation, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(operation, source))?;
     let value = match rows
         .next()
-        .map_err(|source| cancellable_sqlite_error(operation, source, cancellation))?
+        .map_err(|source| sqlite_operation_error(operation, source))?
     {
         Some(row) => Some(clone_sqlite_text_column_with_cancellation(
             row,
@@ -3816,14 +3877,14 @@ fn query_optional_first_text_with_cancellation(
     };
     drop(rows);
     drop(statement);
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(value)
 }
 
 fn load_snapshot_rows(
     connection: &Connection,
     project: &GenericProject,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericStoredSnapshot, GenericProjectError> {
     let mut files = Vec::new();
     let mut file_indexes = HashMap::new();
@@ -3832,17 +3893,15 @@ fn load_snapshot_rows(
             "SELECT relative_path, ordinal
              FROM main.generic_file ORDER BY ordinal",
         )
-        .map_err(|source| {
-            cancellable_sqlite_error("准备读取 Generic 文件", source, cancellation)
-        })?;
+        .map_err(|source| sqlite_operation_error("准备读取 Generic 文件", source))?;
     let mut file_rows = file_statement
         .query([])
-        .map_err(|source| cancellable_sqlite_error("读取 Generic 文件", source, cancellation))?;
+        .map_err(|source| sqlite_operation_error("读取 Generic 文件", source))?;
     while let Some(row) = file_rows
         .next()
-        .map_err(|source| cancellable_sqlite_error("解码 Generic 文件记录", source, cancellation))?
+        .map_err(|source| sqlite_operation_error("解码 Generic 文件记录", source))?
     {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let path_bytes = clone_sqlite_blob_column_with_cancellation(
             row,
             0,
@@ -3856,7 +3915,7 @@ fn load_snapshot_rows(
                 source,
             })?;
         let relative_path = decode_path_with_cancellation(&path_bytes, cancellation)?;
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let file_index = files.len();
         file_indexes.insert(path_bytes, file_index);
         files.push(GenericStoredFile {
@@ -3878,17 +3937,15 @@ fn load_snapshot_rows(
                ON f.relative_path = g.relative_path
              ORDER BY f.ordinal, g.ordinal",
         )
-        .map_err(|source| {
-            cancellable_sqlite_error("准备读取 Generic Group", source, cancellation)
-        })?;
+        .map_err(|source| sqlite_operation_error("准备读取 Generic Group", source))?;
     let mut group_rows = group_statement
         .query([])
-        .map_err(|source| cancellable_sqlite_error("读取 Generic Group", source, cancellation))?;
+        .map_err(|source| sqlite_operation_error("读取 Generic Group", source))?;
     while let Some(row) = group_rows
         .next()
-        .map_err(|source| cancellable_sqlite_error("解码 Generic Group", source, cancellation))?
+        .map_err(|source| sqlite_operation_error("解码 Generic Group", source))?
     {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let path_bytes =
             clone_sqlite_blob_column_with_cancellation(row, 0, "解码 Generic Group", cancellation)?;
         let group_id =
@@ -3903,7 +3960,7 @@ fn load_snapshot_rows(
             clone_sqlite_text_column_with_cancellation(row, 3, "解码 Generic Group", cancellation)?;
         let context =
             clone_sqlite_blob_column_with_cancellation(row, 4, "解码 Generic Group", cancellation)?;
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let Some(&file_index) = file_indexes.get(&path_bytes) else {
             return Err(invalid_database(
                 GenericProjectDatabaseProblem::GroupReferencesMissingFile {
@@ -3916,7 +3973,7 @@ fn load_snapshot_rows(
         let previous = group_indexes.insert_with_cancellation(
             group_index_key,
             (file_index, group_index),
-            || cancellation.ensure_running(),
+            || ensure_generic_operation_not_cancelled(cancellation),
         )?;
         debug_assert!(previous.is_none());
         files[file_index].groups.push(GenericStoredGroup {
@@ -3932,17 +3989,15 @@ fn load_snapshot_rows(
 
     let mut unit_statement = connection
         .prepare(LOAD_UNITS_NATURAL_SQL)
-        .map_err(|source| {
-            cancellable_sqlite_error("准备读取 Generic Unit", source, cancellation)
-        })?;
+        .map_err(|source| sqlite_operation_error("准备读取 Generic Unit", source))?;
     let mut unit_rows = unit_statement
         .query([])
-        .map_err(|source| cancellable_sqlite_error("读取 Generic Unit", source, cancellation))?;
+        .map_err(|source| sqlite_operation_error("读取 Generic Unit", source))?;
     while let Some(row) = unit_rows
         .next()
-        .map_err(|source| cancellable_sqlite_error("解码 Generic Unit", source, cancellation))?
+        .map_err(|source| sqlite_operation_error("解码 Generic Unit", source))?
     {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let group_id =
             clone_sqlite_text_column_with_cancellation(row, 0, "解码 Generic Unit", cancellation)?;
         let unit_id =
@@ -4043,9 +4098,11 @@ fn load_snapshot_rows(
             "解码 Generic 被拒候选",
             cancellation,
         )?;
-        cancellation.ensure_running()?;
-        let Some(&(file_index, group_index)) =
-            group_indexes.get_with_cancellation(&group_id, || cancellation.ensure_running())?
+        ensure_generic_operation_not_cancelled(cancellation)?;
+        let Some(&(file_index, group_index)) = group_indexes
+            .get_with_cancellation(&group_id, || {
+                ensure_generic_operation_not_cancelled(cancellation)
+            })?
         else {
             return Err(invalid_database(
                 GenericProjectDatabaseProblem::UnitReferencesMissingGroup {
@@ -4176,7 +4233,7 @@ fn load_snapshot_rows(
             });
     }
     drop(unit_rows);
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(GenericStoredSnapshot {
         project: project.clone(),
         files,
@@ -4190,10 +4247,13 @@ fn create_initial_schema(
     source_language: &LanguageId,
     target_language: &LanguageId,
     cancellation: &CooperativeCancellation,
+    performance: &RunPerformanceCounters,
 ) -> Result<(), GenericProjectError> {
     run_cancellable_transaction(
         connection,
         cancellation,
+        performance,
+        SqliteTransactionScope::DatabaseInitialization,
         "开始建立 Generic schema",
         "提交 Generic schema",
         "回滚 Generic schema",
@@ -4235,23 +4295,23 @@ struct GenericSchemaObject {
 
 fn read_generic_att_schema_with_cancellation(
     connection: &Connection,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<Vec<GenericSchemaObject>, GenericProjectError> {
     const OPERATION: &str = "读取当前 Generic schema";
 
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let mut statement = connection
         .prepare(SELECT_GENERIC_ATT_SCHEMA)
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?;
     let mut rows = statement
         .query([])
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?;
     let mut objects = Vec::new();
     while let Some(row) = rows
         .next()
-        .map_err(|source| cancellable_sqlite_error(OPERATION, source, cancellation))?
+        .map_err(|source| sqlite_operation_error(OPERATION, source))?
     {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         objects.push(GenericSchemaObject {
             kind: clone_sqlite_text_column_with_cancellation(row, 0, OPERATION, cancellation)?,
             name: clone_sqlite_text_column_with_cancellation(row, 1, OPERATION, cancellation)?,
@@ -4266,7 +4326,7 @@ fn read_generic_att_schema_with_cancellation(
     }
     drop(rows);
     drop(statement);
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(objects)
 }
 
@@ -4309,14 +4369,14 @@ pub(crate) fn validate_current_generic_schema_with_cancellation(
 fn validate_generic_schema_objects_with_cancellation(
     actual: &[GenericSchemaObject],
     expected: &[GenericSchemaObject],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<(), GenericProjectError> {
     let mut missing = Vec::new();
     for expected_object in expected {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let mut found = false;
         for actual_object in actual {
-            cancellation.ensure_running()?;
+            ensure_generic_operation_not_cancelled(cancellation)?;
             if schema_object_identity_equal_with_cancellation(
                 actual_object,
                 expected_object,
@@ -4336,10 +4396,10 @@ fn validate_generic_schema_objects_with_cancellation(
 
     let mut definition_mismatches = Vec::new();
     for expected_object in expected {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let mut matching = None;
         for actual_object in actual {
-            cancellation.ensure_running()?;
+            ensure_generic_operation_not_cancelled(cancellation)?;
             if schema_object_identity_equal_with_cancellation(
                 actual_object,
                 expected_object,
@@ -4361,10 +4421,10 @@ fn validate_generic_schema_objects_with_cancellation(
 
     let mut unexpected = Vec::new();
     for actual_object in actual {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         let mut found = false;
         for expected_object in expected {
-            cancellation.ensure_running()?;
+            ensure_generic_operation_not_cancelled(cancellation)?;
             if schema_object_identity_equal_with_cancellation(
                 actual_object,
                 expected_object,
@@ -4389,7 +4449,7 @@ fn validate_generic_schema_objects_with_cancellation(
     {
         return Ok(());
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Err(invalid_database(
         GenericProjectDatabaseProblem::SchemaMismatch {
             expected_count: expected.len(),
@@ -4404,7 +4464,7 @@ fn validate_generic_schema_objects_with_cancellation(
 fn schema_object_identity_equal_with_cancellation(
     left: &GenericSchemaObject,
     right: &GenericSchemaObject,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<bool, GenericProjectError> {
     Ok(
         bytes_equal_with_cancellation(left.kind.as_bytes(), right.kind.as_bytes(), cancellation)?
@@ -4419,7 +4479,7 @@ fn schema_object_identity_equal_with_cancellation(
 fn schema_object_equal_with_cancellation(
     left: &GenericSchemaObject,
     right: &GenericSchemaObject,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<bool, GenericProjectError> {
     Ok(
         schema_object_identity_equal_with_cancellation(left, right, cancellation)?
@@ -4438,13 +4498,13 @@ fn schema_object_equal_with_cancellation(
 
 fn schema_object_label_with_cancellation(
     object: &GenericSchemaObject,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<SafeIdentifier, GenericProjectError> {
     let mut label = String::new();
     append_text_with_cancellation(&mut label, &object.kind, cancellation)?;
     append_text_with_cancellation(&mut label, "/", cancellation)?;
     append_text_with_cancellation(&mut label, &object.name, cancellation)?;
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(project_safe_identifier(label, "schema_object"))
 }
 
@@ -4476,9 +4536,7 @@ fn validate_schema_with_compiled_resources(
             [],
             |row| row.get(0),
         )
-        .map_err(|source| {
-            cancellable_sqlite_error("检查 Generic 翻译资源", source, cancellation)
-        })?;
+        .map_err(|source| sqlite_operation_error("检查 Generic 翻译资源", source))?;
     if resource_count != 3 {
         return Err(invalid_database(
             GenericProjectDatabaseProblem::TranslationResourceCount {
@@ -4661,7 +4719,7 @@ fn publish_initial_database_candidate(
                 row.get::<_, i64>(2)?,
             ))
         })
-        .map_err(|source| cancellable_sqlite_error(CHECKPOINT_OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(CHECKPOINT_OPERATION, source))?;
     if busy != 0 || log_frames != checkpointed_frames {
         if cancellation.is_requested() {
             return Err(GenericProjectError::Cancelled);
@@ -4688,7 +4746,7 @@ fn publish_initial_database_candidate(
         .query_row("PRAGMA main.journal_mode = DELETE", [], |row| {
             row.get::<_, String>(0)
         })
-        .map_err(|source| cancellable_sqlite_error(JOURNAL_MODE_OPERATION, source, cancellation))?;
+        .map_err(|source| sqlite_operation_error(JOURNAL_MODE_OPERATION, source))?;
     if !journal_mode.eq_ignore_ascii_case("delete") {
         return Err(GenericProjectError::Sqlite {
             operation: JOURNAL_MODE_OPERATION,
@@ -4800,25 +4858,15 @@ fn validate_translation(translation: &str) -> Result<(), GenericProjectTranslati
     Ok(())
 }
 
-trait GenericOperationCancellation {
-    fn ensure_running(&self) -> Result<(), GenericProjectError>;
-}
-
-impl GenericOperationCancellation for CooperativeCancellation {
-    fn ensure_running(&self) -> Result<(), GenericProjectError> {
-        ensure_generic_operation_not_cancelled(self)
-    }
-}
-
-struct CancellableResourceJsonReader<'a, C: ?Sized> {
+struct CancellableResourceJsonReader<'a> {
     remaining: &'a [u8],
-    cancellation: &'a C,
+    cancellation: &'a CooperativeCancellation,
     bytes_until_check: usize,
     cancelled: bool,
 }
 
-impl<'a, C: GenericOperationCancellation + ?Sized> CancellableResourceJsonReader<'a, C> {
-    fn new(remaining: &'a [u8], cancellation: &'a C) -> Self {
+impl<'a> CancellableResourceJsonReader<'a> {
+    fn new(remaining: &'a [u8], cancellation: &'a CooperativeCancellation) -> Self {
         Self {
             remaining,
             cancellation,
@@ -4828,7 +4876,7 @@ impl<'a, C: GenericOperationCancellation + ?Sized> CancellableResourceJsonReader
     }
 }
 
-impl<C: GenericOperationCancellation + ?Sized> Read for CancellableResourceJsonReader<'_, C> {
+impl Read for CancellableResourceJsonReader<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if self.cancelled {
             // serde_json 在一次底层读取失败后仍可能请求更多输入。取消事实必须锁存，
@@ -4839,7 +4887,7 @@ impl<C: GenericOperationCancellation + ?Sized> Read for CancellableResourceJsonR
             return Ok(0);
         }
         if self.bytes_until_check == 0 {
-            if self.cancellation.ensure_running().is_err() {
+            if ensure_generic_operation_not_cancelled(self.cancellation).is_err() {
                 self.cancelled = true;
                 return Err(io::Error::other("Generic 翻译资源 JSON 解析已取消"));
             }
@@ -4856,15 +4904,15 @@ impl<C: GenericOperationCancellation + ?Sized> Read for CancellableResourceJsonR
     }
 }
 
-struct CancellableResourceJsonWriter<'a, C: ?Sized> {
+struct CancellableResourceJsonWriter<'a> {
     output: &'a mut Vec<u8>,
-    cancellation: &'a C,
+    cancellation: &'a CooperativeCancellation,
     bytes_until_check: usize,
     cancelled: bool,
 }
 
-impl<'a, C: GenericOperationCancellation + ?Sized> CancellableResourceJsonWriter<'a, C> {
-    fn new(output: &'a mut Vec<u8>, cancellation: &'a C) -> Self {
+impl<'a> CancellableResourceJsonWriter<'a> {
+    fn new(output: &'a mut Vec<u8>, cancellation: &'a CooperativeCancellation) -> Self {
         Self {
             output,
             cancellation,
@@ -4874,7 +4922,7 @@ impl<'a, C: GenericOperationCancellation + ?Sized> CancellableResourceJsonWriter
     }
 }
 
-impl<C: GenericOperationCancellation + ?Sized> Write for CancellableResourceJsonWriter<'_, C> {
+impl Write for CancellableResourceJsonWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.cancelled {
             // 与 reader 保持同一锁存语义，避免序列化器在首次错误后重复轮询取消。
@@ -4884,7 +4932,7 @@ impl<C: GenericOperationCancellation + ?Sized> Write for CancellableResourceJson
             return Ok(0);
         }
         if self.bytes_until_check == 0 {
-            if self.cancellation.ensure_running().is_err() {
+            if ensure_generic_operation_not_cancelled(self.cancellation).is_err() {
                 self.cancelled = true;
                 return Err(io::Error::other("Generic 翻译资源 JSON 编码已取消"));
             }
@@ -4904,7 +4952,7 @@ impl<C: GenericOperationCancellation + ?Sized> Write for CancellableResourceJson
 fn validate_translation_resources_with_cancellation(
     terminology_json: &str,
     placeholder_rules_json: &str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericCompiledTranslationResources, GenericProjectError> {
     let terminology_json = clone_text_with_cancellation(terminology_json, cancellation)?;
     let placeholder_rules_json =
@@ -4919,13 +4967,13 @@ fn validate_translation_resources_with_cancellation(
 fn compile_translation_resources_with_cancellation(
     terminology_json: String,
     placeholder_rules_json: String,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericCompiledTranslationResources, GenericProjectError> {
     let terminology =
         compile_terminology_resource_with_cancellation(terminology_json, cancellation)?;
     let placeholder =
         compile_placeholder_resource_with_cancellation(placeholder_rules_json, cancellation)?;
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(GenericCompiledTranslationResources {
         terminology,
         placeholder,
@@ -4934,19 +4982,19 @@ fn compile_translation_resources_with_cancellation(
 
 fn clone_text_with_cancellation(
     value: &str,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<String, GenericProjectError> {
     let mut cloned = String::with_capacity(value.len());
     append_text_with_cancellation(&mut cloned, value, cancellation)?;
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(cloned)
 }
 
 fn compile_terminology_resource_with_cancellation(
     canonical_json: String,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericCompiledTerminologyResource, GenericProjectError> {
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let slice_reader = CancellableResourceJsonReader::new(canonical_json.as_bytes(), cancellation);
     let mut reader = BufReader::with_capacity(RESOURCE_CANCELLATION_CHECK_BYTES, slice_reader);
     let entries_result = serde_json::from_reader::<_, Vec<TerminologyEntry>>(&mut reader);
@@ -4955,7 +5003,7 @@ fn compile_terminology_resource_with_cancellation(
     if cancelled {
         return Err(GenericProjectError::Cancelled);
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     let entries = entries_result.map_err(|source| {
         GenericProjectError::InvalidResource(GenericProjectResourceError::InvalidSnapshot {
             resource: GenericResourceKind::Terminology,
@@ -4972,7 +5020,7 @@ fn compile_terminology_resource_with_cancellation(
     if cancelled {
         return Err(GenericProjectError::Cancelled);
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     encode_result.map_err(|source| {
         GenericProjectError::InvalidResource(GenericProjectResourceError::SnapshotEncoding {
             resource: GenericResourceKind::Terminology,
@@ -4987,10 +5035,11 @@ fn compile_terminology_resource_with_cancellation(
         ));
     }
 
-    let compiled =
-        compile_terminology_with_cancellation(entries, &|| cancellation.ensure_running().is_err())
-            .map_err(terminology_resource_error)?;
-    cancellation.ensure_running()?;
+    let compiled = compile_terminology_with_cancellation(entries, &|| {
+        ensure_generic_operation_not_cancelled(cancellation).is_err()
+    })
+    .map_err(terminology_resource_error)?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(GenericCompiledTerminologyResource {
         canonical_json: Arc::new(canonical_json),
         compiled: Arc::new(compiled),
@@ -5008,11 +5057,13 @@ fn terminology_resource_error(source: TerminologyDefinitionError) -> GenericProj
 
 fn compile_placeholder_resource_with_cancellation(
     canonical_json: String,
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<GenericCompiledPlaceholderResource, GenericProjectError> {
     let service = GenericPlaceholderService::default();
     let definitions = service
-        .parse_canonical_json_with_cancellation(&canonical_json, || cancellation.ensure_running())?
+        .parse_canonical_json_with_cancellation(&canonical_json, || {
+            ensure_generic_operation_not_cancelled(cancellation)
+        })?
         .map_err(placeholder_resource_error)?;
     let mut encoded = Vec::with_capacity(canonical_json.len());
     let (encode_result, cancelled) = {
@@ -5023,7 +5074,7 @@ fn compile_placeholder_resource_with_cancellation(
     if cancelled {
         return Err(GenericProjectError::Cancelled);
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     encode_result.map_err(|source| {
         GenericProjectError::InvalidResource(GenericProjectResourceError::SnapshotEncoding {
             resource: GenericResourceKind::PlaceholderRules,
@@ -5038,9 +5089,11 @@ fn compile_placeholder_resource_with_cancellation(
         ));
     }
     let compiled = service
-        .compile_with_cancellation(definitions, || cancellation.ensure_running())?
+        .compile_with_cancellation(definitions, || {
+            ensure_generic_operation_not_cancelled(cancellation)
+        })?
         .map_err(placeholder_resource_error)?;
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(GenericCompiledPlaceholderResource {
         canonical_json: Arc::new(canonical_json),
         compiled,
@@ -5054,9 +5107,9 @@ fn placeholder_resource_error(source: GenericPlaceholderError) -> GenericProject
 fn bytes_equal_with_cancellation(
     left: &[u8],
     right: &[u8],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<bool, GenericProjectError> {
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     if left.len() != right.len() {
         return Ok(false);
     }
@@ -5064,12 +5117,12 @@ fn bytes_equal_with_cancellation(
         .chunks(RESOURCE_CANCELLATION_CHECK_BYTES)
         .zip(right.chunks(RESOURCE_CANCELLATION_CHECK_BYTES))
     {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         if left != right {
             return Ok(false);
         }
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(true)
 }
 
@@ -5123,11 +5176,11 @@ fn encode_path(path: &Path) -> Vec<u8> {
 #[cfg(windows)]
 fn decode_path_with_cancellation(
     bytes: &[u8],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<PathBuf, GenericProjectError> {
     use std::os::windows::ffi::OsStringExt;
 
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return Err(invalid_database(
             GenericProjectDatabaseProblem::InvalidUtf16Path {
@@ -5137,12 +5190,12 @@ fn decode_path_with_cancellation(
     }
     let mut units = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks(RESOURCE_CANCELLATION_CHECK_BYTES) {
-        cancellation.ensure_running()?;
+        ensure_generic_operation_not_cancelled(cancellation)?;
         for pair in chunk.chunks_exact(2) {
             units.push(u16::from_le_bytes([pair[0], pair[1]]));
         }
     }
-    cancellation.ensure_running()?;
+    ensure_generic_operation_not_cancelled(cancellation)?;
     Ok(PathBuf::from(OsString::from_wide(&units)))
 }
 
@@ -5154,7 +5207,7 @@ fn encode_path(path: &Path) -> Vec<u8> {
 #[cfg(not(windows))]
 fn decode_path_with_cancellation(
     bytes: &[u8],
-    cancellation: &(impl GenericOperationCancellation + ?Sized),
+    cancellation: &CooperativeCancellation,
 ) -> Result<PathBuf, GenericProjectError> {
     if let Err(source) = validate_utf8_bytes_with_cancellation(bytes, cancellation)? {
         return Err(invalid_database(
@@ -5173,63 +5226,25 @@ fn decode_path_with_cancellation(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::fs;
 
     use tempfile::tempdir;
 
     use super::*;
 
-    struct CancelResourceAt {
-        cancel_at: usize,
-        polls: Cell<usize>,
-    }
-
-    impl CancelResourceAt {
-        fn new(cancel_at: usize) -> Self {
-            Self {
-                cancel_at,
-                polls: Cell::new(0),
-            }
-        }
-    }
-
-    impl GenericOperationCancellation for CancelResourceAt {
-        fn ensure_running(&self) -> Result<(), GenericProjectError> {
-            let polls = self.polls.get() + 1;
-            self.polls.set(polls);
-            if polls >= self.cancel_at {
-                Err(GenericProjectError::Cancelled)
-            } else {
-                Ok(())
-            }
-        }
-    }
-
     #[test]
-    fn cancellable_sqlite_errors_use_the_actual_sqlite_failure() {
-        let running = CooperativeCancellation::default();
+    fn sqlite_operation_errors_use_the_actual_sqlite_failure() {
         let interrupted = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
             None,
         );
         assert!(matches!(
-            cancellable_sqlite_error("测试查询", interrupted, &running),
+            sqlite_operation_error("测试查询", interrupted),
             GenericProjectError::Cancelled
         ));
 
-        let requested = CooperativeCancellation::default();
-        requested.request();
         assert!(matches!(
-            cancellable_sqlite_error("测试查询", rusqlite::Error::QueryReturnedNoRows, &requested,),
-            GenericProjectError::Sqlite {
-                operation: "测试查询",
-                source: rusqlite::Error::QueryReturnedNoRows,
-            }
-        ));
-
-        assert!(matches!(
-            cancellable_sqlite_error("测试查询", rusqlite::Error::QueryReturnedNoRows, &running,),
+            sqlite_operation_error("测试查询", rusqlite::Error::QueryReturnedNoRows),
             GenericProjectError::Sqlite {
                 operation: "测试查询",
                 source: rusqlite::Error::QueryReturnedNoRows,
@@ -5280,77 +5295,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_resource_validation_can_cancel_json_parsing_and_encoding() {
-        let long_terminology = format!(
-            r#"[{{"term":"{}","translation":"译文","triggers":["触发"]}}]"#,
-            "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
-        );
-        let terminology_parse_cancellation = CancelResourceAt::new(3);
-        assert!(matches!(
-            compile_terminology_resource_with_cancellation(
-                long_terminology,
-                &terminology_parse_cancellation,
-            ),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(terminology_parse_cancellation.polls.get(), 3);
-
-        let terminology_encode_cancellation = CancelResourceAt::new(4);
-        assert!(matches!(
-            compile_terminology_resource_with_cancellation(
-                "[]".to_owned(),
-                &terminology_encode_cancellation,
-            ),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(terminology_encode_cancellation.polls.get(), 4);
-
-        let long_placeholder = format!(
-            r#"[{{"kind":"rule","definition":{{"order":"preserve","pattern":"{}"}}}}]"#,
-            "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
-        );
-        let placeholder_parse_cancellation = CancelResourceAt::new(3);
-        assert!(matches!(
-            compile_placeholder_resource_with_cancellation(
-                long_placeholder,
-                &placeholder_parse_cancellation,
-            ),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(placeholder_parse_cancellation.polls.get(), 3);
-
-        let placeholder_encode_cancellation = CancelResourceAt::new(4);
-        assert!(matches!(
-            compile_placeholder_resource_with_cancellation(
-                "[]".to_owned(),
-                &placeholder_encode_cancellation,
-            ),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(placeholder_encode_cancellation.polls.get(), 4);
-    }
-
-    #[test]
-    fn snapshot_text_lookup_and_exact_comparison_poll_between_long_chunks() {
-        let long = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
-        let fingerprint_cancellation = CancelResourceAt::new(2);
-        assert!(matches!(
-            lookup_text_fingerprint_with_cancellation(&long, &fingerprint_cancellation),
-            Err(GenericProjectError::Cancelled)
-        ));
-
-        let comparison_cancellation = CancelResourceAt::new(3);
-        assert!(matches!(
-            bytes_equal_with_cancellation(
-                long.as_bytes(),
-                long.as_bytes(),
-                &comparison_cancellation
-            ),
-            Err(GenericProjectError::Cancelled)
-        ));
-    }
-
-    #[test]
     fn resource_worker_start_failures_preserve_typed_backend_facts() {
         assert!(matches!(
             terminology_resource_error(TerminologyDefinitionError::Cancelled),
@@ -5396,82 +5340,6 @@ mod tests {
     }
 
     #[test]
-    fn project_row_clone_is_chunked() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
-        let project_name = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
-        connection
-            .execute(
-                "INSERT INTO generic_project (
-                     singleton, project_name, source_root, source_language, target_language
-                 ) VALUES (1, ?1, x'0100', 'ja', 'zh-Hans')",
-                [&project_name],
-            )
-            .unwrap();
-        let cancellation = CancelResourceAt::new(3);
-
-        assert!(matches!(
-            load_generic_project_row_with_cancellation(&connection, &cancellation),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(cancellation.polls.get(), 3);
-    }
-
-    #[test]
-    fn snapshot_row_clone_is_chunked() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
-        let relative_path = vec![b'x'; RESOURCE_CANCELLATION_CHECK_BYTES * 3];
-        connection
-            .execute(
-                "INSERT INTO generic_file (relative_path, ordinal) VALUES (?1, 0)",
-                [&relative_path],
-            )
-            .unwrap();
-        let project = GenericProject {
-            project_name: "game".parse().unwrap(),
-            workspace_root: PathBuf::from("workspace"),
-            database_path: PathBuf::from("workspace/project.db"),
-            source_root: PathBuf::from("source"),
-            language_pair: LanguagePair::new(language("ja"), language("zh-Hans")),
-            extracted_raw_fingerprint: None,
-            extracted_asset_fingerprint: None,
-            last_profile_id: None,
-        };
-        let cancellation = CancelResourceAt::new(4);
-
-        assert!(matches!(
-            load_snapshot_rows(&connection, &project, &cancellation),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(cancellation.polls.get(), 4);
-    }
-
-    #[test]
-    fn schema_comparison_polls_while_comparing_a_large_definition() {
-        let long_prefix = "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3);
-        let actual = [GenericSchemaObject {
-            kind: "table".to_owned(),
-            name: "generic_project".to_owned(),
-            table_name: "generic_project".to_owned(),
-            sql: format!("{long_prefix}a"),
-        }];
-        let expected = [GenericSchemaObject {
-            kind: "table".to_owned(),
-            name: "generic_project".to_owned(),
-            table_name: "generic_project".to_owned(),
-            sql: format!("{long_prefix}b"),
-        }];
-        let cancellation = CancelResourceAt::new(28);
-
-        assert!(matches!(
-            validate_generic_schema_objects_with_cancellation(&actual, &expected, &cancellation,),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(cancellation.polls.get(), 28);
-    }
-
-    #[test]
     fn current_schema_validation_uses_the_command_cancellation() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
@@ -5485,60 +5353,18 @@ mod tests {
     }
 
     #[test]
-    fn translation_resource_row_clone_is_chunked() {
+    fn sqlite_row_text_clone_preserves_conversion_errors() {
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CREATE_INITIAL_SCHEMA_SQL).unwrap();
-        let canonical_json = format!(
-            r#"["{}"]"#,
-            "x".repeat(RESOURCE_CANCELLATION_CHECK_BYTES * 3)
-        );
-        connection
-            .execute(
-                "UPDATE translation_resource SET canonical_json = ?1
-                 WHERE resource_kind = 'terminology'",
-                [&canonical_json],
-            )
-            .unwrap();
-        let cancellation = CancelResourceAt::new(3);
-
-        assert!(matches!(
-            load_translation_resource_row_with_cancellation(
-                &connection,
-                TERMINOLOGY_RESOURCE,
-                &cancellation,
-            ),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(cancellation.polls.get(), 3);
-    }
-
-    #[test]
-    fn sqlite_row_text_clone_is_chunked_and_preserves_conversion_errors() {
-        let connection = Connection::open_in_memory().unwrap();
-        let large_text = "你".repeat(RESOURCE_CANCELLATION_CHECK_BYTES);
-        let mut statement = connection.prepare("SELECT ?1 AS value").unwrap();
-        let mut rows = statement.query([&large_text]).unwrap();
-        let row = rows.next().unwrap().unwrap();
-        let cancellation = CancelResourceAt::new(3);
-
-        assert!(matches!(
-            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &cancellation,),
-            Err(GenericProjectError::Cancelled)
-        ));
-        assert_eq!(cancellation.polls.get(), 3);
-        drop(rows);
-        drop(statement);
-
         let mut statement = connection.prepare("SELECT 7 AS value").unwrap();
         let mut rows = statement.query([]).unwrap();
         let row = rows.next().unwrap().unwrap();
-        let never_cancel = CancelResourceAt::new(usize::MAX);
+        let cancellation = CooperativeCancellation::default();
         assert!(matches!(
             clone_sqlite_text_column_with_cancellation(
                 row,
                 0,
                 "读取测试 TEXT",
-                &never_cancel,
+                &cancellation,
             ),
             Err(GenericProjectError::Sqlite {
                 source: rusqlite::Error::InvalidColumnType(
@@ -5558,7 +5384,7 @@ mod tests {
         let mut rows = statement.query([]).unwrap();
         let row = rows.next().unwrap().unwrap();
         let error =
-            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &never_cancel)
+            clone_sqlite_text_column_with_cancellation(row, 0, "读取测试 TEXT", &cancellation)
                 .expect_err("无效 UTF-8 TEXT 必须拒绝");
         assert!(matches!(
             &error,
@@ -5737,6 +5563,37 @@ mod tests {
             store.load_snapshot(),
             Err(GenericProjectError::ExtractRequired)
         ));
+    }
+
+    #[test]
+    fn generic_init_records_its_sqlite_transaction() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let performance = Arc::new(RunPerformanceCounters::default());
+
+        GenericProjectStore::initialize_with_cancellation(
+            GenericInitRequest {
+                project_name: "game".parse().unwrap(),
+                workspace_root: temp.path().join("project"),
+                source_root: Some(source),
+                source_language: Some(language("ja")),
+                target_language: Some(language("zh-Hans")),
+            },
+            CooperativeCancellation::default(),
+            Arc::clone(&performance),
+        )
+        .expect("首次 Init 应成功");
+
+        let transactions = performance
+            .snapshot()
+            .sqlite_transactions
+            .database_initialization;
+        assert_eq!(transactions.begin.attempted, 1);
+        assert_eq!(transactions.begin.succeeded, 1);
+        assert_eq!(transactions.commit.attempted, 1);
+        assert_eq!(transactions.commit.succeeded, 1);
+        assert_eq!(transactions.rollback.attempted, 0);
     }
 
     #[test]
@@ -6086,6 +5943,7 @@ mod tests {
                 &language("ja"),
                 &language("zh-Hans"),
                 &cancellation,
+                &RunPerformanceCounters::default(),
             )
             .expect("应建立候选 schema");
             fs::write(&stale_sidecar, b"appeared-during-init")
@@ -6133,6 +5991,7 @@ mod tests {
             &language("ja"),
             &language("zh-Hans"),
             &cancellation,
+            &RunPerformanceCounters::default(),
         )
         .expect("应建立候选 schema");
 
@@ -6214,6 +6073,7 @@ mod tests {
             &language("ja"),
             &language("zh-Hans"),
             &cancellation,
+            &RunPerformanceCounters::default(),
         );
         assert!(result.is_err(), "单例写入失败时 Init 事务应失败");
 
@@ -6467,7 +6327,7 @@ mod tests {
         assert_eq!(
             retained.state_fingerprint(),
             Sha256Fingerprint::from_bytes([7; 32]),
-            "Extract 只能保留正文和原状态，不能把无当前含义的状态升级成 V2"
+            "Extract 只能保留正文和原状态，不能把失配状态改写成当前适用性"
         );
         assert_eq!(
             crate::generic::current_translation_for_stored_with_cancellation(
@@ -6824,7 +6684,7 @@ mod tests {
         let snapshot = store.load_snapshot().unwrap();
         let group = &snapshot.files()[0].groups()[0];
         let unit = &group.units()[0];
-        let old_state = crate::translation::generic_automatic_applicability_v2(
+        let old_state = crate::translation::generic_automatic_applicability(
             "ja",
             "zh-Hans",
             group.id(),
@@ -6852,7 +6712,7 @@ mod tests {
         let unit = &group.units()[0];
         let previous = unit.translation().expect("旧正文必须保留").clone();
         let source_lines = vec![unit.source_text().to_owned()];
-        let current_state = crate::translation::generic_automatic_applicability_v2(
+        let current_state = crate::translation::generic_automatic_applicability(
             "ja",
             "zh-Hans",
             group.id(),
@@ -7204,7 +7064,7 @@ mod tests {
             let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
             let group = &snapshot.files()[0].groups()[0];
             let unit = &group.units()[0];
-            let current_state = crate::translation::generic_automatic_applicability_v2(
+            let current_state = crate::translation::generic_automatic_applicability(
                 snapshot.project().language_pair().source().as_str(),
                 snapshot.project().language_pair().target().as_str(),
                 group.id(),
@@ -7273,7 +7133,7 @@ mod tests {
             assert_eq!(
                 changed_unit.translation().unwrap().state_fingerprint(),
                 current_state,
-                "语言变化只能改变当前适用性，不能重写已有 V2 状态"
+                "语言变化只能改变当前适用性，不能重写已有状态"
             );
             assert_eq!(
                 crate::generic::current_translation_for_stored_with_cancellation(
@@ -7296,317 +7156,6 @@ mod tests {
                 .unwrap();
             assert_eq!(terminology_json, "[]");
         }
-    }
-
-    #[test]
-    fn untagged_automatic_body_is_retained_but_never_upgraded_or_current() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        fs::create_dir(&source).unwrap();
-        write_source(
-            &source,
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
-        );
-        let workspace = temp.path().join("project");
-        let store = init(&workspace, &source);
-        store.extract().expect("首次 Extract 应成功");
-        let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
-        let group = &snapshot.files()[0].groups()[0];
-        let unit = &group.units()[0];
-        let untagged = Sha256Fingerprint::from_bytes([31; 32]);
-        store
-            .commit_translations(
-                snapshot.project().extracted_raw_fingerprint().unwrap(),
-                &[TranslationWrite {
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    expected_source_text: unit.source_text().to_owned(),
-                    expected_group_context: group.context_fingerprint(),
-                    translation: "译文".to_owned(),
-                    state_fingerprint: untagged,
-                    expected_translation: None,
-                    was_current_rejected: false,
-                }],
-            )
-            .expect("未标记状态的测试译文应该可提交");
-
-        GenericProjectStore::initialize(GenericInitRequest {
-            project_name: "game".parse().unwrap(),
-            workspace_root: workspace.clone(),
-            source_root: None,
-            source_language: None,
-            target_language: Some(language("zh-Hant")),
-        })
-        .expect("改变目标语言应成功");
-        let changed = store
-            .load_snapshot()
-            .expect("语言变化后应保留 Extract 快照");
-        let changed_group = &changed.files()[0].groups()[0];
-        let changed_unit = &changed_group.units()[0];
-        assert_eq!(
-            changed_unit.translation().unwrap().state_fingerprint(),
-            untagged,
-            "语言变化不得重写无当前含义的旧状态"
-        );
-        assert_eq!(changed_unit.translation().unwrap().translation(), "译文");
-        assert_eq!(
-            crate::generic::current_translation_for_stored_with_cancellation(
-                changed.project(),
-                changed_group,
-                changed_unit,
-                &CooperativeCancellation::default(),
-            )
-            .unwrap(),
-            None,
-            "旧语言正文在新语言对下不得作为 Current"
-        );
-
-        GenericProjectStore::initialize(GenericInitRequest {
-            project_name: "game".parse().unwrap(),
-            workspace_root: workspace,
-            source_root: None,
-            source_language: None,
-            target_language: Some(language("zh-Hans")),
-        })
-        .expect("恢复目标语言应成功");
-        let restored = store
-            .load_snapshot()
-            .expect("恢复语言后应保留 Extract 快照");
-        let restored_group = &restored.files()[0].groups()[0];
-        let restored_unit = &restored_group.units()[0];
-        assert_eq!(
-            restored_unit.translation().unwrap().state_fingerprint(),
-            untagged,
-            "往返语言变化也不得把旧状态升级成当前 V2"
-        );
-        assert_eq!(
-            crate::generic::current_translation_for_stored_with_cancellation(
-                restored.project(),
-                restored_group,
-                restored_unit,
-                &CooperativeCancellation::default(),
-            )
-            .unwrap(),
-            None,
-            "无当前 V2 身份的正文在语言事实恢复后仍不得成为 Current"
-        );
-    }
-
-    #[test]
-    fn untagged_rejected_is_retained_but_never_upgraded_or_current() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        fs::create_dir(&source).unwrap();
-        write_source(
-            &source,
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"原文\"}]}\n",
-        );
-        let workspace = temp.path().join("project");
-        let store = init(&workspace, &source);
-        store.extract().expect("首次 Extract 应成功");
-        let snapshot = store.load_snapshot().unwrap();
-        let group = &snapshot.files()[0].groups()[0];
-        let unit = &group.units()[0];
-        let source_lines = vec![unit.source_text().to_owned()];
-        let untagged = Sha256Fingerprint::from_bytes([63; 32]);
-        let rejected = RejectedTranslationWrite {
-            group_id: group.id().to_owned(),
-            unit_id: unit.id().to_owned(),
-            readable_id: "old/path.jsonl:line9:unit9:text".to_owned(),
-            origin: TranslationOrigin::Automatic,
-            expected_source_text: unit.source_text().to_owned(),
-            source: source_lines.clone(),
-            expected_group_context: group.context_fingerprint(),
-            expected_manual_applicability: crate::manual::generic_manual_applicability(
-                group.id(),
-                unit.id(),
-                "text.jsonl",
-                group.kind(),
-                "ja",
-                "zh-Hans",
-                &source_lines,
-            ),
-            candidate_json: "true".to_owned(),
-            translation: None,
-            violation: ProvenInvariantViolation::InvalidCandidateShape,
-            planning_state: untagged,
-            expected_translation: None,
-            was_current_rejected: false,
-        };
-        assert_eq!(
-            store
-                .commit_translation_results_for_profile(
-                    snapshot.project().extracted_raw_fingerprint().unwrap(),
-                    &[],
-                    &[rejected],
-                    "primary",
-                )
-                .unwrap()
-                .rejected,
-            1
-        );
-
-        GenericProjectStore::initialize(GenericInitRequest {
-            project_name: "game".parse().unwrap(),
-            workspace_root: workspace.clone(),
-            source_root: None,
-            source_language: None,
-            target_language: Some(language("en")),
-        })
-        .expect("改变目标语言应成功");
-        let changed = store.load_snapshot().unwrap();
-        let changed_group = &changed.files()[0].groups()[0];
-        let changed_rejected = changed_group.units()[0]
-            .rejected()
-            .expect("Rejected 候选正文应保留");
-        assert_eq!(changed_rejected.planning_state, untagged);
-        let changed_applicability = crate::translation::generic_automatic_applicability_v2(
-            "ja",
-            "en",
-            changed_group.id(),
-            changed_group.units()[0].id(),
-            changed_group.units()[0].source_text(),
-            changed_group.context_fingerprint(),
-        );
-        assert!(
-            !crate::translation::generic_automatic_applicability_is_current(
-                changed_rejected.planning_state,
-                changed_applicability,
-            )
-        );
-
-        GenericProjectStore::initialize(GenericInitRequest {
-            project_name: "game".parse().unwrap(),
-            workspace_root: workspace,
-            source_root: None,
-            source_language: None,
-            target_language: Some(language("zh-Hans")),
-        })
-        .expect("恢复目标语言应成功");
-        let restored = store.load_snapshot().unwrap();
-        let restored_group = &restored.files()[0].groups()[0];
-        let restored_rejected = restored_group.units()[0].rejected().unwrap();
-        assert_eq!(restored_rejected.planning_state, untagged);
-        assert!(
-            !crate::translation::generic_automatic_applicability_is_current(
-                restored_rejected.planning_state,
-                crate::translation::generic_automatic_applicability_v2(
-                    "ja",
-                    "zh-Hans",
-                    restored_group.id(),
-                    restored_group.units()[0].id(),
-                    restored_group.units()[0].source_text(),
-                    restored_group.context_fingerprint(),
-                ),
-            ),
-            "恢复语言事实不能让未标记 Rejected 阻止新的当前候选"
-        );
-    }
-
-    #[test]
-    fn sibling_context_change_preserves_untagged_body_without_upgrading_or_reactivating_it() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        fs::create_dir(&source).unwrap();
-        let original = "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u1\",\"text\":\"原文一\"},{\"id\":\"u2\",\"text\":\"原文二\"}]}\n";
-        write_source(&source, original);
-        let workspace = temp.path().join("project");
-        let store = init(&workspace, &source);
-        store.extract().expect("首次 Extract 应成功");
-        let snapshot = store.load_snapshot().expect("应该可读取 Extract 快照");
-        let group = &snapshot.files()[0].groups()[0];
-        let unit = &group.units()[0];
-        let untagged = Sha256Fingerprint::from_bytes([17; 32]);
-        store
-            .commit_translations(
-                snapshot.project().extracted_raw_fingerprint().unwrap(),
-                &[TranslationWrite {
-                    group_id: group.id().to_owned(),
-                    unit_id: unit.id().to_owned(),
-                    expected_source_text: unit.source_text().to_owned(),
-                    expected_group_context: group.context_fingerprint(),
-                    translation: "译文一".to_owned(),
-                    state_fingerprint: untagged,
-                    expected_translation: None,
-                    was_current_rejected: false,
-                }],
-            )
-            .expect("未标记状态的测试译文应该可提交");
-
-        write_source(
-            &source,
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u1\",\"text\":\"原文一\"},{\"id\":\"u2\",\"text\":\"变化后的兄弟\"}]}\n",
-        );
-        store.extract().expect("兄弟正文变化应可重新 Extract");
-        let changed = store.load_snapshot().unwrap();
-        let changed_group = &changed.files()[0].groups()[0];
-        let changed_unit = &changed_group.units()[0];
-        let retained = changed_unit.translation().expect("目标 Unit 正文应该保留");
-        assert_eq!(retained.translation(), "译文一");
-        assert_eq!(retained.state_fingerprint(), untagged);
-        assert_eq!(
-            crate::generic::current_translation_for_stored_with_cancellation(
-                changed.project(),
-                changed_group,
-                changed_unit,
-                &CooperativeCancellation::default(),
-            )
-            .unwrap(),
-            None,
-            "旧 Group 语境的正文不得在新语境成为 Current"
-        );
-        let conflict = store
-            .commit_translations(
-                changed.project().extracted_raw_fingerprint().unwrap(),
-                &[TranslationWrite {
-                    group_id: changed_group.id().to_owned(),
-                    unit_id: changed_unit.id().to_owned(),
-                    expected_source_text: changed_unit.source_text().to_owned(),
-                    expected_group_context: changed_group.context_fingerprint(),
-                    translation: "不应写入".to_owned(),
-                    state_fingerprint: crate::translation::generic_automatic_applicability_v2(
-                        "ja",
-                        "zh-Hans",
-                        changed_group.id(),
-                        changed_unit.id(),
-                        changed_unit.source_text(),
-                        changed_group.context_fingerprint(),
-                    ),
-                    expected_translation: None,
-                    was_current_rejected: false,
-                }],
-            )
-            .expect("CAS 冲突应作为可观察提交结果返回");
-        assert_eq!(conflict.committed, 0);
-        assert_eq!(conflict.conflicts, [("g".to_owned(), "u1".to_owned())]);
-        assert_eq!(
-            store.load_snapshot().unwrap().files()[0].groups()[0].units()[0]
-                .translation()
-                .unwrap()
-                .translation(),
-            "译文一",
-            "没有精确携带旧正文与状态的替换不得覆盖保留值"
-        );
-
-        write_source(&source, original);
-        store.extract().expect("恢复兄弟正文应可重新 Extract");
-        let restored = store.load_snapshot().unwrap();
-        let restored_group = &restored.files()[0].groups()[0];
-        let restored_unit = &restored_group.units()[0];
-        let restored_translation = restored_unit.translation().expect("保留正文不得被删除");
-        assert_eq!(restored_translation.translation(), "译文一");
-        assert_eq!(restored_translation.state_fingerprint(), untagged);
-        assert_eq!(
-            crate::generic::current_translation_for_stored_with_cancellation(
-                restored.project(),
-                restored_group,
-                restored_unit,
-                &CooperativeCancellation::default(),
-            )
-            .unwrap(),
-            None,
-            "旧 Group 事实恢复后，未标记状态仍不得升级或重新成为 Current"
-        );
     }
 
     #[test]
@@ -7680,6 +7229,7 @@ mod tests {
         let cancellable_store = GenericProjectStore::for_workspace_with_cancellation(
             workspace.clone(),
             cancellation.clone(),
+            Arc::new(RunPerformanceCounters::default()),
         );
         let barrier = Arc::new(Barrier::new(2));
         let worker_barrier = Arc::clone(&barrier);
@@ -7743,6 +7293,7 @@ mod tests {
         let store = GenericProjectStore::for_workspace_with_cancellation(
             workspace.clone(),
             cancellation.clone(),
+            Arc::new(RunPerformanceCounters::default()),
         );
         let project = store.open().expect("应打开 Generic 项目");
         let scanned = scan_input_tree(&source).expect("应扫描测试输入");
@@ -7770,6 +7321,8 @@ mod tests {
         let result = store.finish_cancellable(run_cancellable_transaction(
             &mut connection,
             &cancellation,
+            &RunPerformanceCounters::default(),
+            SqliteTransactionScope::WritePlan,
             "开始测试 Extract 事务",
             "提交测试 Extract 事务",
             "回滚测试 Extract 事务",
@@ -7831,6 +7384,8 @@ mod tests {
         let result: Result<(), GenericProjectError> = run_cancellable_transaction(
             &mut connection,
             &cancellation,
+            &RunPerformanceCounters::default(),
+            SqliteTransactionScope::WritePlan,
             "开始回滚失败测试事务",
             "提交回滚失败测试事务",
             "回滚失败测试事务",
@@ -7848,6 +7403,7 @@ mod tests {
         let classifier = GenericProjectStore::for_workspace_with_cancellation(
             PathBuf::new(),
             cancellation.clone(),
+            Arc::new(RunPerformanceCounters::default()),
         );
         let result = classifier.finish_cancellable(result);
         let error = result.expect_err("ROLLBACK 被拒绝时不得报告干净取消");
@@ -7922,6 +7478,8 @@ mod tests {
         let result = run_cancellable_transaction(
             &mut connection,
             &cancellation,
+            &RunPerformanceCounters::default(),
+            SqliteTransactionScope::WritePlan,
             "开始提交取消测试事务",
             "提交取消测试事务",
             "回滚提交取消测试事务",
@@ -7983,6 +7541,8 @@ mod tests {
         let result = run_cancellable_transaction(
             &mut connection,
             &cancellation,
+            &RunPerformanceCounters::default(),
+            SqliteTransactionScope::WritePlan,
             "开始提交失败测试事务",
             "提交失败测试事务",
             "回滚提交失败测试事务",
@@ -7999,6 +7559,7 @@ mod tests {
         let classifier = GenericProjectStore::for_workspace_with_cancellation(
             PathBuf::new(),
             cancellation.clone(),
+            Arc::new(RunPerformanceCounters::default()),
         );
         let result = classifier.finish_cancellable(result);
         let error = result.expect_err("COMMIT 被拒绝后必须报告确认未提交");
@@ -8064,6 +7625,8 @@ mod tests {
         let result = run_cancellable_transaction(
             &mut connection,
             &cancellation,
+            &RunPerformanceCounters::default(),
+            SqliteTransactionScope::WritePlan,
             "开始提交终态未知测试事务",
             "提交终态未知测试事务",
             "回滚提交终态未知测试事务",
@@ -8080,6 +7643,7 @@ mod tests {
         let classifier = GenericProjectStore::for_workspace_with_cancellation(
             PathBuf::new(),
             cancellation.clone(),
+            Arc::new(RunPerformanceCounters::default()),
         );
         let result = classifier.finish_cancellable(result);
         let error = result.expect_err("COMMIT 与 ROLLBACK 都失败时结果必须未知");

@@ -4,39 +4,32 @@ use std::path::PathBuf;
 
 use super::builtin::BuiltInExtraction;
 use super::rules::RulesExtraction;
-use super::{ExtractInput, ExtractOutput, ExtractProgress, ExtractProgressPhase, SelectedRules};
+use super::{ExtractOutput, ExtractProgress, ExtractProgressPhase, SelectedRules};
 use crate::execution::{CooperativeCancellation, OperationCompletion};
 use crate::progress::ProgressObserver;
-use crate::project_lease::{ProjectCommandLeaseError, ProjectCommandLeaseProvider};
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
-use crate::rpg_maker::project::ExistingProjectOpener;
+use crate::rpg_maker::project::OpenedProject;
 
 /// 按固定业务顺序编排一次 RPG Maker 文本提取。
 ///
-/// 用例只打开一次项目，随后按 Builtin、Rules 执行被选择的阶段。首个失败会
+/// Application 交入已经打开且持有排他租约的项目，随后按 Builtin、Rules 执行被选择的阶段。首个失败会
 /// 阻止后续阶段，已经成功提交的前序阶段不由本层做组合回滚。
-pub(crate) struct ExtractService<O, B, R, P> {
-    project_opener: O,
+pub(crate) struct ExtractService<B, R> {
     built_in_extraction: Option<B>,
     selected_rules: Option<SelectedRules<R>>,
-    project_lease: P,
     cancellation: CooperativeCancellation,
     progress: ExtractProgress,
 }
 
-impl<O, B, R, P> ExtractService<O, B, R, P> {
+impl<B, R> ExtractService<B, R> {
     pub(crate) fn new(
-        project_opener: O,
         built_in_extraction: Option<B>,
         selected_rules: Option<SelectedRules<R>>,
-        project_lease: P,
         cancellation: CooperativeCancellation,
     ) -> Self {
         Self {
-            project_opener,
             built_in_extraction,
             selected_rules,
-            project_lease,
             cancellation,
             progress: ExtractProgress::default(),
         }
@@ -56,37 +49,15 @@ impl<O, B, R, P> ExtractService<O, B, R, P> {
     }
 }
 
-impl<O, B, R, P> ExtractService<O, B, R, P>
+impl<B, R> ExtractService<B, R>
 where
-    O: ExistingProjectOpener,
     B: BuiltInExtraction,
     R: RulesExtraction,
-    P: ProjectCommandLeaseProvider,
 {
     pub(crate) async fn execute(
         &self,
-        input: ExtractInput,
-    ) -> Result<
-        OperationCompletion<ExtractOutput>,
-        ExtractServiceError<O::Error, B::Error, R::Error, P::Error>,
-    > {
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let ExtractInput { name } = input;
-        let _lease = self
-            .project_lease
-            .acquire(&name)
-            .await
-            .map_err(ExtractServiceError::ProjectLease)?;
-        if self.cancellation.is_requested() {
-            return Ok(OperationCompletion::Cancelled);
-        }
-        let project = self
-            .project_opener
-            .open(&name)
-            .await
-            .map_err(ExtractServiceError::OpenProject)?;
+        project: &OpenedProject,
+    ) -> Result<OperationCompletion<ExtractOutput>, ExtractServiceError<B::Error, R::Error>> {
         if self.cancellation.is_requested() {
             return Ok(OperationCompletion::Cancelled);
         }
@@ -99,7 +70,7 @@ where
             // 分母，否则 Builtin 的完成快照会被误解为 Rules 尚未开始。
             self.observe_owner(ExtractProgressPhase::Builtin, 0, 1);
             built_in_extraction
-                .refresh(&project, self.progress.clone())
+                .refresh(project, self.progress.clone())
                 .await
                 .map_err(ExtractServiceError::BuiltIn)?;
             committed_owners.push(RpgMakerAssetOwner::Builtin);
@@ -115,7 +86,7 @@ where
             let rules_output = selected_rules
                 .executor()
                 .replace(
-                    &project,
+                    project,
                     selected_rules.program().clone(),
                     self.progress.clone(),
                 )
@@ -130,7 +101,7 @@ where
         }
 
         Ok(OperationCompletion::Completed(ExtractOutput {
-            name,
+            name: project.name().clone(),
             rules_warnings,
         }))
     }
@@ -138,9 +109,7 @@ where
 
 /// 提取用例在直接依赖边界上遇到的阶段失败。
 #[derive(Debug)]
-pub(crate) enum ExtractServiceError<OE, BE, RE, PE> {
-    ProjectLease(ProjectCommandLeaseError<PE>),
-    OpenProject(OE),
+pub(crate) enum ExtractServiceError<BE, RE> {
     BuiltIn(BE),
     Rules {
         rules_path: PathBuf,
@@ -150,17 +119,13 @@ pub(crate) enum ExtractServiceError<OE, BE, RE, PE> {
     },
 }
 
-impl<OE, BE, RE, PE> fmt::Display for ExtractServiceError<OE, BE, RE, PE>
+impl<BE, RE> fmt::Display for ExtractServiceError<BE, RE>
 where
-    OE: Error,
     BE: Error,
     RE: Error,
-    PE: Error,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ProjectLease(error) => error.fmt(formatter),
-            Self::OpenProject(source) => write!(formatter, "打开项目失败：{source}"),
             Self::BuiltIn(source) => write!(formatter, "内置提取失败：{source}"),
             Self::Rules {
                 rules_path,
@@ -183,17 +148,13 @@ where
     }
 }
 
-impl<OE, BE, RE, PE> Error for ExtractServiceError<OE, BE, RE, PE>
+impl<BE, RE> Error for ExtractServiceError<BE, RE>
 where
-    OE: Error + 'static,
     BE: Error + 'static,
     RE: Error + 'static,
-    PE: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ProjectLease(error) => Some(error),
-            Self::OpenProject(source) => Some(source),
             Self::BuiltIn(source) => Some(source),
             Self::Rules { source, .. } => Some(source),
         }
@@ -206,8 +167,6 @@ mod tests {
 
     use super::*;
     use crate::progress::{ProgressAmount, ProgressSnapshot};
-    use crate::project_lease::{ProjectCommandLease, ProjectCommandLeaseProvider};
-    use crate::project_name::ProjectName;
     use crate::rpg_maker::extract::builtin::BuiltInExtraction;
     use crate::rpg_maker::extract::rules::{RulesExtraction, RulesExtractionOutput, RulesProgram};
     use crate::rpg_maker::project::OpenedProject;
@@ -222,35 +181,6 @@ mod tests {
     }
 
     impl Error for FakeError {}
-
-    #[derive(Clone)]
-    struct FakeProjectOpener {
-        project: OpenedProject,
-    }
-
-    impl ExistingProjectOpener for FakeProjectOpener {
-        type Error = FakeError;
-
-        async fn open(&self, _name: &ProjectName) -> Result<OpenedProject, Self::Error> {
-            Ok(self.project.clone())
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct FakeLease;
-
-    impl ProjectCommandLeaseProvider for FakeLease {
-        type Error = FakeError;
-        type LeaseState = ();
-
-        async fn acquire(
-            &self,
-            _project: &ProjectName,
-        ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>>
-        {
-            Ok(ProjectCommandLease::for_test(()))
-        }
-    }
 
     #[derive(Clone, Copy)]
     struct FakeBuiltIn;
@@ -322,20 +252,13 @@ mod tests {
         let rules = RulesProgram::from_toml(PathBuf::from("rules.toml"), b"rule = []".to_vec())
             .expect("测试 Rules 应合法");
         let extract = ExtractService::new(
-            FakeProjectOpener { project },
             Some(FakeBuiltIn),
             Some(SelectedRules::new(rules, FakeRules)),
-            FakeLease,
             CooperativeCancellation::default(),
         )
         .with_progress(progress.clone());
 
-        let completion = extract
-            .execute(ExtractInput {
-                name: "demo".parse().expect("项目名应合法"),
-            })
-            .await
-            .expect("Extract 应成功");
+        let completion = extract.execute(&project).await.expect("Extract 应成功");
         assert!(matches!(completion, OperationCompletion::Completed(_)));
 
         let lifecycle_phases = progress

@@ -1835,13 +1835,7 @@ const fn diagnostic_mutation_access(access: MutationResourceAccess) -> RpgMakerM
 }
 
 fn rpg_maker_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
-    }
+    JsonErrorCategory::from(source).into()
 }
 
 #[derive(Default)]
@@ -2434,7 +2428,7 @@ fn group_source_context_fingerprint<'a>(
     group_kind: &str,
     units: impl ExactSizeIterator<Item = (&'a str, &'a [u8], &'a str, &'a str)>,
 ) -> Sha256Fingerprint {
-    crate::translation::rpg_maker_group_source_context_v2(group_kind, units)
+    crate::translation::rpg_maker_group_source_context(group_kind, units)
 }
 
 type EncodedClaim = EncodedMutationClaim;
@@ -3136,13 +3130,19 @@ mod tests {
     use crate::rpg_maker::extract::model::{
         ExtractedTextUnit, RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource,
     };
+    #[cfg(feature = "release-stress")]
+    use crate::rpg_maker::model::MutationClaim;
     use crate::rpg_maker::model::{
-        DirectTextPart, DirectTextRecipe, MutationClaim, ScalarFieldKey, TextProjectionRecipe,
-        TextUnitContent, TextUnitRole,
+        DirectTextPart, DirectTextRecipe, ScalarFieldKey, TextProjectionRecipe, TextUnitContent,
+        TextUnitRole,
     };
     use crate::rpg_maker::semantic_order::RpgMakerSemanticOrderKey;
-    use crate::rpg_maker::text::{DataFileName, StandardDataFile};
+    #[cfg(feature = "release-stress")]
+    use crate::rpg_maker::text::DataFileName;
+    use crate::rpg_maker::text::StandardDataFile;
+    #[cfg(feature = "release-stress")]
     use crate::rpg_maker::translate::asset_reader::RpgMakerTranslationAssetReadingService;
+    #[cfg(feature = "release-stress")]
     use crate::rpg_maker::translate::pipeline::RpgMakerTranslationAssetReader;
     use crate::rpg_maker::write_back::asset_reader::RpgMakerWriteBackAssetReadingService;
     use crate::rpg_maker::write_back::planner::RpgMakerWriteBackAssetReader;
@@ -3197,12 +3197,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     #[derive(Clone)]
     struct ObservedRayonCpu {
         inner: RayonCpuExecutor,
         ordered_input_counts: Arc<Mutex<Vec<usize>>>,
     }
 
+    #[cfg(feature = "release-stress")]
     impl ObservedRayonCpu {
         fn new(inner: RayonCpuExecutor) -> Self {
             Self {
@@ -3219,6 +3221,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     impl CpuTaskExecutor for ObservedRayonCpu {
         type Error = <RayonCpuExecutor as CpuTaskExecutor>::Error;
 
@@ -3751,8 +3754,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn thousands_of_repeated_intents_collapse_to_one_summary_row_per_resource() {
+    fn release_stress_thousands_of_repeated_intents_collapse_to_one_summary_row_per_resource() {
         const GROUPS: usize = 10_000;
         let batches = split_groups(
             (0..GROUPS)
@@ -3907,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_group_unit_order_change_keeps_body_and_v2_state_but_is_not_current() {
+    fn complete_group_unit_order_change_keeps_body_and_state_but_is_not_current() {
         let mut snapshot = EncodedSnapshot::merge(
             RpgMakerAssetOwner::Builtin,
             vec![
@@ -3941,7 +3945,7 @@ mod tests {
             )]
             .into_iter(),
         );
-        let previous_state = crate::translation::rpg_maker_automatic_applicability_v2(
+        let previous_state = crate::translation::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             snapshot.owner.storage_name(),
@@ -3980,10 +3984,7 @@ mod tests {
         assert_eq!(translation.content_json, r#""译文""#);
         let inherited_state =
             Sha256Fingerprint::from_slice(&translation.state).expect("继承状态必须保持 32 字节");
-        assert_eq!(
-            inherited_state, previous_state,
-            "Extract 不得改写已有 V2 状态"
-        );
+        assert_eq!(inherited_state, previous_state, "Extract 不得改写已有状态");
         let current_group_context = group_source_context_fingerprint(
             snapshot.groups[0].group_kind,
             snapshot.units.iter().map(|unit| {
@@ -3995,7 +3996,7 @@ mod tests {
                 )
             }),
         );
-        let current_state = crate::translation::rpg_maker_automatic_applicability_v2(
+        let current_state = crate::translation::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             snapshot.owner.storage_name(),
@@ -4008,11 +4009,8 @@ mod tests {
             current_group_context,
         );
         assert!(
-            !crate::translation::rpg_maker_automatic_applicability_is_current(
-                inherited_state,
-                current_state,
-            ),
-            "Group 顺序变化后旧 V2 状态不得作为 Current"
+            inherited_state != current_state,
+            "Group 顺序变化后旧状态不得作为 Current"
         );
     }
 
@@ -4402,8 +4400,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn large_claim_snapshot_round_trips_through_extract_translate_and_write_back_readers() {
+    async fn release_stress_large_claim_snapshot_round_trips_all_readers() {
         const CLAIM_RECIPES: usize = 76_659;
         const REQUIRED_CLAIMS: usize = 229_974;
         const DIALOGUE_DEFINITION_JSON: &str = r#"{"rules":[]}"#;
@@ -4534,8 +4533,9 @@ mod tests {
         cpu.shutdown().expect("CPU 根应关闭");
     }
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn large_group_and_unit_snapshot_is_consumed_in_natural_order_by_production_readers() {
+    async fn release_stress_large_group_and_unit_snapshot_keeps_natural_order() {
         const TOTAL: usize = 229_975;
 
         let workspace = tempfile::tempdir().expect("应建立大 Group/Unit 项目工作区");
@@ -4784,7 +4784,7 @@ mod tests {
             &description_role,
         )
         .expect("描述配方形状应可编码");
-        let automatic_state = crate::translation::rpg_maker_automatic_applicability_v2(
+        let previous_applicability = crate::translation::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             owner.storage_name(),
@@ -4796,19 +4796,7 @@ mod tests {
             &description_unit.source_context_json,
             old_group_context,
         );
-        let previous_rejected_state = crate::translation::rpg_maker_rejected_applicability_v2(
-            "ja",
-            "zh-Hans",
-            owner.storage_name(),
-            old.groups[0].group_kind,
-            &description_unit.group_location,
-            &description_unit.unit_role,
-            &description_recipe_shape,
-            &description_unit.source_content_json,
-            &description_unit.source_context_json,
-            old_group_context,
-        );
-        let current_automatic_state = crate::translation::rpg_maker_automatic_applicability_v2(
+        let current_applicability = crate::translation::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             owner.storage_name(),
@@ -4820,24 +4808,16 @@ mod tests {
             &description_unit.source_context_json,
             new_group_context,
         );
-        let current_rejected_state = crate::translation::rpg_maker_rejected_applicability_v2(
-            "ja",
-            "zh-Hans",
-            owner.storage_name(),
-            new.groups[0].group_kind,
-            &description_unit.group_location,
-            &description_unit.unit_role,
-            &description_recipe_shape,
-            &description_unit.source_content_json,
-            &description_unit.source_context_json,
-            new_group_context,
-        );
-
         let workspace = tempfile::tempdir().expect("应创建测试工作区");
         let database_path = workspace.path().join("project.db");
         let mut connection = Connection::open(&database_path).expect("应创建测试数据库");
         create_current_schema(&connection);
-        seed_snapshot(&connection, &old, r#""旧译文""#, automatic_state.as_bytes());
+        seed_snapshot(
+            &connection,
+            &old,
+            r#""旧译文""#,
+            previous_applicability.as_bytes(),
+        );
         let manual_unit = old
             .units
             .iter()
@@ -4909,11 +4889,11 @@ mod tests {
                         &crate::translation::candidate_validation::ProvenInvariantViolation::InvalidCandidateShape,
                     )
                         .expect("违反项应可编码"),
-                    previous_rejected_state.as_bytes().to_vec(),
+                    previous_applicability.as_bytes().to_vec(),
                     &manual_unit.group_location,
                 ),
             )
-            .expect("当前 V2 Rejected 应写入当前 Unit");
+            .expect("当前 Rejected 应写入当前 Unit");
         let previous_rows = PreviousAssetRows {
             groups: read_rows(&connection, READ_OWNER_GROUPS, owner, 5),
             units: read_rows(&connection, READ_OWNER_UNITS, owner, 8),
@@ -4971,14 +4951,11 @@ mod tests {
         )
         .expect("继承状态必须保持 32 字节");
         assert_eq!(
-            inherited_state, automatic_state,
-            "sibling 变化必须逐字保留旧 V2 状态"
+            inherited_state, previous_applicability,
+            "sibling 变化必须逐字保留旧状态"
         );
         assert!(
-            !crate::translation::rpg_maker_automatic_applicability_is_current(
-                inherited_state,
-                current_automatic_state,
-            ),
+            inherited_state != current_applicability,
             "旧 Group 事实的自动正文不得在新 Group 语境下成为 Current"
         );
         assert_eq!(
@@ -5001,14 +4978,11 @@ mod tests {
             .expect("Extract 必须保留同一自然 Unit 的 Rejected 候选");
         assert_eq!(
             stored_rejected_state.as_slice(),
-            previous_rejected_state.as_bytes().as_slice(),
-            "Extract 必须逐字保留当前 V2 Rejected 状态"
+            previous_applicability.as_bytes().as_slice(),
+            "Extract 必须逐字保留当前 Rejected 状态"
         );
         assert!(
-            !crate::translation::rpg_maker_rejected_applicability_is_current(
-                previous_rejected_state,
-                current_rejected_state,
-            ),
+            previous_applicability != current_applicability,
             "旧 Group 事实的 Rejected 候选不得在新 Group 语境下成为当前候选"
         );
         drop(connection);
@@ -5720,7 +5694,7 @@ mod tests {
         assert_eq!(
             state.as_slice(),
             [0x44; 32].as_slice(),
-            "Extract 必须保留旧正文及其原状态，不得伪造当前 V2 适用性"
+            "Extract 必须保留旧正文及其原状态，不得伪造当前适用性"
         );
     }
 
@@ -6096,24 +6070,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     const LARGE_GROUP_UNIT_SOURCE_CONTENT_JSON: &str = r#""原文""#;
+    #[cfg(feature = "release-stress")]
     const LARGE_GROUP_UNIT_SOURCE_CONTEXT_JSON: &str = "{}";
+    #[cfg(feature = "release-stress")]
     const LARGE_GROUP_UNIT_ROLE_JSON: &str = r#"{"f":"name"}"#;
+    #[cfg(feature = "release-stress")]
     const LARGE_GROUP_UNIT_DIALOGUE_DEFINITION_JSON: &str = r#"{"rules":[]}"#;
 
+    #[cfg(feature = "release-stress")]
     fn large_data_file_name(ordinal: usize) -> String {
         format!("LargeData{ordinal:06}.json")
     }
 
+    #[cfg(feature = "release-stress")]
     fn large_data_root_location(ordinal: usize) -> String {
         let file_name = large_data_file_name(ordinal);
         format!(r#"["v",["d","{file_name}"],[]]"#)
     }
 
+    #[cfg(feature = "release-stress")]
     fn large_data_root_recipe(location: &str) -> String {
         format!(r#"[{{"d":[{location},{{"v":{location}}},"原文",[{{"t":{{"f":"name"}}}}]]}}]"#)
     }
 
+    #[cfg(feature = "release-stress")]
     fn large_data_root_group(ordinal: usize) -> ExtractedTextGroup {
         let source = RpgMakerSource::data_file(
             DataFileName::parse(large_data_file_name(ordinal)).expect("大项目 data 文件名应合法"),
@@ -6130,6 +6112,7 @@ mod tests {
         .expect("大项目单 Unit Group 应合法")
     }
 
+    #[cfg(feature = "release-stress")]
     fn assert_large_data_root_location(location: &RpgMakerLocation, ordinal: usize) {
         let RpgMakerSource::DataFile(file) = location.source() else {
             panic!("大项目自然序 Group 来源无效：{location}");
@@ -6141,6 +6124,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     fn seed_large_group_and_unit_snapshot(
         connection: &mut Connection,
         total: usize,
@@ -6386,6 +6370,7 @@ mod tests {
         ])
     }
 
+    #[cfg(feature = "release-stress")]
     fn claim_heavy_group(claim_recipes: usize) -> ExtractedTextGroup {
         let source = RpgMakerSource::data(StandardDataFile::Items);
         let group_location =

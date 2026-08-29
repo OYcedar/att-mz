@@ -199,7 +199,7 @@ impl RpgMakerProjectDocuments {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     pub(crate) fn from_stack_safe_parts(
         documents: BTreeMap<RpgMakerDocumentId, StackSafeJsonValue>,
         plugins: Vec<PluginConfiguration>,
@@ -1112,15 +1112,7 @@ where
 fn rpg_maker_json_failure(
     category: crate::json_diagnostic::JsonErrorCategory,
 ) -> RpgMakerJsonFailureKind {
-    match category {
-        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
-            RpgMakerJsonFailureKind::DuplicateObjectKey
-        }
-    }
+    category.into()
 }
 
 fn rpg_maker_plugins_envelope_failure(
@@ -1313,7 +1305,7 @@ fn parse_plugins(path: PathBuf, text: &str) -> Result<ParsedDocument, ParseFailu
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "release-stress"))]
 pub(crate) fn parse_json_document_for_test(
     id: RpgMakerDocumentId,
     text: &str,
@@ -1329,7 +1321,7 @@ pub(crate) fn parse_json_document_for_test(
     RpgMakerProjectDocuments::from_stack_safe_parts(BTreeMap::from([(id, value)]), Vec::new())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "release-stress"))]
 pub(crate) fn parse_plugins_document_for_test(text: &str) -> RpgMakerProjectDocuments {
     let ParsedDocument::Plugins { records, prefix } = parse_document(
         DocumentRequestKind::Plugins,

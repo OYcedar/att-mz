@@ -480,7 +480,7 @@ pub(super) struct RulesSourceMatchResult {
     contributions: Vec<RuleMatchContribution>,
     #[cfg(test)]
     event_document_scans: usize,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     shared_path_node_visits: usize,
 }
 
@@ -525,13 +525,13 @@ impl RulesSourceMatchWorkUnit {
                         source_order,
                     ));
                 }
-                #[cfg(not(test))]
+                #[cfg(not(all(test, feature = "release-stress")))]
                 let _ = shared_path_node_visits;
                 RulesSourceMatchResult {
                     contributions,
                     #[cfg(test)]
                     event_document_scans: usize::from(scans_event_document),
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "release-stress"))]
                     shared_path_node_visits,
                 }
             }
@@ -543,13 +543,13 @@ impl RulesSourceMatchWorkUnit {
             } => {
                 let (contributions, shared_path_node_visits) =
                     match_plugin_rules_on_source(&rules, &rule_indexes, &plugin, source_order);
-                #[cfg(not(test))]
+                #[cfg(not(all(test, feature = "release-stress")))]
                 let _ = shared_path_node_visits;
                 RulesSourceMatchResult {
                     contributions,
                     #[cfg(test)]
                     event_document_scans: 0,
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "release-stress"))]
                     shared_path_node_visits,
                 }
             }
@@ -3016,15 +3016,7 @@ fn rules_json_value_kind(source: JsonValueKind) -> RpgMakerJsonValueKind {
 }
 
 fn rules_json_failure(source: &StackSafeJsonError) -> RpgMakerJsonFailureKind {
-    match source.diagnostic_category() {
-        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
-            RpgMakerJsonFailureKind::DuplicateObjectKey
-        }
-    }
+    source.diagnostic_category().into()
 }
 
 fn rules_pcre2_failure(source: &pcre2::Error) -> Pcre2Failure {
@@ -4289,8 +4281,9 @@ path = 'Config.Description'
         assert_shared_matches_rule_driven_reference(&nested_error, &nested_error_input);
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn shared_path_node_visits_do_not_scale_with_identical_file_or_plugin_rules() {
+    fn release_stress_shared_path_node_visits_do_not_scale_with_identical_file_or_plugin_rules() {
         let file_input = input([(
             "Custom.json",
             json!({
@@ -4341,8 +4334,9 @@ path = 'Config.rows[].text'
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn production_matchers_support_rule_paths_deeper_than_the_native_call_stack() {
+    fn release_stress_production_matchers_support_rule_paths_deeper_than_the_native_call_stack() {
         const DEPTH: usize = 32_768;
 
         let deep_path = (0..DEPTH)
@@ -4509,6 +4503,7 @@ path = '{deep_path}.command_text'
         merge_ordered_rule_matches(matches)
     }
 
+    #[cfg(feature = "release-stress")]
     fn shared_path_node_visits(source: &str, input: RulesMatchInput) -> usize {
         let definition = RulesDefinition::parse(source).expect("计数规则应合法");
         let plan = build_source_match_plan(definition.into_rules(), input);
@@ -4574,6 +4569,7 @@ path = '{deep_path}.command_text'
         )
     }
 
+    #[cfg(feature = "release-stress")]
     fn deeply_nested_rule_value(depth: usize, terminal: Value) -> Value {
         (0..depth).rev().fold(terminal, |value, index| {
             Value::Object(Map::from_iter([(format!("k{index}"), value)]))

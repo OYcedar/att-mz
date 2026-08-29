@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::json_diagnostic::JsonErrorCategory;
+
 use super::{
     ByteRange, DiagnosticResolution, DiagnosticStage, FileSystemOrdinalKeyPhase, IoFailure,
     Pcre2Failure, PlaceholderIssue, PlaceholderRuleOrigin, PlaceholderRuleSource, SafeIdentifier,
@@ -565,6 +567,18 @@ impl RpgMakerJsonFailureKind {
             Self::Data => "data",
             Self::Eof => "eof",
             Self::DuplicateObjectKey => "duplicate_object_key",
+        }
+    }
+}
+
+impl From<JsonErrorCategory> for RpgMakerJsonFailureKind {
+    fn from(value: JsonErrorCategory) -> Self {
+        match value {
+            JsonErrorCategory::Io => Self::Io,
+            JsonErrorCategory::Syntax => Self::Syntax,
+            JsonErrorCategory::Data => Self::Data,
+            JsonErrorCategory::Eof => Self::Eof,
+            JsonErrorCategory::DuplicateObjectKey => Self::DuplicateObjectKey,
         }
     }
 }

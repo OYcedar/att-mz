@@ -7,22 +7,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::SelectedRules;
 use super::builtin::BuiltInExtractionService;
 use super::document::{RpgMakerDocumentReadingConfig, RpgMakerProjectDocumentReadingService};
 use super::rules::RulesExtractionService;
 use super::service::ExtractService;
 use super::store::asset_store::RpgMakerExtractionAssetStore;
-use super::{ExtractInput, SelectedRules};
 use crate::execution::OperationCompletion;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
 use crate::fingerprint::Sha256Fingerprint;
-use crate::project_lease::{
-    ProjectCommandLease, ProjectCommandLeaseError, ProjectCommandLeaseProvider,
-};
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
-use crate::rpg_maker::project::ExistingProjectOpeningService;
+use crate::rpg_maker::project::{ExistingProjectOpener, ExistingProjectOpeningService};
 use crate::rpg_maker::project_database::ProjectDatabaseRecordReadingService;
 use crate::storage::file_system::{
     DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
@@ -45,21 +42,6 @@ impl fmt::Display for FakeRootError {
 }
 
 impl Error for FakeRootError {}
-
-#[derive(Clone, Copy)]
-struct FakeProjectLease;
-
-impl ProjectCommandLeaseProvider for FakeProjectLease {
-    type Error = FakeRootError;
-    type LeaseState = ();
-
-    async fn acquire(
-        &self,
-        _: &ProjectName,
-    ) -> Result<ProjectCommandLease<Self::LeaseState>, ProjectCommandLeaseError<Self::Error>> {
-        Ok(ProjectCommandLease::for_test(()))
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Event {
@@ -386,6 +368,8 @@ async fn root_fakes_drive_the_complete_non_root_extract_tree() {
         FakeDirectoryResolver,
         FakeDirectoryTreeFingerprinter,
     );
+    let name: ProjectName = "demo".parse().expect("测试项目名应该合法");
+    let project = opener.open(&name).await.expect("测试项目应可打开");
     let builtin = BuiltInExtractionService::new(
         RpgMakerProjectDocumentReadingService::new(
             file_reader.clone(),
@@ -407,7 +391,6 @@ async fn root_fakes_drive_the_complete_non_root_extract_tree() {
         cpu.clone(),
     );
     let extract = ExtractService::new(
-        opener,
         Some(builtin),
         Some(SelectedRules::new(
             crate::rpg_maker::extract::rules::RulesProgram::from_toml(
@@ -426,13 +409,11 @@ parameter = 0
             .expect("测试 Rules 应合法"),
             rules,
         )),
-        FakeProjectLease,
         cancellation,
     );
 
-    let name: ProjectName = "demo".parse().expect("测试项目名应该合法");
     let output = extract
-        .execute(ExtractInput { name: name.clone() })
+        .execute(&project)
         .await
         .expect("完整非根树应该成功完成组合提取");
 
@@ -463,7 +444,7 @@ parameter = 0
     *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("builtin".to_owned());
 
     extract
-        .execute(ExtractInput { name: name.clone() })
+        .execute(&project)
         .await
         .expect_err("Builtin 根事务失败必须停止 Rules");
 
@@ -476,7 +457,7 @@ parameter = 0
     *fail_owner.lock().expect("SQLite 失败配置锁不应中毒") = Some("rules".to_owned());
 
     let error = extract
-        .execute(ExtractInput { name: name.clone() })
+        .execute(&project)
         .await
         .expect_err("Rules 根事务失败必须保留已经提交的 Builtin 事实");
     let super::service::ExtractServiceError::Rules {
@@ -498,7 +479,7 @@ parameter = 0
         .expect("SQLite 取消配置锁不应中毒") = Some("rules".to_owned());
 
     let completion = extract
-        .execute(ExtractInput { name })
+        .execute(&project)
         .await
         .expect("Rules 提交后到达的取消不得抹掉已完成结果");
     let OperationCompletion::Completed(output) = completion else {

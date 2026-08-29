@@ -20,7 +20,7 @@ use std::time::Duration;
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::limits::Limit;
 use rusqlite::types::{ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, ErrorCode, OpenFlags, Statement, params_from_iter};
+use rusqlite::{Connection, ErrorCode, OpenFlags, Statement, Transaction, params_from_iter};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::diagnostic::{
@@ -1442,7 +1442,7 @@ fn map_query_open_error(
     }
 }
 
-fn execute_transaction_control(
+pub(crate) fn execute_transaction_control(
     connection: &Connection,
     performance: &RunPerformanceCounters,
     scope: SqliteTransactionScope,
@@ -1453,6 +1453,19 @@ fn execute_transaction_control(
     let result = connection.execute_batch(statement);
     if result.is_ok() {
         performance.sqlite_control_succeeded(scope, control);
+    }
+    result
+}
+
+pub(crate) fn begin_cancellable_transaction<'connection>(
+    connection: &'connection mut AttSqliteCancellableConnection,
+    performance: &RunPerformanceCounters,
+    scope: SqliteTransactionScope,
+) -> rusqlite::Result<Transaction<'connection>> {
+    performance.sqlite_control_attempted(scope, SqliteTransactionControl::Begin);
+    let result = connection.transaction();
+    if result.is_ok() {
+        performance.sqlite_control_succeeded(scope, SqliteTransactionControl::Begin);
     }
     result
 }
@@ -5171,8 +5184,9 @@ mod tests {
         storage.shutdown().await.expect("SQLite 根应可关闭");
     }
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn large_query_and_batch_are_limited_only_by_real_sqlite_and_machine_resources() {
+    async fn release_stress_large_query_and_batch_have_no_att_capacity_limit() {
         const ROWS: usize = 230_000;
         let directory = TestDirectory::new();
         let database = directory.database("large-batch.db");

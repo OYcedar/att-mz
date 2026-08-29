@@ -2542,26 +2542,21 @@ fn load_generic_entries(
         let automatic_state: Option<Vec<u8>> = row.get(9)?;
         let project_source_language: String = row.get(21)?;
         let project_target_language: String = row.get(22)?;
-        let expected_automatic_applicability =
-            crate::translation::generic_automatic_applicability_v2(
-                &project_source_language,
-                &project_target_language,
-                &group_id,
-                &unit_id,
-                &source_text,
-                group_context,
-            );
+        let expected_automatic_applicability = crate::translation::generic_automatic_applicability(
+            &project_source_language,
+            &project_target_language,
+            &group_id,
+            &unit_id,
+            &source_text,
+            group_context,
+        );
         let automatic = match (automatic, automatic_state) {
             (None, None) => None,
             (Some(translation), Some(state)) => {
                 let state = Sha256Fingerprint::from_slice(&state).map_err(|_| {
                     ManualDatabaseError::InvalidProject("Generic 自动译文状态长度无效".to_owned())
                 })?;
-                crate::translation::generic_automatic_applicability_is_current(
-                    state,
-                    expected_automatic_applicability,
-                )
-                .then_some(translation)
+                (state == expected_automatic_applicability).then_some(translation)
             }
             _ => {
                 return Err(ManualDatabaseError::InvalidProject(
@@ -2636,10 +2631,7 @@ fn load_generic_entries(
                     })?;
                 if rejected_source != source
                     || rejected_group_context != group_context
-                    || !crate::translation::generic_automatic_applicability_is_current(
-                        rejected_planning_state,
-                        expected_automatic_applicability,
-                    )
+                    || rejected_planning_state != expected_automatic_applicability
                 {
                     None
                 } else {
@@ -2868,31 +2860,25 @@ pub(crate) fn load_rpg_maker_manual_lua_snapshot(
     })
 }
 
-struct ManualAutomaticApplicabilityUnit {
+struct ManualRpgMakerApplicabilityUnit {
     role: String,
     semantic_order_key: Vec<u8>,
     source_content_json: String,
     source_context_json: String,
 }
 
-struct ManualAutomaticApplicabilityGroup {
+struct ManualRpgMakerApplicabilityGroup {
     owner: String,
     location: String,
     kind: String,
     projection_recipe_json: String,
     semantic_order_key: Vec<u8>,
-    units: Vec<ManualAutomaticApplicabilityUnit>,
+    units: Vec<ManualRpgMakerApplicabilityUnit>,
 }
 
-#[derive(Clone, Copy)]
-struct ManualRpgMakerApplicability {
-    automatic: Sha256Fingerprint,
-    rejected: Sha256Fingerprint,
-}
-
-fn load_rpg_maker_automatic_applicability(
+fn load_rpg_maker_applicability(
     connection: &Connection,
-) -> Result<HashMap<(String, String, String), ManualRpgMakerApplicability>, ManualDatabaseError> {
+) -> Result<HashMap<(String, String, String), Sha256Fingerprint>, ManualDatabaseError> {
     let mut statement = connection.prepare(
         "SELECT g.owner, g.group_location, g.group_kind, g.projection_recipe_json,
                 g.semantic_order_key, u.unit_role, u.semantic_order_key,
@@ -2904,7 +2890,7 @@ fn load_rpg_maker_automatic_applicability(
                   g.semantic_order_key, u.semantic_order_key",
     )?;
     let mut rows = statement.query([])?;
-    let mut groups = Vec::<ManualAutomaticApplicabilityGroup>::new();
+    let mut groups = Vec::<ManualRpgMakerApplicabilityGroup>::new();
     while let Some(row) = rows.next()? {
         let owner: String = row.get(0)?;
         let location: String = row.get(1)?;
@@ -2924,7 +2910,7 @@ fn load_rpg_maker_automatic_applicability(
             .last()
             .is_none_or(|group| group.owner != owner || group.location != location);
         if new_group {
-            groups.push(ManualAutomaticApplicabilityGroup {
+            groups.push(ManualRpgMakerApplicabilityGroup {
                 owner,
                 location,
                 kind,
@@ -2939,7 +2925,7 @@ fn load_rpg_maker_automatic_applicability(
                 || group.semantic_order_key != group_order
             {
                 return Err(ManualDatabaseError::InvalidProject(
-                    "RPG Maker Group 自动译文事实不一致".to_owned(),
+                    "RPG Maker Group 译文适用性事实不一致".to_owned(),
                 ));
             }
         }
@@ -2947,7 +2933,7 @@ fn load_rpg_maker_automatic_applicability(
             .last_mut()
             .expect("当前行必须建立或命中一个 Group")
             .units
-            .push(ManualAutomaticApplicabilityUnit {
+            .push(ManualRpgMakerApplicabilityUnit {
                 role,
                 semantic_order_key: unit_order,
                 source_content_json,
@@ -2991,7 +2977,7 @@ fn load_rpg_maker_automatic_applicability(
             .flat_map(|index| groups[*index].units.iter())
             .collect::<Vec<_>>();
         units.sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
-        let context = crate::translation::rpg_maker_group_source_context_v2(
+        let context = crate::translation::rpg_maker_group_source_context(
             &definition.kind,
             units.iter().map(|unit| {
                 (
@@ -3012,7 +2998,7 @@ fn load_rpg_maker_automatic_applicability(
             .expect("每个物理 Group 必须属于一个完整逻辑 Group");
         for unit in group.units {
             let role = RpgMakerProjectionCodec::decode_role(&unit.role).map_err(|_| {
-                ManualDatabaseError::InvalidProject("RPG Maker 自动译文 Unit role 无效".to_owned())
+                ManualDatabaseError::InvalidProject("RPG Maker 译文 Unit role 无效".to_owned())
             })?;
             let recipe_shape = RpgMakerProjectionCodec::encode_role_recipe_shape(
                 &group.projection_recipe_json,
@@ -3021,19 +3007,7 @@ fn load_rpg_maker_automatic_applicability(
             .map_err(|_| {
                 ManualDatabaseError::InvalidProject("RPG Maker 自动译文写回结构无效".to_owned())
             })?;
-            let automatic = crate::translation::rpg_maker_automatic_applicability_v2(
-                &source_language,
-                &target_language,
-                &group.owner,
-                &group.kind,
-                &group.location,
-                &unit.role,
-                &recipe_shape,
-                &unit.source_content_json,
-                &unit.source_context_json,
-                group_context,
-            );
-            let rejected = crate::translation::rpg_maker_rejected_applicability_v2(
+            let current = crate::translation::rpg_maker_applicability(
                 &source_language,
                 &target_language,
                 &group.owner,
@@ -3048,15 +3022,12 @@ fn load_rpg_maker_automatic_applicability(
             if applicability
                 .insert(
                     (group.owner.clone(), group.location.clone(), unit.role),
-                    ManualRpgMakerApplicability {
-                        automatic,
-                        rejected,
-                    },
+                    current,
                 )
                 .is_some()
             {
                 return Err(ManualDatabaseError::InvalidProject(
-                    "RPG Maker 自动译文 Unit 重复".to_owned(),
+                    "RPG Maker 译文 Unit 重复".to_owned(),
                 ));
             }
         }
@@ -3069,7 +3040,7 @@ fn load_rpg_maker_entries(
     _engine: RpgMakerEngine,
     semantics: Option<&ResolvedTranslationSemantics>,
 ) -> Result<Vec<ManualTranslationEntry>, ManualDatabaseError> {
-    let automatic_applicability = load_rpg_maker_automatic_applicability(connection)?;
+    let current_applicability = load_rpg_maker_applicability(connection)?;
     let mut statement = connection.prepare(
         "SELECT g.owner, g.group_location, g.group_kind, g.projection_recipe_json,
                 g.semantic_order_key, u.unit_role, u.source_content_json,
@@ -3247,7 +3218,7 @@ fn load_rpg_maker_entries(
                             "{id} 的 Rejected planning_state 无效"
                         ))
                     })?;
-                let expected_rejected = automatic_applicability
+                let expected = current_applicability
                     .get(&(
                         owner_raw.clone(),
                         group_location_raw.clone(),
@@ -3260,10 +3231,7 @@ fn load_rpg_maker_entries(
                     })?;
                 if rejected_source != content
                     || rejected_context_json != identity.source_context_json()
-                    || !crate::translation::rpg_maker_rejected_applicability_is_current(
-                        planning_state,
-                        expected_rejected.rejected,
-                    )
+                    || planning_state != *expected
                 {
                     None
                 } else {
@@ -3309,19 +3277,16 @@ fn load_rpg_maker_entries(
                 let state = Sha256Fingerprint::from_slice(&state).map_err(|_| {
                     ManualDatabaseError::InvalidProject(format!("{id} 的自动译文状态长度无效"))
                 })?;
-                let expected = automatic_applicability
+                let expected = current_applicability
                     .get(&(
                         owner_raw.clone(),
                         group_location_raw.clone(),
                         role_raw.clone(),
                     ))
                     .ok_or_else(|| {
-                        ManualDatabaseError::InvalidProject(format!("{id} 缺少自动译文适用性事实"))
+                        ManualDatabaseError::InvalidProject(format!("{id} 缺少译文适用性事实"))
                     })?;
-                if crate::translation::rpg_maker_automatic_applicability_is_current(
-                    state,
-                    expected.automatic,
-                ) {
+                if state == *expected {
                     Some(serde_json::from_str::<TextUnitContent>(value).map_err(|_| {
                         ManualDatabaseError::InvalidProject(format!("{id} 的自动译文无法读取"))
                     })?)
@@ -4915,7 +4880,7 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
         let group_context = Sha256Fingerprint::from_bytes([81; 32]);
-        let current_state = crate::translation::generic_automatic_applicability_v2(
+        let current_state = crate::translation::generic_automatic_applicability(
             "ja",
             "zh-Hans",
             "g",
@@ -5273,9 +5238,9 @@ mod tests {
                 .expect("跨 owner Unit 应可写入");
         }
 
-        let actual = load_rpg_maker_automatic_applicability(&connection)
+        let actual = load_rpg_maker_applicability(&connection)
             .expect("Manual 应建立跨 owner 完整 Group 适用性");
-        let complete_context = crate::translation::rpg_maker_group_source_context_v2(
+        let complete_context = crate::translation::rpg_maker_group_source_context(
             "database_entry",
             [
                 (
@@ -5301,8 +5266,8 @@ mod tests {
             ))
             .expect("Builtin Unit 应有适用性");
         assert_eq!(
-            builtin.automatic,
-            crate::translation::rpg_maker_automatic_applicability_v2(
+            *builtin,
+            crate::translation::rpg_maker_applicability(
                 "ja",
                 "zh-Hans",
                 "builtin",
@@ -5315,7 +5280,7 @@ mod tests {
                 complete_context,
             )
         );
-        let owner_only = crate::translation::rpg_maker_group_source_context_v2(
+        let owner_only = crate::translation::rpg_maker_group_source_context(
             "database_entry",
             [(
                 builtin_role.as_str(),

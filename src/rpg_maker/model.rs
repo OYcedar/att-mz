@@ -452,7 +452,7 @@ pub(crate) struct MutationClaimIndex<'a> {
     // 发现冲突时才克隆最终要进入错误值的那一个资源。
     resources: HashMap<&'a RpgMakerLocation, IndexedMutationResource>,
     next_group_index: usize,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     resource_lookups: usize,
 }
 
@@ -467,7 +467,7 @@ impl<'a> MutationClaimIndex<'a> {
         Self {
             resources: HashMap::with_capacity(resource_capacity),
             next_group_index: 0,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "release-stress"))]
             resource_lookups: 0,
         }
     }
@@ -481,7 +481,7 @@ impl<'a> MutationClaimIndex<'a> {
         let mut inserted_resources = Vec::new();
         let mut selected = None::<(usize, &'a RpgMakerLocation)>;
         for lock in claims.locks() {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "release-stress"))]
             {
                 self.resource_lookups += 1;
             }
@@ -523,7 +523,7 @@ impl<'a> MutationClaimIndex<'a> {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     fn resource_lookups(&self) -> usize {
         self.resource_lookups
     }
@@ -1144,8 +1144,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn claim_index_work_grows_with_claim_locks_instead_of_group_pairs() {
+    fn release_stress_claim_index_work_grows_with_claim_locks_instead_of_group_pairs() {
         let source = RpgMakerSource::data(StandardDataFile::Items);
         let group_count = 2_000;
         let claims = (0..group_count)

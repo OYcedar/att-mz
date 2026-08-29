@@ -581,8 +581,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn direct_value_builder_cleans_deep_partial_trees_iteratively_on_every_failure_shape() {
+    fn release_stress_deep_partial_trees_are_cleaned_iteratively() {
         const DEPTH: usize = 20_000;
         let mut deep = "[".repeat(DEPTH);
         deep.push_str("null");
@@ -615,8 +616,9 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn deeply_nested_values_parse_and_drop_without_using_the_rust_stack() {
+    fn release_stress_deeply_nested_values_parse_and_drop_without_using_the_rust_stack() {
         const DEPTH: usize = 20_000;
         let mut source = "[".repeat(DEPTH);
         source.push_str("null");
@@ -635,8 +637,9 @@ mod tests {
         drop_serde_value(value);
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn parses_a_seventeen_mibibyte_string_without_an_att_size_check() {
+    fn release_stress_parses_a_seventeen_mibibyte_string_without_an_att_size_check() {
         const PAYLOAD_BYTES: usize = 17 * 1024 * 1024;
         let mut source = String::with_capacity(PAYLOAD_BYTES + 2);
         source.push('"');

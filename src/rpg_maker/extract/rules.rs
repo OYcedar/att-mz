@@ -285,15 +285,7 @@ fn rules_definition_problem(source: &RulesDefinitionError) -> RpgMakerRulesDefin
 }
 
 fn rpg_maker_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match crate::json_diagnostic::JsonErrorCategory::from(source) {
-        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
-            RpgMakerJsonFailureKind::DuplicateObjectKey
-        }
-    }
+    crate::json_diagnostic::JsonErrorCategory::from(source).into()
 }
 
 fn pcre2_failure(source: &pcre2::Error) -> Pcre2Failure {
@@ -353,17 +345,7 @@ fn rules_path_failure(source: InvalidPathReason) -> RpgMakerRulesPathFailure {
             column,
         } => RpgMakerRulesPathFailure::InvalidQuotedKey {
             byte_offset: offset,
-            json_category: match json_category {
-                crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-                crate::json_diagnostic::JsonErrorCategory::Syntax => {
-                    RpgMakerJsonFailureKind::Syntax
-                }
-                crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-                crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-                crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
-                    RpgMakerJsonFailureKind::DuplicateObjectKey
-                }
-            },
+            json_category: json_category.into(),
             line,
             column,
         },
@@ -914,8 +896,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "release-stress")]
     use std::fmt::Write as _;
+    #[cfg(feature = "release-stress")]
     use std::fs::File;
+    #[cfg(feature = "release-stress")]
     use std::io::{BufWriter, Write as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -929,12 +914,14 @@ mod tests {
     use crate::rpg_maker::extract::document::RpgMakerProjectDocumentReadingError;
     use crate::rpg_maker::model::{DirectTextPart, ProjectionModelError, TextProjectionRecipe};
     use crate::rpg_maker::text::MapId;
+    #[cfg(feature = "release-stress")]
     use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
+    #[cfg(feature = "release-stress")]
     use crate::storage::file_system::FileReader;
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn thousands_of_semantic_rules_larger_than_seventeen_mibibytes_cross_production_read_and_state_round_trip()
-     {
+    async fn release_stress_seventeen_mibibyte_rules_round_trip_production_path() {
         const RULE_COUNT: usize = 4_096;
         const PATH_SEGMENTS_PER_RULE: usize = 112;
 

@@ -980,9 +980,7 @@ fn mz_language_pair_round_trip_hides_and_restores_the_same_automatic_body() {
             [&source_json],
             |row| row.get(0),
         )
-        .expect("初始自动译文必须保存当前 V2 状态");
-    assert_eq!(&original_state[..8], b"ATTRATV2");
-
+        .expect("初始自动译文必须保存当前适用性");
     assert_success(
         "MZ target en Init",
         &run_att(
@@ -1001,7 +999,7 @@ fn mz_language_pair_round_trip_hides_and_restores_the_same_automatic_body() {
         .expect("保留正文必须同时保留状态");
     assert_eq!(
         state, original_state,
-        "语言事实变化只能改变适用性，不能改写持久化的当前 V2 状态"
+        "语言事实变化只能改变适用性，不能改写持久状态"
     );
     drop(connection);
 
@@ -1037,7 +1035,7 @@ fn mz_language_pair_round_trip_hides_and_restores_the_same_automatic_body() {
     assert_eq!(
         read_items(&output)[1]["description"],
         TRANSLATION,
-        "语言对恢复后同一 V2 正文必须无需重跑模型即可重新成为 Current"
+        "语言对恢复后同一正文必须无需重跑模型即可重新成为 Current"
     );
 }
 

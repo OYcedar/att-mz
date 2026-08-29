@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/att-json-repair"]
+default-members = [".", "crates/att-json-repair"]
 resolver = "3"
 
 [package]
@@ -11,6 +12,9 @@ publish = false
 description = "面向 Agent 的游戏翻译命令行工具"
 license = "AGPL-3.0-only"
 repository = "https://github.com/yexi-by/att"
+
+[features]
+release-stress = []
 
 [dependencies]
 att-json-repair = { path = "crates/att-json-repair" }
@@ -48,7 +52,6 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
 
 [profile.release]
 # ATT 的 Release 制品以大型游戏端到端吞吐优先，接受更长的本机构建时间。

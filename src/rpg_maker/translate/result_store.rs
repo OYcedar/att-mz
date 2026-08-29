@@ -711,13 +711,7 @@ impl ResultStoragePlanError {
 }
 
 fn result_store_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
-    }
+    JsonErrorCategory::from(source).into()
 }
 
 impl fmt::Display for ResultStoragePlanError {
@@ -1270,7 +1264,7 @@ fn encode_commit_unit(work: CommitUnitWork) -> Result<EncodedCommitUnit, ResultS
             }
             (
                 target.identity(),
-                target.state_context().finish(patch.translation()),
+                target.state_context().applicability(),
                 target.expected_previous(),
             )
         }
@@ -1713,6 +1707,7 @@ fn map_transaction_error<S, C>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "release-stress")]
     use std::cell::Cell;
     use std::future::{Future, ready};
     use std::num::NonZeroUsize;
@@ -2142,7 +2137,7 @@ mod tests {
                             identity.clone(),
                             Vec::new(),
                             translation.clone(),
-                            context.finish(&translation),
+                            context.applicability(),
                         ),
                     ),
                     Vec::new(),
@@ -2183,7 +2178,7 @@ mod tests {
                         identity.clone(),
                         Vec::new(),
                         translation.clone(),
-                        context.finish(&translation),
+                        context.applicability(),
                     ),
                 ),
                 Vec::new(),
@@ -2339,7 +2334,7 @@ mod tests {
             identity,
             Vec::new(),
             translation.clone(),
-            context.finish(&translation),
+            context.applicability(),
         );
 
         let failure = match service
@@ -2471,8 +2466,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn huge_propagation_family_encodes_and_owns_translation_once_per_decision() {
+    fn release_stress_huge_propagation_family_encodes_and_owns_translation_once_per_decision() {
         const TARGETS: usize = 50_000;
 
         let representative = scalar_identity(0, "name", "共同原文", "{}");
@@ -2489,7 +2485,7 @@ mod tests {
             representative,
             propagation_targets,
             translation.clone(),
-            state_context(0x5a).finish(&translation),
+            state_context(0x5a).applicability(),
         )]);
         let work = commit_work(outcome).expect("超大全族应可建立提交工作");
         assert_eq!(work.decisions.len(), 1);
@@ -2552,13 +2548,13 @@ mod tests {
                     state_context(0x12),
                 )],
                 first_translation.clone(),
-                state_context(0x11).finish(&first_translation),
+                state_context(0x11).applicability(),
             ),
             TranslationPatch::new(
                 second_representative,
                 Vec::new(),
                 second_translation.clone(),
-                state_context(0x21).finish(&second_translation),
+                state_context(0x21).applicability(),
             ),
         ]);
         let work = commit_work(outcome).expect("提交工作应保持任务自然顺序");
@@ -2957,7 +2953,7 @@ mod tests {
             identity,
             Vec::new(),
             translation.clone(),
-            context.finish(&translation),
+            context.applicability(),
         );
         let work = commit_work(complete_outcome(vec![patch.clone(), patch]))
             .expect("重复应由最终计划阶段按编码身份识别");
@@ -3046,8 +3042,8 @@ mod tests {
         let translation = value(r"已修复的译文 \V[1]");
         let representative_context = state_context(0x51);
         let propagation_context = state_context(0x52);
-        let committed_representative_state = representative_context.finish(&translation);
-        let committed_propagation_state = propagation_context.finish(&translation);
+        let committed_representative_state = representative_context.applicability();
+        let committed_propagation_state = propagation_context.applicability();
         let outcome = complete_outcome(vec![TranslationPatch::new(
             representative,
             vec![TranslationPropagationTarget::new(
@@ -3166,7 +3162,7 @@ mod tests {
                 state_context(0x82),
             )],
             translation.clone(),
-            state_context(0x81).finish(&translation),
+            state_context(0x81).applicability(),
         )]);
         let prepared = service
             .prepare_commit(outcome)
@@ -3204,8 +3200,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
         let database_path = directory.path().join("request-failed").join("project.db");
         let identity = scalar_identity(1, "name", "翻訳対象", "{}");
-        let previous_state =
-            crate::translation::unrelated_rpg_maker_automatic_applicability_for_test();
+        let previous_state = crate::translation::unrelated_rpg_maker_applicability_for_test();
         create_unit_database(
             &database_path,
             &[StoredUnit::new(
@@ -3395,7 +3390,7 @@ mod tests {
             leader,
             vec![TranslationPropagationTarget::new(target, context)],
             translation.clone(),
-            context.finish(&translation),
+            context.applicability(),
         )]);
 
         let work = commit_work(result).expect("结果形状应合法");
@@ -3617,7 +3612,7 @@ mod tests {
             identity,
             Vec::new(),
             translation.clone(),
-            state_context(state_byte).finish(&translation),
+            state_context(state_byte).applicability(),
         )
     }
 

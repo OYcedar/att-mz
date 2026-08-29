@@ -92,6 +92,9 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 列出的开发材料。普通检查只要求活动配置存在，不把它与模板作摘要比较；公开发行检查才要求
 二者完全相同。该脚本不修改或证明 `att.exe` 和 `projects/` 的状态，也不代替包内链接与
 独立运行检查。
+同步 Formic 时以本节列出的当前托管集合直接收敛目录：删除不在当前集合中的文件或目录，并替换
+当前托管资源；已有活动 `config.toml` 始终逐字节保留。该收敛不使用历史文件名清单，也不触碰
+发行根中的 `projects/`；ATT 与 Formic 的活动配置仍按前述使用者状态规则保留。
 
 脚本默认操作仓库 `dist/`；公开发行验证可以用 `-TargetRoot` 指向新建的干净暂存目录。
 无论目标在哪里，脚本都只从当前仓库权威资源读取，并拒绝操作目标根之外的路径。
@@ -114,11 +117,15 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 构建。标签使用 `vMAJOR.MINOR.PATCH`，版本必须同时等于 `Cargo.toml`、`Cargo.lock`、CLI
 `--version` 和 Windows manifest 中的版本；标签提交必须就是触发时的远端 `main`。
 
-标签建立前完成格式、Clippy、测试、第三方许可重生成、PE 依赖和本规格第 4 节完整检查。
+标签建立前完成格式、Clippy、普通行为测试、第三方许可重生成、PE 依赖和本规格第 4 节完整检查。
+普通测试不启用 `release-stress` feature；合成的大容量、超深结构和墙钟性能回归不属于提交前或
+PR 门禁。
 
-Release workflow 不重复这些检查；它只使用锁定工具链和依赖构建静态 `att.exe`，从空的
-`dist/` 同步托管资源并首次创建两份活动配置，再确认活动配置与各自模板完全相同且不含真实凭据，
-校验 `att.exe --version`、打包并发布。`projects/` 作为空目录进入压缩包。
+Release workflow 不重复普通检查；它使用锁定工具链和依赖构建静态 `att.exe`，随后分别运行
+根 crate 与 `att-json-repair` crate 的 `release-stress` 测试组。该 workflow 是此测试组的唯一
+触发入口，压力验证失败时不得打包或发布。通过后，workflow 从空的 `dist/` 同步托管资源并首次
+创建两份活动配置，再确认活动配置与各自模板完全相同且不含真实凭据，校验 `att.exe --version`、
+打包并发布。`projects/` 作为空目录进入压缩包。
 
 正式附件固定为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 和 `SHA256SUMS.txt`。ZIP 使用
 兼容 Windows 常用解压工具的标准 Deflate，并采用可用工具的最高压缩级别。同一 job 完成构建、

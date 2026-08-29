@@ -78,14 +78,7 @@ pub(crate) enum RuntimeOperation {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RuntimeBoundaryOperation {
-    InitProjectLeaseAlreadyHeld,
     InitWorkspaceStageRequestInvalid,
-    ExtractProjectLeaseAlreadyHeld,
-    ExtractProjectAlreadyOpened,
-    TranslateProjectLeaseAlreadyHeld,
-    TranslateProjectAlreadyOpened,
-    WriteBackProjectLeaseAlreadyHeld,
-    WriteBackProjectAlreadyOpened,
     TranslateResultStorePlanInvalid,
     TranslateResultStoreSessionChanged,
     TranslateResultStoreSessionFinalized,
@@ -94,14 +87,7 @@ pub(crate) enum RuntimeBoundaryOperation {
 impl RuntimeBoundaryOperation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::InitProjectLeaseAlreadyHeld => "init_project_lease_already_held",
             Self::InitWorkspaceStageRequestInvalid => "init_workspace_stage_request_invalid",
-            Self::ExtractProjectLeaseAlreadyHeld => "extract_project_lease_already_held",
-            Self::ExtractProjectAlreadyOpened => "extract_project_already_opened",
-            Self::TranslateProjectLeaseAlreadyHeld => "translate_project_lease_already_held",
-            Self::TranslateProjectAlreadyOpened => "translate_project_already_opened",
-            Self::WriteBackProjectLeaseAlreadyHeld => "write_back_project_lease_already_held",
-            Self::WriteBackProjectAlreadyOpened => "write_back_project_already_opened",
             Self::TranslateResultStorePlanInvalid => "translate_result_store_plan_invalid",
             Self::TranslateResultStoreSessionChanged => "translate_result_store_session_changed",
             Self::TranslateResultStoreSessionFinalized => {

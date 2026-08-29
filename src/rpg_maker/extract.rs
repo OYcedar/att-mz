@@ -50,12 +50,6 @@ fn extraction_compute_report(
     )
 }
 
-/// 提取指定 RPG Maker 游戏文本所需的输入。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtractInput {
-    pub name: ProjectName,
-}
-
 /// Extract 当前正在执行的 owner 或 owner 内部阶段。
 ///
 /// `Builtin` / `Rules` 只表达 owner 的 `i/N`；其余变体拥有

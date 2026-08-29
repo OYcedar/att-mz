@@ -1771,14 +1771,19 @@ impl Error for PlaceholderDefinitionError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "release-stress")]
     use std::fs::File;
+    #[cfg(feature = "release-stress")]
     use std::io::Write as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "release-stress")]
     use std::time::Instant;
 
     use super::*;
+    #[cfg(feature = "release-stress")]
     use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
+    #[cfg(feature = "release-stress")]
     use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
 
     #[test]
@@ -2454,8 +2459,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn ten_thousand_literal_triggers_share_one_compiled_matcher() {
+    fn release_stress_ten_thousand_literal_triggers_share_one_compiled_matcher() {
         let definitions = (0..10_000)
             .map(|index| TerminologyEntry {
                 term: format!("term-{index:05}"),
@@ -2517,8 +2523,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[tokio::test]
-    async fn terminology_larger_than_nine_mibibytes_crosses_production_read_and_prepare() {
+    async fn release_stress_nine_mibibyte_terminology_crosses_production_path() {
         const TRANSLATION_BYTES: usize = 9 * 1024 * 1024 + 1;
 
         let directory = tempfile::tempdir().expect("应建立临时目录");

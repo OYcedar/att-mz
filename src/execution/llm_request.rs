@@ -21,6 +21,15 @@ pub(crate) trait AsyncDelay: Send + Sync {
     fn wait(&self, duration: Duration) -> impl Future<Output = ()> + Send;
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TokioAsyncDelay;
+
+impl AsyncDelay for TokioAsyncDelay {
+    async fn wait(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
 /// 一次请求执行所消费的外部重试策略。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LlmRequestRetryPolicy<'a> {

@@ -123,12 +123,21 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(feature = "release-stress")]
+    use std::time::Instant;
 
     use super::*;
 
-    #[test]
-    fn active_worker_does_not_delay_cancellation_and_test_reclaims_it() {
+    struct ActiveWorkerCancellationObservation {
+        result: Result<(), IsolatedOperationError<&'static str>>,
+        returned_before_release: bool,
+        retained_cancelled_worker: bool,
+        #[cfg(feature = "release-stress")]
+        elapsed: Duration,
+    }
+
+    fn observe_active_worker_cancellation() -> ActiveWorkerCancellationObservation {
         let cancellation = Arc::new(AtomicBool::new(false));
         let caller_cancellation = Arc::clone(&cancellation);
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
@@ -161,9 +170,11 @@ mod tests {
         started_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("隔离 worker 应在取消前实际开始运行");
+        #[cfg(feature = "release-stress")]
         let cancellation_started = Instant::now();
         cancellation.store(true, Ordering::Release);
         let first_result = result_receiver.recv_timeout(Duration::from_secs(1));
+        #[cfg(feature = "release-stress")]
         let cancellation_elapsed = cancellation_started.elapsed();
         let cancelled_worker = worker_receiver.try_recv().ok();
         let returned_before_release = first_result.is_ok();
@@ -183,21 +194,42 @@ mod tests {
         }
         caller.join().expect("调用线程应正常结束");
 
-        assert!(matches!(
+        ActiveWorkerCancellationObservation {
             result,
+            returned_before_release,
+            retained_cancelled_worker,
+            #[cfg(feature = "release-stress")]
+            elapsed: cancellation_elapsed,
+        }
+    }
+
+    #[test]
+    fn active_worker_returns_cancellation_before_release_and_test_reclaims_it() {
+        let observation = observe_active_worker_cancellation();
+
+        assert!(matches!(
+            observation.result,
             Err(IsolatedOperationError::Cancelled("cancelled"))
         ));
         assert!(
-            cancellation_elapsed < Duration::from_millis(500),
-            "10ms 轮询应及时返回，实际耗时 {cancellation_elapsed:?}"
-        );
-        assert!(
-            returned_before_release,
+            observation.returned_before_release,
             "调用方取消后不应等待第三方计算结束"
         );
         assert!(
-            retained_cancelled_worker,
+            observation.retained_cancelled_worker,
             "测试必须取得并 join 取消路径留下的 worker"
+        );
+    }
+
+    #[cfg(feature = "release-stress")]
+    #[test]
+    fn release_stress_active_worker_cancellation_returns_within_poll_budget() {
+        let observation = observe_active_worker_cancellation();
+
+        assert!(
+            observation.elapsed < Duration::from_millis(500),
+            "10ms 轮询应及时返回，实际耗时 {:?}",
+            observation.elapsed
         );
     }
 }

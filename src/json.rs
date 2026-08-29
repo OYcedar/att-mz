@@ -374,8 +374,9 @@ pub(crate) fn drop_value(root: Value) {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn deeply_nested_values_parse_clone_compare_serialize_and_drop_iteratively() {
+    fn release_stress_deeply_nested_values_parse_clone_compare_serialize_and_drop_iteratively() {
         const DEPTH: usize = 10_000;
         let mut source = "[".repeat(DEPTH);
         source.push_str(r#"{"number":1e999,"negativeZero":-0,"text":"值"}"#);

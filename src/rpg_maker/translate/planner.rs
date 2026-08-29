@@ -1010,19 +1010,15 @@ fn preprocess_scope(
                 && asset.rejected.as_ref().is_some_and(|rejected| {
                     rejected.source_content() == asset.identity.source_content()
                         && rejected.source_context_json() == asset.identity.source_context_json()
-                        && state_context
-                            .rejected_applicability_is_current(rejected.planning_state())
+                        && state_context.is_current(rejected.planning_state())
                 });
             let skipped_rejected = current_rejected && !retry_rejected;
             let current = asset.translation.as_ref().is_some_and(|_translation| {
                 candidate_contract_valid
                     && (asset.manual
-                        || asset.translation_state.is_some_and(|state| {
-                            crate::translation::rpg_maker_automatic_applicability_is_current(
-                                state,
-                                state_context.finish(asset.identity.source_content()),
-                            )
-                        }))
+                        || asset
+                            .translation_state
+                            .is_some_and(|state| state_context.is_current(state)))
             });
             let invalidated = asset.translation.is_some() && !current;
             let invalidation_violation = (asset.translation.is_some() && !candidate_contract_valid)
@@ -1286,15 +1282,13 @@ fn append_planner_text_with_cancellation(
     ensure_planner_cpu_running(cancellation).map_err(|()| ScopeTaskPlanningFailure::Cancelled)
 }
 
-/// 同时建立相互独立的 Rejected 与自动正文 V2 适用性。
-///
-/// 两者使用各自 tag/domain，但只绑定结果实际针对的稳定项目和来源事实。
+/// 建立自动正文与 Rejected 候选共用的当前适用性。
 fn translation_state_context_with_applicability_cancellation<E>(
     language_pair: &LanguagePair,
     group_context: GroupContextFingerprint,
     identity: &TranslationUnitIdentity,
     recipe_shape: &str,
-    mut ensure_running: impl FnMut() -> Result<(), E>,
+    ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<TranslationStateContext, ScopePreprocessingError>, E> {
     let group_location = match RpgMakerLocationCodec::encode(identity.group_location()) {
         Ok(value) => value,
@@ -1306,38 +1300,20 @@ fn translation_state_context_with_applicability_cancellation<E>(
     };
     let source_content_json = serde_json::to_string(identity.source_content())
         .expect("受信 TextUnitContent 必须可序列化为规范 JSON");
-    let rejected_applicability =
-        crate::translation::rpg_maker_rejected_applicability_v2_with_cancellation(
-            language_pair.source().as_str(),
-            language_pair.target().as_str(),
-            identity.owner().storage_name(),
-            identity.kind().storage_name(),
-            &group_location,
-            &role,
-            recipe_shape,
-            &source_content_json,
-            identity.source_context_json(),
-            group_context.as_fingerprint(),
-            &mut ensure_running,
-        )?;
-    let automatic_applicability =
-        crate::translation::rpg_maker_automatic_applicability_v2_with_cancellation(
-            language_pair.source().as_str(),
-            language_pair.target().as_str(),
-            identity.owner().storage_name(),
-            identity.kind().storage_name(),
-            &group_location,
-            &role,
-            recipe_shape,
-            &source_content_json,
-            identity.source_context_json(),
-            group_context.as_fingerprint(),
-            ensure_running,
-        )?;
-    Ok(Ok(TranslationStateContext::from_applicabilities(
-        rejected_applicability,
-        automatic_applicability,
-    )))
+    let applicability = crate::translation::rpg_maker_applicability_with_cancellation(
+        language_pair.source().as_str(),
+        language_pair.target().as_str(),
+        identity.owner().storage_name(),
+        identity.kind().storage_name(),
+        &group_location,
+        &role,
+        recipe_shape,
+        &source_content_json,
+        identity.source_context_json(),
+        group_context.as_fingerprint(),
+        ensure_running,
+    )?;
+    Ok(Ok(TranslationStateContext::new(applicability)))
 }
 
 type UnitPosition = (usize, usize, usize);
@@ -1411,8 +1387,7 @@ fn unit_invalidation(unit: &PreprocessedUnit) -> TranslationInvalidation {
             translation,
             translation_state,
             violation,
-            unit.state_context
-                .rejection_planning_state(unit.identity.source_content()),
+            unit.state_context.applicability(),
             origin,
         ),
         None => TranslationInvalidation::new(unit.identity.clone(), translation, translation_state),
@@ -1796,7 +1771,7 @@ struct TerminologyPromptLine {
 }
 
 impl TerminologyPromptIndex {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "release-stress"))]
     fn new(terminology: &CompiledTerminology) -> Self {
         match Self::new_with_cancellation(terminology, &CooperativeCancellation::default()) {
             Ok(index) => index,
@@ -1836,7 +1811,7 @@ impl TerminologyPromptIndex {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "release-stress"))]
 fn render_user_message(
     groups: &[RenderedGroup],
     terminology: &TerminologyPromptIndex,
@@ -2921,9 +2896,9 @@ mod tests {
             "[]",
             || Ok::<_, Infallible>(()),
         )
-        .expect("测试 V2 状态不能取消")
-        .expect("测试 V2 状态应可编码")
-        .finish(identity.source_content())
+        .expect("测试适用性不能取消")
+        .expect("测试适用性应可编码")
+        .applicability()
     }
 
     fn translation_state_context_for_group(
@@ -3154,7 +3129,7 @@ mod tests {
         )
         .expect("测试自动状态不能取消")
         .expect("测试自动状态应可建立")
-        .finish(speaker.source_content());
+        .applicability();
         let scope = |body_source: &str,
                      body_order: RpgMakerSemanticOrderKey,
                      body_translation: Option<&str>| PreparedScope {
@@ -3211,7 +3186,7 @@ mod tests {
         );
         assert!(
             !speaker_is_current(scope("こんばんは", original_body_order, None)),
-            "兄弟原文变化后，旧 V2 组上下文与当前事实不一致，自动译文不能保持 Current"
+            "兄弟原文变化后，旧组上下文与当前事实不一致，自动译文不能保持 Current"
         );
         assert!(
             !speaker_is_current(scope(
@@ -3219,7 +3194,7 @@ mod tests {
                 RpgMakerSemanticOrderKey::new(vec![1, 1, 0], 3),
                 None
             )),
-            "兄弟语义顺序变化后，旧 V2 组上下文与当前事实不一致，自动译文不能保持 Current"
+            "兄弟语义顺序变化后，旧组上下文与当前事实不一致，自动译文不能保持 Current"
         );
     }
 
@@ -3858,8 +3833,8 @@ pattern = '\A<Help:(?<text>.*?)>\z'
             ],
         );
         let speaker_translation = TextUnitContent::Value("爱丽丝".to_owned());
-        let speaker_state = translation_state_context_for_group(&fingerprint_group, &speaker)
-            .finish(speaker.source_content());
+        let speaker_state =
+            translation_state_context_for_group(&fingerprint_group, &speaker).applicability();
         let corpus = RpgMakerTranslationCorpus::new(vec![RpgMakerTranslationGroup::new(
             TextGroupKind::EventDialogue,
             group_location,
@@ -4238,8 +4213,7 @@ pattern = '保護対象'
             "{}",
         );
         let previous_translation = TextUnitContent::Value("仍可恢复的旧译文".to_owned());
-        let previous_state =
-            crate::translation::unrelated_rpg_maker_automatic_applicability_for_test();
+        let previous_state = crate::translation::unrelated_rpg_maker_applicability_for_test();
         let corpus = RpgMakerTranslationCorpus::new(vec![RpgMakerTranslationGroup::new(
             TextGroupKind::DatabaseEntry,
             group_location,
@@ -5344,8 +5318,9 @@ pattern = '保護対象'
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn sparse_terminology_prompt_visits_only_matches_and_preserves_natural_order() {
+    fn release_stress_sparse_terminology_prompt_visits_only_matches_and_preserves_natural_order() {
         let entries = (0..4_096)
             .map(|index| {
                 crate::translation::planning_resource::TerminologyEntry::new(

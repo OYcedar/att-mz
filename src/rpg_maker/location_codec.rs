@@ -190,13 +190,7 @@ impl RpgMakerLocationCodecError {
 }
 
 fn codec_json_failure(source: &serde_json::Error) -> RpgMakerJsonFailureKind {
-    match JsonErrorCategory::from(source) {
-        JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        JsonErrorCategory::DuplicateObjectKey => RpgMakerJsonFailureKind::DuplicateObjectKey,
-    }
+    JsonErrorCategory::from(source).into()
 }
 
 struct StoredLocation {
@@ -1086,8 +1080,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn long_location_path_round_trips_without_an_encoding_limit() {
+    fn release_stress_long_location_path_round_trips_without_an_encoding_limit() {
         let steps = (0..16_384)
             .map(|index| match index % 3 {
                 0 => RpgMakerLocationStep::key(format!("key-{index}")),

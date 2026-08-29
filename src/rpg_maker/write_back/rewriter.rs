@@ -17,7 +17,7 @@ use super::planner::{
 };
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, FileSystemOrdinalKeyPhase, IoFailure, ReportedFailure,
-    RpgMakerComputeFailure, RpgMakerDocumentConsumer, RpgMakerIssue, RpgMakerJsonFailureKind,
+    RpgMakerDocumentConsumer, RpgMakerIssue, RpgMakerJsonFailureKind,
     RpgMakerWriteBackDocumentRewriteProblem, RpgMakerWriteBackMutationViolation, SafePath,
     StateEffect,
 };
@@ -2665,29 +2665,12 @@ fn rewrite_report(problem: RpgMakerWriteBackDocumentRewriteProblem) -> Diagnosti
 fn rewrite_compute_report(
     source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
 ) -> DiagnosticReport {
-    let failure = match source {
-        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
-            RpgMakerComputeFailure::ExecutorClosed
-        }
-        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
-            RpgMakerComputeFailure::StatePoisoned
-        }
-        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
-    };
+    let failure = crate::rpg_maker::compute_failure(source);
     rewrite_report(RpgMakerWriteBackDocumentRewriteProblem::RewriteCompute { failure })
 }
 
 fn rewrite_json_failure(source: &StackSafeJsonError) -> RpgMakerJsonFailureKind {
-    match source.diagnostic_category() {
-        crate::json_diagnostic::JsonErrorCategory::Io => RpgMakerJsonFailureKind::Io,
-        crate::json_diagnostic::JsonErrorCategory::Syntax => RpgMakerJsonFailureKind::Syntax,
-        crate::json_diagnostic::JsonErrorCategory::Data => RpgMakerJsonFailureKind::Data,
-        crate::json_diagnostic::JsonErrorCategory::Eof => RpgMakerJsonFailureKind::Eof,
-        crate::json_diagnostic::JsonErrorCategory::DuplicateObjectKey => {
-            RpgMakerJsonFailureKind::DuplicateObjectKey
-        }
-    }
+    source.diagnostic_category().into()
 }
 
 macro_rules! map_mutation_violation {
@@ -2778,8 +2761,10 @@ mod tests {
     use crate::diagnostic::render_diagnostic_report;
     use crate::i18n::{UiLocale, UiLocalizer};
     use crate::lossless_json::LosslessJsonError;
+    use crate::rpg_maker::extract::document::PluginConfiguration;
+    #[cfg(feature = "release-stress")]
     use crate::rpg_maker::extract::document::{
-        PluginConfiguration, parse_json_document_for_test, parse_plugins_document_for_test,
+        parse_json_document_for_test, parse_plugins_document_for_test,
     };
     use crate::rpg_maker::model::{
         DialogueLinePart, DialogueLineRecipe, DialogueWriteRecipe, DirectSpeakerTarget,
@@ -4611,8 +4596,9 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn standard_data_at_4096_levels_parses_rewrites_serializes_and_drops_without_recursion() {
+    fn release_stress_standard_data_at_4096_levels_round_trips() {
         const DEPTH: usize = 4_096;
         let mut source_text = "[".repeat(DEPTH);
         source_text.push_str(r#""原文""#);
@@ -4644,8 +4630,9 @@ mod tests {
         assert_eq!(current.as_str(), Some("译文"));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn plugin_parameter_at_10000_levels_parses_rewrites_serializes_and_drops_without_recursion() {
+    fn release_stress_plugin_parameter_at_10000_levels_round_trips() {
         const DEPTH: usize = 10_000;
         let mut nested = "[".repeat(DEPTH);
         nested.push_str(r#""原文""#);

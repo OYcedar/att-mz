@@ -21,6 +21,25 @@ pub(crate) mod write_back;
 
 use std::path::{Path, PathBuf};
 
+use crate::diagnostic::RpgMakerComputeFailure;
+use crate::execution::cpu::CpuTaskExecutionError;
+use crate::runtime::cpu::CpuExecutorUnavailable;
+
+pub(crate) fn compute_failure(
+    source: &CpuTaskExecutionError<CpuExecutorUnavailable>,
+) -> RpgMakerComputeFailure {
+    match source {
+        CpuTaskExecutionError::Cancelled => RpgMakerComputeFailure::Cancelled,
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::ShuttingDown) => {
+            RpgMakerComputeFailure::ExecutorClosed
+        }
+        CpuTaskExecutionError::Unavailable(CpuExecutorUnavailable::StatePoisoned) => {
+            RpgMakerComputeFailure::StatePoisoned
+        }
+        CpuTaskExecutionError::TaskPanicked => RpgMakerComputeFailure::WorkerPanicked,
+    }
+}
+
 /// 当前支持的 RPG Maker 引擎。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RpgMakerEngine {

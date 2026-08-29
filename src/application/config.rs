@@ -5739,8 +5739,9 @@ api_key = "{API_KEY}" "invalid"
         assert!(!diagnostics.contains("UNSELECTED_API_KEY_SENTINEL"));
     }
 
+    #[cfg(feature = "release-stress")]
     #[test]
-    fn large_configuration_file_is_loaded_without_an_att_size_limit() {
+    fn release_stress_large_configuration_file_is_loaded_without_an_att_size_limit() {
         let directory = TestDirectory::new();
         let path = directory.path().join("large.toml");
         let mut source = minimal_init_configuration().to_owned();
