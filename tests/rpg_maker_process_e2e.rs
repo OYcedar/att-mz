@@ -1905,8 +1905,7 @@ fn mv_source_placeholder_failure_fails_before_database_and_model_side_effects() 
         .as_str()
         .expect("规划诊断 object 必须是可读文本");
     for expected in [
-        "Items.json",
-        "role=scalar:description",
+        "Items.json:2:description",
         "overlapping-mv-placeholders.toml",
         "builtin",
         "custom rule 1",
