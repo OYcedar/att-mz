@@ -140,7 +140,7 @@ result-plan-saved = Kế hoạch chạy thành công đã được lưu.
 log-run-started = Lệnh { $command } đã bắt đầu.
 log-run-succeeded = Lệnh { $command } đã hoàn tất thành công.
 log-run-failed = Lệnh { $command } thất bại.
-log-run-outcome-unknown = Lệnh { $command } đã kết thúc nhưng kết quả cuối cùng chưa xác định; hãy làm theo các vị trí khôi phục trong lỗi.
+log-run-outcome-unknown = Lệnh { $command } đã kết thúc nhưng kết quả cuối cùng chưa xác định; hãy xử lý theo chẩn đoán trước khi thử lại.
 log-run-cancelled = Lệnh { $command } đã bị hủy.
 log-performance-counters = Bộ đếm hiệu năng: số lần thử điều khiển giao dịch SQLite { $sqlite_control_attempted_total }; xác thực toàn bộ cây ứng viên đã bắt đầu { $candidate_validation_started }, đã hoàn tất { $candidate_validation_completed }.
 log-lua-print = Lua: { $message }
@@ -220,6 +220,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] Sửa trường cấu hình được nêu rồi thử lại
     [fix_input] Sửa dữ liệu đầu vào được nêu rồi thử lại
     [fix_placeholder_rules] Sửa quy tắc Placeholder được nêu rồi thử lại
+    [review_translation] Xem lại bản dịch được chỉ ra; dùng Manual để sửa nếu cần
     [review_disabled_rules] Nếu đây là kết quả mong đợi thì không cần xử lý; nếu không, hãy thêm quy tắc hợp lệ vào tệp được chỉ ra rồi chạy lại Extract
     [check_path_and_permissions] Kiểm tra đường dẫn, trạng thái hệ thống tệp và quyền
     [check_project_state] Kiểm tra và sửa trạng thái dự án rồi thử lại
@@ -296,6 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] Luồng mô hình tiếp tục xuất sau finish
     [model_stream_unexpected_done] Luồng Responses trả về [DONE] ngoài dự kiến
     [invalid_response_contract] Phản hồi mô hình không đáp ứng hợp đồng phản hồi bắt buộc
+    [needs_review] Bản dịch cần được xem xét
     [lua_compilation_failed] Không thể biên dịch chương trình Lua chính
     [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy
     [rules_pattern_match_failed] Không thể đánh giá mẫu PCRE2 của Rules

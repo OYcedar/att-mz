@@ -140,7 +140,7 @@ result-plan-saved = 已儲存本次成功執行方案。
 log-run-started = 命令 { $command } 已開始。
 log-run-succeeded = 命令 { $command } 已成功完成。
 log-run-failed = 命令 { $command } 失敗。
-log-run-outcome-unknown = 命令 { $command } 已結束，但最終結果未知；請依錯誤中的復原位置處理。
+log-run-outcome-unknown = 命令 { $command } 已結束，但最終結果未知；請先依診斷處理，再決定是否重試。
 log-run-cancelled = 命令 { $command } 已取消。
 log-performance-counters = 效能計數：SQLite 事務控制嘗試 { $sqlite_control_attempted_total } 次；完整候選樹驗證開始 { $candidate_validation_started } 次，完成 { $candidate_validation_completed } 次。
 log-lua-print = Lua：{ $message }
@@ -220,6 +220,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] 修正指出的設定欄位後重試
     [fix_input] 修正指出的輸入後重試
     [fix_placeholder_rules] 修正指出的 Placeholder 規則後重試
+    [review_translation] 複核指出的譯文；需要修正時使用 Manual
     [review_disabled_rules] 如果這是預期結果，無需處理；否則在指出的檔案中加入有效規則並重新執行 Extract
     [check_path_and_permissions] 檢查路徑、檔案系統狀態與權限
     [check_project_state] 檢查並修正專案狀態後重試
@@ -296,6 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] 模型串流在 finish 後繼續輸出
     [model_stream_unexpected_done] Responses 模型串流意外傳回 [DONE]
     [invalid_response_contract] 模型回應不符合必要的回應契約
+    [needs_review] 譯文需要複核
     [lua_compilation_failed] 無法編譯 Lua 主程式
     [lua_execution_failed] Lua 主程式執行時失敗
     [rules_pattern_match_failed] 無法評估 Rules 的 PCRE2 模式

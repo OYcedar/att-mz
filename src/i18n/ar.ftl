@@ -140,7 +140,7 @@ result-plan-saved = حُفظت خطة التشغيل الناجحة.
 log-run-started = بدأ الأمر { $command }.
 log-run-succeeded = اكتمل الأمر { $command } بنجاح.
 log-run-failed = فشل الأمر { $command }.
-log-run-outcome-unknown = انتهى الأمر { $command } لكن النتيجة النهائية غير معروفة؛ اتبع مواقع الاسترداد الواردة في الخطأ.
+log-run-outcome-unknown = انتهى الأمر { $command } لكن النتيجة النهائية غير معروفة؛ اتبع التشخيص قبل إعادة المحاولة.
 log-run-cancelled = أُلغي الأمر { $command }.
 log-performance-counters = عدادات الأداء: محاولات التحكم في معاملات SQLite‏ { $sqlite_control_attempted_total }؛ بدء التحقق الكامل من شجرة المرشح { $candidate_validation_started }، واكتماله { $candidate_validation_completed }.
 log-lua-print = Lua: { $message }
@@ -227,6 +227,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] صحح حقل الإعدادات المحدد ثم أعد المحاولة
     [fix_input] صحح الإدخال المحدد ثم أعد المحاولة
     [fix_placeholder_rules] صحح قاعدة Placeholder المحددة ثم أعد المحاولة
+    [review_translation] راجع الترجمة المشار إليها؛ استخدم Manual لتصحيحها عند الحاجة
     [review_disabled_rules] إذا كانت هذه النتيجة متوقعة فلا يلزم إجراء؛ وإلا فأضف قواعد صالحة إلى الملف المشار إليه ثم شغّل Extract مجددًا
     [check_path_and_permissions] تحقق من المسار وحالة نظام الملفات والأذونات
     [check_project_state] افحص حالة المشروع وصححها ثم أعد المحاولة
@@ -303,6 +304,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] واصل تدفق النموذج الإخراج بعد finish
     [model_stream_unexpected_done] أعاد تدفق Responses علامة [DONE] غير متوقعة
     [invalid_response_contract] استجابة النموذج لا تستوفي عقد الاستجابة المطلوب
+    [needs_review] تحتاج الترجمة إلى مراجعة
     [lua_compilation_failed] تعذر تجميع برنامج Lua الرئيسي
     [lua_execution_failed] فشل برنامج Lua الرئيسي أثناء التشغيل
     [rules_pattern_match_failed] تعذر تقييم نمط PCRE2 في Rules

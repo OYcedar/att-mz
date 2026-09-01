@@ -140,7 +140,7 @@ result-plan-saved = Le plan d’exécution réussi a été enregistré.
 log-run-started = La commande { $command } a démarré.
 log-run-succeeded = La commande { $command } s’est terminée avec succès.
 log-run-failed = La commande { $command } a échoué.
-log-run-outcome-unknown = La commande { $command } s’est terminée avec un résultat final inconnu ; suivez les emplacements de récupération indiqués dans l’erreur.
+log-run-outcome-unknown = La commande { $command } s’est terminée avec un résultat final inconnu ; suivez le diagnostic avant de réessayer.
 log-run-cancelled = La commande { $command } a été annulée.
 log-performance-counters = Compteurs de performances : { $sqlite_control_attempted_total } tentatives de contrôle de transaction SQLite ; validations complètes de l’arborescence candidate démarrées { $candidate_validation_started }, terminées { $candidate_validation_completed }.
 log-lua-print = Lua : { $message }
@@ -223,6 +223,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] Corrigez le champ de configuration indiqué, puis réessayez
     [fix_input] Corrigez l’entrée indiquée, puis réessayez
     [fix_placeholder_rules] Corrigez la règle Placeholder indiquée, puis réessayez
+    [review_translation] Vérifiez la traduction indiquée ; utilisez Manual pour la corriger si nécessaire
     [review_disabled_rules] Si ce résultat est attendu, aucune action n’est nécessaire ; sinon, ajoutez des règles valides au fichier indiqué et relancez Extract
     [check_path_and_permissions] Vérifiez le chemin, l’état du système de fichiers et les autorisations
     [check_project_state] Examinez et corrigez l’état du projet, puis réessayez
@@ -299,6 +300,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] Le flux du modèle a continué après finish
     [model_stream_unexpected_done] Le flux Responses a renvoyé un [DONE] inattendu
     [invalid_response_contract] La réponse du modèle ne respecte pas le contrat de réponse requis
+    [needs_review] La traduction doit être vérifiée
     [lua_compilation_failed] Le programme Lua principal n’a pas pu être compilé
     [lua_execution_failed] Le programme Lua principal a échoué pendant son exécution
     [rules_pattern_match_failed] Le motif PCRE2 de Rules n’a pas pu être évalué

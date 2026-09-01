@@ -1163,6 +1163,24 @@ pub(crate) enum GenericTaskResponseProblem {
 }
 
 impl GenericTaskResponseProblem {
+    const fn output_id(&self) -> Option<u64> {
+        match self {
+            Self::UnexpectedId { output_id }
+            | Self::DuplicateId { output_id }
+            | Self::MissingId { output_id }
+            | Self::InvalidValue { output_id, .. }
+            | Self::InvalidTranslation { output_id, .. }
+            | Self::InvalidDestination { output_id, .. }
+            | Self::DestinationReview { output_id, .. } => Some(*output_id),
+            Self::InvalidId
+            | Self::InvalidJson { .. }
+            | Self::ThinkingEmpty { .. }
+            | Self::NonStopFinish
+            | Self::ResponseReview { .. }
+            | Self::CommitConflict { .. } => None,
+        }
+    }
+
     fn code(&self) -> &'static str {
         match self {
             Self::InvalidId => "generic.translation.response.invalid_id",
@@ -1282,6 +1300,10 @@ impl GenericTaskResponseProblem {
                     }
                 }
             },
+            Self::InvalidJson {
+                category: GenericTaskResponseJsonCategory::Shape,
+                ..
+            } => "generic.translation.response.invalid_shape",
             Self::InvalidJson { .. } => "generic.translation.response.invalid_json",
             Self::ThinkingEmpty { .. } => "generic.translation.response.thinking_empty",
             Self::NonStopFinish => "generic.translation.response.non_stop_finish",
@@ -1307,6 +1329,10 @@ impl GenericTaskResponseProblem {
 
     const fn summary_code(&self) -> &'static str {
         match self {
+            Self::InvalidJson {
+                category: GenericTaskResponseJsonCategory::Shape,
+                ..
+            } => "invalid_response_contract",
             Self::InvalidJson { .. } => "response_parsing_failed",
             Self::CommitConflict { .. } => "state_mismatch",
             Self::ResponseReview { .. } | Self::DestinationReview { .. } => "needs_review",
@@ -1937,7 +1963,10 @@ impl GenericProblem {
             Self::MissingProfileId | Self::BlankProfileId => DiagnosticResolution::FixConfiguration,
             Self::SerializeJson { .. } => DiagnosticResolution::ReportBug,
             Self::TaskResponse { problem, .. } => match problem {
-                GenericTaskResponseProblem::CommitConflict { .. } => DiagnosticResolution::Retry,
+                GenericTaskResponseProblem::ResponseReview { .. }
+                | GenericTaskResponseProblem::DestinationReview { .. } => {
+                    DiagnosticResolution::ReviewTranslation
+                }
                 _ => DiagnosticResolution::Retry,
             },
             Self::TaskUnavailable { .. } => DiagnosticResolution::Retry,
@@ -2110,8 +2139,27 @@ impl GenericProblem {
             | Self::DuplicateTranslationClear { group_id, unit_id }
             | Self::UnitNotFound { group_id, unit_id } => format!("{group_id}/{unit_id}"),
             Self::MissingProfileId | Self::BlankProfileId => "profile_id".to_owned(),
-            Self::TaskResponse { task_ordinal, .. }
-            | Self::TaskUnavailable { task_ordinal, .. } => {
+            Self::TaskResponse {
+                task_ordinal,
+                problem,
+                ..
+            } => {
+                let mut subject = match problem {
+                    GenericTaskResponseProblem::InvalidDestination { destination, .. }
+                    | GenericTaskResponseProblem::DestinationReview { destination, .. } => {
+                        format!(
+                            "{} (generic_translation_task_{task_ordinal})",
+                            destination.readable_id()
+                        )
+                    }
+                    _ => format!("generic_translation_task_{task_ordinal}"),
+                };
+                if let Some(output_id) = problem.output_id() {
+                    subject.push_str(&format!("; output_id={output_id}"));
+                }
+                subject
+            }
+            Self::TaskUnavailable { task_ordinal, .. } => {
                 format!("generic_translation_task_{task_ordinal}")
             }
             Self::TranslationPreparation { unit, .. } => unit.as_ref().map_or_else(
@@ -2559,7 +2607,10 @@ fn optional_number(value: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::{Diagnostic, DiagnosticReport, StateEffect};
+    use crate::diagnostic::{
+        Diagnostic, DiagnosticReport, DiagnosticResolution, StateEffect, render_diagnostic_fields,
+    };
+    use crate::i18n::{UiLocale, UiLocalizer};
 
     #[test]
     fn jsonl_location_rejects_zero_line() {
@@ -2619,5 +2670,109 @@ mod tests {
                 error_len: Some(1),
             },
         );
+    }
+
+    #[test]
+    fn response_shape_problem_is_reported_as_contract_failure() {
+        let issue = GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskResponse {
+                task_ordinal: 1,
+                total_tasks: 1,
+                problem: GenericTaskResponseProblem::InvalidJson {
+                    category: GenericTaskResponseJsonCategory::Shape,
+                    line: NonZeroUsize::MIN,
+                    column: NonZeroUsize::MIN,
+                },
+            },
+        );
+        assert_eq!(issue.code(), "generic.translation.response.invalid_shape");
+        let fields = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        );
+        assert!(fields.reason.contains("响应契约"));
+        assert!(!fields.reason.contains("有效 JSON"));
+    }
+
+    #[test]
+    fn response_review_uses_review_action_without_fallback() {
+        let issue = GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskResponse {
+                task_ordinal: 1,
+                total_tasks: 1,
+                problem: GenericTaskResponseProblem::ResponseReview {
+                    finding: GenericResponseReviewFinding::SourceResidual,
+                },
+            },
+        );
+        assert_eq!(issue.resolution(), DiagnosticResolution::ReviewTranslation);
+        let fields = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        );
+        assert_eq!(fields.reason, "译文需要复核");
+        assert!(fields.help.contains("Manual"));
+        assert!(!fields.reason.contains("__ATT_FALLBACK__"));
+    }
+
+    #[test]
+    fn response_problem_subject_names_the_temporary_output_id() {
+        let issue = GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskResponse {
+                task_ordinal: 1,
+                total_tasks: 1,
+                problem: GenericTaskResponseProblem::MissingId { output_id: 7 },
+            },
+        );
+
+        assert_eq!(issue.subject(), "generic_translation_task_1; output_id=7");
+    }
+
+    #[test]
+    fn destination_response_subject_names_the_natural_unit_without_internal_ids() {
+        let destination = GenericUnitLocator::new(
+            "story.jsonl",
+            "internal-group",
+            "internal-unit",
+            Some("internal-role"),
+        )
+        .with_natural_position(3, 2);
+        let problems = [
+            GenericTaskResponseProblem::InvalidDestination {
+                output_id: 7,
+                destination: destination.clone(),
+                problem: GenericResponseDestinationProblem::MissingPlanningFact,
+            },
+            GenericTaskResponseProblem::DestinationReview {
+                output_id: 7,
+                destination,
+                finding: GenericResponseReviewFinding::SourceResidual,
+            },
+        ];
+
+        for problem in problems {
+            let issue = GenericIssue::project(
+                GenericDiagnosticStage::Translate,
+                GenericProblem::TaskResponse {
+                    task_ordinal: 1,
+                    total_tasks: 1,
+                    problem,
+                },
+            );
+            let fields = render_diagnostic_fields(
+                &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
+                &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            );
+            assert_eq!(
+                fields.object,
+                "story.jsonl:line3:unit2:text (generic_translation_task_1); output_id=7"
+            );
+            for internal in ["internal-group", "internal-unit", "internal-role"] {
+                assert!(!fields.object.contains(internal));
+            }
+        }
     }
 }

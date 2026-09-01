@@ -309,6 +309,7 @@ impl RpgMakerDiagnosticRole {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RpgMakerUnitLocator {
+    readable_id: SafeText,
     owner: RpgMakerDiagnosticOwner,
     group_kind: RpgMakerDiagnosticGroupKind,
     group_location: RpgMakerDiagnosticLocation,
@@ -317,12 +318,14 @@ pub(crate) struct RpgMakerUnitLocator {
 
 impl RpgMakerUnitLocator {
     pub(crate) const fn new(
+        readable_id: SafeText,
         owner: RpgMakerDiagnosticOwner,
         group_kind: RpgMakerDiagnosticGroupKind,
         group_location: RpgMakerDiagnosticLocation,
         role: RpgMakerDiagnosticRole,
     ) -> Self {
         Self {
+            readable_id,
             owner,
             group_kind,
             group_location,
@@ -332,6 +335,7 @@ impl RpgMakerUnitLocator {
 
     fn facts(&self) -> Vec<(&'static str, String)> {
         vec![
+            ("readable_id", self.readable_id.to_string()),
             ("owner", self.owner.as_str().to_owned()),
             ("group_kind", self.group_kind.as_str().to_owned()),
             ("source", self.group_location.source_fact()),
@@ -345,25 +349,17 @@ impl RpgMakerUnitLocator {
         rule_source: &PlaceholderRuleSource,
         rules: Option<String>,
     ) -> String {
-        let mut details = vec![
-            format!("group={}", self.group_kind.as_str()),
-            format!("role={}", self.role.fact_value()),
-            format!(
-                "Placeholder={}",
-                match rule_source {
-                    PlaceholderRuleSource::ExternalFile { path } => path.to_string(),
-                    PlaceholderRuleSource::ProjectSnapshot => "project snapshot".to_owned(),
-                }
-            ),
-        ];
+        let mut details = vec![format!(
+            "Placeholder={}",
+            match rule_source {
+                PlaceholderRuleSource::ExternalFile { path } => path.to_string(),
+                PlaceholderRuleSource::ProjectSnapshot => "project snapshot".to_owned(),
+            }
+        )];
         if let Some(rules) = rules {
             details.push(format!("rules={rules}"));
         }
-        format!(
-            "{} ({})",
-            self.group_location.natural_location(),
-            details.join("; ")
-        )
+        format!("{} ({})", self.readable_id, details.join("; "))
     }
 }
 
@@ -1641,14 +1637,26 @@ impl RpgMakerResponseProcessingScope {
     }
 
     fn subject(&self) -> String {
+        let natural_task_number =
+            |task_index: usize| task_index.checked_add(1).expect("翻译任务自然编号不得溢出");
         match self {
-            Self::Task { task_index } => format!("translation_task_{task_index}"),
+            Self::Task { task_index } => {
+                format!("translation_task_{}", natural_task_number(*task_index))
+            }
             Self::Unit { task_index, unit } => format!(
-                "translation_task_{task_index}:{}:{}",
-                unit.owner.as_str(),
-                unit.group_kind.as_str()
+                "{} (translation_task_{})",
+                unit.readable_id,
+                natural_task_number(*task_index),
             ),
         }
+    }
+
+    fn task_response_subject(&self, output_id: Option<usize>) -> String {
+        let mut subject = self.subject();
+        if let Some(output_id) = output_id {
+            subject.push_str(&format!("; output_id={output_id}"));
+        }
+        subject
     }
 }
 
@@ -2019,8 +2027,27 @@ pub(crate) enum RpgMakerTaskResponseProblem {
 }
 
 impl RpgMakerTaskResponseProblem {
+    const fn output_id(&self) -> Option<usize> {
+        match self {
+            Self::UnknownId { output_id, .. }
+            | Self::UnitRejected { output_id, .. }
+            | Self::UnitReview { output_id, .. }
+            | Self::MissingPlannedOutput { output_id } => Some(*output_id),
+            Self::InvalidJson { .. }
+            | Self::ThinkingEmpty { .. }
+            | Self::NonStopFinish { .. }
+            | Self::InvalidId { .. }
+            | Self::ModelResponseUnusable
+            | Self::AllOutputsRejected => None,
+        }
+    }
+
     const fn code(&self) -> &'static str {
         match self {
+            Self::InvalidJson {
+                category: RpgMakerTaskResponseJsonCategory::Shape,
+                ..
+            } => "rpg_maker.translation.response.invalid_shape",
             Self::InvalidJson { .. } => "rpg_maker.translation.response.invalid_json",
             Self::ThinkingEmpty { .. } => "rpg_maker.translation.response.thinking_empty",
             Self::NonStopFinish { .. } => "rpg_maker.translation.response.non_stop_finish",
@@ -2038,6 +2065,10 @@ impl RpgMakerTaskResponseProblem {
 
     const fn summary_code(&self) -> &'static str {
         match self {
+            Self::InvalidJson {
+                category: RpgMakerTaskResponseJsonCategory::Shape,
+                ..
+            } => "invalid_response_contract",
             Self::InvalidJson { .. } => "response_parsing_failed",
             Self::NonStopFinish { .. } | Self::UnitReview { .. } => "needs_review",
             Self::ModelResponseUnusable | Self::AllOutputsRejected => "invalid_response_contract",
@@ -6939,7 +6970,13 @@ impl RpgMakerIssue {
                     DiagnosticResolution::ReportBug
                 }
             },
-            RpgMakerProblem::TaskResponse { .. } => DiagnosticResolution::Retry,
+            RpgMakerProblem::TaskResponse { problem, .. } => match problem {
+                RpgMakerTaskResponseProblem::NonStopFinish { .. }
+                | RpgMakerTaskResponseProblem::UnitReview { .. } => {
+                    DiagnosticResolution::ReviewTranslation
+                }
+                _ => DiagnosticResolution::Retry,
+            },
             RpgMakerProblem::ResultStore { problem } => problem.resolution(),
             RpgMakerProblem::TranslationAsset { problem, .. } => problem.resolution(),
             RpgMakerProblem::WriteBackAsset { problem, .. } => problem.resolution(),
@@ -7040,8 +7077,10 @@ impl RpgMakerIssue {
             RpgMakerProblem::PlaceholderProjection {
                 rule_source, unit, ..
             } => unit.placeholder_subject(rule_source, None),
-            RpgMakerProblem::ResponseProcessing { scope, .. }
-            | RpgMakerProblem::TaskResponse { scope, .. } => scope.subject(),
+            RpgMakerProblem::ResponseProcessing { scope, .. } => scope.subject(),
+            RpgMakerProblem::TaskResponse { scope, problem } => {
+                scope.task_response_subject(problem.output_id())
+            }
             RpgMakerProblem::ResultStore { problem } => problem.subject(),
             RpgMakerProblem::TranslationAsset { database_path, .. } => database_path.to_string(),
             RpgMakerProblem::WriteBackAsset {
@@ -7063,7 +7102,7 @@ impl RpgMakerIssue {
             RpgMakerProblem::WriteBackDocumentRewrite { problem } => problem.subject(),
             RpgMakerProblem::TranslationPlanning { problem } => match problem {
                 RpgMakerTranslationPlanningProblem::OutputContract { unit, .. } => {
-                    format!("{}:{}", unit.owner.as_str(), unit.group_kind.as_str())
+                    unit.readable_id.to_string()
                 }
                 _ => "rpg_maker_translation_planning".to_owned(),
             },
@@ -7254,6 +7293,7 @@ mod tests {
     #[test]
     fn missing_text_capture_wire_keeps_complete_rpg_maker_locator() {
         let unit = RpgMakerUnitLocator::new(
+            SafeText::new("Actors.json:3:name"),
             RpgMakerDiagnosticOwner::Builtin,
             RpgMakerDiagnosticGroupKind::DatabaseEntry,
             RpgMakerDiagnosticLocation::new(
@@ -7292,6 +7332,7 @@ mod tests {
         let issue = RpgMakerIssue::placeholder_planning(
             PlaceholderRuleSource::ProjectSnapshot,
             RpgMakerUnitLocator::new(
+                SafeText::new("Actors.json:1:name"),
                 RpgMakerDiagnosticOwner::Builtin,
                 RpgMakerDiagnosticGroupKind::DatabaseEntry,
                 RpgMakerDiagnosticLocation::new(
@@ -7309,10 +7350,10 @@ mod tests {
         assert!(facts.contains(&("source", "data:Actors.json".to_owned())));
         assert!(facts.contains(&("location_steps", "key:name".to_owned())));
         assert!(facts.contains(&("role", "scalar:name".to_owned())));
+        assert!(facts.contains(&("readable_id", "Actors.json:1:name".to_owned())));
         let subject = issue.subject();
         for expected in [
-            "Actors.json:name",
-            "role=scalar:name",
+            "Actors.json:1:name",
             "Placeholder=project snapshot",
             "custom rule 7",
         ] {
@@ -7332,6 +7373,7 @@ mod tests {
         let issue = RpgMakerIssue::placeholder_planning(
             PlaceholderRuleSource::external_file("C:/input/placeholders.toml"),
             RpgMakerUnitLocator::new(
+                SafeText::new("Items.json:2:description"),
                 RpgMakerDiagnosticOwner::Builtin,
                 RpgMakerDiagnosticGroupKind::DatabaseEntry,
                 RpgMakerDiagnosticLocation::new(
@@ -7355,8 +7397,7 @@ mod tests {
 
         let subject = issue.subject();
         for expected in [
-            "Items.json[2]:description",
-            "role=scalar:description",
+            "Items.json:2:description",
             "C:/input/placeholders.toml",
             "builtin",
             "custom rule 1",
@@ -7379,6 +7420,7 @@ mod tests {
         let issue = RpgMakerIssue::placeholder_projection(
             PlaceholderRuleSource::ProjectSnapshot,
             RpgMakerUnitLocator::new(
+                SafeText::new("Map002.json:event1:page1:dialogue1"),
                 RpgMakerDiagnosticOwner::Rules,
                 RpgMakerDiagnosticGroupKind::EventDialogue,
                 RpgMakerDiagnosticLocation::new(
@@ -7398,8 +7440,7 @@ mod tests {
         assert!(issue.facts().contains(&("actual", "1".to_owned())));
         let subject = issue.subject();
         for expected in [
-            "Map002.json[7]",
-            "role=dialogue_body",
+            "Map002.json:event1:page1:dialogue1",
             "Placeholder=project snapshot",
         ] {
             assert!(
@@ -7410,8 +7451,40 @@ mod tests {
     }
 
     #[test]
+    fn output_contract_subject_names_the_readable_unit() {
+        let issue = RpgMakerIssue::translation_planning(
+            RpgMakerTranslationPlanningProblem::OutputContract {
+                task_id: 0,
+                unit: RpgMakerUnitLocator::new(
+                    SafeText::new("Items.json:2:description"),
+                    RpgMakerDiagnosticOwner::Builtin,
+                    RpgMakerDiagnosticGroupKind::DatabaseEntry,
+                    RpgMakerDiagnosticLocation::new(
+                        RpgMakerDiagnosticSource::data("Items.json"),
+                        vec![
+                            RpgMakerDiagnosticLocationStep::array_index(2),
+                            RpgMakerDiagnosticLocationStep::object_key("description"),
+                        ],
+                    ),
+                    RpgMakerDiagnosticRole::scalar("description"),
+                ),
+                violation: RpgMakerOutputContractViolation::ScalarAlignedCountInvalid { actual: 2 },
+            },
+        );
+
+        let fields = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::Unchanged, Diagnostic::rpg_maker(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        );
+        assert_eq!(fields.object, "Items.json:2:description");
+        assert!(!fields.object.contains("builtin"));
+        assert!(!fields.object.contains("database_entry"));
+    }
+
+    #[test]
     fn task_response_blank_line_mismatch_keeps_unit_locator_and_leaf_code() {
         let unit = RpgMakerUnitLocator::new(
+            SafeText::new("CommonEvents.json:66:choices"),
             RpgMakerDiagnosticOwner::Builtin,
             RpgMakerDiagnosticGroupKind::EventChoices,
             RpgMakerDiagnosticLocation::new(
@@ -7438,6 +7511,16 @@ mod tests {
             )),
         );
 
+        let object =
+            render_diagnostic_fields(&report, &UiLocalizer::new(UiLocale::SimplifiedChinese))
+                .object;
+        assert_eq!(
+            object,
+            "CommonEvents.json:66:choices (translation_task_42); output_id=1"
+        );
+        assert!(!object.contains("builtin"));
+        assert!(!object.contains("event_choices"));
+
         let value = serde_json::to_value(report).expect("诊断必须可序列化");
         assert_eq!(
             value["primary"]["code"],
@@ -7454,6 +7537,45 @@ mod tests {
             value["primary"]["issue"]["details"]["problem"]["problem"]["problem"]["expected_blank"],
             true
         );
+    }
+
+    #[test]
+    fn task_response_subject_and_review_use_natural_task_number_and_review_action() {
+        let issue = RpgMakerIssue::task_response(
+            RpgMakerResponseProcessingScope::task(0),
+            RpgMakerTaskResponseProblem::NonStopFinish {
+                reason: RpgMakerModelNonStopFinishReason::Length,
+            },
+        );
+
+        assert_eq!(issue.subject(), "translation_task_1");
+        assert_eq!(issue.resolution(), DiagnosticResolution::ReviewTranslation);
+        let fields = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::rpg_maker(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        );
+        assert_eq!(fields.reason, "译文需要复核");
+        assert!(fields.help.contains("Manual"));
+        assert!(!fields.reason.contains("__ATT_FALLBACK__"));
+    }
+
+    #[test]
+    fn response_shape_problem_is_reported_as_contract_failure() {
+        let issue = RpgMakerIssue::task_response(
+            RpgMakerResponseProcessingScope::task(0),
+            RpgMakerTaskResponseProblem::InvalidJson {
+                category: RpgMakerTaskResponseJsonCategory::Shape,
+                line: 1,
+                column: 1,
+            },
+        );
+        assert_eq!(issue.code(), "rpg_maker.translation.response.invalid_shape");
+        let fields = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::rpg_maker(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        );
+        assert!(fields.reason.contains("响应契约"));
+        assert!(!fields.reason.contains("有效 JSON"));
     }
 
     #[test]

@@ -140,7 +140,7 @@ result-plan-saved = 성공한 실행 계획을 저장했습니다.
 log-run-started = 명령 { $command }이 시작되었습니다.
 log-run-succeeded = 명령 { $command }이 성공적으로 완료되었습니다.
 log-run-failed = 명령 { $command }이 실패했습니다.
-log-run-outcome-unknown = 명령 { $command }이 종료되었지만 최종 결과를 알 수 없습니다. 오류에 표시된 복구 위치를 따르십시오.
+log-run-outcome-unknown = 명령 { $command }이 종료되었지만 최종 결과를 알 수 없습니다. 다시 시도하기 전에 진단에 따라 조치하세요.
 log-run-cancelled = 명령 { $command }이 취소되었습니다.
 log-performance-counters = 성능 카운터: SQLite 트랜잭션 제어 시도 { $sqlite_control_attempted_total }회, 전체 후보 트리 검증 시작 { $candidate_validation_started }회, 완료 { $candidate_validation_completed }회.
 log-lua-print = Lua: { $message }
@@ -220,6 +220,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] 표시된 구성 필드를 수정한 후 다시 시도하세요
     [fix_input] 표시된 입력을 수정한 후 다시 시도하세요
     [fix_placeholder_rules] 표시된 Placeholder 규칙을 수정한 후 다시 시도하세요
+    [review_translation] 표시된 번역을 검토하고 수정이 필요하면 Manual을 사용하세요
     [review_disabled_rules] 의도한 결과라면 조치가 필요 없습니다. 아니라면 지정된 파일에 유효한 규칙을 추가하고 Extract를 다시 실행하세요
     [check_path_and_permissions] 경로, 파일 시스템 상태 및 권한을 확인하세요
     [check_project_state] 프로젝트 상태를 확인하고 수정한 후 다시 시도하세요
@@ -296,6 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] 모델 스트림이 finish 뒤에도 출력을 계속했습니다
     [model_stream_unexpected_done] Responses 스트림이 예기치 않은 [DONE]을 반환했습니다
     [invalid_response_contract] 모델 응답이 필수 응답 계약을 충족하지 않습니다
+    [needs_review] 번역 검토가 필요합니다
     [lua_compilation_failed] Lua 주 프로그램을 컴파일할 수 없습니다
     [lua_execution_failed] Lua 주 프로그램 실행 중 오류가 발생했습니다
     [rules_pattern_match_failed] Rules PCRE2 패턴을 평가할 수 없습니다

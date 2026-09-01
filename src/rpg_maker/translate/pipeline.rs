@@ -1082,6 +1082,7 @@ pub(super) fn rpg_maker_diagnostic_unit(
     identity: &TranslationUnitIdentity,
 ) -> crate::diagnostic::RpgMakerUnitLocator {
     crate::diagnostic::RpgMakerUnitLocator::new(
+        crate::diagnostic::SafeText::new(identity.readable_id()),
         identity.owner().diagnostic_owner(),
         identity.kind().diagnostic_group_kind(),
         identity.group_location().diagnostic_location(),
@@ -1587,6 +1588,11 @@ impl ExpectedTranslationOutputContractTarget {
 
     fn diagnostic_unit_locator(&self) -> RpgMakerUnitLocator {
         RpgMakerUnitLocator::new(
+            crate::diagnostic::SafeText::new(crate::manual::readable_rpg_maker_id(
+                &self.group_location,
+                self.group_kind,
+                &self.role,
+            )),
             self.owner.diagnostic_owner(),
             self.group_kind.diagnostic_group_kind(),
             self.group_location.diagnostic_location(),
@@ -2572,6 +2578,7 @@ impl UnresolvedTranslationUnit {
         Self::new(
             id,
             RpgMakerUnitLocator::new(
+                crate::diagnostic::SafeText::new("Items.json:1:description"),
                 RpgMakerDiagnosticOwner::Builtin,
                 RpgMakerDiagnosticGroupKind::DatabaseEntry,
                 RpgMakerDiagnosticLocation::new(
@@ -2802,9 +2809,10 @@ impl TranslationTaskOutcome {
 fn task_response_report(
     scope: RpgMakerResponseProcessingScope,
     problem: RpgMakerTaskResponseProblem,
+    effect: StateEffect,
 ) -> DiagnosticReport {
     DiagnosticReport::new(
-        StateEffect::ProgressPreserved,
+        effect,
         Diagnostic::rpg_maker(RpgMakerIssue::task_response(scope, problem)),
     )
 }
@@ -2958,6 +2966,7 @@ fn task_response_unit_problem(
 fn task_response_protocol_report(
     task_index: RpgMakerTranslationTaskIndex,
     diagnostic: &TranslationProtocolDiagnostic,
+    applied_any_output: bool,
 ) -> DiagnosticReport {
     let (scope, problem) = match diagnostic {
         TranslationProtocolDiagnostic::NonStopFinish { reason, finding } => {
@@ -3001,7 +3010,14 @@ fn task_response_protocol_report(
             },
         ),
     };
-    task_response_report(scope, problem)
+    let effect = match &problem {
+        RpgMakerTaskResponseProblem::UnitReview { .. } => StateEffect::Applied,
+        RpgMakerTaskResponseProblem::NonStopFinish { .. } if applied_any_output => {
+            StateEffect::Applied
+        }
+        _ => StateEffect::ProgressPreserved,
+    };
+    task_response_report(scope, problem, effect)
 }
 
 fn task_response_unit_report(
@@ -3015,6 +3031,7 @@ fn task_response_unit_report(
             output_id: unresolved.id().get(),
             problem,
         },
+        StateEffect::ProgressPreserved,
     ))
 }
 
@@ -3027,11 +3044,14 @@ fn task_outcome_diagnostics(
     outcome: &TranslationTaskOutcome,
 ) -> Vec<DiagnosticReport> {
     let task_index = task.index();
+    let applied_any_output = !outcome.accepted().is_empty();
     let protocol_reports = || {
         outcome
             .diagnostics()
             .iter()
-            .map(|diagnostic| task_response_protocol_report(task_index, diagnostic))
+            .map(|diagnostic| {
+                task_response_protocol_report(task_index, diagnostic, applied_any_output)
+            })
             .collect::<Vec<_>>()
     };
     let unit_reports = || {
@@ -3066,6 +3086,7 @@ fn task_outcome_diagnostics(
                     vec![task_response_report(
                         RpgMakerResponseProcessingScope::task(task_index.get()),
                         RpgMakerTaskResponseProblem::ModelResponseUnusable,
+                        StateEffect::ProgressPreserved,
                     )]
                 } else {
                     reports
@@ -3078,6 +3099,7 @@ fn task_outcome_diagnostics(
                     reports.push(task_response_report(
                         RpgMakerResponseProcessingScope::task(task_index.get()),
                         RpgMakerTaskResponseProblem::AllOutputsRejected,
+                        StateEffect::ProgressPreserved,
                     ));
                 }
                 reports
@@ -4643,6 +4665,90 @@ mod tests {
 
     fn task_id(value: usize) -> TaskId {
         TaskId::new(value)
+    }
+
+    #[test]
+    fn committed_candidate_review_reports_the_applied_effect() {
+        let unresolved = UnresolvedTranslationUnit::for_test(
+            task_id(0),
+            TranslationUnitRejectionReason::Missing,
+        );
+        let report = task_response_protocol_report(
+            RpgMakerTranslationTaskIndex::new(0),
+            &TranslationProtocolDiagnostic::CandidateReview {
+                id: task_id(0),
+                unit: unresolved.unit().clone(),
+                finding: ReviewFinding::SourceResidual,
+            },
+            true,
+        );
+
+        assert_eq!(report.effect(), StateEffect::Applied);
+        assert_eq!(
+            report.primary().resolution(),
+            crate::diagnostic::DiagnosticResolution::ReviewTranslation
+        );
+    }
+
+    #[test]
+    fn non_stop_finish_reports_whether_the_task_applied_output() {
+        let diagnostic = TranslationProtocolDiagnostic::NonStopFinish {
+            reason: RpgMakerModelNonStopFinishReason::Length,
+            finding: ReviewFinding::NonStopFinish,
+        };
+
+        assert_eq!(
+            task_response_protocol_report(
+                RpgMakerTranslationTaskIndex::new(0),
+                &diagnostic,
+                false,
+            )
+            .effect(),
+            StateEffect::ProgressPreserved
+        );
+        assert_eq!(
+            task_response_protocol_report(RpgMakerTranslationTaskIndex::new(0), &diagnostic, true,)
+                .effect(),
+            StateEffect::Applied
+        );
+    }
+
+    #[test]
+    fn raw_response_errors_keep_the_rpg_maker_shape_and_syntax_categories() {
+        for (raw, expected_code, expected_summary, expected_category) in [
+            (
+                r#"{"think":"判断"}"#,
+                "rpg_maker.translation.response.invalid_shape",
+                "invalid_response_contract",
+                "shape",
+            ),
+            (
+                "```json\n{\"0\":[\"first\"]}\n```\n```json\n{\"1\":[\"second\"]}\n```",
+                "rpg_maker.translation.response.invalid_json",
+                "response_parsing_failed",
+                "syntax",
+            ),
+        ] {
+            let error = crate::translation_protocol::parse_translation_response(
+                raw,
+                crate::translation_protocol::TranslationResponseMode::new(true, false),
+            )
+            .expect_err("测试原始响应必须由共享解析器拒绝");
+            let diagnostic = TranslationProtocolDiagnostic::InvalidResponse { error };
+            let report = task_response_protocol_report(
+                RpgMakerTranslationTaskIndex::new(0),
+                &diagnostic,
+                false,
+            );
+
+            assert_eq!(report.primary().code(), expected_code);
+            assert_eq!(report.primary().issue().summary_code(), expected_summary);
+            let wire = serde_json::to_string(&report).expect("RPG Maker 诊断必须可序列化");
+            assert!(
+                wire.contains(&format!(r#""category":"{expected_category}""#)),
+                "诊断必须保留共享解析类别：{wire}"
+            );
+        }
     }
 
     fn test_retry_exhausted_report() -> crate::diagnostic::DiagnosticReport {

@@ -140,7 +140,7 @@ result-plan-saved = The successful run plan was saved.
 log-run-started = Command { $command } started.
 log-run-succeeded = Command { $command } completed successfully.
 log-run-failed = Command { $command } failed.
-log-run-outcome-unknown = Command { $command } ended with an unknown final outcome; follow the recovery locations in the error.
+log-run-outcome-unknown = Command { $command } ended with an unknown final outcome; follow the diagnostic before retrying.
 log-run-cancelled = Command { $command } was cancelled.
 log-performance-counters = Performance counters: SQLite transaction-control attempts { $sqlite_control_attempted_total }; full candidate-tree validations started { $candidate_validation_started }, completed { $candidate_validation_completed }.
 log-lua-print = Lua: { $message }
@@ -223,6 +223,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] Correct the named configuration field and retry
     [fix_input] Correct the named input and retry
     [fix_placeholder_rules] Correct the indicated Placeholder rule and retry
+    [review_translation] Review the highlighted translation; use Manual to revise it if needed
     [review_disabled_rules] If this is expected, no action is needed; otherwise add valid rules to the indicated file and run Extract again
     [check_path_and_permissions] Check the path, filesystem state, and permissions
     [check_project_state] Inspect the project state, correct it, and retry
@@ -299,6 +300,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] The model stream continued after finish
     [model_stream_unexpected_done] The Responses model stream returned an unexpected [DONE]
     [invalid_response_contract] The model response does not satisfy the required response contract
+    [needs_review] The translation needs review
     [lua_compilation_failed] the Lua main program could not be compiled
     [lua_execution_failed] The Lua main program failed while it was running
     [rules_pattern_match_failed] The Rules PCRE2 pattern could not be evaluated

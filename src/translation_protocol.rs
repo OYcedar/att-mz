@@ -1415,6 +1415,16 @@ mod tests {
                 )
             );
         }
+
+        let missing_translations =
+            parse_translation_response(r#"{"think":"判断"}"#, mode(true, false))
+                .expect_err("缺少 translations 的合法 JSON 必须按根响应合同拒绝");
+        assert_eq!(
+            missing_translations.kind(),
+            TranslationTaskResponseParseErrorKind::Json(
+                TranslationTaskResponseJsonErrorCategory::Shape
+            )
+        );
     }
 
     #[test]

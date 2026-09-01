@@ -140,7 +140,7 @@ result-plan-saved = Se guardó el plan de ejecución correcto.
 log-run-started = El comando { $command } comenzó.
 log-run-succeeded = El comando { $command } terminó correctamente.
 log-run-failed = El comando { $command } falló.
-log-run-outcome-unknown = El comando { $command } terminó con un resultado final desconocido; siga las ubicaciones de recuperación indicadas en el error.
+log-run-outcome-unknown = El comando { $command } terminó con un resultado final desconocido; siga el diagnóstico antes de volver a intentarlo.
 log-run-cancelled = El comando { $command } se canceló.
 log-performance-counters = Contadores de rendimiento: { $sqlite_control_attempted_total } intentos de control de transacciones SQLite; validaciones completas del árbol candidato iniciadas { $candidate_validation_started }, completadas { $candidate_validation_completed }.
 log-lua-print = Lua: { $message }
@@ -223,6 +223,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] Corrige el campo de configuración indicado y vuelve a intentarlo
     [fix_input] Corrige la entrada indicada y vuelve a intentarlo
     [fix_placeholder_rules] Corrige la regla Placeholder indicada y vuelve a intentarlo
+    [review_translation] Revisa la traducción indicada; usa Manual para corregirla si es necesario
     [review_disabled_rules] Si este resultado es el esperado, no hace falta actuar; de lo contrario, añade reglas válidas al archivo indicado y vuelve a ejecutar Extract
     [check_path_and_permissions] Comprueba la ruta, el estado del sistema de archivos y los permisos
     [check_project_state] Revisa y corrige el estado del proyecto y vuelve a intentarlo
@@ -299,6 +300,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] El flujo del modelo continuó después de finish
     [model_stream_unexpected_done] El flujo Responses devolvió un [DONE] inesperado
     [invalid_response_contract] La respuesta del modelo no cumple el contrato requerido
+    [needs_review] La traducción requiere revisión
     [lua_compilation_failed] No se pudo compilar el programa Lua principal
     [lua_execution_failed] El programa Lua principal falló durante la ejecución
     [rules_pattern_match_failed] No se pudo evaluar el patrón PCRE2 de Rules

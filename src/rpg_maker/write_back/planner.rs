@@ -2242,8 +2242,10 @@ impl RpgMakerWriteBackPlaceholderValidationError {
         role: TextUnitRole,
         reason: TranslationPlanningFailureReason,
     ) -> Self {
+        let readable_id = crate::manual::readable_rpg_maker_id(&group_location, kind, &role);
         Self {
             unit: RpgMakerUnitLocator::new(
+                crate::diagnostic::SafeText::new(readable_id),
                 owner.diagnostic_owner(),
                 kind.diagnostic_group_kind(),
                 group_location.diagnostic_location(),

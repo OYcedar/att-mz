@@ -140,7 +140,7 @@ result-plan-saved = 成功した実行プランを保存しました。
 log-run-started = コマンド { $command } を開始しました。
 log-run-succeeded = コマンド { $command } は正常に完了しました。
 log-run-failed = コマンド { $command } に失敗しました。
-log-run-outcome-unknown = コマンド { $command } は終了しましたが、最終結果は不明です。エラーに示された復旧場所を確認してください。
+log-run-outcome-unknown = コマンド { $command } は終了しましたが、最終結果は不明です。再試行する前に診断に従って対処してください。
 log-run-cancelled = コマンド { $command } をキャンセルしました。
 log-performance-counters = パフォーマンスカウンター：SQLite トランザクション制御の試行 { $sqlite_control_attempted_total } 回、候補ツリー全体の検証開始 { $candidate_validation_started } 回、完了 { $candidate_validation_completed } 回。
 log-lua-print = Lua：{ $message }
@@ -220,6 +220,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] 指定された設定項目を修正して再試行してください
     [fix_input] 指定された入力を修正して再試行してください
     [fix_placeholder_rules] 指定された Placeholder ルールを修正して再試行してください
+    [review_translation] 指摘された翻訳を確認し、修正が必要な場合は Manual を使用してください
     [review_disabled_rules] これが意図した結果なら対応は不要です。そうでなければ、指定されたファイルに有効なルールを追加して Extract を再実行してください
     [check_path_and_permissions] パス、ファイルシステムの状態、権限を確認してください
     [check_project_state] プロジェクトの状態を確認・修正して再試行してください
@@ -296,6 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] モデルストリームが finish 後も出力を続けました
     [model_stream_unexpected_done] Responses ストリームが予期しない [DONE] を返しました
     [invalid_response_contract] モデル応答が必要な応答契約を満たしていません
+    [needs_review] 翻訳内容の確認が必要です
     [lua_compilation_failed] Lua メインプログラムをコンパイルできませんでした
     [lua_execution_failed] Lua メインプログラムの実行中に失敗しました
     [rules_pattern_match_failed] Rules の PCRE2 パターンを評価できませんでした

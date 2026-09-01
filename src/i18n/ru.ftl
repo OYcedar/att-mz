@@ -140,7 +140,7 @@ result-plan-saved = Успешный план запуска сохранён.
 log-run-started = Команда { $command } запущена.
 log-run-succeeded = Команда { $command } успешно завершена.
 log-run-failed = Команда { $command } завершилась ошибкой.
-log-run-outcome-unknown = Команда { $command } завершилась, но итоговое состояние неизвестно; используйте пути восстановления из ошибки.
+log-run-outcome-unknown = Команда { $command } завершилась, но итоговое состояние неизвестно; выполните указания диагностики перед повторной попыткой.
 log-run-cancelled = Команда { $command } отменена.
 log-performance-counters = Счётчики производительности: попыток управления транзакциями SQLite — { $sqlite_control_attempted_total }; полных проверок дерева-кандидата начато — { $candidate_validation_started }, завершено — { $candidate_validation_completed }.
 log-lua-print = Lua: { $message }
@@ -225,6 +225,7 @@ diagnostic-resolution-value = { $code ->
     [fix_configuration] Исправьте указанный параметр конфигурации и повторите попытку
     [fix_input] Исправьте указанные входные данные и повторите попытку
     [fix_placeholder_rules] Исправьте указанное правило Placeholder и повторите попытку
+    [review_translation] Проверьте указанный перевод; при необходимости исправьте его через Manual
     [review_disabled_rules] Если это ожидаемый результат, ничего делать не нужно; иначе добавьте допустимые правила в указанный файл и снова запустите Extract
     [check_path_and_permissions] Проверьте путь, состояние файловой системы и разрешения
     [check_project_state] Проверьте и исправьте состояние проекта, затем повторите попытку
@@ -301,6 +302,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_output_after_finish] Поток модели продолжил вывод после finish
     [model_stream_unexpected_done] Поток Responses вернул неожиданный [DONE]
     [invalid_response_contract] Ответ модели не соответствует обязательному контракту
+    [needs_review] Перевод требует проверки
     [lua_compilation_failed] Не удалось скомпилировать основную программу Lua
     [lua_execution_failed] Ошибка во время выполнения основной программы Lua
     [rules_pattern_match_failed] Не удалось вычислить шаблон PCRE2 Rules

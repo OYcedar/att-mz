@@ -3198,6 +3198,60 @@ fn generic_response_review_diagnostic(
     )
 }
 
+fn generic_review_effect(
+    commit: Option<&CommitTranslationResultsOutcome>,
+    destination: Option<&GenericPlanningUnitLocator>,
+) -> StateEffect {
+    let Some(commit) = commit else {
+        return StateEffect::ProgressPreserved;
+    };
+    let applied = destination.map_or(commit.committed > 0, |destination| {
+        commit.committed > 0
+            && !commit.conflicts.iter().any(|(group_id, unit_id)| {
+                group_id == destination.group_id() && unit_id == destination.unit_id()
+            })
+    });
+    if applied {
+        StateEffect::Applied
+    } else {
+        StateEffect::ProgressPreserved
+    }
+}
+
+fn generic_accepted_task_diagnostics(
+    task_index: usize,
+    total_tasks: usize,
+    finish_review: bool,
+    mut response_problem_diagnostics: Vec<DiagnosticReport>,
+    reviews: Vec<TranslationReview>,
+    commit: Option<&CommitTranslationResultsOutcome>,
+) -> Vec<DiagnosticReport> {
+    let mut diagnostics = Vec::with_capacity(
+        response_problem_diagnostics.len() + reviews.len() + usize::from(finish_review),
+    );
+    if finish_review {
+        diagnostics.push(
+            generic_task_response_diagnostic(
+                task_index,
+                total_tasks,
+                GenericTaskResponseProblem::ResponseReview {
+                    finding: GenericResponseReviewFinding::NonStopFinish,
+                },
+            )
+            .with_effect(generic_review_effect(commit, None)),
+        );
+    }
+    diagnostics.append(&mut response_problem_diagnostics);
+    for review in reviews {
+        let effect = generic_review_effect(commit, Some(review.locator()));
+        diagnostics.push(
+            generic_response_review_diagnostic(task_index, total_tasks, &review)
+                .with_effect(effect),
+        );
+    }
+    diagnostics
+}
+
 fn generic_response_parse_diagnostic(
     task_index: usize,
     total_tasks: usize,
@@ -3627,6 +3681,8 @@ enum GenericPreparedTaskOutcome {
         writes: Vec<TranslationWrite>,
         rejections: Vec<RejectedTranslationWrite>,
         diagnostics: Vec<DiagnosticReport>,
+        finish_review: bool,
+        reviews: Vec<TranslationReview>,
         accepted_units: usize,
         response_problems: usize,
         response_complete: bool,
@@ -3910,8 +3966,18 @@ async fn execute_generic_tasks(
                     GenericPreparedTaskOutcome::Accepted {
                         accepted_output_ids,
                         diagnostics,
+                        finish_review,
+                        reviews,
                         ..
                     } => {
+                        let diagnostics = generic_accepted_task_diagnostics(
+                            task_index,
+                            total_tasks,
+                            finish_review,
+                            diagnostics,
+                            reviews,
+                            None,
+                        );
                         if prior_was_cancelled {
                             GenericTaskRecordState::cancelled_after_acceptance(
                                 accepted_output_ids,
@@ -3940,7 +4006,9 @@ async fn execute_generic_tasks(
             GenericPreparedTaskOutcome::Accepted {
                 writes,
                 rejections,
-                mut diagnostics,
+                diagnostics,
+                finish_review,
+                reviews,
                 accepted_units,
                 response_problems,
                 response_complete,
@@ -3985,6 +4053,14 @@ async fn execute_generic_tasks(
                             [report.clone()],
                         );
                         if let Some(record) = record {
+                            let mut diagnostics = generic_accepted_task_diagnostics(
+                                task_index,
+                                total_tasks,
+                                finish_review,
+                                diagnostics,
+                                reviews,
+                                None,
+                            );
                             diagnostics.push(report.clone());
                             task_records.submit(record.finish(
                                 GenericTaskRecordState::failed_after_acceptance(
@@ -4023,6 +4099,14 @@ async fn execute_generic_tasks(
                         .expect("Generic Task 的 Rejected 终态计数必须保持有效");
                     stored.conflicted_units += commit.conflicts.len();
                 });
+                let mut diagnostics = generic_accepted_task_diagnostics(
+                    task_index,
+                    total_tasks,
+                    finish_review,
+                    diagnostics,
+                    reviews,
+                    Some(&commit),
+                );
                 if !commit.conflicts.is_empty() {
                     diagnostics.push(generic_task_response_diagnostic(
                         task_index,
@@ -4236,16 +4320,7 @@ async fn execute_generic_task(
                 LlmRequestExecutionOutcome::Response { response, .. } => {
                     let (content, finish_reason) = response.into_content_and_finish_reason();
                     ensure_generic_response_processing_running(&response_cancellation)?;
-                    let finish_review =
-                        (!matches!(finish_reason, LlmFinishReason::Stop)).then(|| {
-                            generic_task_response_diagnostic(
-                                task_index,
-                                total_tasks,
-                                GenericTaskResponseProblem::ResponseReview {
-                                    finding: GenericResponseReviewFinding::NonStopFinish,
-                                },
-                            )
-                        });
+                    let finish_review = !matches!(finish_reason, LlmFinishReason::Stop);
                     match parse_translation_response_with_cancellation(
                         &content,
                         response_mode,
@@ -4271,14 +4346,7 @@ async fn execute_generic_task(
                             let accepted_units = accepted.len();
                             let response_problems = problems.len();
                             let response_complete = problems.is_empty();
-                            let mut diagnostics = Vec::with_capacity(
-                                problems.len()
-                                    + reviews.len()
-                                    + usize::from(finish_review.is_some()),
-                            );
-                            if let Some(finish_review) = finish_review {
-                                diagnostics.push(finish_review);
-                            }
+                            let mut diagnostics = Vec::with_capacity(problems.len());
                             for problem in &problems {
                                 ensure_generic_response_processing_running(&response_cancellation)?;
                                 diagnostics.push(generic_response_problem_diagnostic(
@@ -4287,14 +4355,7 @@ async fn execute_generic_task(
                                     problem,
                                 ));
                             }
-                            for review in &reviews {
-                                ensure_generic_response_processing_running(&response_cancellation)?;
-                                diagnostics.push(generic_response_review_diagnostic(
-                                    task_index,
-                                    total_tasks,
-                                    review,
-                                ));
-                            }
+                            ensure_generic_response_processing_running(&response_cancellation)?;
                             let mut writes = Vec::with_capacity(accepted.len());
                             for accepted in accepted {
                                 ensure_generic_response_processing_running(&response_cancellation)?;
@@ -4309,6 +4370,8 @@ async fn execute_generic_task(
                                 writes,
                                 rejections,
                                 diagnostics,
+                                finish_review,
+                                reviews,
                                 accepted_units,
                                 response_problems,
                                 response_complete,
@@ -6495,6 +6558,8 @@ mod tests {
             writes: Vec::new(),
             rejections: Vec::new(),
             diagnostics: Vec::new(),
+            finish_review: false,
+            reviews: Vec::new(),
             accepted_units: 0,
             response_problems: 0,
             response_complete: true,
@@ -6966,6 +7031,118 @@ mod tests {
             wire["primary"]["issue"]["details"]["problem"]["problem"]["output_id"],
             7
         );
+    }
+
+    #[test]
+    fn generic_review_diagnostics_follow_the_exact_commit_outcome() {
+        let committed_review = TranslationReview::new(
+            task_id(0),
+            GenericPlanningUnitLocator::new("scene.jsonl", "group", "committed", "dialogue"),
+            ReviewFinding::SourceResidual,
+        );
+        let conflicted_review = TranslationReview::new(
+            task_id(1),
+            GenericPlanningUnitLocator::new("scene.jsonl", "group", "conflicted", "dialogue"),
+            ReviewFinding::SourceResidual,
+        );
+        let commit = CommitTranslationResultsOutcome {
+            committed: 1,
+            rejected: 0,
+            resolved_rejected: 0,
+            newly_rejected: 0,
+            conflicts: vec![("group".to_owned(), "conflicted".to_owned())],
+        };
+
+        let diagnostics = generic_accepted_task_diagnostics(
+            0,
+            1,
+            true,
+            vec![generic_response_problem_diagnostic(
+                0,
+                1,
+                &ResponseProblem::MissingId { output_id: 2 },
+            )],
+            vec![committed_review, conflicted_review],
+            Some(&commit),
+        );
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(DiagnosticReport::effect)
+                .collect::<Vec<_>>(),
+            [
+                StateEffect::Applied,
+                StateEffect::ProgressPreserved,
+                StateEffect::Applied,
+                StateEffect::ProgressPreserved,
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_review_diagnostics_without_a_committed_translation_preserve_progress() {
+        let review = TranslationReview::new(
+            task_id(0),
+            GenericPlanningUnitLocator::new("scene.jsonl", "group", "unit", "dialogue"),
+            ReviewFinding::SourceResidual,
+        );
+        let conflict = CommitTranslationResultsOutcome {
+            committed: 0,
+            rejected: 0,
+            resolved_rejected: 0,
+            newly_rejected: 0,
+            conflicts: vec![("group".to_owned(), "unit".to_owned())],
+        };
+
+        for commit in [None, Some(&conflict)] {
+            let diagnostics = generic_accepted_task_diagnostics(
+                0,
+                1,
+                true,
+                Vec::new(),
+                vec![review.clone()],
+                commit,
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.effect() == StateEffect::ProgressPreserved)
+            );
+        }
+    }
+
+    #[test]
+    fn raw_response_errors_keep_the_generic_shape_and_syntax_categories() {
+        for (raw, expected_code, expected_summary, expected_category) in [
+            (
+                r#"{"think":"判断"}"#,
+                "generic.translation.response.invalid_shape",
+                "invalid_response_contract",
+                "shape",
+            ),
+            (
+                "```json\n{\"0\":[\"first\"]}\n```\n```json\n{\"1\":[\"second\"]}\n```",
+                "generic.translation.response.invalid_json",
+                "response_parsing_failed",
+                "syntax",
+            ),
+        ] {
+            let error = crate::translation_protocol::parse_translation_response(
+                raw,
+                TranslationResponseMode::new(true, false),
+            )
+            .expect_err("测试原始响应必须由共享解析器拒绝");
+            let report = generic_response_parse_diagnostic(0, 1, error);
+
+            assert_eq!(report.primary().code(), expected_code);
+            assert_eq!(report.primary().issue().summary_code(), expected_summary);
+            let wire = serde_json::to_string(&report).expect("Generic 诊断必须可序列化");
+            assert!(
+                wire.contains(&format!(r#""category":"{expected_category}""#)),
+                "诊断必须保留共享解析类别：{wire}"
+            );
+        }
     }
 
     #[test]
