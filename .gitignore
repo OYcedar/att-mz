@@ -4,7 +4,6 @@
 /测试集/
 /config.toml
 **/*.rs.bk
-写给自己和维护者看的哲学思想.md
 /dist/
 /.workbuddy/
 /.venv/
