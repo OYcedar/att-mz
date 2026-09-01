@@ -100,6 +100,10 @@ unavailable、failed、not committed after an earlier failure 或 cancelled；�
 或服务停发门拒绝仍是 not_started，不会产生伪造的 attempt、started 或 `task.finished`。
 `task.finished.attempts` 必须大于零，并只计算该任务真实开始的 HTTP attempt。
 
+发生重试时，`retry.summary` 的 attempted、recovered 与 exhausted 都以第一次请求之后的
+实际 HTTP attempt 为单位。recovered 统计未耗尽重试过程中的额外 attempt，exhausted
+统计耗尽重试过程中的额外 attempt，因此始终满足 `attempted = recovered + exhausted`。
+
 每次 Translate 恰好写一条 `translation.finished`，保存完整任务计数和对应引擎的业务
 汇总。计数满足：
 
@@ -129,6 +133,8 @@ Rejected 都必须为零。
 清零；终端短汇总直接使用同一份事实。Generic 的 remaining_units 是计划交给模型的 Unit
 减去实际写入的 Unit，CAS 冲突不算写入；RPG Maker 的剩余决策和位置同样按实际提交递减。
 服务停发后没有开始的 Task 只计入 not_started。
+执行器结束准入并确认全部已开始 Task 后，`confirmed_tasks` 阶段按实际 started/total 完成；
+Incomplete 可以保留 `started < total`，未开始部分仍由任务汇总表达。
 Placeholder 等规划错误发生在模型请求前时，日志写可读 `diagnostic.run_plan`，不得声明
 Task 已开始。
 

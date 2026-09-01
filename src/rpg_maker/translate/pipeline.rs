@@ -3138,6 +3138,36 @@ impl RpgMakerTranslationRunReport {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_summary_for_test(summary: super::TranslationSummary) -> Self {
+        assert_eq!(
+            summary.started_tasks,
+            summary.complete_tasks + summary.partial_tasks + summary.unavailable_tasks
+        );
+        assert_eq!(
+            summary.total_tasks,
+            summary.started_tasks + summary.not_started_tasks
+        );
+        Self {
+            total_tasks: summary.total_tasks,
+            complete_tasks: summary.complete_tasks,
+            partial_tasks: summary.partial_tasks,
+            unavailable_tasks: summary.unavailable_tasks,
+            accepted_decisions: summary.accepted_decisions,
+            written_locations: summary.written_locations,
+            unresolved_decisions: summary.remaining_decisions,
+            unresolved_locations: summary.remaining_locations,
+            rejected_locations: summary.rejected_locations,
+            protocol_diagnostics: summary.protocol_diagnostics,
+            recoverable_request_exhaustions: summary.recoverable_request_exhaustions,
+            request_admission_stopped: summary.request_admission_stopped,
+            retained: summary.retained,
+            invalidated: summary.invalidated,
+            not_applicable: summary.not_applicable,
+            reused: summary.reused,
+        }
+    }
+
     pub(crate) fn from_plan(
         total_tasks: usize,
         planned_decisions: usize,
@@ -3461,6 +3491,14 @@ pub(crate) struct RpgMakerTaskDiagnosticReports {
 }
 
 impl RpgMakerTaskDiagnosticReports {
+    #[cfg(test)]
+    pub(crate) fn for_test(primary: DiagnosticReport) -> Self {
+        Self {
+            primary,
+            related: Vec::new(),
+        }
+    }
+
     fn from_reports(reports: Vec<DiagnosticReport>) -> Self {
         let mut reports = reports.into_iter();
         let primary = reports

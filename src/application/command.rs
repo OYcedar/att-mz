@@ -3663,10 +3663,19 @@ fn completed_output<T>(
 
 #[cfg(test)]
 mod progress_lifecycle_tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use crate::application::arguments::{InitArguments, ProjectArguments};
+    use crate::rpg_maker::translate::TranslationSummary;
+    use crate::rpg_maker::translate::pipeline::{
+        RpgMakerTaskDiagnosticReports, RpgMakerTranslationTaskIndex,
+    };
 
-    fn active_project_log(projects_root: &Path) -> ActiveProjectLog {
+    fn active_project_log_for(
+        projects_root: &Path,
+        log_command: ProjectLogCommand,
+    ) -> ActiveProjectLog {
         let command = ConfiguredInitCommand::for_test(
             InitArguments {
                 project: ProjectArguments {
@@ -3684,10 +3693,37 @@ mod progress_lifecycle_tests {
             locale: UiLocale::SimplifiedChinese,
             engine: ProjectLogEngine::RpgMakerMv,
             project: "phase-contract",
-            command: ProjectLogCommand::Init,
+            command: log_command,
             performance: Arc::new(RunPerformanceCounters::default()),
             selected_api_key_redactor: None,
         })
+    }
+
+    fn active_project_log(projects_root: &Path) -> ActiveProjectLog {
+        active_project_log_for(projects_root, ProjectLogCommand::Init)
+    }
+
+    fn retry_exhausted_report() -> DiagnosticReport {
+        DiagnosticReport::new(
+            StateEffect::ProgressPreserved,
+            Diagnostic::http(crate::diagnostic::HttpIssue::Status {
+                endpoint: crate::diagnostic::HttpEndpoint::new(
+                    crate::diagnostic::HttpScheme::Https,
+                    "example.test",
+                    None,
+                ),
+                status: 429,
+                retry_after_seconds: Some(2),
+                provider_code: Some(
+                    SafeIdentifier::new("busy").expect("测试 provider code 应有效"),
+                ),
+                provider_type: Some(
+                    SafeIdentifier::new("service_error").expect("测试 provider type 应有效"),
+                ),
+                provider_message: None,
+                response_read_failure: None,
+            }),
+        )
     }
 
     #[tokio::test]
@@ -3963,6 +3999,228 @@ mod progress_lifecycle_tests {
             "显式完成 Planning 并停止其余阶段后应通过日志合同"
         );
         terminal.finish().expect("关闭静默进度不应失败");
+    }
+
+    #[test]
+    fn retry_summary_uses_retry_attempts_for_each_outcome_bucket() {
+        let temporary = tempfile::tempdir().expect("临时目录应可建立");
+        let project_log = active_project_log_for(temporary.path(), ProjectLogCommand::Translate);
+        let log_path = project_log
+            .established_log_path()
+            .expect("Translate 测试应建立项目日志")
+            .to_path_buf();
+        let business_log = ProductionBusinessLog::from_active(&project_log);
+        let final_summary = TranslationSummary {
+            total_tasks: 2,
+            started_tasks: 2,
+            not_started_tasks: 0,
+            complete_tasks: 1,
+            partial_tasks: 0,
+            unavailable_tasks: 1,
+            accepted_decisions: 1,
+            written_locations: 1,
+            remaining_decisions: 1,
+            remaining_locations: 1,
+            rejected_locations: 0,
+            protocol_diagnostics: 0,
+            recoverable_request_exhaustions: 1,
+            request_admission_stopped: true,
+            retained: 0,
+            invalidated: 0,
+            not_applicable: 0,
+            reused: 0,
+        };
+        let first_task_summary = TranslationSummary {
+            started_tasks: 1,
+            not_started_tasks: 1,
+            unavailable_tasks: 0,
+            recoverable_request_exhaustions: 0,
+            request_admission_stopped: false,
+            ..final_summary
+        };
+
+        RpgMakerTranslationLog::emit(
+            &business_log,
+            RpgMakerTranslationLogEvent::PlanningCompleted {
+                report: RpgMakerTranslationRunReport::with_reconciliation(2, 2, 2, 0, 0, 0, 0),
+            },
+        );
+        for (task_index, attempts, retry_exhausted) in [(0, 4, false), (1, 3, true)] {
+            RpgMakerTranslationLog::emit(
+                &business_log,
+                RpgMakerTranslationLogEvent::TaskStarted {
+                    task_index: RpgMakerTranslationTaskIndex::new(task_index),
+                    total_tasks: 2,
+                },
+            );
+            RpgMakerTranslationLog::emit(
+                &business_log,
+                RpgMakerTranslationLogEvent::TaskFinished {
+                    task_index: RpgMakerTranslationTaskIndex::new(task_index),
+                    outcome: if retry_exhausted {
+                        RpgMakerTranslationLogTaskOutcome::Unavailable {
+                            diagnostics: RpgMakerTaskDiagnosticReports::for_test(
+                                retry_exhausted_report(),
+                            ),
+                        }
+                    } else {
+                        RpgMakerTranslationLogTaskOutcome::Complete {
+                            diagnostics: Vec::new(),
+                        }
+                    },
+                    attempts: NonZeroUsize::new(attempts),
+                    retry_exhausted,
+                    report: RpgMakerTranslationRunReport::from_summary_for_test(
+                        if retry_exhausted {
+                            final_summary
+                        } else {
+                            first_task_summary
+                        },
+                    ),
+                },
+            );
+        }
+
+        business_log.emit_retry_summary();
+        let execution =
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(TranslateOutput {
+                name: "phase-contract".parse().expect("测试项目名应有效"),
+                profile_id: "default".to_owned(),
+                summary: final_summary,
+            })));
+        assert!(business_log.emit_translation_finished(&execution).is_none());
+        drop(business_log);
+        assert!(
+            project_log.pending_succeeded().finish().is_none(),
+            "重试汇总各字段使用相同计数单位时应通过项目日志合同"
+        );
+
+        let records = std::fs::read_to_string(log_path)
+            .expect("Translate 项目日志应可读取")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
+            .collect::<Vec<_>>();
+        let retry_summary = records
+            .iter()
+            .find(|record| record["event"] == "retry.summary")
+            .expect("重试发生后应写出 retry.summary");
+        assert_eq!(
+            retry_summary["payload"],
+            serde_json::json!({
+                "attempted": 5,
+                "recovered": 3,
+                "exhausted": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn incomplete_translation_completes_confirmed_tasks_with_actual_amount() {
+        let temporary = tempfile::tempdir().expect("临时目录应可建立");
+        let project_log = active_project_log_for(temporary.path(), ProjectLogCommand::Translate);
+        let log_path = project_log
+            .established_log_path()
+            .expect("Translate 测试应建立项目日志")
+            .to_path_buf();
+        let terminal = TerminalProgress::with_writer(io::sink(), |_| String::new());
+        let observer = ProductionProgressObserver::new(
+            terminal.observer(),
+            &project_log,
+            translate_phase_code,
+        );
+        observer.observe(ProgressSnapshot::indeterminate(
+            TranslateProgressPhase::Planning,
+        ));
+        let business_log = ProductionBusinessLog::for_translation(&project_log, observer.clone());
+        let final_summary = TranslationSummary {
+            total_tasks: 3,
+            started_tasks: 1,
+            not_started_tasks: 2,
+            complete_tasks: 0,
+            partial_tasks: 0,
+            unavailable_tasks: 1,
+            accepted_decisions: 0,
+            written_locations: 0,
+            remaining_decisions: 3,
+            remaining_locations: 3,
+            rejected_locations: 0,
+            protocol_diagnostics: 0,
+            recoverable_request_exhaustions: 1,
+            request_admission_stopped: true,
+            retained: 0,
+            invalidated: 0,
+            not_applicable: 0,
+            reused: 0,
+        };
+
+        RpgMakerTranslationLog::emit(
+            &business_log,
+            RpgMakerTranslationLogEvent::PlanningCompleted {
+                report: RpgMakerTranslationRunReport::with_reconciliation(3, 3, 3, 0, 0, 0, 0),
+            },
+        );
+        RpgMakerTranslationLog::emit(
+            &business_log,
+            RpgMakerTranslationLogEvent::TaskStarted {
+                task_index: RpgMakerTranslationTaskIndex::new(0),
+                total_tasks: 3,
+            },
+        );
+        RpgMakerTranslationLog::emit(
+            &business_log,
+            RpgMakerTranslationLogEvent::TaskFinished {
+                task_index: RpgMakerTranslationTaskIndex::new(0),
+                outcome: RpgMakerTranslationLogTaskOutcome::Unavailable {
+                    diagnostics: RpgMakerTaskDiagnosticReports::for_test(retry_exhausted_report()),
+                },
+                attempts: NonZeroUsize::new(3),
+                retry_exhausted: true,
+                report: RpgMakerTranslationRunReport::from_summary_for_test(final_summary),
+            },
+        );
+        let execution =
+            DrivenCommand::Finished(Ok(OperationCompletion::Completed(TranslateOutput {
+                name: "phase-contract".parse().expect("测试项目名应有效"),
+                profile_id: "default".to_owned(),
+                summary: final_summary,
+            })));
+
+        assert!(business_log.emit_translation_finished(&execution).is_none());
+        drop(business_log);
+        assert!(
+            project_log.pending_succeeded().finish().is_none(),
+            "正常 Incomplete 的显式阶段终态应通过项目日志合同"
+        );
+        terminal.finish().expect("关闭静默进度不应失败");
+
+        let records = std::fs::read_to_string(log_path)
+            .expect("Translate 项目日志应可读取")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("日志行应为 JSON"))
+            .collect::<Vec<_>>();
+        let completed = records
+            .iter()
+            .filter(|record| {
+                record["event"] == "phase.completed"
+                    && record["payload"]["phase"] == "confirmed_tasks"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["payload"]["amount"],
+            serde_json::json!({
+                "kind": "determinate",
+                "completed": 1,
+                "total": 3,
+            })
+        );
+        assert!(records.iter().any(|record| {
+            record["event"] == "translation.finished"
+                && record["payload"]["result"]["kind"] == "incomplete"
+        }));
+        assert!(records.iter().any(|record| {
+            record["event"] == "run.finished" && record["payload"]["result"]["kind"] == "succeeded"
+        }));
     }
 }
 
@@ -4422,6 +4680,11 @@ impl ProductionBusinessLog {
             } => Some(output),
             _ => None,
         };
+        if completed.is_some()
+            && let Some(progress) = &self.translation_progress
+        {
+            progress.complete_phase(TranslateProgressPhase::ConfirmedTasks);
+        }
         let result = if let Some(output) = completed {
             let summary = Self::translation_summary(output);
             if output.summary.is_incomplete() {
@@ -4655,9 +4918,17 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                 if retries > 0 {
                     increment_counter(&self.translation_retry_attempts, retries, "翻译重试次数");
                     if retry_exhausted {
-                        increment_counter(&self.translation_retry_exhausted, 1, "重试耗尽任务数");
+                        increment_counter(
+                            &self.translation_retry_exhausted,
+                            retries,
+                            "重试耗尽次数",
+                        );
                     } else {
-                        increment_counter(&self.translation_retry_recovered, 1, "重试恢复任务数");
+                        increment_counter(
+                            &self.translation_retry_recovered,
+                            retries,
+                            "重试恢复次数",
+                        );
                     }
                 }
                 let diagnostics = outcome
