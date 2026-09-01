@@ -1,37 +1,49 @@
-# ATT 1.2.0
+# ATT 1.3.0
 
-ATT 1.2 扩展 OpenAI-compatible 模型接入与流式执行，统一翻译状态、候选验收和译后 QA，
-并更新随包 Formic 与游戏汉化辅助能力。
+ATT 1.3 新增模型连接自检，完整同步 RPG Maker 启动标题，并改进翻译诊断、随包 Formic
+和 MV 姓名牌模板。
 
-## 模型服务与翻译执行
+## 模型连接自检
 
-- 模型 Client 支持 `chat_completions` 与 `responses` 两种协议，`url` 可以填写基础地址或完整
-  端点；`stream` 可以选择完整 JSON 或 SSE 流式响应，两种方式都会在响应完整结束后统一验收
-  和保存译文。
-- HTTP 诊断会区分 DNS、TCP、TLS、发送、读取与各类超时，并按当前配置处理重试、
-  `Retry-After`、限速和取消，让失败位置与可继续范围更明确。
-- 自动译文、人工译文与 Rejected 候选采用统一状态规则。替代候选通过逐项验收后再提交，
-  Placeholder 按源文实际绑定校验，未完整与取消任务会准确汇总已保存结果和剩余工作。
+- 新增 `att test`。命令会完整校验发行配置，并按 Client ID 顺序逐项使用当前协议、流式设置、
+  Endpoint、认证、代理、PEM、超时、限速和请求参数检查全部 LLM Client。
+- 单个 Client 失败后会继续检查后续 Client，并统一输出结果与汇总；命令不会建立翻译项目、
+  数据库、项目日志或任务记录。
+- 每个 Client 会发送一次真实模型请求，执行时可能产生少量模型用量。
 
-## QA 与随包工具
+## 翻译执行与诊断
 
-- Generic 项目可以使用
-  `python skills/translate-with-att/scripts/translation_qa.py scan --translations <译文 JSONL> --generic-input <当前 JSONL 根> --output <QA 目录>`
-  独立执行全量静态 QA；游戏调查、术语制作、译前检查和译后验收流程已同步精简。
-- 随包 Formic 更新到当前静态 Windows x64 构建，并采用当前 TOML 配置、文档和第三方许可材料。
-- 新增 MV 玻璃姓名牌汉化 Skill 与 `ATT_NamePlate.js`，可以按游戏实际界面选择接入方式并配置
-  姓名牌颜色。
+- 重试汇总中的 attempted、recovered 与 exhausted 现在都准确表示首次请求后的额外 HTTP
+  attempt。
+- 未完整翻译会按实际 started/total 完成任务确认阶段，并保留未开始任务和剩余工作。
+- 模型响应诊断会区分 JSON 语法错误与响应结构不符合契约，并使用自然任务编号、可读 Unit ID
+  和临时 output ID 定位问题。
+- 需要复核的译文会根据实际提交结果说明已写入或进度已保留，并直接给出 Manual 复核路径。
 
-## 从 v1.1.0 升级
+## RPG Maker MV/MZ
 
-1. 升级前用 v1.1.0 为每个项目执行
-   `att <mv|mz|generic> manual export --name <项目> --selection all <备份>.toml`。
-2. 把 v1.2.0 解压到新目录，带入原 `projects/`，再以新的 `config.example.toml` 为字段集合
-   重建 `config.toml`；填写服务值并选择 `protocol` 与必填的 `stream`。
-3. 保持项目数据库与最近一次 Extract 快照不变，依次执行 `manual check` 和 `manual apply`，
-   将有效条目写为当前人工译文；按提示修正未通过项，未填写项随后用 Manual 或 Translate 完成。
-4. 使用 Formic 时同样按新模板重建其 `config.toml`，并为每次 `formic run` 指定必填的
-   `--worker-output-access none|published`。
+- Init 会把标准根 `package.json` 及其 `main` 指向的安全 HTML 纳入只读来源快照。
+- `System.json.gameTitle` 继续只建立一个 Builtin Unit。WriteBack 会把译题同步到仍与原题一致的
+  `package.json.window.title` 和唯一标准 `<title>`，同时逐字保留独立标题及其他内容。
+- 游戏调查工具使用同一规则识别启动标题消费者，避免建立重复翻译 Unit。
+- MV 姓名牌模板更新为透明背景、白色细边和贴合对话框的布局。新模板采用固定视觉样式，
+  不再读取原有颜色、偏移和间距参数。
 
-v1.1.0 的项目正文会保留在数据库中，但旧译文适用性与 v1.2.0 不同，未按上述步骤重新应用的
-正文不会作为 Current 参与 WriteBack。
+## 随包 Formic 与发行资源
+
+- 随包 Formic 同步到公开源码提交
+  [`f1bce99`](https://github.com/yexi-by/formic/commit/f1bce99f0732a4d5a40e50d42c97232122734eed)。
+  新增 `formic test --config config.toml`，可以依次检查真实 LLM 请求、MCP 初始化和完整工具目录；
+  自检失败后会继续检查后续服务并输出汇总，不会建立或修改作业档案。
+- Formic 结构化输出支持 nullable、`const`、字符串与数组长度和数值范围约束；一次反馈全部格式
+  问题，并在提交结果与普通工具混用时于工具执行前拒绝整个回合。
+- Windows 发布检出统一使用 LF，发行包中的托管文档与配置模板会和仓库权威内容逐字节一致。
+
+## 从 ATT 1.2 升级
+
+- 项目数据库和活动配置格式保持不变，可以继续使用现有 `projects/`、ATT `config.toml` 和
+  Formic `config.toml`。
+- 现有 MV/MZ 项目如需启用启动标题同步，先重新执行 `att <mv|mz> init --name <项目>`，再执行
+  `att <mv|mz> extract --name <项目>`；随后生成的 WriteBack 会包含符合条件的启动标题消费者。
+- 替换为新版 `ATT_NamePlate.js` 后，姓名牌使用当前固定视觉样式；原有颜色、偏移和间距参数
+  不再生效，请按实际游戏界面完成普通人物对话、旁白、长姓名、上下位置消息和对话回看的实机检查。
