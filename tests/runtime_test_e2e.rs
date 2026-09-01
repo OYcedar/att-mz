@@ -23,7 +23,7 @@ const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[test]
 fn root_test_checks_each_unique_client_once_without_touching_projects() {
     let root = tempfile::tempdir().expect("应创建测试目录");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("应建立 Mock HTTP 服务");
+    let listener = TcpListener::bind("[::1]:0").expect("应建立 Mock HTTP 服务");
     let port = listener.local_addr().expect("应取得监听地址").port();
     let server = MockServer::responses(
         listener,
@@ -85,7 +85,7 @@ fn root_test_checks_each_unique_client_once_without_touching_projects() {
 #[test]
 fn root_test_continues_after_a_client_failure() {
     let root = tempfile::tempdir().expect("应创建测试目录");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("应建立 Mock HTTP 服务");
+    let listener = TcpListener::bind("[::1]:0").expect("应建立 Mock HTTP 服务");
     let port = listener.local_addr().expect("应取得监听地址").port();
     let server = MockServer::responses(
         listener,
@@ -125,7 +125,7 @@ fn root_test_continues_after_a_client_failure() {
 #[test]
 fn root_test_ctrl_break_finishes_the_active_client_and_skips_the_rest() {
     let root = tempfile::tempdir().expect("应创建测试目录");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("应建立 Mock HTTP 服务");
+    let listener = TcpListener::bind("[::1]:0").expect("应建立 Mock HTTP 服务");
     let port = listener.local_addr().expect("应取得监听地址").port();
     let (server, first_request, release_response) = MockServer::gated_first_response(listener);
 
@@ -443,7 +443,7 @@ fn test_configuration(port: u16) -> String {
     format!(
         r#"[llm.clients.z-chat]
 protocol = "chat_completions"
-url = "http://127.0.0.1:{port}/v1"
+url = "http://[::1]:{port}/v1"
 api_key = "chat-key"
 model = "test-model"
 stream = false
@@ -459,7 +459,7 @@ parameters = '''{{"temperature":0}}'''
 
 [llm.clients.a-responses]
 protocol = "responses"
-url = "http://127.0.0.1:{port}/v1"
+url = "http://[::1]:{port}/v1"
 api_key = "responses-key"
 model = "test-model"
 stream = false
