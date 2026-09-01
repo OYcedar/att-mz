@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -47,6 +48,45 @@ _PLUGIN_SCHEMA_DIRECTIVE = re.compile(
     r"(?m)^[ \t]*(?:\*[ \t]*)?@(?P<name>param|type)[ \t]+(?P<value>.*?)[ \t]*$"
 )
 ReadOnce = Callable[[Path], tuple[bytes, FileSnapshot]]
+_HTML_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+@dataclass(frozen=True, slots=True)
+class _MainHtmlResolution:
+    html: Path
+    package: Path
+    package_document: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapTitleConsumers:
+    package: Path
+    main_html: Path
+    package_window_title: bool
+    main_html_title_line: int | None
+    main_html_title_lines: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenHtmlTitle:
+    start: int
+    content_start: int
+    attrs: tuple[tuple[str, str | None], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _HtmlTitleElement:
+    start: int
+    content_start: int
+    closing_start: int
+    end: int
+    attrs: tuple[tuple[str, str | None], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MainHtmlTitleMatch:
+    line: int
+    whole_line: bool
 
 
 class _ScriptSourceParser(HTMLParser):
@@ -62,12 +102,131 @@ class _ScriptSourceParser(HTMLParser):
                 self.sources.append(value)
 
 
-def _main_html(
+_HTML_RAW_TEXT_ELEMENTS = frozenset(
+    {"script", "style", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript"}
+)
+_HTML_FOREIGN_ELEMENTS = frozenset({"svg", "math"})
+
+
+class _TitleElementParser(HTMLParser):
+    def __init__(self, text: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self._text = text
+        self._parser_line_starts = [
+            0,
+            *(index + 1 for index, character in enumerate(text) if character == "\n"),
+        ]
+        self.title_starts = 0
+        self.elements: list[_HtmlTitleElement] = []
+        self._open: list[_OpenHtmlTitle] = []
+        self._ignored: list[tuple[str, str]] = []
+
+    def _position(self) -> int:
+        line, column = self.getpos()
+        return self._parser_line_starts[line - 1] + column
+
+    def _ignore_start(self, normalized: str, *, self_closing: bool) -> bool:
+        if self._ignored:
+            if self._ignored[-1][1] in {"raw", "plaintext"}:
+                return True
+            if normalized == "plaintext":
+                self._ignored.append((normalized, "plaintext"))
+            elif normalized in _HTML_RAW_TEXT_ELEMENTS:
+                self._ignored.append((normalized, "raw"))
+            elif normalized == "template" or (not self_closing and normalized in _HTML_FOREIGN_ELEMENTS):
+                self._ignored.append((normalized, "subtree"))
+            return True
+        if normalized == "plaintext":
+            self._ignored.append((normalized, "plaintext"))
+        elif normalized in _HTML_RAW_TEXT_ELEMENTS:
+            self._ignored.append((normalized, "raw"))
+        elif normalized == "template" or (not self_closing and normalized in _HTML_FOREIGN_ELEMENTS):
+            self._ignored.append((normalized, "subtree"))
+        return bool(self._ignored)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.casefold()
+        if self._ignore_start(normalized, self_closing=False):
+            return
+        if normalized != "title":
+            return
+        start = self._position()
+        raw_tag = self.get_starttag_text() or ""
+        self.title_starts += 1
+        self._open.append(
+            _OpenHtmlTitle(
+                start=start,
+                content_start=start + len(raw_tag),
+                attrs=tuple(attrs),
+            )
+        )
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.casefold()
+        if self._ignore_start(normalized, self_closing=True):
+            return
+        if normalized == "title":
+            self.title_starts += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.casefold()
+        if self._ignored:
+            ignored_name, ignored_mode = self._ignored[-1]
+            if ignored_mode != "plaintext" and normalized == ignored_name:
+                self._ignored.pop()
+            return
+        if normalized != "title" or not self._open:
+            return
+        closing_start = self._position()
+        closing_end = self._text.find(">", closing_start)
+        if closing_end < 0:
+            return
+        opening = self._open.pop()
+        self.elements.append(
+            _HtmlTitleElement(
+                start=opening.start,
+                content_start=opening.content_start,
+                closing_start=closing_start,
+                end=closing_end + 1,
+                attrs=opening.attrs,
+            )
+        )
+
+
+def _package_main_html(
+    package: Path,
+    existing: Mapping[Path, Path],
+    game_root: Path,
+    read_once: ReadOnce,
+) -> _MainHtmlResolution | None:
+    raw, _snapshot = read_once(existing[package])
+    root = parse_json_text(decode_text(raw, existing[package]), str(existing[package]))
+    if not isinstance(root, dict) or not isinstance(root.get("main"), str):
+        return None
+    main = cast(str, root["main"])
+    split = urlsplit(main)
+    if split.scheme or split.netloc:
+        return None
+    target = (existing[package].parent / unquote(split.path)).resolve(strict=False)
+    if (
+        target not in existing
+        or not target.is_relative_to(game_root)
+        or target.suffix.lower() not in {".htm", ".html"}
+    ):
+        return None
+    return _MainHtmlResolution(
+        html=existing[target],
+        package=existing[package],
+        package_document=root,
+    )
+
+
+def _main_html_resolution(
     game: GameInfo,
     game_root: Path,
     files: Sequence[Path],
     read_once: ReadOnce,
-) -> Path | None:
+) -> _MainHtmlResolution | None:
     existing = {path.resolve(strict=True): path for path in files}
     candidates: list[Path] = []
     for root in (game.supplied_root, game.content_root, game_root):
@@ -75,23 +234,122 @@ def _main_html(
         if package in existing and package not in candidates:
             candidates.append(package)
     for package in candidates:
-        raw, _snapshot = read_once(existing[package])
-        root = parse_json_text(decode_text(raw, existing[package]), str(existing[package]))
-        if not isinstance(root, dict) or not isinstance(root.get("main"), str):
-            continue
-        main = cast(str, root["main"])
-        split = urlsplit(main)
-        if split.scheme or split.netloc:
-            continue
-        target = (existing[package].parent / unquote(split.path)).resolve(strict=False)
-        if (
-            target in existing
-            and target.is_relative_to(game_root)
-            and target.suffix.lower() in {".htm", ".html"}
-        ):
-            return existing[target]
+        if (resolved := _package_main_html(package, existing, game_root, read_once)) is not None:
+            return resolved
+    return None
+
+
+def _main_html(
+    game: GameInfo,
+    game_root: Path,
+    files: Sequence[Path],
+    read_once: ReadOnce,
+) -> Path | None:
+    resolved = _main_html_resolution(game, game_root, files, read_once)
+    if resolved is not None:
+        return resolved.html
+    existing = {path.resolve(strict=True): path for path in files}
     fallback = (game.content_root / "index.html").resolve(strict=False)
     return existing.get(fallback)
+
+
+def _line_number_at(text: str, position: int) -> int:
+    return 1 + sum(1 for _match in _HTML_LINE_BREAK.finditer(text, 0, position))
+
+
+def _matching_main_html_title(text: str, game_title: str) -> _MainHtmlTitleMatch | None:
+    parser = _TitleElementParser(text)
+    parser.feed(text)
+    parser.close()
+    if parser.title_starts != 1 or len(parser.elements) != 1:
+        return None
+    element = parser.elements[0]
+    if (
+        element.attrs
+        or text[element.start : element.content_start] != "<title>"
+        or text[element.content_start : element.closing_start] != game_title
+        or text[element.closing_start : element.end] != "</title>"
+    ):
+        return None
+    opening_line = _line_number_at(text, element.start)
+    closing_line = _line_number_at(text, element.end)
+    line_start_match = list(_HTML_LINE_BREAK.finditer(text, 0, element.start))
+    line_start = line_start_match[-1].end() if line_start_match else 0
+    line_end_match = _HTML_LINE_BREAK.search(text, element.end)
+    line_end = line_end_match.start() if line_end_match is not None else len(text)
+    before_title = text[line_start : element.start]
+    after_title = text[element.end : line_end]
+    return _MainHtmlTitleMatch(
+        line=opening_line,
+        whole_line=(
+            opening_line == closing_line
+            and is_structural_blank(before_title)
+            and is_structural_blank(after_title)
+        ),
+    )
+
+
+def bootstrap_title_consumers(
+    game_root: Path,
+    files: Sequence[Path],
+    read_once: ReadOnce,
+    game_title: str,
+) -> BootstrapTitleConsumers | None:
+    """确认标准 bootstrap 中仍与非空 System 标题同源的派生消费者。"""
+
+    if not game_title:
+        return None
+    existing = {path.resolve(strict=True): path for path in files}
+    root_package = (game_root / "package.json").resolve(strict=False)
+    if root_package not in existing:
+        return None
+    package_path = existing[root_package]
+    raw_package, _snapshot = read_once(package_path)
+    package_document = parse_json_text(decode_text(raw_package, package_path), str(package_path))
+    if not isinstance(package_document, dict):
+        return None
+    main = package_document.get("main")
+    if not isinstance(main, str) or not _is_rust_bootstrap_main(main):
+        return None
+    target = (game_root / Path(*main.split("/"))).resolve(strict=False)
+    if target not in existing or not target.is_relative_to(game_root):
+        return None
+    resolved = _MainHtmlResolution(
+        html=existing[target],
+        package=package_path,
+        package_document=package_document,
+    )
+    window = resolved.package_document.get("window")
+    package_title_matches = isinstance(window, dict) and window.get("title") == game_title
+    raw_html, _snapshot = read_once(resolved.html)
+    html = decode_text(raw_html, resolved.html)
+    html_title = _matching_main_html_title(html, game_title)
+    return BootstrapTitleConsumers(
+        package=resolved.package.resolve(strict=True),
+        main_html=resolved.html.resolve(strict=True),
+        package_window_title=package_title_matches,
+        main_html_title_line=html_title.line if html_title is not None else None,
+        main_html_title_lines=(
+            frozenset({html_title.line}) if html_title is not None and html_title.whole_line else frozenset()
+        ),
+    )
+
+
+def _is_rust_bootstrap_main(main: str) -> bool:
+    if (
+        not main
+        or main.startswith("/")
+        or main.endswith("/")
+        or "//" in main
+        or "\\" in main
+        or ":" in main
+        or any(unicodedata.category(character) == "Cc" for character in main)
+    ):
+        return False
+    segments = main.split("/")
+    if any(not segment or segment in {".", ".."} or segment.endswith((".", " ")) for segment in segments):
+        return False
+    return Path(segments[-1]).suffix == ".html"
 
 
 def _direct_html_code_roots(

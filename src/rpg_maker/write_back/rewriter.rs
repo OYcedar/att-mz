@@ -40,7 +40,9 @@ use crate::rpg_maker::structured_path::{
     edit_structured_path, split_at_decode_boundary,
     value_at_plain_steps_mut as shared_value_at_plain_steps_mut,
 };
-use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource};
+use crate::rpg_maker::text::{
+    RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+};
 use crate::runtime::cpu::CpuExecutorUnavailable;
 use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 
@@ -49,6 +51,30 @@ use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 pub(crate) struct RpgMakerRewrittenFile {
     relative_path: PathBuf,
     bytes: Vec<u8>,
+}
+
+/// Rewriter 已验收并应用的标准游戏标题前后值。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RpgMakerGameTitleRewrite {
+    original: String,
+    candidate: String,
+}
+
+impl RpgMakerGameTitleRewrite {
+    fn new(original: impl Into<String>, candidate: impl Into<String>) -> Self {
+        Self {
+            original: original.into(),
+            candidate: candidate.into(),
+        }
+    }
+
+    pub(super) fn original(&self) -> &str {
+        &self.original
+    }
+
+    pub(super) fn candidate(&self) -> &str {
+        &self.candidate
+    }
 }
 
 impl RpgMakerRewrittenFile {
@@ -84,13 +110,24 @@ pub(crate) struct RpgMakerRewrittenDocuments {
     project_name: ProjectName,
     workspace_root: PathBuf,
     files: Vec<RpgMakerRewrittenFile>,
+    game_title_rewrite: Option<RpgMakerGameTitleRewrite>,
 }
 
 impl RpgMakerRewrittenDocuments {
+    #[cfg(test)]
     pub(super) fn new(
         project_name: ProjectName,
         workspace_root: PathBuf,
         files: Vec<RpgMakerRewrittenFile>,
+    ) -> Result<Self, RpgMakerWriteBackDocumentRewriteFailure> {
+        Self::new_with_game_title_rewrite(project_name, workspace_root, files, None)
+    }
+
+    fn new_with_game_title_rewrite(
+        project_name: ProjectName,
+        workspace_root: PathBuf,
+        files: Vec<RpgMakerRewrittenFile>,
+        game_title_rewrite: Option<RpgMakerGameTitleRewrite>,
     ) -> Result<Self, RpgMakerWriteBackDocumentRewriteFailure> {
         let mut files = files;
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -109,6 +146,7 @@ impl RpgMakerRewrittenDocuments {
             project_name,
             workspace_root,
             files,
+            game_title_rewrite,
         })
     }
 
@@ -117,6 +155,7 @@ impl RpgMakerRewrittenDocuments {
             project_name: project.name().clone(),
             workspace_root: project.workspace_root().to_path_buf(),
             files: Vec::new(),
+            game_title_rewrite: None,
         }
     }
 
@@ -133,8 +172,25 @@ impl RpgMakerRewrittenDocuments {
         &self.files
     }
 
-    pub(crate) fn into_files(self) -> Vec<RpgMakerRewrittenFile> {
-        self.files
+    #[cfg(test)]
+    fn game_title_rewrite(&self) -> Option<&RpgMakerGameTitleRewrite> {
+        self.game_title_rewrite.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_game_title_rewrite(
+        mut self,
+        original: impl Into<String>,
+        candidate: impl Into<String>,
+    ) -> Self {
+        self.game_title_rewrite = Some(RpgMakerGameTitleRewrite::new(original, candidate));
+        self
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (Vec<RpgMakerRewrittenFile>, Option<RpgMakerGameTitleRewrite>) {
+        (self.files, self.game_title_rewrite)
     }
 }
 
@@ -252,6 +308,7 @@ where
         let PreparedDocumentRewrite {
             project_name,
             workspace_root,
+            game_title_rewrite,
             jobs,
         } = prepared.map_err(RpgMakerWriteBackDocumentRewritingError::Rewrite)?;
         let total_documents = u64::try_from(jobs.len()).expect("写回文档数量必须可表示为 u64");
@@ -283,7 +340,12 @@ where
                     .into_iter()
                     .flatten()
                     .collect();
-                RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
+                RpgMakerRewrittenDocuments::new_with_game_title_rewrite(
+                    project_name,
+                    workspace_root,
+                    files,
+                    game_title_rewrite,
+                )
             })
             .await
             .map_err(RpgMakerWriteBackDocumentRewritingError::ScheduleRewrite)?
@@ -494,6 +556,7 @@ struct ProgressTrackedRewriteJob {
 struct PreparedDocumentRewrite {
     project_name: ProjectName,
     workspace_root: PathBuf,
+    game_title_rewrite: Option<RpgMakerGameTitleRewrite>,
     jobs: Vec<DocumentRewriteJob>,
 }
 
@@ -504,6 +567,7 @@ fn prepare_rewrite_jobs(
     plan: RpgMakerWriteBackMutationPlan,
 ) -> Result<PreparedDocumentRewrite, RpgMakerWriteBackDocumentRewriteFailure> {
     validate_structural_conflicts(plan.mutations())?;
+    let game_title_rewrite = game_title_rewrite(&plan);
     let mut partitions = BTreeMap::<PhysicalDocumentKey, Vec<RpgMakerWriteBackMutation>>::new();
     for mutation in plan.into_mutations() {
         let key = mutation_document_key(&mutation)?;
@@ -548,7 +612,29 @@ fn prepare_rewrite_jobs(
     Ok(PreparedDocumentRewrite {
         project_name,
         workspace_root,
+        game_title_rewrite,
         jobs,
+    })
+}
+
+fn game_title_rewrite(plan: &RpgMakerWriteBackMutationPlan) -> Option<RpgMakerGameTitleRewrite> {
+    plan.mutations().iter().find_map(|mutation| {
+        let RpgMakerWriteBackMutation::SetText(mutation) = mutation else {
+            return None;
+        };
+        let location = mutation.exact_location();
+        if location.source() != &RpgMakerSource::Data(StandardDataFile::System)
+            || !matches!(
+                location.steps(),
+                [RpgMakerLocationStep::ObjectKey(field)] if field == "gameTitle"
+            )
+        {
+            return None;
+        }
+        Some(RpgMakerGameTitleRewrite::new(
+            mutation.expected_original(),
+            mutation.replacement(),
+        ))
     })
 }
 
@@ -730,6 +816,7 @@ fn rewrite_documents(
     let PreparedDocumentRewrite {
         project_name,
         workspace_root,
+        game_title_rewrite,
         jobs,
     } = prepare_rewrite_jobs(project_name, workspace_root, documents, plan)?;
     let files = jobs
@@ -739,7 +826,12 @@ fn rewrite_documents(
         .into_iter()
         .flatten()
         .collect();
-    RpgMakerRewrittenDocuments::new(project_name, workspace_root, files)
+    RpgMakerRewrittenDocuments::new_with_game_title_rewrite(
+        project_name,
+        workspace_root,
+        files,
+        game_title_rewrite,
+    )
 }
 
 fn compare_structural_operations(
@@ -4549,6 +4641,63 @@ mod tests {
             RpgMakerWriteBackDocumentRewriteFailure::InvalidMutation { location, .. }
                 if location.as_ref() == &actor_location
         ));
+    }
+
+    #[test]
+    fn verified_system_game_title_rewrite_is_carried_to_the_publisher_boundary() {
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(
+                RpgMakerDocumentId::Data(StandardDataFile::System),
+                json!({"gameTitle": "原题", "currencyUnit": "G"}),
+            )]),
+            Vec::new(),
+        );
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::System),
+            vec![RpgMakerLocationStep::key("gameTitle")],
+        );
+
+        let candidate = rewrite_documents(
+            project_name(),
+            workspace_root(),
+            documents,
+            plan(vec![set_text(location, "原题", "译题")]),
+        )
+        .expect("已匹配的游戏标题应生成候选");
+
+        let rewrite = candidate
+            .game_title_rewrite()
+            .expect("候选应携带已验证的游戏标题前后值");
+        assert_eq!(rewrite.original(), "原题");
+        assert_eq!(rewrite.candidate(), "译题");
+        let system = parse_json(file_text(&candidate, Path::new("data/System.json")))
+            .expect("System 候选应为有效 JSON");
+        assert_eq!(system["gameTitle"].as_str(), Some("译题"));
+    }
+
+    #[test]
+    fn non_title_system_rewrite_does_not_claim_a_bootstrap_title_change() {
+        let documents = RpgMakerProjectDocuments::new(
+            BTreeMap::from([(
+                RpgMakerDocumentId::Data(StandardDataFile::System),
+                json!({"gameTitle": "原题", "currencyUnit": "G"}),
+            )]),
+            Vec::new(),
+        );
+        let location = RpgMakerLocation::value(
+            RpgMakerSource::data(StandardDataFile::System),
+            vec![RpgMakerLocationStep::key("currencyUnit")],
+        );
+
+        let candidate = rewrite_documents(
+            project_name(),
+            workspace_root(),
+            documents,
+            plan(vec![set_text(location, "G", "金币")]),
+        )
+        .expect("其他 System 字段应生成候选");
+
+        assert!(candidate.game_title_rewrite().is_none());
     }
 
     #[test]

@@ -205,6 +205,7 @@ type ProductionProjectOpeningError = ExistingProjectOpeningError<
     ProjectDatabaseReadError<SqliteRuntimeError>,
     SystemFileSystemError,
     Box<SystemFileSystemError>,
+    SystemFileSystemError,
 >;
 
 type ProductionWorkspaceConvergenceError = ProjectWorkspaceConvergenceError<
@@ -2831,7 +2832,10 @@ impl ProductionRpgMakerCommandRunner {
                 .complete_continuation_whitespace(),
         )
         .with_progress(progress_observer.clone());
-        let publisher = RpgMakerWriteBackPublishingService::new(directory_publisher.clone());
+        let publisher = RpgMakerWriteBackPublishingService::new(
+            file_system.clone(),
+            directory_publisher.clone(),
+        );
         let business_log = ProductionBusinessLog::from_active(&project_log);
         let service = WriteBackService::new(
             write_back,

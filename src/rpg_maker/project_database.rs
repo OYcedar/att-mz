@@ -315,7 +315,7 @@ const RESET_TERMINOLOGY_RESOURCE: &str = r#"UPDATE rpg_maker_translation_resourc
 SET canonical_json = '[]'
 WHERE resource_kind = 'terminology'"#;
 
-/// 冻结布局所选 `data` 与 `js` 内容的精确身份。
+/// 冻结布局所选 `data`、`js` 与可选标准启动壳内容的精确身份。
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourceSnapshotFingerprint(Sha256Fingerprint);
 

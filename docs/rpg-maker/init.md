@@ -23,7 +23,10 @@ att mz init --name NAME --path GAME_ROOT \
 
 ATT 按引擎核对游戏根的必要目录和文件；遇到错误引擎、无效 JSON、无效 UTF-8、硬链接
 歧义或不安全的目录关系时明确拒绝。检查通过后，在项目工作区建立只读来源副本，之后
-Extract 与 WriteBack 只与这份副本打交道，原游戏始终保持原样。
+Extract 与 WriteBack 只与这份副本打交道，原游戏始终保持原样。来源副本包含引擎内容目录
+中的 `data/`、`js/`；游戏根存在标准 NW.js `package.json`，且 `main` 指向游戏根内安全的
+相对 `.html` 普通文件时，还逐字冻结该 `package.json` 与活动 HTML。二者共同参与来源快照
+身份，修改任一文件都会由再次 Init 建立新快照。
 
 再次 Init 时：
 

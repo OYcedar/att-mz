@@ -86,6 +86,11 @@ Builtin 只读取下表中的标准字段。数据库数组里的 `null` 条目�
 - 根数组 `elements[*]`、`skillTypes[*]`、`weaponTypes[*]`、`armorTypes[*]`、
   `equipTypes[*]`。
 
+非空 `System.json.gameTitle` 只建立这一项 Builtin Unit。标准 NW.js `package.json` 的
+`window.title` 与 `package.main` 活动 HTML 中实际且唯一的小写无属性 `<title>` 元素是该
+Unit 的派生启动显示位置，
+不建立重复 Unit，也不进入 Rules 或 Generic ownership。
+
 上述数组中的 `null` 槽跳过，其他槽必须是字符串。Map 与事件列表只读取：
 
 | 来源 | Builtin 位置 |

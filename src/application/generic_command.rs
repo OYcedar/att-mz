@@ -6126,11 +6126,13 @@ fn generic_publication_request_failure(
                 second: SafePath::new(second),
             }
         }
-        DirectoryStageRequestError::OverlayOutsideSourceMappings { relative_file } => {
-            PublicationRequestViolation::OverlayOutsideSourceMappings {
-                relative_file: SafePath::new(relative_file),
-            }
-        }
+        DirectoryStageRequestError::OverlayOverlapsSourceTarget {
+            overlay,
+            source_target,
+        } => PublicationRequestViolation::OverlayOverlapsSourceTarget {
+            overlay: SafePath::new(overlay),
+            source_target: SafePath::new(source_target),
+        },
         DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
             empty_directory,
             source_target,

@@ -306,6 +306,93 @@ fn manual_export_check_and_apply_work_for_mv_and_mz() {
 }
 
 #[test]
+fn mz_standard_bootstrap_titles_follow_the_single_game_title_unit() {
+    let temporary = tempfile::tempdir().expect("应可建立启动标题纵向测试目录");
+    let root = temporary.path();
+    let game = root.join("mz-bootstrap-title-game");
+    write_minimal_mz_game(&game);
+    let system_path = game.join("data/System.json");
+    let mut system: Value =
+        serde_json::from_slice(&fs::read(&system_path).expect("System 夹具应可读取"))
+            .expect("System 夹具应为 JSON");
+    system["gameTitle"] = Value::String("原题".to_owned());
+    fs::write(
+        &system_path,
+        serde_json::to_vec(&system).expect("System 夹具应可序列化"),
+    )
+    .expect("System 夹具应可写入");
+    let package = r#"{"name":"demo","main":"index.html","window" : {"title" : "原题", "width":816},"title":"原题"}"#;
+    let html = r#"<head><title>原题</title><meta name="title" content="原题"></head><body title="原题">原题</body>"#;
+    fs::write(game.join("package.json"), package).expect("package 夹具应可写入");
+    fs::write(game.join("index.html"), html).expect("HTML 夹具应可写入");
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+
+    assert_success("启动标题 Init", &run_att(root, init_arguments("mz", &game)));
+    assert_success(
+        "启动标题 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    let manual = root.join("bootstrap-title.toml");
+    let mut export = arguments(&["mz", "manual", "export", "--name", PROJECT]);
+    export.push(manual.as_os_str().to_owned());
+    assert_success("启动标题 Manual export", &run_att(root, export));
+    let document = read_manual_toml(&manual);
+    let entries = document["translation"]
+        .as_array()
+        .expect("Manual translation 必须是数组");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["id"].as_str() == Some("System.json:gameTitle"))
+            .count(),
+        1,
+        "启动标题只能复用唯一 System.gameTitle Unit"
+    );
+    set_manual_toml_field(
+        &manual,
+        "System.json:gameTitle",
+        "translation",
+        toml::Value::Array(vec![toml::Value::String("译题".to_owned())]),
+    );
+    let mut apply = arguments(&["mz", "manual", "apply", "--name", PROJECT]);
+    apply.push(manual.as_os_str().to_owned());
+    assert_success("启动标题 Manual apply", &run_att(root, apply));
+    assert_success(
+        "启动标题 WriteBack",
+        &run_att(root, arguments(&["mz", "write-back", "--name", PROJECT])),
+    );
+
+    let output = distribution_root(root)
+        .join("projects/mz")
+        .join(PROJECT)
+        .join("write_back");
+    let output_system: Value = serde_json::from_slice(
+        &fs::read(output.join("data/System.json")).expect("输出 System 应可读取"),
+    )
+    .expect("输出 System 应为 JSON");
+    assert_eq!(output_system["gameTitle"], "译题");
+    assert_eq!(
+        fs::read_to_string(output.join("package.json")).expect("输出 package 应可读取"),
+        r#"{"name":"demo","main":"index.html","window" : {"title" : "译题", "width":816},"title":"原题"}"#
+    );
+    assert_eq!(
+        fs::read_to_string(output.join("index.html")).expect("输出 HTML 应可读取"),
+        r#"<head><title>译题</title><meta name="title" content="原题"></head><body title="原题">原题</body>"#
+    );
+    assert_eq!(
+        fs::read_to_string(game.join("package.json")).expect("原 package 应可读取"),
+        package
+    );
+    assert_eq!(
+        fs::read_to_string(game.join("index.html")).expect("原 HTML 应可读取"),
+        html
+    );
+}
+
+#[test]
 fn fixed_configuration_is_required_and_stage_commands_reject_lua_options() {
     let temporary = tempfile::tempdir().expect("应可建立 CLI 参数测试目录");
     let root = temporary.path();

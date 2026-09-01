@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, FileSystemDiagnosticStage, RpgMakerDiagnosticStage,
@@ -15,6 +16,9 @@ use crate::language::{LanguageId, LanguagePair};
 use crate::project_name::ProjectName;
 #[cfg(test)]
 use crate::rpg_maker::RpgMakerLayout;
+use crate::rpg_maker::bootstrap::{
+    RpgMakerBootstrapFiles, read_optional_bootstrap_files, source_snapshot_fingerprint,
+};
 use crate::rpg_maker::dialogue::MvDialogueDefinition;
 use crate::rpg_maker::project_database::ProjectDatabaseReadError;
 use crate::rpg_maker::project_database::{
@@ -25,13 +29,15 @@ use crate::runtime::filesystem::SystemFileSystemError;
 use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::file_system::{
     DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter,
-    DirectoryTreeRoot, ExistingDirectoryResolver, ResolveDirectoryError,
+    DirectoryTreeRoot, ExistingDirectoryResolver, FileReader, ReadFileError, ResolveDirectoryError,
+    SnapshotFileReader,
 };
 
 /// 已由项目开启边界建立、可供 RPG Maker 各用例直接信任的项目上下文。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpenedProject {
     record: StoredProjectRecord,
+    verified_bootstrap: Option<Arc<RpgMakerBootstrapFiles>>,
 }
 
 impl OpenedProject {
@@ -44,21 +50,49 @@ impl OpenedProject {
         source_language: String,
         target_language: String,
     ) -> Self {
-        let language_pair = LanguagePair::new(
-            LanguageId::parse(&source_language).expect("测试源语言应为有效规范标签"),
-            LanguageId::parse(&target_language).expect("测试目标语言应为有效规范标签"),
-        );
-        Self::from_record(StoredProjectRecord::new(
+        Self::new_with_layout(
             name,
             workspace_root,
             database_path,
             RpgMakerLayout::MZ,
-            language_pair,
-        ))
+            source_language,
+            target_language,
+        )
     }
 
-    fn from_record(record: StoredProjectRecord) -> Self {
-        Self { record }
+    #[cfg(test)]
+    pub(crate) fn new_with_layout(
+        name: ProjectName,
+        workspace_root: PathBuf,
+        database_path: PathBuf,
+        layout: RpgMakerLayout,
+        source_language: String,
+        target_language: String,
+    ) -> Self {
+        let language_pair = LanguagePair::new(
+            LanguageId::parse(&source_language).expect("测试源语言应为有效规范标签"),
+            LanguageId::parse(&target_language).expect("测试目标语言应为有效规范标签"),
+        );
+        Self::from_record(
+            StoredProjectRecord::new(name, workspace_root, database_path, layout, language_pair),
+            None,
+        )
+    }
+
+    fn from_record(
+        record: StoredProjectRecord,
+        verified_bootstrap: Option<Arc<RpgMakerBootstrapFiles>>,
+    ) -> Self {
+        Self {
+            record,
+            verified_bootstrap,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_verified_bootstrap(mut self, bootstrap: RpgMakerBootstrapFiles) -> Self {
+        self.verified_bootstrap = Some(Arc::new(bootstrap));
+        self
     }
 
     pub(crate) fn name(&self) -> &ProjectName {
@@ -102,6 +136,10 @@ impl OpenedProject {
         self.record.source_snapshot_fingerprint()
     }
 
+    pub(crate) fn verified_bootstrap(&self) -> Option<&Arc<RpgMakerBootstrapFiles>> {
+        self.verified_bootstrap.as_ref()
+    }
+
     pub(crate) fn mv_dialogue_definition(&self) -> &MvDialogueDefinition {
         self.record.mv_dialogue_definition()
     }
@@ -112,7 +150,7 @@ pub(crate) trait ExistingProjectOpener: Send + Sync {
     /// 项目开启失败。
     type Error: Error + Send + Sync + 'static;
 
-    /// 打开项目并重新观测按当前引擎布局冻结的 `data` 与 `js`。
+    /// 打开项目并重新观测按当前引擎布局冻结的来源快照。
     fn open(
         &self,
         name: &ProjectName,
@@ -144,9 +182,14 @@ impl<R, D, F> ExistingProjectOpener for ExistingProjectOpeningService<R, D, F>
 where
     R: ProjectDatabaseRecordReader,
     D: ExistingDirectoryResolver,
-    F: DirectoryTreeFingerprinter,
+    F: DirectoryTreeFingerprinter + SnapshotFileReader,
 {
-    type Error = ExistingProjectOpeningError<R::Error, D::Error, F::Error>;
+    type Error = ExistingProjectOpeningError<
+        R::Error,
+        D::Error,
+        <F as DirectoryTreeFingerprinter>::Error,
+        <F as FileReader>::Error,
+    >;
 
     async fn open(&self, name: &ProjectName) -> Result<OpenedProject, Self::Error> {
         let record = self
@@ -177,7 +220,13 @@ where
             .fingerprint_directory_tree(request)
             .await
             .map_err(ExistingProjectOpeningError::FingerprintSource)?;
-        let observed = SourceSnapshotFingerprint::from_bytes(observed.into_bytes());
+        let bootstrap = read_optional_bootstrap_files(
+            &self.directory_tree_fingerprinter,
+            record.layout().source_root(),
+        )
+        .await
+        .map_err(ExistingProjectOpeningError::ObserveBootstrap)?;
+        let observed = source_snapshot_fingerprint(observed, bootstrap.as_ref());
         let persisted = record.source_snapshot_fingerprint();
         if observed != persisted {
             return Err(ExistingProjectOpeningError::SourceSnapshotMismatch {
@@ -186,13 +235,13 @@ where
             });
         }
 
-        Ok(OpenedProject::from_record(record))
+        Ok(OpenedProject::from_record(record, bootstrap.map(Arc::new)))
     }
 }
 
 /// 项目开启服务在自身职责边界内产生的阶段错误。
 #[derive(Debug)]
-pub(crate) enum ExistingProjectOpeningError<R, D, F> {
+pub(crate) enum ExistingProjectOpeningError<R, D, F, B> {
     /// 无法读取项目数据库记录。
     ReadProjectRecord(R),
     /// 冻结的 `data` 目录当前不可用。
@@ -201,6 +250,8 @@ pub(crate) enum ExistingProjectOpeningError<R, D, F> {
     ResolveSourceJs(ResolveDirectoryError<D>),
     /// 无法建立冻结来源的当前内容指纹。
     FingerprintSource(DirectoryTreeFingerprintError<F>),
+    /// 无法读取冻结的标准 NW.js 启动壳。
+    ObserveBootstrap(ReadFileError<B>),
     /// 工作区的实际冻结来源已与数据库记录分离。
     SourceSnapshotMismatch {
         persisted: SourceSnapshotFingerprint,
@@ -208,11 +259,12 @@ pub(crate) enum ExistingProjectOpeningError<R, D, F> {
     },
 }
 
-impl<R, D, F> fmt::Display for ExistingProjectOpeningError<R, D, F>
+impl<R, D, F, B> fmt::Display for ExistingProjectOpeningError<R, D, F, B>
 where
     R: fmt::Display,
     D: fmt::Display,
     F: fmt::Display,
+    B: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -226,6 +278,9 @@ where
             Self::FingerprintSource(error) => {
                 write!(formatter, "无法建立冻结来源指纹：{error}")
             }
+            Self::ObserveBootstrap(error) => {
+                write!(formatter, "无法读取冻结启动壳：{error}")
+            }
             Self::SourceSnapshotMismatch {
                 persisted,
                 observed,
@@ -237,17 +292,19 @@ where
     }
 }
 
-impl<R, D, F> Error for ExistingProjectOpeningError<R, D, F>
+impl<R, D, F, B> Error for ExistingProjectOpeningError<R, D, F, B>
 where
     R: Error + 'static,
     D: Error + 'static,
     F: Error + 'static,
+    B: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadProjectRecord(error) => Some(error),
             Self::ResolveSourceData(error) | Self::ResolveSourceJs(error) => Some(error),
             Self::FingerprintSource(error) => Some(error),
+            Self::ObserveBootstrap(error) => Some(error),
             Self::SourceSnapshotMismatch { .. } => None,
         }
     }
@@ -258,6 +315,7 @@ impl
         ProjectDatabaseReadError<SqliteRuntimeError>,
         SystemFileSystemError,
         Box<SystemFileSystemError>,
+        SystemFileSystemError,
     >
 {
     /// 项目开启边界消费下层的同一份安全报告，不从显示正文重建事实。
@@ -268,6 +326,9 @@ impl
                 source.diagnostic_report_at(FileSystemDiagnosticStage::Project)
             }
             Self::FingerprintSource(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Project)
+            }
+            Self::ObserveBootstrap(source) => {
                 source.diagnostic_report_at(FileSystemDiagnosticStage::Project)
             }
             Self::SourceSnapshotMismatch {
@@ -396,6 +457,26 @@ mod tests {
                     source: FakeFingerprintError,
                 },
             })
+        }
+    }
+
+    impl FileReader for FakeDirectoryTreeFingerprinter {
+        type Error = FakeFingerprintError;
+
+        async fn read_file(
+            &self,
+            path: PathBuf,
+        ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            Err(ReadFileError::NotFound { path })
+        }
+    }
+
+    impl SnapshotFileReader for FakeDirectoryTreeFingerprinter {
+        async fn read_snapshot_file(
+            &self,
+            path: PathBuf,
+        ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            self.read_file(path).await
         }
     }
 

@@ -4,6 +4,7 @@
 
 pub(crate) mod asset;
 pub(crate) mod asset_storage;
+pub(crate) mod bootstrap;
 pub(crate) mod dialogue;
 pub(crate) mod extract;
 pub(crate) mod init;

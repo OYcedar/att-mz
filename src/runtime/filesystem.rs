@@ -50,8 +50,8 @@ use crate::storage::file_system::{
     ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFile, ReadFileError,
     RecoverableDirectoryPublisher, ResolveDirectoryError, ScopedDirectoryBindError,
     ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryEntry,
-    ScopedDirectoryEntryKind, ScopedDirectoryPath, ScopedDirectoryScope, StagedDirectory,
-    StagingCleanupFailure,
+    ScopedDirectoryEntryKind, ScopedDirectoryPath, ScopedDirectoryScope, SnapshotFileReader,
+    StagedDirectory, StagingCleanupFailure,
 };
 use crate::windows_path::{WindowsOrdinalCaseKey, WindowsOrdinalCaseKeyError};
 use sha2::{Digest, Sha256};
@@ -1753,6 +1753,34 @@ impl FileReader for SystemFileSystem {
     }
 }
 
+impl SnapshotFileReader for SystemFileSystem {
+    fn read_snapshot_file(
+        &self,
+        path: PathBuf,
+    ) -> impl std::future::Future<Output = Result<ReadFile, ReadFileError<Self::Error>>> + Send
+    {
+        let requested = absolutize(path);
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let requested = requested.map_err(|source| ReadFileError::Io {
+                path: PathBuf::from("."),
+                source,
+            })?;
+            let error_path = requested.clone();
+            inner
+                .pool
+                .execute("read_snapshot_file", &error_path, move || {
+                    read_snapshot_file_sync(requested)
+                })
+                .await
+                .map_err(|source| ReadFileError::Io {
+                    path: error_path,
+                    source,
+                })?
+        }
+    }
+}
+
 impl ScopedDirectoryEditor for SystemDirectoryPublisher {
     type CandidateState = SystemStagingState;
     type ScopeState = SystemScopedDirectoryState;
@@ -2394,6 +2422,101 @@ fn read_file_sync(path: PathBuf) -> Result<ReadFile, ReadFileError<SystemFileSys
         source: io_error("读取文件", &path, source),
     })?;
     Ok(ReadFile::new(resolved_path, bytes))
+}
+
+fn read_snapshot_file_sync(
+    path: PathBuf,
+) -> Result<ReadFile, ReadFileError<SystemFileSystemError>> {
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(ReadFileError::NotFound { path });
+        }
+        Err(source) => {
+            return Err(ReadFileError::Io {
+                path: path.clone(),
+                source: io_error("读取快照文件元数据", &path, source),
+            });
+        }
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ReadFileError::Io {
+            path: path.clone(),
+            source: WindowsFsError::ReparsePoint { path }.into(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(ReadFileError::NotFile { path });
+    }
+
+    let mut pinned =
+        pin_regular_file_for_snapshot_read(&path).map_err(|source| ReadFileError::Io {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+    let before = pinned.metadata().map_err(|source| ReadFileError::Io {
+        path: path.clone(),
+        source: source.into(),
+    })?;
+    if !before.is_file() {
+        return Err(ReadFileError::NotFile { path });
+    }
+    let before_links =
+        number_of_links(pinned.file(), &path).map_err(|source| ReadFileError::Io {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+    if before_links != 1 {
+        return Err(snapshot_file_violation(
+            path,
+            FileSystemPathViolation::HardLink,
+        ));
+    }
+    let before_identity =
+        FileIdentity::of(pinned.file(), &path).map_err(|source| ReadFileError::Io {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+    let resolved_path = pinned.resolved_path().to_path_buf();
+    let bytes = read_all_bytes(pinned.file_mut()).map_err(|source| ReadFileError::Io {
+        path: path.clone(),
+        source: io_error("读取快照文件", &path, source),
+    })?;
+    let after = pinned.metadata().map_err(|source| ReadFileError::Io {
+        path: path.clone(),
+        source: source.into(),
+    })?;
+    let after_identity =
+        FileIdentity::of(pinned.file(), &path).map_err(|source| ReadFileError::Io {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+    let after_links =
+        number_of_links(pinned.file(), &path).map_err(|source| ReadFileError::Io {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+    if before.len() != bytes.len() as u64
+        || after.len() != before.len()
+        || after_identity != before_identity
+        || after_links != 1
+    {
+        return Err(snapshot_file_violation(
+            path,
+            FileSystemPathViolation::SourceChanged,
+        ));
+    }
+    Ok(ReadFile::new(resolved_path, bytes))
+}
+
+fn snapshot_file_violation(
+    path: PathBuf,
+    violation: FileSystemPathViolation,
+) -> ReadFileError<SystemFileSystemError> {
+    ReadFileError::Io {
+        path: path.clone(),
+        source: SystemFileSystemError::InvalidPath { path, violation },
+    }
 }
 
 /// 只依据底层 `Read` 的实际产出来增长缓冲区；调用方不得把文件元数据长度作为容量门槛。
@@ -3491,8 +3614,8 @@ fn build_candidate(
 ) -> Result<(), SystemFileSystemError> {
     ensure_operation_active(cancellation, "建立目录候选", stage_root)?;
     validate_declared_windows_paths(source_mappings, overlays, empty_directories)?;
-    // 先冻结确定性来源 manifest，再创建候选内容；覆盖文件只在物化时
-    // 写入最终字节一次，但仍与普通文件一样接受来源身份、类型和大小复核。
+    // 先冻结确定性来源 manifest，再创建候选内容。来源树内覆盖在物化时
+    // 复核原文件的身份、类型和大小；独立覆盖按请求字节建立，再由调用方候选门禁复核内容一致性。
     let manifest = build_candidate_manifest(
         stage_root,
         target_root,
@@ -3521,6 +3644,10 @@ enum CandidateManifestOperation {
     CopySource {
         relative_target: PathBuf,
         source_tree: CandidateManifestSourceTree,
+    },
+    WriteOverlay {
+        relative_file: PathBuf,
+        overlay_index: usize,
     },
 }
 
@@ -3630,17 +3757,17 @@ fn build_candidate_manifest(
     for (index, overlay) in overlays.iter().enumerate() {
         ensure_operation_active(cancellation, "观察候选覆盖", overlay.relative_file())?;
         validate_relative_windows_path(overlay.relative_file())?;
-        let Some(original_size) = observation.matched_overlay_sizes[index] else {
-            let source_path = source_mappings
-                .iter()
-                .find_map(|mapping| {
-                    overlay
-                        .relative_file()
-                        .strip_prefix(mapping.relative_target())
-                        .ok()
-                        .map(|relative| mapping.source_directory().join(relative))
-                })
-                .expect("覆盖路径在请求边界已经确认属于唯一来源映射");
+        if observation.matched_overlay_sizes[index].is_some() {
+            continue;
+        }
+        let source_path = source_mappings.iter().find_map(|mapping| {
+            overlay
+                .relative_file()
+                .strip_prefix(mapping.relative_target())
+                .ok()
+                .map(|relative| mapping.source_directory().join(relative))
+        });
+        if let Some(source_path) = source_path {
             match pin_regular_file_for_snapshot_read(&source_path) {
                 Err(source) => return Err(source.into()),
                 Ok(_) => {
@@ -3650,8 +3777,14 @@ fn build_candidate_manifest(
                     });
                 }
             }
-        };
-        let _ = original_size;
+        }
+        if let Some(parent) = overlay.relative_file().parent() {
+            reserve_manifest_directories(parent, &mut declared_directories, &mut operations)?;
+        }
+        operations.push(CandidateManifestOperation::WriteOverlay {
+            relative_file: overlay.relative_file().to_path_buf(),
+            overlay_index: index,
+        });
     }
     for directory in empty_directories {
         ensure_operation_active(cancellation, "观察候选空目录", directory)?;
@@ -3889,6 +4022,16 @@ fn materialize_candidate_manifest(
                 &mut files,
                 cancellation,
             )?,
+            CandidateManifestOperation::WriteOverlay {
+                relative_file,
+                overlay_index,
+            } => files.push(CandidateFileTask {
+                ordinal: files.len(),
+                kind: CandidateFileTaskKind::StandaloneOverlay {
+                    overlay_index: *overlay_index,
+                },
+                destination: stage_root.join(relative_file),
+            }),
         }
     }
     materialize_candidate_files(&files, overlays, cancellation, worker_width)?;
@@ -3903,8 +4046,14 @@ fn materialize_candidate_manifest(
 
 struct CandidateFileTask<'a> {
     ordinal: usize,
-    manifest: &'a CandidateManifestFile,
+    kind: CandidateFileTaskKind<'a>,
     destination: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum CandidateFileTaskKind<'a> {
+    Source(&'a CandidateManifestFile),
+    StandaloneOverlay { overlay_index: usize },
 }
 
 fn prepare_candidate_source_tree<'a>(
@@ -3936,7 +4085,7 @@ fn prepare_candidate_source_tree<'a>(
         match work {
             Work::File { file, destination } => files.push(CandidateFileTask {
                 ordinal: files.len(),
-                manifest: &source_tree.files[file],
+                kind: CandidateFileTaskKind::Source(&source_tree.files[file]),
                 destination,
             }),
             Work::Directory {
@@ -4029,15 +4178,24 @@ fn materialize_candidate_file_worker(
             return;
         };
         let result = ensure_operation_active(cancellation, "物化候选文件", &task.destination)
-            .and_then(|()| match task.manifest.overlay_index {
-                Some(overlay) => write_candidate_overlay(
-                    task.manifest,
-                    &task.destination,
-                    &overlays[overlay],
-                    cancellation,
-                ),
-                None => copy_manifest_regular_file(task.manifest, &task.destination, cancellation)
-                    .map(|_| ()),
+            .and_then(|()| match task.kind {
+                CandidateFileTaskKind::Source(manifest) => match manifest.overlay_index {
+                    Some(overlay) => write_candidate_overlay(
+                        manifest,
+                        &task.destination,
+                        &overlays[overlay],
+                        cancellation,
+                    ),
+                    None => copy_manifest_regular_file(manifest, &task.destination, cancellation)
+                        .map(|_| ()),
+                },
+                CandidateFileTaskKind::StandaloneOverlay { overlay_index } => {
+                    write_candidate_overlay_bytes(
+                        &task.destination,
+                        &overlays[overlay_index],
+                        cancellation,
+                    )
+                }
             });
         let cancelled = matches!(result, Err(SystemFileSystemError::Cancelled { .. }));
         if let Err(error) = result {
@@ -4388,6 +4546,16 @@ fn write_candidate_overlay(
 ) -> Result<(), SystemFileSystemError> {
     ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
     let input = pin_manifest_regular_file(manifest)?;
+    write_candidate_overlay_bytes(destination, overlay, cancellation)?;
+    validate_materialized_source_file(&input, manifest)
+}
+
+fn write_candidate_overlay_bytes(
+    destination: &Path,
+    overlay: &DirectoryFileOverlay,
+    cancellation: &AtomicBool,
+) -> Result<(), SystemFileSystemError> {
+    ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -4403,8 +4571,7 @@ fn write_candidate_overlay(
     output
         .sync_data()
         .map_err(|source| io_error("同步候选覆盖", destination, source))?;
-    ensure_operation_active(cancellation, "写入候选覆盖", destination)?;
-    validate_materialized_source_file(&input, manifest)
+    ensure_operation_active(cancellation, "写入候选覆盖", destination)
 }
 
 #[cfg(test)]
@@ -7137,7 +7304,8 @@ mod tests {
             .iter()
             .find_map(|operation| match operation {
                 CandidateManifestOperation::CopySource { source_tree, .. } => Some(source_tree),
-                CandidateManifestOperation::EnsureDirectory(_) => None,
+                CandidateManifestOperation::EnsureDirectory(_)
+                | CandidateManifestOperation::WriteOverlay { .. } => None,
             })
             .expect("manifest 应包含来源树");
         let directory = &source_tree.directories[source_tree.root_directory];
@@ -7168,6 +7336,95 @@ mod tests {
             fs::read(stage.join("snapshot/content/z.json")).expect("应该可读取未覆盖副本"),
             b"untouched"
         );
+    }
+
+    #[test]
+    fn standalone_overlays_create_parent_directories_and_write_exact_bytes() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source");
+        let stage = temporary.path().join("stage");
+        let target = temporary.path().join("target");
+        fs::create_dir(&source).expect("应该可建立来源目录");
+        fs::create_dir(&stage).expect("应该可建立候选目录");
+        fs::write(source.join("catalog.json"), b"source").expect("应该可建立来源文件");
+        let mappings = vec![
+            DirectorySourceMapping::new(source, PathBuf::from("content"))
+                .expect("测试来源映射应合法"),
+        ];
+        let overlays = vec![
+            DirectoryFileOverlay::new(PathBuf::from("package.json"), b"package".to_vec())
+                .expect("根文件覆盖应合法"),
+            DirectoryFileOverlay::new(
+                PathBuf::from("shell/index.html"),
+                b"<title>translated</title>".to_vec(),
+            )
+            .expect("嵌套文件覆盖应合法"),
+        ];
+        let cancellation = AtomicBool::new(true);
+        let manifest =
+            build_candidate_manifest(&stage, &target, &mappings, &overlays, &[], &cancellation)
+                .expect("独立覆盖应进入候选 manifest");
+
+        materialize_candidate_manifest(&stage, &manifest, &overlays, &cancellation, 4)
+            .expect("独立覆盖应可物化");
+
+        assert_eq!(
+            fs::read(stage.join("package.json")).expect("应该可读取根覆盖"),
+            b"package"
+        );
+        assert_eq!(
+            fs::read(stage.join("shell/index.html")).expect("应该可读取嵌套覆盖"),
+            b"<title>translated</title>"
+        );
+        assert_eq!(
+            fs::read(stage.join("content/catalog.json")).expect("应该保留来源树"),
+            b"source"
+        );
+    }
+
+    #[test]
+    fn standalone_overlay_uses_shared_file_task_error_order() {
+        let temporary = tempfile::tempdir().expect("应该可创建临时目录");
+        let source = temporary.path().join("source.json");
+        let source_destination = temporary.path().join("source-output.json");
+        let standalone_destination = temporary.path().join("package.json");
+        fs::write(&source, b"source").expect("应该可建立来源文件");
+        fs::write(&source_destination, b"occupied").expect("应该可占用来源输出路径");
+        fs::write(&standalone_destination, b"occupied").expect("应该可占用独立覆盖路径");
+
+        let enumerated = pin_path_without_reparse(&source).expect("应该可固定来源文件");
+        let manifest = CandidateManifestFile {
+            source: source.clone(),
+            expected_identity: FileIdentity::of(enumerated.file(), &source)
+                .expect("应该可读取来源身份"),
+            observed_size: enumerated.metadata().expect("应该可读取来源大小").len(),
+            overlay_index: None,
+        };
+        drop(enumerated);
+        let overlays = vec![
+            DirectoryFileOverlay::new(PathBuf::from("package.json"), b"overlay".to_vec())
+                .expect("独立覆盖应合法"),
+        ];
+        let files = vec![
+            CandidateFileTask {
+                ordinal: 0,
+                kind: CandidateFileTaskKind::Source(&manifest),
+                destination: source_destination.clone(),
+            },
+            CandidateFileTask {
+                ordinal: 1,
+                kind: CandidateFileTaskKind::StandaloneOverlay { overlay_index: 0 },
+                destination: standalone_destination,
+            },
+        ];
+        let cancellation = AtomicBool::new(true);
+
+        let error = materialize_candidate_files(&files, &overlays, &cancellation, 2)
+            .expect_err("两个文件任务失败时必须按声明顺序选择主错误");
+        assert!(matches!(
+            error,
+            SystemFileSystemError::Io { path, .. } if path == source_destination
+        ));
     }
 
     #[test]

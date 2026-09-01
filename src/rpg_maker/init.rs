@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::asset::RpgMakerAssetOwner;
+use super::bootstrap::{
+    RpgMakerBootstrapFiles, read_optional_bootstrap_files, source_snapshot_fingerprint,
+};
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
     FileSystemIssue, FileSystemOperation, FileSystemPathViolation, FileSystemProblem,
@@ -29,13 +32,14 @@ use crate::runtime::filesystem::SystemFileSystemError;
 use crate::runtime::sqlite::SqliteRuntimeError;
 use crate::storage::file_system::{
     BoundScopedDirectory, DirectChildDirectoryEnsurer, DirectoryDiscardError, DirectoryEntry,
-    DirectoryEntryKind, DirectoryLister, DirectoryPrepareError, DirectoryPublishError,
-    DirectoryPublishIntent, DirectoryRecoveryError, DirectorySourceMapping, DirectoryStageRequest,
-    DirectoryStageRequestError, DirectoryTreeFingerprintError, DirectoryTreeFingerprintRequest,
-    DirectoryTreeFingerprinter, DirectoryTreeRoot, ExistingDirectoryResolver, FileReader,
-    ListDirectoryError, ReadFileError, RecoverableDirectoryPublisher, ResolveDirectoryError,
-    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryPath,
-    ScopedDirectoryScope, StagedDirectory,
+    DirectoryEntryKind, DirectoryFileOverlay, DirectoryLister, DirectoryPrepareError,
+    DirectoryPublishError, DirectoryPublishIntent, DirectoryRecoveryError, DirectorySourceMapping,
+    DirectoryStageRequest, DirectoryStageRequestError, DirectoryTreeFingerprintError,
+    DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, DirectoryTreeRoot,
+    ExistingDirectoryResolver, FileReader, ListDirectoryError, ReadFileError,
+    RecoverableDirectoryPublisher, ResolveDirectoryError, ScopedDirectoryBindError,
+    ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryPath, ScopedDirectoryScope,
+    SnapshotFileReader, StagedDirectory,
 };
 use crate::storage::scoped_path::ScopedDirectoryPathError;
 use crate::storage::sqlite::{SnapshotDatabaseError, SqliteDatabaseSnapshotter};
@@ -212,7 +216,7 @@ where
     F: ExistingDirectoryResolver
         + DirectChildDirectoryEnsurer<Error = <F as ExistingDirectoryResolver>::Error>
         + DirectoryLister<Error = <F as ExistingDirectoryResolver>::Error>
-        + FileReader<Error = <F as ExistingDirectoryResolver>::Error>
+        + SnapshotFileReader<Error = <F as ExistingDirectoryResolver>::Error>
         + DirectoryTreeFingerprinter,
     A: RecoverableDirectoryPublisher
         + ScopedDirectoryEditor<
@@ -315,6 +319,9 @@ where
                 core_script: self.rpg_maker_layout.core_script(),
             });
         }
+        let source_bootstrap = read_optional_bootstrap_files(&self.file_system, &source_game_root)
+            .await
+            .map_err(ProjectWorkspaceConvergenceError::ObserveInputBootstrap)?;
 
         // 这两个名称一旦存在就必须是目录。它们承载运行历史和人工补译材料，
         // 即使项目其余状态完全一致，也不能把同名普通文件当成“无需保留”。
@@ -352,6 +359,7 @@ where
                     &self.file_system,
                     self.rpg_maker_layout,
                     &source_game_root,
+                    source_bootstrap.as_ref(),
                 )
                 .await
                 .map_err(ProjectWorkspaceConvergenceError::ObserveInputSource)?;
@@ -392,6 +400,19 @@ where
             self.rpg_maker_layout.write_back_js_relative(),
         ];
         empty_directories.extend(preserved_directories.iter().map(PathBuf::from));
+        let bootstrap_overlays = match source_bootstrap.as_ref() {
+            Some(bootstrap) => vec![
+                DirectoryFileOverlay::new(
+                    PathBuf::from("source/package.json"),
+                    bootstrap.package_bytes().to_vec(),
+                )?,
+                DirectoryFileOverlay::new(
+                    PathBuf::from("source").join(bootstrap.main_relative()),
+                    bootstrap.main_html_bytes().to_vec(),
+                )?,
+            ],
+            None => Vec::new(),
+        };
         let stage_request = DirectoryStageRequest::new(
             final_layout.workspace_root().to_path_buf(),
             publish_intent,
@@ -405,7 +426,7 @@ where
                     self.rpg_maker_layout.source_js_relative(),
                 )?,
             ],
-            Vec::new(),
+            bootstrap_overlays,
             empty_directories,
         )?;
         let staged = self
@@ -417,6 +438,51 @@ where
             staged.staging_root().to_path_buf(),
             self.rpg_maker_layout,
         );
+
+        match read_optional_bootstrap_files(&self.file_system, &source_game_root).await {
+            Ok(observed) if observed == source_bootstrap => {}
+            Ok(_) => {
+                let discard = self.directories.discard(staged).await.err();
+                return Err(ProjectWorkspaceConvergenceError::InputBootstrapChanged {
+                    game_root: source_game_root,
+                    discard,
+                });
+            }
+            Err(source) => {
+                let discard = self.directories.discard(staged).await.err();
+                return Err(
+                    ProjectWorkspaceConvergenceError::ObservePreparedInputBootstrap {
+                        source,
+                        discard,
+                    },
+                );
+            }
+        }
+        let candidate_bootstrap =
+            match read_optional_bootstrap_files(&self.file_system, staged_layout.source_root())
+                .await
+            {
+                Ok(candidate) if candidate == source_bootstrap => candidate,
+                Ok(_) => {
+                    let candidate_root = staged_layout.source_root().to_path_buf();
+                    let discard = self.directories.discard(staged).await.err();
+                    return Err(
+                        ProjectWorkspaceConvergenceError::CandidateBootstrapChanged {
+                            candidate_root,
+                            discard,
+                        },
+                    );
+                }
+                Err(source) => {
+                    let discard = self.directories.discard(staged).await.err();
+                    return Err(
+                        ProjectWorkspaceConvergenceError::ObserveCandidateBootstrap {
+                            source,
+                            discard,
+                        },
+                    );
+                }
+            };
 
         if self.cancellation.is_requested() {
             return discard_cancelled_candidate(&self.directories, staged).await;
@@ -452,19 +518,25 @@ where
                 });
             }
         }
-        let candidate_fingerprint =
-            match fingerprint_source(&self.file_system, &staged_layout, false).await {
-                Ok(Some(fingerprint)) => fingerprint,
-                Ok(None) => unreachable!("候选来源缺失必须由指纹根返回错误"),
-                Err(source) => {
-                    return Err(discard_candidate_failure(
-                        &self.directories,
-                        staged,
-                        ProjectWorkspaceCandidateFailure::FingerprintCandidate(source),
-                    )
-                    .await);
-                }
-            };
+        let candidate_fingerprint = match fingerprint_source_with_bootstrap(
+            &self.file_system,
+            &staged_layout,
+            candidate_bootstrap.as_ref(),
+            false,
+        )
+        .await
+        {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => unreachable!("候选来源缺失必须由指纹根返回错误"),
+            Err(source) => {
+                return Err(discard_candidate_failure(
+                    &self.directories,
+                    staged,
+                    ProjectWorkspaceCandidateFailure::FingerprintCandidate(source),
+                )
+                .await);
+            }
+        };
         let requested_project =
             NewProject::new(request.name, settings.language_pair, candidate_fingerprint);
 
@@ -630,6 +702,7 @@ async fn fingerprint_game_source<F>(
     file_system: &F,
     layout: RpgMakerLayout,
     game_root: &std::path::Path,
+    bootstrap: Option<&RpgMakerBootstrapFiles>,
 ) -> Result<SourceSnapshotFingerprint, DirectoryTreeFingerprintError<F::Error>>
 where
     F: DirectoryTreeFingerprinter,
@@ -638,6 +711,7 @@ where
         file_system,
         game_root.join(layout.data_relative()),
         game_root.join(layout.js_relative()),
+        bootstrap,
     )
     .await
 }
@@ -700,11 +774,74 @@ fn count_child(children: &[DirectoryEntry], expected: (&str, DirectoryEntryKind)
         .count()
 }
 
+#[derive(Debug)]
+pub(crate) enum FrozenSourceObservationError<E, P> {
+    Bootstrap(ReadFileError<E>),
+    Tree(DirectoryTreeFingerprintError<P>),
+}
+
+impl<E, P> fmt::Display for FrozenSourceObservationError<E, P>
+where
+    E: fmt::Display,
+    P: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bootstrap(source) => write!(formatter, "无法读取启动壳文件：{source}"),
+            Self::Tree(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<E, P> Error for FrozenSourceObservationError<E, P>
+where
+    E: Error + 'static,
+    P: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Bootstrap(source) => Some(source),
+            Self::Tree(source) => Some(source),
+        }
+    }
+}
+
 async fn fingerprint_source<F>(
     file_system: &F,
     layout: &ProjectWorkspaceLayout,
     absence_is_repairable: bool,
-) -> Result<Option<SourceSnapshotFingerprint>, DirectoryTreeFingerprintError<F::Error>>
+) -> Result<
+    Option<SourceSnapshotFingerprint>,
+    FrozenSourceObservationError<
+        <F as FileReader>::Error,
+        <F as DirectoryTreeFingerprinter>::Error,
+    >,
+>
+where
+    F: SnapshotFileReader + DirectoryTreeFingerprinter,
+{
+    let bootstrap = read_optional_bootstrap_files(file_system, layout.source_root())
+        .await
+        .map_err(FrozenSourceObservationError::Bootstrap)?;
+    fingerprint_source_with_bootstrap(
+        file_system,
+        layout,
+        bootstrap.as_ref(),
+        absence_is_repairable,
+    )
+    .await
+    .map_err(FrozenSourceObservationError::Tree)
+}
+
+async fn fingerprint_source_with_bootstrap<F>(
+    file_system: &F,
+    layout: &ProjectWorkspaceLayout,
+    bootstrap: Option<&RpgMakerBootstrapFiles>,
+    absence_is_repairable: bool,
+) -> Result<
+    Option<SourceSnapshotFingerprint>,
+    DirectoryTreeFingerprintError<<F as DirectoryTreeFingerprinter>::Error>,
+>
 where
     F: DirectoryTreeFingerprinter,
 {
@@ -712,6 +849,7 @@ where
         file_system,
         layout.source_data().to_path_buf(),
         layout.source_js().to_path_buf(),
+        bootstrap,
     )
     .await
     {
@@ -728,6 +866,7 @@ async fn fingerprint_roots<F>(
     file_system: &F,
     data_root: PathBuf,
     js_root: PathBuf,
+    bootstrap: Option<&RpgMakerBootstrapFiles>,
 ) -> Result<SourceSnapshotFingerprint, DirectoryTreeFingerprintError<F::Error>>
 where
     F: DirectoryTreeFingerprinter,
@@ -740,7 +879,7 @@ where
     file_system
         .fingerprint_directory_tree(request)
         .await
-        .map(|value| SourceSnapshotFingerprint::from_bytes(value.into_bytes()))
+        .map(|value| source_snapshot_fingerprint(value, bootstrap))
 }
 
 /// 工作区重建时按当前契约保留的非权威可观测性目录。
@@ -963,6 +1102,7 @@ where
 pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     SourceGameRoot(ResolveDirectoryError<E>),
     ObserveGameLayout(ListDirectoryError<E>),
+    ObserveInputBootstrap(ReadFileError<E>),
     InvalidGameLayout {
         game_root: PathBuf,
         engine: &'static str,
@@ -976,7 +1116,7 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     InspectExistingDatabase(I),
     MissingInitialSettings(Vec<MissingInitialProjectSetting>),
     ObserveWorkspaceStructure(ListDirectoryError<E>),
-    ObserveExistingSource(DirectoryTreeFingerprintError<P>),
+    ObserveExistingSource(FrozenSourceObservationError<E, P>),
     ObserveInputSource(DirectoryTreeFingerprintError<P>),
     InvalidStageRequest(DirectoryStageRequestError),
     Recover(DirectoryRecoveryError<A>),
@@ -984,6 +1124,22 @@ pub(crate) enum ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> {
     ObservePreservedDirectory(ResolveDirectoryError<E>),
     PreserveObservability {
         failure: PreserveObservabilityFailure<E, A>,
+        discard: Option<DirectoryDiscardError<A>>,
+    },
+    ObservePreparedInputBootstrap {
+        source: ReadFileError<E>,
+        discard: Option<DirectoryDiscardError<A>>,
+    },
+    InputBootstrapChanged {
+        game_root: PathBuf,
+        discard: Option<DirectoryDiscardError<A>>,
+    },
+    ObserveCandidateBootstrap {
+        source: ReadFileError<E>,
+        discard: Option<DirectoryDiscardError<A>>,
+    },
+    CandidateBootstrapChanged {
+        candidate_root: PathBuf,
         discard: Option<DirectoryDiscardError<A>>,
     },
     CandidateFailure {
@@ -1017,6 +1173,9 @@ impl ProductionWorkspaceConvergenceError {
             Self::ObserveGameLayout(source) | Self::ObserveWorkspaceStructure(source) => {
                 source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
             }
+            Self::ObserveInputBootstrap(source) => {
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+            }
             Self::InvalidGameLayout {
                 game_root,
                 engine,
@@ -1047,7 +1206,8 @@ impl ProductionWorkspaceConvergenceError {
                     settings: settings.iter().copied().map(initial_setting).collect(),
                 })
             }
-            Self::ObserveExistingSource(source) | Self::ObserveInputSource(source) => {
+            Self::ObserveExistingSource(source) => frozen_source_observation_report(source),
+            Self::ObserveInputSource(source) => {
                 source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
             }
             Self::InvalidStageRequest(_) => DiagnosticReport::new(
@@ -1063,6 +1223,46 @@ impl ProductionWorkspaceConvergenceError {
             Self::PreserveObservability { failure, discard } => {
                 attach_optional_discard(preserve_observability_report(failure), discard.as_ref())
             }
+            Self::ObservePreparedInputBootstrap { source, discard }
+            | Self::ObserveCandidateBootstrap { source, discard } => attach_optional_discard(
+                source.diagnostic_report_at(FileSystemDiagnosticStage::Init),
+                discard.as_ref(),
+            ),
+            Self::InputBootstrapChanged { game_root, discard } => attach_optional_discard(
+                DiagnosticReport::new(
+                    StateEffect::Unchanged,
+                    Diagnostic::file_system(FileSystemIssue::new(
+                        FileSystemDiagnosticContext::new(
+                            FileSystemDiagnosticStage::Init,
+                            FileSystemOperation::Read,
+                        ),
+                        FileSystemProblem::InvalidPath {
+                            path: SafePath::new(game_root),
+                            violation: FileSystemPathViolation::SourceChanged,
+                        },
+                    )),
+                ),
+                discard.as_ref(),
+            ),
+            Self::CandidateBootstrapChanged {
+                candidate_root,
+                discard,
+            } => attach_optional_discard(
+                DiagnosticReport::new(
+                    StateEffect::Unchanged,
+                    Diagnostic::file_system(FileSystemIssue::new(
+                        FileSystemDiagnosticContext::new(
+                            FileSystemDiagnosticStage::Init,
+                            FileSystemOperation::Read,
+                        ),
+                        FileSystemProblem::InvalidPath {
+                            path: SafePath::new(candidate_root),
+                            violation: FileSystemPathViolation::SourceChanged,
+                        },
+                    )),
+                ),
+                discard.as_ref(),
+            ),
             Self::CandidateFailure { failure, discard } => {
                 attach_optional_discard(candidate_failure_report(failure), discard.as_ref())
             }
@@ -1175,6 +1375,19 @@ fn preserve_observability_report(
     }
 }
 
+fn frozen_source_observation_report(
+    source: &FrozenSourceObservationError<SystemFileSystemError, Box<SystemFileSystemError>>,
+) -> DiagnosticReport {
+    match source {
+        FrozenSourceObservationError::Bootstrap(source) => {
+            source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+        }
+        FrozenSourceObservationError::Tree(source) => {
+            source.diagnostic_report_at(FileSystemDiagnosticStage::Init)
+        }
+    }
+}
+
 fn candidate_failure_report(
     failure: &ProjectWorkspaceCandidateFailure<
         ProjectDatabaseCreateError<SqliteRuntimeError>,
@@ -1264,6 +1477,7 @@ impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> 
         match self {
             Self::SourceGameRoot(_)
             | Self::ObserveGameLayout(_)
+            | Self::ObserveInputBootstrap(_)
             | Self::InvalidGameLayout { .. }
             | Self::EngineWorkspaceRoot(_)
             | Self::MissingInitialSettings(_)
@@ -1286,6 +1500,10 @@ impl<D, S, I, R, E, P, A> ProjectWorkspaceConvergenceError<D, S, I, R, E, P, A> 
                 }
             }
             Self::PreserveObservability { discard, .. }
+            | Self::ObservePreparedInputBootstrap { discard, .. }
+            | Self::ObserveCandidateBootstrap { discard, .. }
+            | Self::InputBootstrapChanged { discard, .. }
+            | Self::CandidateBootstrapChanged { discard, .. }
             | Self::CandidateFailure { discard, .. } => {
                 if discard.is_some() {
                     Impact::RecoveryRequired
@@ -1348,6 +1566,9 @@ where
         match self {
             Self::SourceGameRoot(error) => write!(formatter, "无法使用游戏根目录：{error}"),
             Self::ObserveGameLayout(error) => write!(formatter, "无法检查游戏目录结构：{error}"),
+            Self::ObserveInputBootstrap(error) => {
+                write!(formatter, "无法读取游戏启动壳文件：{error}")
+            }
             Self::InvalidGameLayout {
                 game_root,
                 engine,
@@ -1401,6 +1622,45 @@ where
             }
             Self::PreserveObservability { failure, discard } => {
                 write!(formatter, "无法保留现存可观测性目录：{failure}")?;
+                if let Some(discard) = discard {
+                    write!(formatter, "；且候选清理失败：{discard}")?;
+                }
+                Ok(())
+            }
+            Self::ObservePreparedInputBootstrap { source, discard } => {
+                write!(formatter, "候选准备后无法复核输入游戏启动壳：{source}")?;
+                if let Some(discard) = discard {
+                    write!(formatter, "；且候选清理失败：{discard}")?;
+                }
+                Ok(())
+            }
+            Self::InputBootstrapChanged { game_root, discard } => {
+                write!(
+                    formatter,
+                    "游戏启动壳在候选准备期间发生变化：{}",
+                    game_root.display()
+                )?;
+                if let Some(discard) = discard {
+                    write!(formatter, "；且候选清理失败：{discard}")?;
+                }
+                Ok(())
+            }
+            Self::ObserveCandidateBootstrap { source, discard } => {
+                write!(formatter, "无法读取工作区候选启动壳：{source}")?;
+                if let Some(discard) = discard {
+                    write!(formatter, "；且候选清理失败：{discard}")?;
+                }
+                Ok(())
+            }
+            Self::CandidateBootstrapChanged {
+                candidate_root,
+                discard,
+            } => {
+                write!(
+                    formatter,
+                    "工作区候选启动壳与已准备内容不一致：{}",
+                    candidate_root.display()
+                )?;
                 if let Some(discard) = discard {
                     write!(formatter, "；且候选清理失败：{discard}")?;
                 }
@@ -1668,6 +1928,7 @@ mod tests {
         existing_source: ExistingSourceObservation,
         candidate_fingerprint: [u8; 32],
         preservation_failure: Option<PreservationFailure>,
+        candidate_bootstrap_changed: bool,
     }
 
     impl DirectChildDirectoryEnsurer for FakeWorkspaceFileSystem {
@@ -2103,6 +2364,26 @@ mod tests {
             &self,
             path: PathBuf,
         ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            if self.candidate_bootstrap_changed {
+                let bytes = match path.as_path() {
+                    path if path == Path::new("C:/games/source/package.json") => {
+                        Some(br#"{"main":"index.html","window":{"title":"source"}}"#.to_vec())
+                    }
+                    path if path == Path::new("C:/games/source/index.html") => {
+                        Some(b"<title>source</title>".to_vec())
+                    }
+                    path if path == Path::new("C:/projects/.game-stage/source/package.json") => {
+                        Some(br#"{"main":"index.html","window":{"title":"changed"}}"#.to_vec())
+                    }
+                    path if path == Path::new("C:/projects/.game-stage/source/index.html") => {
+                        Some(b"<title>source</title>".to_vec())
+                    }
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    return Ok(crate::storage::file_system::ReadFile::new(path, bytes));
+                }
+            }
             if path == Path::new("C:/projects/mz/game/logs/run.bin") {
                 if matches!(self.preservation_failure, Some(PreservationFailure::Read)) {
                     return Err(ReadFileError::Io {
@@ -2116,6 +2397,15 @@ mod tests {
                 ));
             }
             Err(ReadFileError::NotFound { path })
+        }
+    }
+
+    impl SnapshotFileReader for FakeWorkspaceFileSystem {
+        async fn read_snapshot_file(
+            &self,
+            path: PathBuf,
+        ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            self.read_file(path).await
         }
     }
 
@@ -2341,6 +2631,7 @@ mod tests {
                     existing_source,
                     candidate_fingerprint: [candidate_fingerprint; 32],
                     preservation_failure: None,
+                    candidate_bootstrap_changed: false,
                 },
                 FakePublisher {
                     observations: observations.clone(),
@@ -2567,6 +2858,57 @@ mod tests {
                 .lock()
                 .expect("snapshots mutex should not be poisoned")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn init_rejects_staged_bootstrap_bytes_that_differ_from_the_input() {
+        let candidate_state = database_state(0x22, Vec::new());
+        let (mut service, observations) = service(
+            false,
+            WorkspaceStructureObservation::Complete,
+            ExistingSourceObservation::Missing,
+            0x22,
+            Ok(candidate_state.clone()),
+            Ok(ProjectDatabaseReconciliation::for_test(candidate_state)),
+            Ok(()),
+        );
+        service.file_system.candidate_bootstrap_changed = true;
+
+        let error = service
+            .converge(request())
+            .await
+            .expect_err("候选 package 字节变化必须阻止 Init 发布");
+
+        assert!(matches!(
+            error,
+            ProjectWorkspaceConvergenceError::CandidateBootstrapChanged {
+                candidate_root,
+                discard: None,
+            } if candidate_root == Path::new("C:/projects/.game-stage/source")
+        ));
+        assert_eq!(
+            observations.events(),
+            vec![
+                "workspace_root",
+                "game_root",
+                "ensure_engine_root",
+                "prepare",
+                "discard",
+            ]
+        );
+        let stage_requests = observations
+            .stage_requests
+            .lock()
+            .expect("stage requests mutex should not be poisoned");
+        assert_eq!(stage_requests[0].overlays().len(), 2);
+        assert_eq!(
+            stage_requests[0].overlays()[0].relative_file(),
+            Path::new("source/package.json")
+        );
+        assert_eq!(
+            stage_requests[0].overlays()[1].relative_file(),
+            Path::new("source/index.html")
         );
     }
 

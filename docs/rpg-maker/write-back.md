@@ -54,6 +54,14 @@ Review，不会拒绝候选或阻止 WriteBack。
 Partial 项目同样可以生成候选，结果会明确报告保留
 原文的数量。
 
+冻结来源包含标准 NW.js 启动文档时，WriteBack 还把唯一
+`System.json.gameTitle` Unit 的当前输出同步到两个明确的派生消费者：原
+`package.json.window.title` 为非空原 `gameTitle` 时只替换该 JSON string 值；活动
+`package.main` HTML 中实际且唯一的小写无属性 `<title>` 元素内容逐字等于同一原值时
+只替换其内容。原
+`gameTitle` 为空、消费者为空或消费者已有不同标题时保持冻结字节，不猜测或覆盖独立标题。
+该同步不增加 Unit，也不扩大到其他 HTML、package 字段或插件参数。
+
 WriteBack 不使用 Init 中的统一宽度，也不扫描全部文本猜测可换行位置。语言、术语、措辞和
 未被规则处理的运行时显示风险仍由译后 QA 生成 Review；需要修订时按自然 ID 使用
 `manual export --ids`、check 和 apply，再重新 WriteBack。
@@ -66,7 +74,7 @@ WriteBack 不使用 Init 中的统一宽度，也不扫描全部文本猜测可�
 - 每个 recipe 的原值、目标位置和结构；
 - 修改范围没有重复、祖先/后代或跨 owner 冲突；
 - 全部 JSON、事件命令、数组形状和控制符有效；
-- 未声明位置与冻结来源逐字一致。
+- 除上述同源启动标题消费者外，未声明位置与冻结来源逐字一致。
 
 候选必须重新解析，并证明改动只落在受管范围内。新增 `401/405` 时事件列表作为完整结构
 重建，并按每个输出行的原始母行复制 indent 和未知字段；不是在正向遍历数组时原地插入。

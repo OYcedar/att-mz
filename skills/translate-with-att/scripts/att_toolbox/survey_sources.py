@@ -22,7 +22,7 @@ from .rpg import (
     require_game_root,
 )
 from .rpg_control_codes import is_structural_blank, split_rpg_text_lines
-from .survey_code import scan_code_sources
+from .survey_code import bootstrap_title_consumers, scan_code_sources
 from .survey_identity import rule_manual_id
 from .survey_io import decode_text, file_bytes
 from .survey_model import FileSnapshot, LocationFact, SurveyBundle
@@ -120,6 +120,26 @@ def scan_game(game_path: Path) -> SurveyBundle:
 
     locations = builtin_database_locations(documents, relative_files, game.engine)
     locations.extend(builtin_system_locations(documents, relative_files))
+    game_title_fact = next(
+        (
+            fact
+            for fact in locations
+            if fact.classification == "builtin"
+            and fact.location == "System.json:gameTitle"
+            and isinstance(fact.expected_manual_id, str)
+        ),
+        None,
+    )
+    bootstrap_consumers = (
+        bootstrap_title_consumers(
+            game_root,
+            files,
+            read_once,
+            game_title_fact.source_text,
+        )
+        if game_title_fact is not None
+        else None
+    )
     events = list(event_lists(documents, canonical_maps))
     locations.extend(builtin_event_locations(events, documents, relative_files, game.engine))
     event_parameter_paths = {
@@ -353,6 +373,34 @@ def scan_game(game_path: Path) -> SurveyBundle:
                 continue
             for leaf in iter_string_leaves(external_json):
                 json_location = f"{snapshot.relative_path}:{actual_path(leaf.path)}"
+                if (
+                    bootstrap_consumers is not None
+                    and game_title_fact is not None
+                    and bootstrap_consumers.package_window_title
+                    and path.resolve(strict=True) == bootstrap_consumers.package
+                    and leaf.path == ("window", "title")
+                ):
+                    locations.append(
+                        LocationFact(
+                            source=snapshot.relative_path,
+                            location=json_location,
+                            source_text=leaf.value,
+                            classification="builtin",
+                            physical_file=snapshot.relative_path,
+                            json_path=leaf.path,
+                            decode_positions=leaf.decode_positions,
+                            roles={"builtin_member"},
+                            evidence=[
+                                {
+                                    "kind": "builtin_derived_consumer",
+                                    "owner_manual_id": game_title_fact.expected_manual_id,
+                                    "consumer": "package.window.title",
+                                    "analysis_status": "confirmed",
+                                }
+                            ],
+                        )
+                    )
+                    continue
                 if is_structural_blank(leaf.value):
                     locations.append(
                         LocationFact(
@@ -415,6 +463,32 @@ def scan_game(game_path: Path) -> SurveyBundle:
                 )
             continue
         for line_number, line in enumerate(split_rpg_text_lines(text), start=1):
+            if (
+                bootstrap_consumers is not None
+                and game_title_fact is not None
+                and path.resolve(strict=True) == bootstrap_consumers.main_html
+                and line_number == bootstrap_consumers.main_html_title_line
+            ):
+                locations.append(
+                    LocationFact(
+                        source=snapshot.relative_path,
+                        location=f"{snapshot.relative_path}:title",
+                        source_text=game_title_fact.source_text,
+                        classification="builtin",
+                        physical_file=snapshot.relative_path,
+                        roles={"builtin_member"},
+                        evidence=[
+                            {
+                                "kind": "builtin_derived_consumer",
+                                "owner_manual_id": game_title_fact.expected_manual_id,
+                                "consumer": "package.main.html.title",
+                                "analysis_status": "confirmed",
+                            }
+                        ],
+                    )
+                )
+                if line_number in bootstrap_consumers.main_html_title_lines:
+                    continue
             if is_structural_blank(line):
                 locations.append(
                     LocationFact(

@@ -3,23 +3,27 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::diagnostic::{
-    Diagnostic, DiagnosticReport, PublicationCandidateBindingProblem,
-    PublicationCandidateInspectionProblem, PublicationIssue, PublicationProblem,
-    PublicationRequestViolation, PublicationStep, RelatedFailureRelation, ReportedFailure,
-    SafeIdentifier, SafePath, StateEffect,
+    Diagnostic, DiagnosticReport, FileSystemDiagnosticContext, FileSystemDiagnosticStage,
+    FileSystemIssue, FileSystemOperation, FileSystemPathViolation, FileSystemProblem,
+    PublicationCandidateBindingProblem, PublicationCandidateInspectionProblem, PublicationIssue,
+    PublicationProblem, PublicationRequestViolation, PublicationStep, RelatedFailureRelation,
+    ReportedFailure, SafeIdentifier, SafePath, StateEffect,
 };
 use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
+use crate::rpg_maker::bootstrap::{RpgMakerBootstrapFiles, read_optional_bootstrap_files};
 use crate::rpg_maker::project::OpenedProject;
+use crate::runtime::filesystem::SystemFileSystemError;
 use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryFileOverlay, DirectoryPrepareError,
     DirectoryPublicationDiagnostic, DirectoryPublicationDiagnosticSource, DirectoryPublishError,
     DirectoryPublishIntent, DirectorySourceMapping, DirectoryStageRequest,
-    DirectoryStageRequestError, RecoverableDirectoryPublisher, ScopedDirectoryBindError,
-    ScopedDirectoryEditError, ScopedDirectoryEditor, ScopedDirectoryEntry,
-    ScopedDirectoryEntryKind, ScopedDirectoryPath,
+    DirectoryStageRequestError, FileReader, ReadFileError, RecoverableDirectoryPublisher,
+    ScopedDirectoryBindError, ScopedDirectoryEditError, ScopedDirectoryEditor,
+    ScopedDirectoryEntry, ScopedDirectoryEntryKind, ScopedDirectoryPath, SnapshotFileReader,
 };
 
 use super::rewriter::RpgMakerRewrittenDocuments;
@@ -32,6 +36,9 @@ use super::{
 pub(crate) struct PreparedWriteBack<S> {
     output_root: PathBuf,
     layout: RpgMakerLayout,
+    source_root: PathBuf,
+    source_bootstrap: Option<Arc<RpgMakerBootstrapFiles>>,
+    candidate_bootstrap: Option<Arc<RpgMakerBootstrapFiles>>,
     staged: crate::storage::file_system::StagedDirectory<S>,
 }
 
@@ -54,22 +61,25 @@ where
     }
 }
 
-/// 用当前引擎布局下冻结的 `data`、`js` 基底发布 RPG Maker 写回候选。
-pub(crate) struct RpgMakerWriteBackPublishingService<A> {
+/// 用当前引擎布局下的完整冻结来源发布 RPG Maker 写回候选。
+pub(crate) struct RpgMakerWriteBackPublishingService<F, A> {
+    file_reader: F,
     directory_publisher: A,
 }
 
-impl<A> RpgMakerWriteBackPublishingService<A> {
-    pub(crate) fn new(directory_publisher: A) -> Self {
+impl<F, A> RpgMakerWriteBackPublishingService<F, A> {
+    pub(crate) fn new(file_reader: F, directory_publisher: A) -> Self {
         Self {
+            file_reader,
             directory_publisher,
         }
     }
 }
 
-impl<A> RpgMakerWriteBackPublisher<RpgMakerRewrittenDocuments>
-    for RpgMakerWriteBackPublishingService<A>
+impl<F, A> RpgMakerWriteBackPublisher<RpgMakerRewrittenDocuments>
+    for RpgMakerWriteBackPublishingService<F, A>
 where
+    F: SnapshotFileReader,
     A: RecoverableDirectoryPublisher
         + ScopedDirectoryEditor<
             CandidateState = <A as RecoverableDirectoryPublisher>::StagingState,
@@ -77,7 +87,10 @@ where
         >,
 {
     type Candidate = PreparedWriteBack<<A as RecoverableDirectoryPublisher>::StagingState>;
-    type Error = RpgMakerWriteBackPublishingError<<A as RecoverableDirectoryPublisher>::Error>;
+    type Error = RpgMakerWriteBackPublishingError<
+        <F as FileReader>::Error,
+        <A as RecoverableDirectoryPublisher>::Error,
+    >;
 
     async fn prepare(
         &self,
@@ -100,6 +113,7 @@ where
             output_root: output_root.clone(),
             source,
         };
+        let source_bootstrap = project.verified_bootstrap().cloned();
         let source_mappings = vec![
             DirectorySourceMapping::new(
                 project.layout().source_data().to_path_buf(),
@@ -112,11 +126,58 @@ where
             )
             .map_err(&invalid_request)?,
         ];
-        let overlays = documents
-            .into_files()
+        let (rewritten_files, game_title_rewrite) = documents.into_parts();
+        let rewritten_files = rewritten_files
             .into_iter()
-            .map(|file| {
-                let (relative_path, bytes) = file.into_parts();
+            .map(|file| file.into_parts())
+            .collect::<Vec<_>>();
+        let mut bootstrap_overlays = Vec::with_capacity(2);
+        let mut candidate_bootstrap = None;
+        if let Some(bootstrap) = source_bootstrap.as_deref() {
+            let rewritten_titles = game_title_rewrite
+                .filter(|rewrite| !rewrite.original().is_empty())
+                .map(|rewrite| {
+                    (
+                        bootstrap
+                            .rewritten_package_title(rewrite.original(), rewrite.candidate())
+                            .unwrap_or_else(|| bootstrap.package_bytes().to_vec()),
+                        bootstrap
+                            .rewritten_html_title(rewrite.original(), rewrite.candidate())
+                            .unwrap_or_else(|| bootstrap.main_html_bytes().to_vec()),
+                    )
+                });
+            let (package_bytes, html_bytes) = rewritten_titles.unwrap_or_else(|| {
+                (
+                    bootstrap.package_bytes().to_vec(),
+                    bootstrap.main_html_bytes().to_vec(),
+                )
+            });
+            let expected = if package_bytes == bootstrap.package_bytes()
+                && html_bytes == bootstrap.main_html_bytes()
+            {
+                Arc::clone(source_bootstrap.as_ref().expect("已确认冻结启动壳存在"))
+            } else {
+                Arc::new(bootstrap.with_document_bytes(package_bytes, html_bytes))
+            };
+            bootstrap_overlays.push(
+                DirectoryFileOverlay::new(
+                    PathBuf::from("package.json"),
+                    expected.package_bytes().to_vec(),
+                )
+                .map_err(&invalid_request)?,
+            );
+            bootstrap_overlays.push(
+                DirectoryFileOverlay::new(
+                    expected.main_relative().to_path_buf(),
+                    expected.main_html_bytes().to_vec(),
+                )
+                .map_err(&invalid_request)?,
+            );
+            candidate_bootstrap = Some(expected);
+        }
+        let mut overlays = rewritten_files
+            .into_iter()
+            .map(|(relative_path, bytes)| {
                 let relative_path = project
                     .layout()
                     .rpg_maker_layout()
@@ -124,6 +185,7 @@ where
                 DirectoryFileOverlay::new(relative_path, bytes).map_err(&invalid_request)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        overlays.append(&mut bootstrap_overlays);
         let request = DirectoryStageRequest::new(
             output_root.clone(),
             DirectoryPublishIntent::ReplaceExisting,
@@ -141,6 +203,9 @@ where
         Ok(PreparedWriteBack {
             output_root: project.write_back_root().to_path_buf(),
             layout: project.layout().rpg_maker_layout(),
+            source_root: project.layout().source_root().to_path_buf(),
+            source_bootstrap,
+            candidate_bootstrap,
             staged,
         })
     }
@@ -148,7 +213,7 @@ where
     fn validate<'a>(
         &'a self,
         candidate: &Self::Candidate,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + use<'a, A> {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + use<'a, F, A> {
         // 先同步建立不再借用候选的 bind future，避免把只承诺 Send 的根 token state
         // 通过 `&Candidate` 带入异步状态机并错误要求 Sync。
         let bind = self.directory_publisher.bind_scoped_directory(
@@ -157,8 +222,21 @@ where
         );
         let candidate_root = candidate.candidate_root().to_path_buf();
         let layout = candidate.layout;
+        let source_root = candidate.source_root.clone();
+        let expected_source_bootstrap = candidate.source_bootstrap.clone();
+        let expected_candidate_bootstrap = candidate.candidate_bootstrap.clone();
+        let file_reader = &self.file_reader;
         let directory_publisher = &self.directory_publisher;
         async move {
+            let observed_bootstrap = read_optional_bootstrap_files(file_reader, &source_root)
+                .await
+                .map_err(RpgMakerWriteBackPublishingError::ReadSource)?;
+            if observed_bootstrap.as_ref() != expected_source_bootstrap.as_deref() {
+                return Err(RpgMakerWriteBackPublishingError::SourceChanged { source_root });
+            }
+            let bootstrap_main = expected_candidate_bootstrap
+                .as_deref()
+                .map(|bootstrap| bootstrap.main_relative().to_path_buf());
             let scope =
                 bind.await
                     .map_err(|source| RpgMakerWriteBackPublishingError::BindCandidate {
@@ -175,31 +253,56 @@ where
                     },
                 )?;
             let structure_valid = if let Some(directory) = layout.content_directory() {
-                validate_single_directory(&entries, directory)
-                    && validate_data_and_js(
-                        &directory_publisher
-                            .list_scoped_directory(
-                                &scope,
-                                ScopedDirectoryPath::new(PathBuf::from(directory))
-                                    .expect("固定内容目录必须是安全相对路径"),
-                            )
-                            .await
-                            .map_err(|source| {
-                                RpgMakerWriteBackPublishingError::InspectCandidateRoot {
-                                    candidate_root: candidate_root.clone(),
-                                    source,
-                                }
-                            })?,
+                let content_entries = directory_publisher
+                    .list_scoped_directory(
+                        &scope,
+                        ScopedDirectoryPath::new(PathBuf::from(directory))
+                            .expect("固定内容目录必须是安全相对路径"),
                     )
+                    .await
+                    .map_err(
+                        |source| RpgMakerWriteBackPublishingError::InspectCandidateRoot {
+                            candidate_root: candidate_root.clone(),
+                            source,
+                        },
+                    )?;
+                if let Some(main) = bootstrap_main.as_deref() {
+                    validate_bootstrap_root(&entries, layout, main)
+                        && validate_bootstrap_content(&content_entries, directory, main)
+                } else {
+                    validate_single_directory(&entries, directory)
+                        && validate_data_and_js(&content_entries)
+                }
+            } else if let Some(main) = bootstrap_main.as_deref() {
+                validate_bootstrap_root(&entries, layout, main)
             } else {
                 validate_data_and_js(&entries)
             };
-            if structure_valid {
+            let observed_candidate_bootstrap =
+                read_optional_bootstrap_files(file_reader, &candidate_root)
+                    .await
+                    .map_err(
+                        |source| RpgMakerWriteBackPublishingError::ReadCandidateBootstrap {
+                            candidate_root: candidate_root.clone(),
+                            source,
+                        },
+                    )?;
+            let bootstrap_valid =
+                observed_candidate_bootstrap.as_ref() == expected_candidate_bootstrap.as_deref();
+            if structure_valid && bootstrap_valid {
                 Ok(())
             } else {
-                Err(RpgMakerWriteBackPublishingError::InvalidCandidateRoot {
-                    root: candidate_root,
-                })
+                if !bootstrap_valid {
+                    Err(
+                        RpgMakerWriteBackPublishingError::CandidateBootstrapChanged {
+                            candidate_root,
+                        },
+                    )
+                } else {
+                    Err(RpgMakerWriteBackPublishingError::InvalidCandidateRoot {
+                        root: candidate_root,
+                    })
+                }
             }
         }
     }
@@ -290,7 +393,7 @@ fn publish_failure_state<E>(source: &DirectoryPublishError<E>) -> WriteBackPubli
 
 /// RPG Maker Publisher 在候选交接、请求建立或根终结阶段遇到的失败。
 #[derive(Debug)]
-pub(crate) enum RpgMakerWriteBackPublishingError<E> {
+pub(crate) enum RpgMakerWriteBackPublishingError<F, A> {
     CandidateProjectMismatch {
         expected_name: ProjectName,
         expected_workspace_root: PathBuf,
@@ -301,25 +404,37 @@ pub(crate) enum RpgMakerWriteBackPublishingError<E> {
         output_root: PathBuf,
         source: DirectoryStageRequestError,
     },
-    Prepare(DirectoryPrepareError<E>),
+    ReadSource(ReadFileError<F>),
+    ReadCandidateBootstrap {
+        candidate_root: PathBuf,
+        source: ReadFileError<F>,
+    },
+    SourceChanged {
+        source_root: PathBuf,
+    },
+    CandidateBootstrapChanged {
+        candidate_root: PathBuf,
+    },
+    Prepare(DirectoryPrepareError<A>),
     BindCandidate {
         candidate_root: PathBuf,
-        source: ScopedDirectoryBindError<E>,
+        source: ScopedDirectoryBindError<A>,
     },
     InspectCandidateRoot {
         candidate_root: PathBuf,
-        source: ScopedDirectoryEditError<E>,
+        source: ScopedDirectoryEditError<A>,
     },
     InvalidCandidateRoot {
         root: PathBuf,
     },
-    Publish(DirectoryPublishError<E>),
-    Discard(DirectoryDiscardError<E>),
+    Publish(DirectoryPublishError<A>),
+    Discard(DirectoryDiscardError<A>),
 }
 
-impl<E> fmt::Display for RpgMakerWriteBackPublishingError<E>
+impl<F, A> fmt::Display for RpgMakerWriteBackPublishingError<F, A>
 where
-    E: fmt::Display,
+    F: fmt::Display,
+    A: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -339,6 +454,25 @@ where
             Self::InvalidRequest { source, .. } => {
                 write!(formatter, "写回候选请求无效：{source}")
             }
+            Self::ReadSource(source) => write!(formatter, "无法读取冻结来源：{source}"),
+            Self::ReadCandidateBootstrap {
+                candidate_root,
+                source,
+            } => write!(
+                formatter,
+                "无法读取写回候选启动壳 {}：{source}",
+                candidate_root.display()
+            ),
+            Self::SourceChanged { source_root } => write!(
+                formatter,
+                "冻结启动壳已与项目开启时的快照不一致：{}",
+                source_root.display()
+            ),
+            Self::CandidateBootstrapChanged { candidate_root } => write!(
+                formatter,
+                "写回候选启动壳在验证前发生变化：{}",
+                candidate_root.display()
+            ),
             Self::Prepare(source) => source.fmt(formatter),
             Self::BindCandidate { source, .. } => {
                 write!(formatter, "无法绑定写回候选的物理身份：{source}")
@@ -348,7 +482,7 @@ where
             }
             Self::InvalidCandidateRoot { root } => write!(
                 formatter,
-                "写回候选根必须恰好包含普通 data 与 js 目录：{}",
+                "写回候选根不符合当前 RPG Maker 内容与标准启动壳结构：{}",
                 root.display()
             ),
             Self::Publish(source) => source.fmt(formatter),
@@ -357,14 +491,19 @@ where
     }
 }
 
-impl<E> Error for RpgMakerWriteBackPublishingError<E>
+impl<F, A> Error for RpgMakerWriteBackPublishingError<F, A>
 where
-    E: Error + 'static,
+    F: Error + 'static,
+    A: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CandidateProjectMismatch { .. } => None,
             Self::InvalidRequest { source, .. } => Some(source),
+            Self::ReadSource(source) => Some(source),
+            Self::ReadCandidateBootstrap { source, .. } => Some(source),
+            Self::SourceChanged { .. } => None,
+            Self::CandidateBootstrapChanged { .. } => None,
             Self::Prepare(source) => Some(source),
             Self::BindCandidate { source, .. } => Some(source),
             Self::InspectCandidateRoot { source, .. } => Some(source),
@@ -375,9 +514,9 @@ where
     }
 }
 
-impl<E> RpgMakerWriteBackPublishingError<E>
+impl<A> RpgMakerWriteBackPublishingError<SystemFileSystemError, A>
 where
-    E: DirectoryPublicationDiagnosticSource,
+    A: DirectoryPublicationDiagnosticSource,
 {
     pub(crate) fn diagnostic_report(&self) -> DiagnosticReport {
         match self {
@@ -407,6 +546,38 @@ where
                     violation: request_violation(source),
                 },
             ),
+            Self::ReadSource(source) => {
+                source.diagnostic_report_at(crate::diagnostic::FileSystemDiagnosticStage::WriteBack)
+            }
+            Self::ReadCandidateBootstrap { source, .. } => {
+                source.diagnostic_report_at(crate::diagnostic::FileSystemDiagnosticStage::WriteBack)
+            }
+            Self::SourceChanged { source_root } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    FileSystemDiagnosticContext::new(
+                        FileSystemDiagnosticStage::WriteBack,
+                        FileSystemOperation::Read,
+                    ),
+                    FileSystemProblem::InvalidPath {
+                        path: SafePath::new(source_root),
+                        violation: FileSystemPathViolation::SourceChanged,
+                    },
+                )),
+            ),
+            Self::CandidateBootstrapChanged { candidate_root } => DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::file_system(FileSystemIssue::new(
+                    FileSystemDiagnosticContext::new(
+                        FileSystemDiagnosticStage::WriteBack,
+                        FileSystemOperation::Read,
+                    ),
+                    FileSystemProblem::InvalidPath {
+                        path: SafePath::new(candidate_root),
+                        violation: FileSystemPathViolation::SourceChanged,
+                    },
+                )),
+            ),
             Self::Prepare(source) => source.diagnostic_report(),
             Self::BindCandidate {
                 candidate_root,
@@ -429,9 +600,9 @@ where
     }
 }
 
-impl<E> RpgMakerWriteBackPublishingError<E>
+impl<A> RpgMakerWriteBackPublishingError<SystemFileSystemError, A>
 where
-    E: DirectoryPublicationDiagnosticSource + Error + Send + Sync + 'static,
+    A: DirectoryPublicationDiagnosticSource + Error + Send + Sync + 'static,
 {
     pub(crate) fn into_reported_failure(self) -> ReportedFailure {
         let report = self.diagnostic_report();
@@ -439,9 +610,9 @@ where
     }
 }
 
-impl<E> WriteBackPublishingDiagnostic for RpgMakerWriteBackPublishingError<E>
+impl<A> WriteBackPublishingDiagnostic for RpgMakerWriteBackPublishingError<SystemFileSystemError, A>
 where
-    E: DirectoryPublicationDiagnosticSource + Error + Send + Sync + 'static,
+    A: DirectoryPublicationDiagnosticSource + Error + Send + Sync + 'static,
 {
     fn into_write_back_failure_report(self) -> ReportedFailure {
         self.into_reported_failure()
@@ -491,11 +662,13 @@ fn request_violation(source: &DirectoryStageRequestError) -> PublicationRequestV
                 second: SafePath::new(second),
             }
         }
-        DirectoryStageRequestError::OverlayOutsideSourceMappings { relative_file } => {
-            PublicationRequestViolation::OverlayOutsideSourceMappings {
-                relative_file: SafePath::new(relative_file),
-            }
-        }
+        DirectoryStageRequestError::OverlayOverlapsSourceTarget {
+            overlay,
+            source_target,
+        } => PublicationRequestViolation::OverlayOverlapsSourceTarget {
+            overlay: SafePath::new(overlay),
+            source_target: SafePath::new(source_target),
+        },
         DirectoryStageRequestError::EmptyDirectoryOverlapsSourceTarget {
             empty_directory,
             source_target,
@@ -664,6 +837,10 @@ fn validate_data_and_js(entries: &[ScopedDirectoryEntry]) -> bool {
     if entries.len() != 2 {
         return false;
     }
+    contains_data_and_js(entries)
+}
+
+fn contains_data_and_js(entries: &[ScopedDirectoryEntry]) -> bool {
     let has_data = entries.iter().any(|entry| {
         entry.name() == std::ffi::OsStr::new("data")
             && entry.kind() == ScopedDirectoryEntryKind::Directory
@@ -675,6 +852,107 @@ fn validate_data_and_js(entries: &[ScopedDirectoryEntry]) -> bool {
     has_data && has_js
 }
 
+fn validate_bootstrap_root(
+    entries: &[ScopedDirectoryEntry],
+    layout: RpgMakerLayout,
+    main: &Path,
+) -> bool {
+    let mut expected = std::collections::BTreeMap::new();
+    expected.insert(
+        std::ffi::OsString::from("package.json"),
+        ScopedDirectoryEntryKind::File,
+    );
+    match layout.content_directory() {
+        Some(directory) => {
+            expected.insert(
+                std::ffi::OsString::from(directory),
+                ScopedDirectoryEntryKind::Directory,
+            );
+        }
+        None => {
+            expected.insert(
+                std::ffi::OsString::from("data"),
+                ScopedDirectoryEntryKind::Directory,
+            );
+            expected.insert(
+                std::ffi::OsString::from("js"),
+                ScopedDirectoryEntryKind::Directory,
+            );
+        }
+    }
+    let mut components = main.components();
+    let Some(std::path::Component::Normal(root)) = components.next() else {
+        return false;
+    };
+    let kind = if components.next().is_some() {
+        ScopedDirectoryEntryKind::Directory
+    } else {
+        ScopedDirectoryEntryKind::File
+    };
+    if expected
+        .insert(root.to_os_string(), kind)
+        .is_some_and(|existing| existing != kind)
+    {
+        return false;
+    }
+    entries.len() == expected.len()
+        && entries.iter().all(|entry| {
+            expected
+                .get(entry.name())
+                .is_some_and(|kind| *kind == entry.kind())
+        })
+}
+
+fn validate_bootstrap_content(
+    entries: &[ScopedDirectoryEntry],
+    content_directory: &str,
+    main: &Path,
+) -> bool {
+    let mut expected = std::collections::BTreeMap::from([
+        (
+            std::ffi::OsString::from("data"),
+            ScopedDirectoryEntryKind::Directory,
+        ),
+        (
+            std::ffi::OsString::from("js"),
+            ScopedDirectoryEntryKind::Directory,
+        ),
+    ]);
+    let mut components = main.components();
+    if !matches!(
+        components.next(),
+        Some(std::path::Component::Normal(root))
+            if root == std::ffi::OsStr::new(content_directory)
+    ) {
+        return entries.len() == expected.len()
+            && entries.iter().all(|entry| {
+                expected
+                    .get(entry.name())
+                    .is_some_and(|kind| *kind == entry.kind())
+            });
+    }
+    let Some(std::path::Component::Normal(child)) = components.next() else {
+        return false;
+    };
+    let kind = if components.next().is_some() {
+        ScopedDirectoryEntryKind::Directory
+    } else {
+        ScopedDirectoryEntryKind::File
+    };
+    if expected
+        .insert(child.to_os_string(), kind)
+        .is_some_and(|existing| existing != kind)
+    {
+        return false;
+    }
+    entries.len() == expected.len()
+        && entries.iter().all(|entry| {
+            expected
+                .get(entry.name())
+                .is_some_and(|kind| *kind == entry.kind())
+        })
+}
+
 fn validate_single_directory(entries: &[ScopedDirectoryEntry], name: &str) -> bool {
     matches!(entries, [entry] if entry.name() == std::ffi::OsStr::new(name)
         && entry.kind() == ScopedDirectoryEntryKind::Directory)
@@ -682,11 +960,16 @@ fn validate_single_directory(entries: &[ScopedDirectoryEntry], name: &str) -> bo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::rpg_maker::write_back::rewriter::RpgMakerRewrittenFile;
+    use crate::runtime::filesystem::{
+        DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
+    };
 
     use crate::storage::file_system::{
         BoundScopedDirectory, DirectoryRecoveryError, DirectoryRecoveryOutcome,
@@ -865,6 +1148,79 @@ mod tests {
 
     impl Error for FakeError {}
 
+    #[derive(Clone, Copy)]
+    struct MissingFileReader;
+
+    impl FileReader for MissingFileReader {
+        type Error = FakeError;
+
+        fn read_file(
+            &self,
+            path: PathBuf,
+        ) -> impl std::future::Future<
+            Output = Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>>,
+        > + Send {
+            std::future::ready(Err(ReadFileError::NotFound { path }))
+        }
+    }
+
+    impl SnapshotFileReader for MissingFileReader {
+        fn read_snapshot_file(
+            &self,
+            path: PathBuf,
+        ) -> impl std::future::Future<
+            Output = Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>>,
+        > + Send {
+            self.read_file(path)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryFileReader {
+        files: Arc<Mutex<BTreeMap<PathBuf, Vec<u8>>>>,
+    }
+
+    impl MemoryFileReader {
+        fn new(files: impl IntoIterator<Item = (PathBuf, Vec<u8>)>) -> Self {
+            Self {
+                files: Arc::new(Mutex::new(files.into_iter().collect())),
+            }
+        }
+
+        fn replace(&self, path: PathBuf, bytes: Vec<u8>) {
+            self.files
+                .lock()
+                .expect("内存文件锁不应中毒")
+                .insert(path, bytes);
+        }
+    }
+
+    impl FileReader for MemoryFileReader {
+        type Error = FakeError;
+
+        async fn read_file(
+            &self,
+            path: PathBuf,
+        ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            self.files
+                .lock()
+                .expect("内存文件锁不应中毒")
+                .get(&path)
+                .cloned()
+                .map(|bytes| crate::storage::file_system::ReadFile::new(path.clone(), bytes))
+                .ok_or(ReadFileError::NotFound { path })
+        }
+    }
+
+    impl SnapshotFileReader for MemoryFileReader {
+        async fn read_snapshot_file(
+            &self,
+            path: PathBuf,
+        ) -> Result<crate::storage::file_system::ReadFile, ReadFileError<Self::Error>> {
+            self.read_file(path).await
+        }
+    }
+
     impl DirectoryPublicationDiagnosticSource for FakeError {
         fn publication_diagnostic(&self, step: PublicationStep) -> DirectoryPublicationDiagnostic {
             let operation = match step {
@@ -892,13 +1248,14 @@ mod tests {
     }
     #[test]
     fn invalid_stage_request_wire_preserves_output_and_both_conflicting_paths() {
-        let error = RpgMakerWriteBackPublishingError::<FakeError>::InvalidRequest {
-            output_root: PathBuf::from("D:/games/output"),
-            source: DirectoryStageRequestError::OverlappingOverlays {
-                first: PathBuf::from("data/Items.json"),
-                second: PathBuf::from("data/Items.json/name"),
-            },
-        };
+        let error =
+            RpgMakerWriteBackPublishingError::<SystemFileSystemError, FakeError>::InvalidRequest {
+                output_root: PathBuf::from("D:/games/output"),
+                source: DirectoryStageRequestError::OverlappingOverlays {
+                    first: PathBuf::from("data/Items.json"),
+                    second: PathBuf::from("data/Items.json/name"),
+                },
+            };
 
         assert_eq!(
             serde_json::to_value(error.diagnostic_report()).expect("诊断必须可序列化"),
@@ -931,15 +1288,16 @@ mod tests {
 
     #[test]
     fn publish_report_keeps_cleanup_as_related_failure_and_strongest_effect() {
-        let error =
-            RpgMakerWriteBackPublishingError::Publish(DirectoryPublishError::NotPublished {
+        let error = RpgMakerWriteBackPublishingError::<SystemFileSystemError, FakeError>::Publish(
+            DirectoryPublishError::NotPublished {
                 target_root: PathBuf::from("D:/games/output"),
                 source: FakeError("must-not-leak-primary"),
                 cleanup_failure: Some(StagingCleanupFailure::new(
                     PathBuf::from("D:/games/.output.stage"),
                     FakeError("must-not-leak-cleanup"),
                 )),
-            });
+            },
+        );
 
         let report = error.diagnostic_report();
         assert_eq!(report.effect(), StateEffect::RecoveryRequired);
@@ -996,6 +1354,22 @@ mod tests {
         )
     }
 
+    fn project_with_layout(
+        name: &str,
+        projects_root: &str,
+        layout: RpgMakerLayout,
+    ) -> OpenedProject {
+        let workspace_root = PathBuf::from(projects_root).join(name);
+        OpenedProject::new_with_layout(
+            name.parse().expect("项目名应合法"),
+            workspace_root.clone(),
+            workspace_root.join("project.db"),
+            layout,
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+        )
+    }
+
     fn documents(project: &OpenedProject, files: Vec<(&str, &[u8])>) -> RpgMakerRewrittenDocuments {
         RpgMakerRewrittenDocuments::new(
             project.name().clone(),
@@ -1011,25 +1385,37 @@ mod tests {
         .expect("测试候选文档应合法")
     }
 
+    fn documents_with_game_title(
+        project: &OpenedProject,
+        original: &str,
+        candidate: &str,
+        files: Vec<(&str, &[u8])>,
+    ) -> RpgMakerRewrittenDocuments {
+        documents(project, files).with_game_title_rewrite(original, candidate)
+    }
+
     fn harness(
         prepare_error: Option<PrepareError>,
         result: PublishResult,
     ) -> (
-        RpgMakerWriteBackPublishingService<FakeRecoverablePublisher>,
+        RpgMakerWriteBackPublishingService<MissingFileReader, FakeRecoverablePublisher>,
         PrepareCalls,
         PublishCalls,
     ) {
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         (
-            RpgMakerWriteBackPublishingService::new(FakeRecoverablePublisher {
-                prepare_calls: Arc::clone(&prepare_calls),
-                publish_calls: Arc::clone(&publish_calls),
-                prepare_error: Arc::new(Mutex::new(prepare_error)),
-                publish_result: Arc::new(Mutex::new(Some(result))),
-                discard_calls: Arc::new(Mutex::new(Vec::new())),
-                discard_error: Arc::new(Mutex::new(None)),
-            }),
+            RpgMakerWriteBackPublishingService::new(
+                MissingFileReader,
+                FakeRecoverablePublisher {
+                    prepare_calls: Arc::clone(&prepare_calls),
+                    publish_calls: Arc::clone(&publish_calls),
+                    prepare_error: Arc::new(Mutex::new(prepare_error)),
+                    publish_result: Arc::new(Mutex::new(Some(result))),
+                    discard_calls: Arc::new(Mutex::new(Vec::new())),
+                    discard_error: Arc::new(Mutex::new(None)),
+                },
+            ),
             prepare_calls,
             publish_calls,
         )
@@ -1101,19 +1487,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mv_and_mz_sync_standard_bootstrap_titles_from_the_system_unit() {
+        for (name, layout, main) in [
+            ("mz-title", RpgMakerLayout::MZ, "index.html"),
+            ("mv-title", RpgMakerLayout::MV, "www/index.html"),
+        ] {
+            let project = project_with_layout(name, "C:/projects", layout);
+            let package = format!(
+                r#"{{"name":"game","main":"{main}","window":{{"title":"原题","width":816}}}}"#
+            );
+            let html = b"<head><title>\xe5\x8e\x9f\xe9\xa2\x98</title></head>".to_vec();
+            let reader = MemoryFileReader::new([
+                (
+                    project.layout().source_root().join("package.json"),
+                    package.into_bytes(),
+                ),
+                (project.layout().source_root().join(main), html),
+            ]);
+            let bootstrap = read_optional_bootstrap_files(&reader, project.layout().source_root())
+                .await
+                .expect("测试启动壳读取不应失败")
+                .expect("测试启动壳应存在");
+            let project = project.with_verified_bootstrap(bootstrap);
+            let prepare_calls = Arc::new(Mutex::new(Vec::new()));
+            let publisher = RpgMakerWriteBackPublishingService::new(
+                reader,
+                FakeRecoverablePublisher {
+                    prepare_calls: Arc::clone(&prepare_calls),
+                    publish_calls: Arc::new(Mutex::new(Vec::new())),
+                    prepare_error: Arc::new(Mutex::new(None)),
+                    publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+                    discard_calls: Arc::new(Mutex::new(Vec::new())),
+                    discard_error: Arc::new(Mutex::new(None)),
+                },
+            );
+
+            let candidate = publisher
+                .prepare(
+                    &project,
+                    documents_with_game_title(
+                        &project,
+                        "原题",
+                        "译题",
+                        vec![(
+                            "data/System.json",
+                            r#"{"gameTitle":"译题","currencyUnit":"G"}"#.as_bytes(),
+                        )],
+                    ),
+                )
+                .await
+                .expect("标准启动壳候选应准备成功");
+
+            {
+                let calls = prepare_calls.lock().expect("暂存调用锁不应中毒");
+                let request = calls.last().expect("应准备一个目录候选");
+                assert_eq!(request.source_mappings().len(), 2, "{name}");
+                assert_eq!(
+                    request.source_mappings()[0].source_directory(),
+                    project.layout().source_data(),
+                    "{name}"
+                );
+                assert_eq!(
+                    request.source_mappings()[0].relative_target(),
+                    layout.data_relative(),
+                    "{name}"
+                );
+                assert_eq!(
+                    request.source_mappings()[1].source_directory(),
+                    project.layout().source_js(),
+                    "{name}"
+                );
+                assert_eq!(
+                    request.source_mappings()[1].relative_target(),
+                    layout.js_relative(),
+                    "{name}"
+                );
+                let overlay = |path: &Path| {
+                    request
+                        .overlays()
+                        .iter()
+                        .find(|overlay| overlay.relative_file() == path)
+                        .unwrap_or_else(|| panic!("{name} 应包含 {} 覆盖", path.display()))
+                        .bytes()
+                };
+                assert_eq!(
+                    overlay(Path::new("package.json")),
+                    format!(
+                        r#"{{"name":"game","main":"{main}","window":{{"title":"译题","width":816}}}}"#
+                    )
+                    .as_bytes(),
+                    "{name}"
+                );
+                assert_eq!(
+                    overlay(Path::new(main)),
+                    b"<head><title>\xe8\xaf\x91\xe9\xa2\x98</title></head>",
+                    "{name}"
+                );
+                assert_eq!(
+                    overlay(&layout.map_content_relative(Path::new("data/System.json"))),
+                    r#"{"gameTitle":"译题","currencyUnit":"G"}"#.as_bytes(),
+                    "{name}"
+                );
+            }
+            publisher
+                .discard(candidate)
+                .await
+                .expect("测试候选应可丢弃");
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_changed_after_open_uses_verified_snapshot_and_fails_validation() {
+        let project = project("bootstrap-change", "C:/projects");
+        let source_root = project.layout().source_root().to_path_buf();
+        let reader = MemoryFileReader::new([
+            (
+                source_root.join("package.json"),
+                br#"{"main":"index.html","window":{"title":"demo"}}"#.to_vec(),
+            ),
+            (
+                source_root.join("index.html"),
+                b"<title>demo</title>".to_vec(),
+            ),
+            (
+                project.layout().source_data().join("System.json"),
+                br#"{"gameTitle":"demo"}"#.to_vec(),
+            ),
+        ]);
+        let bootstrap = read_optional_bootstrap_files(&reader, &source_root)
+            .await
+            .expect("测试启动壳读取不应失败")
+            .expect("测试启动壳应存在");
+        let project = project.with_verified_bootstrap(bootstrap);
+        reader.replace(
+            source_root.join("package.json"),
+            br#"{"main":"index.html","window":{"title":"changed"}}"#.to_vec(),
+        );
+        let prepare_calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = RpgMakerWriteBackPublishingService::new(
+            reader.clone(),
+            FakeRecoverablePublisher {
+                prepare_calls: Arc::clone(&prepare_calls),
+                publish_calls: Arc::new(Mutex::new(Vec::new())),
+                prepare_error: Arc::new(Mutex::new(None)),
+                publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+                discard_calls: Arc::new(Mutex::new(Vec::new())),
+                discard_error: Arc::new(Mutex::new(None)),
+            },
+        );
+        let candidate = publisher
+            .prepare(&project, documents(&project, Vec::new()))
+            .await
+            .expect("应先准备启动壳候选");
+        {
+            let calls = prepare_calls.lock().expect("暂存调用锁不应中毒");
+            let request = calls.last().expect("应准备一个目录候选");
+            let package = request
+                .overlays()
+                .iter()
+                .find(|overlay| overlay.relative_file() == Path::new("package.json"))
+                .expect("候选应包含已验证 package");
+            assert_eq!(
+                package.bytes(),
+                br#"{"main":"index.html","window":{"title":"demo"}}"#
+            );
+        }
+
+        let error = publisher
+            .validate(&candidate)
+            .await
+            .expect_err("来源启动壳变化必须阻止发布");
+        assert!(matches!(
+            error,
+            RpgMakerWriteBackPublishingError::SourceChanged { source_root: changed }
+                if changed == source_root
+        ));
+        publisher
+            .discard(candidate)
+            .await
+            .expect("变化测试候选应可丢弃");
+    }
+
+    #[tokio::test]
+    async fn real_candidate_validation_rejects_package_or_html_byte_changes() {
+        let temporary = tempfile::tempdir().expect("应建立真实候选临时目录");
+        let workspace = temporary.path().join("project");
+        for directory in ["source/data", "source/js", "write_back"] {
+            fs::create_dir_all(workspace.join(directory)).expect("应建立项目目录");
+        }
+        fs::write(
+            workspace.join("source/data/System.json"),
+            r#"{"gameTitle":"source"}"#,
+        )
+        .expect("应建立冻结 System");
+        fs::write(workspace.join("source/js/plugins.js"), b"plugins").expect("应建立冻结 JS");
+        fs::write(
+            workspace.join("source/package.json"),
+            r#"{"main":"index.html","window":{"title":"source"}}"#,
+        )
+        .expect("应建立冻结 package");
+        fs::write(
+            workspace.join("source/index.html"),
+            b"<title>source</title>",
+        )
+        .expect("应建立冻结 HTML");
+        let project = OpenedProject::new(
+            "real-bootstrap".parse().expect("项目名应合法"),
+            workspace.clone(),
+            workspace.join("project.db"),
+            "ja".to_owned(),
+            "zh-Hans".to_owned(),
+        );
+        let file_system =
+            SystemFileSystem::new(SystemFileSystemConfig::production()).expect("应建立文件系统根");
+        let bootstrap = read_optional_bootstrap_files(&file_system, project.layout().source_root())
+            .await
+            .expect("真实启动壳读取不应失败")
+            .expect("真实启动壳应存在");
+        let project = project.with_verified_bootstrap(bootstrap);
+        let directory_publisher = file_system.directory_publisher(
+            DirectoryPublisherConfig::production(temporary.path().join("locks"))
+                .expect("发布配置应合法"),
+        );
+
+        for (relative, changed) in [
+            (
+                "package.json",
+                br#"{"main":"index.html","window":{"title":"tampered"}}"#.as_slice(),
+            ),
+            ("index.html", b"<title>tampered</title>".as_slice()),
+        ] {
+            let service = RpgMakerWriteBackPublishingService::new(
+                file_system.clone(),
+                directory_publisher.clone(),
+            );
+            let candidate = service
+                .prepare(
+                    &project,
+                    documents_with_game_title(
+                        &project,
+                        "source",
+                        "translated",
+                        vec![(
+                            "data/System.json",
+                            r#"{"gameTitle":"translated"}"#.as_bytes(),
+                        )],
+                    ),
+                )
+                .await
+                .expect("应准备真实写回候选");
+            fs::write(candidate.candidate_root().join(relative), changed)
+                .expect("应篡改候选启动壳");
+
+            let error = service
+                .validate(&candidate)
+                .await
+                .expect_err("候选启动壳任一字节变化都必须拒绝");
+            assert!(matches!(
+                error,
+                RpgMakerWriteBackPublishingError::CandidateBootstrapChanged { .. }
+            ));
+            service.discard(candidate).await.expect("篡改候选应可丢弃");
+        }
+        file_system.shutdown().await.expect("文件系统根应终结");
+    }
+
+    #[tokio::test]
     async fn prepared_candidate_can_be_explicitly_discarded_without_publishing() {
         let project = project("alice", "C:/projects");
         let prepare_calls = Arc::new(Mutex::new(Vec::new()));
         let publish_calls = Arc::new(Mutex::new(Vec::new()));
         let discard_calls = Arc::new(Mutex::new(Vec::new()));
-        let publisher = RpgMakerWriteBackPublishingService::new(FakeRecoverablePublisher {
-            prepare_calls,
-            publish_calls: Arc::clone(&publish_calls),
-            prepare_error: Arc::new(Mutex::new(None)),
-            publish_result: Arc::new(Mutex::new(Some(Ok(())))),
-            discard_calls: Arc::clone(&discard_calls),
-            discard_error: Arc::new(Mutex::new(None)),
-        });
+        let publisher = RpgMakerWriteBackPublishingService::new(
+            MissingFileReader,
+            FakeRecoverablePublisher {
+                prepare_calls,
+                publish_calls: Arc::clone(&publish_calls),
+                prepare_error: Arc::new(Mutex::new(None)),
+                publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+                discard_calls: Arc::clone(&discard_calls),
+                discard_error: Arc::new(Mutex::new(None)),
+            },
+        );
 
         let candidate = publisher
             .prepare(&project, documents(&project, Vec::new()))
@@ -1131,14 +1786,17 @@ mod tests {
     #[tokio::test]
     async fn discard_failure_preserves_the_exact_staging_root() {
         let project = project("alice", "C:/projects");
-        let publisher = RpgMakerWriteBackPublishingService::new(FakeRecoverablePublisher {
-            prepare_calls: Arc::new(Mutex::new(Vec::new())),
-            publish_calls: Arc::new(Mutex::new(Vec::new())),
-            prepare_error: Arc::new(Mutex::new(None)),
-            publish_result: Arc::new(Mutex::new(Some(Ok(())))),
-            discard_calls: Arc::new(Mutex::new(Vec::new())),
-            discard_error: Arc::new(Mutex::new(Some(FakeError("cleanup")))),
-        });
+        let publisher = RpgMakerWriteBackPublishingService::new(
+            MissingFileReader,
+            FakeRecoverablePublisher {
+                prepare_calls: Arc::new(Mutex::new(Vec::new())),
+                publish_calls: Arc::new(Mutex::new(Vec::new())),
+                prepare_error: Arc::new(Mutex::new(None)),
+                publish_result: Arc::new(Mutex::new(Some(Ok(())))),
+                discard_calls: Arc::new(Mutex::new(Vec::new())),
+                discard_error: Arc::new(Mutex::new(Some(FakeError("cleanup")))),
+            },
+        );
         let candidate = publisher
             .prepare(&project, documents(&project, Vec::new()))
             .await
@@ -1230,7 +1888,7 @@ mod tests {
         root_error: DirectoryPublishError<FakeError>,
     ) -> (
         WriteBackPublishFailureState,
-        RpgMakerWriteBackPublishingError<FakeError>,
+        RpgMakerWriteBackPublishingError<FakeError, FakeError>,
     ) {
         let project = project("alice", "C:/projects");
         let (publisher, _, publish_calls) = harness(None, Err(root_error));

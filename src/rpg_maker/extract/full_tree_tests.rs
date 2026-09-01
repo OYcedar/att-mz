@@ -25,6 +25,7 @@ use crate::storage::file_system::{
     DirectoryEntry, DirectoryLister, DirectoryTreeFingerprintError,
     DirectoryTreeFingerprintRequest, DirectoryTreeFingerprinter, ExistingDirectoryResolver,
     FileReader, ListDirectoryError, ReadFile, ReadFileError, ResolveDirectoryError,
+    SnapshotFileReader,
 };
 use crate::storage::sqlite::{
     ExecuteTransactionError, QueryExistingDatabaseError, SqliteQuery, SqliteQueryExecutor,
@@ -74,6 +75,23 @@ impl DirectoryTreeFingerprinter for FakeDirectoryTreeFingerprinter {
         _: DirectoryTreeFingerprintRequest,
     ) -> Result<Sha256Fingerprint, DirectoryTreeFingerprintError<Self::Error>> {
         Ok(Sha256Fingerprint::from_bytes([0x5a; 32]))
+    }
+}
+
+impl FileReader for FakeDirectoryTreeFingerprinter {
+    type Error = FakeRootError;
+
+    async fn read_file(&self, path: PathBuf) -> Result<ReadFile, ReadFileError<Self::Error>> {
+        Err(ReadFileError::NotFound { path })
+    }
+}
+
+impl SnapshotFileReader for FakeDirectoryTreeFingerprinter {
+    async fn read_snapshot_file(
+        &self,
+        path: PathBuf,
+    ) -> Result<ReadFile, ReadFileError<Self::Error>> {
+        self.read_file(path).await
     }
 }
 

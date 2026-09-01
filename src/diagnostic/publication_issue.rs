@@ -64,8 +64,9 @@ pub(crate) enum PublicationRequestViolation {
         first: SafePath,
         second: SafePath,
     },
-    OverlayOutsideSourceMappings {
-        relative_file: SafePath,
+    OverlayOverlapsSourceTarget {
+        overlay: SafePath,
+        source_target: SafePath,
     },
     EmptyDirectoryOverlapsSourceTarget {
         empty_directory: SafePath,
@@ -91,8 +92,8 @@ impl PublicationRequestViolation {
             Self::OverlappingEmptyDirectories { .. } => {
                 "publication.request.overlapping_empty_directories"
             }
-            Self::OverlayOutsideSourceMappings { .. } => {
-                "publication.request.overlay_outside_source_mappings"
+            Self::OverlayOverlapsSourceTarget { .. } => {
+                "publication.request.overlay_overlaps_source_target"
             }
             Self::EmptyDirectoryOverlapsSourceTarget { .. } => {
                 "publication.request.empty_directory_overlaps_source_target"
@@ -115,9 +116,13 @@ impl PublicationRequestViolation {
                 ("first_path", first.to_string()),
                 ("second_path", second.to_string()),
             ],
-            Self::OverlayOutsideSourceMappings { relative_file } => {
-                vec![("relative_file", relative_file.to_string())]
-            }
+            Self::OverlayOverlapsSourceTarget {
+                overlay,
+                source_target,
+            } => vec![
+                ("overlay", overlay.to_string()),
+                ("source_target", source_target.to_string()),
+            ],
             Self::EmptyDirectoryOverlapsSourceTarget {
                 empty_directory,
                 source_target,

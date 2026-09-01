@@ -255,6 +255,19 @@ pub(crate) trait FileReader: Send + Sync {
     ) -> impl Future<Output = Result<ReadFile, ReadFileError<Self::Error>>> + Send;
 }
 
+/// 提供不会阻塞异步执行器线程的稳定普通文件快照读取能力。
+///
+/// `read_snapshot_file` 成功前必须固定完整父路径链并拒绝 reparse point，确认最终对象是
+/// 单链接普通文件，并复核读取前后的文件身份、长度和链接数。该能力只服务需要把读取字节
+/// 纳入受信来源快照的调用方；普通 [`FileReader`] 的语义保持不变。
+pub(crate) trait SnapshotFileReader: FileReader {
+    /// 读取一个稳定的现存普通文件快照。
+    fn read_snapshot_file(
+        &self,
+        path: PathBuf,
+    ) -> impl Future<Output = Result<ReadFile, ReadFileError<Self::Error>>> + Send;
+}
+
 /// 在指定文件身份上取得跨进程排他租约的受检请求。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExclusiveFileLeaseRequest {
@@ -591,8 +604,9 @@ pub(crate) enum DirectoryPublishIntent {
 
 /// 一次可恢复目录发布的候选准备请求。
 ///
-/// 来源映射构成冻结子树，文件覆盖必须位于某棵来源子树中，
-/// `empty_directories` 则要求候选中至少存在这些目录。暂存位置、复制策略、
+/// 来源映射构成冻结子树；文件覆盖既可以替换来源子树中的文件，
+/// 也可以在来源子树之外建立独立文件。`empty_directories` 则要求候选中至少存在这些目录。
+/// 暂存位置、复制策略、
 /// 交换恢复、取消清理及资源背压全部属于根实现。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryStageRequest {
@@ -650,9 +664,11 @@ impl DirectoryStageRequest {
             if source_index
                 .first_strict_ancestor(overlay.relative_file())
                 .is_none()
+                && let Some(mapping) = source_index.first_overlapping(overlay.relative_file())
             {
-                return Err(DirectoryStageRequestError::OverlayOutsideSourceMappings {
-                    relative_file: overlay.relative_file().to_path_buf(),
+                return Err(DirectoryStageRequestError::OverlayOverlapsSourceTarget {
+                    overlay: overlay.relative_file().to_path_buf(),
+                    source_target: source_mappings[mapping].relative_target().to_path_buf(),
                 });
             }
         }
@@ -875,8 +891,9 @@ pub(crate) enum DirectoryStageRequestError {
         first: PathBuf,
         second: PathBuf,
     },
-    OverlayOutsideSourceMappings {
-        relative_file: PathBuf,
+    OverlayOverlapsSourceTarget {
+        overlay: PathBuf,
+        source_target: PathBuf,
     },
     EmptyDirectoryOverlapsSourceTarget {
         empty_directory: PathBuf,
@@ -919,10 +936,14 @@ impl fmt::Display for DirectoryStageRequestError {
                 first.display(),
                 second.display()
             ),
-            Self::OverlayOutsideSourceMappings { relative_file } => write!(
+            Self::OverlayOverlapsSourceTarget {
+                overlay,
+                source_target,
+            } => write!(
                 formatter,
-                "目录发布的文件覆盖不属于任何来源子树：{}",
-                relative_file.display()
+                "目录发布的文件覆盖 {} 与来源目标子树 {} 冲突",
+                overlay.display(),
+                source_target.display()
             ),
             Self::EmptyDirectoryOverlapsSourceTarget {
                 empty_directory,
@@ -2327,17 +2348,19 @@ mod directory_stage_tests {
     }
 
     #[test]
-    fn overlay_must_be_a_file_below_a_source_target() {
-        assert!(matches!(
-            DirectoryStageRequest::new(
-                PathBuf::from("out"),
-                DirectoryPublishIntent::CreateNew,
-                vec![mapping("source/assets", "assets")],
-                vec![overlay("scripts/main.lua")],
-                Vec::new(),
-            ),
-            Err(DirectoryStageRequestError::OverlayOutsideSourceMappings { .. })
-        ));
+    fn overlay_can_replace_a_source_file_or_create_a_disjoint_file() {
+        DirectoryStageRequest::new(
+            PathBuf::from("out"),
+            DirectoryPublishIntent::CreateNew,
+            vec![mapping("source/assets", "assets")],
+            vec![overlay("assets/catalog.json"), overlay("scripts/main.lua")],
+            Vec::new(),
+        )
+        .expect("来源内替换与独立文件覆盖都应合法");
+    }
+
+    #[test]
+    fn overlay_rejects_a_source_target_or_its_ancestor() {
         assert!(matches!(
             DirectoryStageRequest::new(
                 PathBuf::from("out"),
@@ -2346,7 +2369,23 @@ mod directory_stage_tests {
                 vec![overlay("assets")],
                 Vec::new(),
             ),
-            Err(DirectoryStageRequestError::OverlayOutsideSourceMappings { .. })
+            Err(DirectoryStageRequestError::OverlayOverlapsSourceTarget {
+                overlay,
+                source_target,
+            }) if overlay == Path::new("assets") && source_target == Path::new("assets")
+        ));
+        assert!(matches!(
+            DirectoryStageRequest::new(
+                PathBuf::from("out"),
+                DirectoryPublishIntent::CreateNew,
+                vec![mapping("source/images", "assets/images")],
+                vec![overlay("assets")],
+                Vec::new(),
+            ),
+            Err(DirectoryStageRequestError::OverlayOverlapsSourceTarget {
+                overlay,
+                source_target,
+            }) if overlay == Path::new("assets") && source_target == Path::new("assets/images")
         ));
     }
 
@@ -2378,17 +2417,18 @@ mod directory_stage_tests {
             DirectoryPublishIntent::CreateNew,
             vec![mapping("source/assets", "assets")],
             vec![
-                overlay("scripts/outside.js"),
-                overlay("assets/catalog.json"),
-                overlay("assets/catalog.json/child"),
+                overlay("assets"),
+                overlay("scripts/catalog.json"),
+                overlay("scripts/catalog.json/child"),
             ],
             Vec::new(),
         )
-        .expect_err("较早覆盖的来源范围错误必须先于较晚覆盖间冲突");
+        .expect_err("较早覆盖的来源目标冲突必须先于较晚覆盖间冲突");
         assert_eq!(
             error,
-            DirectoryStageRequestError::OverlayOutsideSourceMappings {
-                relative_file: PathBuf::from("scripts/outside.js"),
+            DirectoryStageRequestError::OverlayOverlapsSourceTarget {
+                overlay: PathBuf::from("assets"),
+                source_target: PathBuf::from("assets"),
             }
         );
     }
