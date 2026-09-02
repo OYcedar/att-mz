@@ -1545,6 +1545,7 @@ pub(crate) enum PlaceholderMultisetErrorKind {
     Mismatch,
     Unexpected,
     OrderMismatch,
+    WrapperTopologyChanged,
 }
 
 impl PlaceholderMultisetErrorKind {
@@ -1553,6 +1554,7 @@ impl PlaceholderMultisetErrorKind {
             Self::Mismatch => "mismatch",
             Self::Unexpected => "unexpected",
             Self::OrderMismatch => "order_mismatch",
+            Self::WrapperTopologyChanged => "wrapper_topology_changed",
         }
     }
 }
@@ -1563,7 +1565,7 @@ impl From<&PlaceholderMultisetError> for PlaceholderMultisetErrorKind {
             PlaceholderMultisetError::Mismatch { .. } => Self::Mismatch,
             PlaceholderMultisetError::Unexpected { .. } => Self::Unexpected,
             PlaceholderMultisetError::OrderMismatch { .. } => Self::OrderMismatch,
-            PlaceholderMultisetError::WrapperTopologyChanged { .. } => Self::OrderMismatch,
+            PlaceholderMultisetError::WrapperTopologyChanged { .. } => Self::WrapperTopologyChanged,
         }
     }
 }
@@ -2503,6 +2505,13 @@ pub(crate) enum TranslationUnitRejectionReason {
     PlaceholderMismatch {
         token: String,
     },
+    OrderMismatch {
+        expected_token: String,
+        actual_token: String,
+    },
+    WrapperTopologyChanged {
+        token: String,
+    },
     UnexpectedPlaceholderToken {
         token: String,
     },
@@ -2953,6 +2962,12 @@ fn task_response_unit_problem(
         }
         TranslationUnitRejectionReason::PlaceholderMismatch { .. } => {
             RpgMakerTaskResponseUnitProblem::PlaceholderMismatch
+        }
+        TranslationUnitRejectionReason::OrderMismatch { .. } => {
+            RpgMakerTaskResponseUnitProblem::OrderMismatch
+        }
+        TranslationUnitRejectionReason::WrapperTopologyChanged { .. } => {
+            RpgMakerTaskResponseUnitProblem::WrapperTopologyChanged
         }
         TranslationUnitRejectionReason::UnexpectedPlaceholderToken { .. } => {
             RpgMakerTaskResponseUnitProblem::UnexpectedPlaceholderToken
@@ -4668,6 +4683,43 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_order_and_wrapper_rejections_keep_distinct_public_diagnostics() {
+        for (reason, expected_code, expected_reason) in [
+            (
+                TranslationUnitRejectionReason::OrderMismatch {
+                    expected_token: "secret-expected-token".to_owned(),
+                    actual_token: "secret-actual-token".to_owned(),
+                },
+                "rpg_maker.translation.response.unit.placeholder_order_mismatch",
+                "控制 token 的顺序",
+            ),
+            (
+                TranslationUnitRejectionReason::WrapperTopologyChanged {
+                    token: "secret-wrapper-token".to_owned(),
+                },
+                "rpg_maker.translation.response.unit.placeholder_wrapper_topology_changed",
+                "Placeholder 边界",
+            ),
+        ] {
+            let unresolved = UnresolvedTranslationUnit::for_test(task_id(0), reason);
+            let report =
+                task_response_unit_report(RpgMakerTranslationTaskIndex::new(0), &unresolved)
+                    .expect("具体候选拒绝必须形成 Unit 诊断");
+            assert_eq!(report.primary().code(), expected_code);
+            let rendered = crate::diagnostic::render_diagnostic_fields(
+                &report,
+                &crate::i18n::UiLocalizer::new(crate::i18n::UiLocale::SimplifiedChinese),
+            );
+            assert!(rendered.reason.contains(expected_reason));
+            let wire = serde_json::to_string(&report).expect("公开诊断必须可序列化");
+            assert!(
+                !wire.contains("secret-"),
+                "公开诊断不得泄漏 Placeholder token"
+            );
+        }
+    }
+
+    #[test]
     fn committed_candidate_review_reports_the_applied_effect() {
         let unresolved = UnresolvedTranslationUnit::for_test(
             task_id(0),
@@ -4719,13 +4771,13 @@ mod tests {
             (
                 r#"{"think":"判断"}"#,
                 "rpg_maker.translation.response.invalid_shape",
-                "invalid_response_contract",
+                "response_shape_invalid",
                 "shape",
             ),
             (
                 "```json\n{\"0\":[\"first\"]}\n```\n```json\n{\"1\":[\"second\"]}\n```",
                 "rpg_maker.translation.response.invalid_json",
-                "response_parsing_failed",
+                "response_json_invalid",
                 "syntax",
             ),
         ] {

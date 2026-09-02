@@ -546,8 +546,10 @@ fn render_diagnostic_reason(
         _ => {}
     }
 
-    if let Some(system_message) = issue
-        .facts()
+    let facts = issue.facts();
+    append_response_details(issue.summary_code(), &facts, &mut details, localizer);
+
+    if let Some(system_message) = facts
         .into_iter()
         .find_map(|(name, value)| (name == "system_message").then_some(value))
         .and_then(|value| readable_system_message(&value))
@@ -559,6 +561,84 @@ fn render_diagnostic_reason(
     } else {
         format!("{summary} ({})", details.join("; "))
     }
+}
+
+fn append_response_details(
+    summary_code: &str,
+    facts: &[(&'static str, String)],
+    details: &mut Vec<String>,
+    localizer: &UiLocalizer,
+) {
+    match summary_code {
+        "response_json_invalid"
+        | "response_shape_invalid"
+        | "response_placeholder_snapshot_invalid" => {
+            if let (Some(line), Some(column)) =
+                (numeric_fact(facts, "line"), numeric_fact(facts, "column"))
+            {
+                details.push(localizer.format(UiMessage::DiagnosticJsonPosition { line, column }));
+            }
+        }
+        "response_id_invalid" | "response_id_unexpected" => {
+            if let Some(item) =
+                numeric_fact(facts, "item_index").and_then(|value| value.checked_add(1))
+            {
+                details.push(localizer.format(UiMessage::DiagnosticResponseItem { item }));
+            }
+        }
+        "response_translation_item_not_string" | "response_echo_source_item_not_string" => {
+            if let Some(item) = numeric_fact(facts, "item") {
+                details.push(localizer.format(UiMessage::DiagnosticArrayItem { item }));
+            }
+        }
+        "response_line_text_invalid" | "response_blank_line_mismatch" => {
+            if let Some(item) =
+                numeric_fact(facts, "line_index").and_then(|value| value.checked_add(1))
+            {
+                details.push(localizer.format(UiMessage::DiagnosticArrayItem { item }));
+            }
+        }
+        "response_placeholder_order_mismatch" => {
+            if let Some(position) =
+                numeric_fact(facts, "position").and_then(|value| value.checked_add(1))
+            {
+                details.push(localizer.format(UiMessage::DiagnosticTokenPosition { position }));
+            }
+        }
+        "response_placeholder_missing" | "response_text_segment_shape_mismatch" => {
+            if let Some(segment) =
+                numeric_fact(facts, "segment_index").and_then(|value| value.checked_add(1))
+            {
+                details.push(localizer.format(UiMessage::DiagnosticTextSegment { segment }));
+            }
+        }
+        "response_line_count_mismatch" | "response_text_segment_count_mismatch" => {
+            if let (Some(expected), Some(actual)) = (
+                numeric_fact(facts, "expected"),
+                numeric_fact(facts, "actual"),
+            ) {
+                details.push(
+                    localizer.format(UiMessage::DiagnosticExpectedActual { expected, actual }),
+                );
+            } else if let (Some(expected), Some(actual)) = (
+                numeric_fact(facts, "expected_line_count"),
+                numeric_fact(facts, "actual_line_count"),
+            ) {
+                details.push(
+                    localizer.format(UiMessage::DiagnosticExpectedActual { expected, actual }),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn numeric_fact(facts: &[(&'static str, String)], name: &str) -> Option<u64> {
+    facts
+        .iter()
+        .find_map(|(candidate, value)| (*candidate == name).then_some(value))?
+        .parse()
+        .ok()
 }
 
 fn placeholder_rule_number(problem: &PlaceholderIssue) -> Option<usize> {

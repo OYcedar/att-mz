@@ -2305,6 +2305,9 @@ fn output_contract_problem(
                 super::pipeline::PlaceholderMultisetErrorKind::OrderMismatch => {
                     RpgMakerPlaceholderMultisetViolation::OrderMismatch
                 }
+                super::pipeline::PlaceholderMultisetErrorKind::WrapperTopologyChanged => {
+                    RpgMakerPlaceholderMultisetViolation::WrapperTopologyChanged
+                }
             },
         },
         ExpectedTranslationOutputContractError::ProtectedPlaceholderCrossesLineBoundary {

@@ -548,6 +548,22 @@ pub(crate) enum UiMessage<'a> {
         line: u64,
         column: u64,
     },
+    DiagnosticResponseItem {
+        item: u64,
+    },
+    DiagnosticArrayItem {
+        item: u64,
+    },
+    DiagnosticTokenPosition {
+        position: u64,
+    },
+    DiagnosticTextSegment {
+        segment: u64,
+    },
+    DiagnosticExpectedActual {
+        expected: u64,
+        actual: u64,
+    },
     DiagnosticPlaceholderRuleFile {
         number: u64,
         path: &'a str,
@@ -927,6 +943,11 @@ impl UiMessage<'_> {
             Self::DiagnosticProviderType { .. } => "diagnostic-provider-type",
             Self::DiagnosticProviderMessage { .. } => "diagnostic-provider-message",
             Self::DiagnosticJsonPosition { .. } => "diagnostic-json-position",
+            Self::DiagnosticResponseItem { .. } => "diagnostic-response-item",
+            Self::DiagnosticArrayItem { .. } => "diagnostic-array-item",
+            Self::DiagnosticTokenPosition { .. } => "diagnostic-token-position",
+            Self::DiagnosticTextSegment { .. } => "diagnostic-text-segment",
+            Self::DiagnosticExpectedActual { .. } => "diagnostic-expected-actual",
             Self::DiagnosticPlaceholderRuleFile { .. } => "diagnostic-placeholder-rule-file",
             Self::DiagnosticPlaceholderRuleProject { .. } => "diagnostic-placeholder-rule-project",
             Self::ManualExported { .. } => "manual-exported",
@@ -1343,6 +1364,22 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "line", line);
                 set_number(&mut arguments, "column", column);
             }
+            Self::DiagnosticResponseItem { item } => {
+                set_number(&mut arguments, "item", item);
+            }
+            Self::DiagnosticArrayItem { item } => {
+                set_number(&mut arguments, "item", item);
+            }
+            Self::DiagnosticTokenPosition { position } => {
+                set_number(&mut arguments, "position", position);
+            }
+            Self::DiagnosticTextSegment { segment } => {
+                set_number(&mut arguments, "segment", segment);
+            }
+            Self::DiagnosticExpectedActual { expected, actual } => {
+                set_number(&mut arguments, "expected", expected);
+                set_number(&mut arguments, "actual", actual);
+            }
             Self::DiagnosticPlaceholderRuleFile { number, path } => {
                 set_number(&mut arguments, "number", number);
                 set_text(&mut arguments, "path", path);
@@ -1740,7 +1777,6 @@ mod tests {
             "model_stream_unexpected_done",
             "invalid_syntax",
             "invalid_value",
-            "needs_review",
             "journal_corrupt",
             "lock_cancelled",
             "lua_compilation_failed",
@@ -1770,6 +1806,38 @@ mod tests {
             "resource_limit",
             "resource_limit_exceeded",
             "response_parsing_failed",
+            "response_json_invalid",
+            "response_shape_invalid",
+            "response_id_invalid",
+            "response_id_unexpected",
+            "response_id_duplicate",
+            "response_id_missing",
+            "response_translation_not_array",
+            "response_translation_item_not_string",
+            "response_echo_shape_invalid",
+            "response_echo_source_item_not_string",
+            "response_translation_blank",
+            "response_translation_text_invalid",
+            "response_placeholder_snapshot_invalid",
+            "response_placeholder_identity_or_count_mismatch",
+            "response_placeholder_missing",
+            "response_placeholder_unexpected",
+            "response_placeholder_order_mismatch",
+            "response_placeholder_binding_mismatch",
+            "response_placeholder_boundary_mismatch",
+            "response_placeholder_reserved_token",
+            "response_placeholder_ambiguous",
+            "response_control_token_invalid",
+            "response_text_segment_count_mismatch",
+            "response_text_segment_shape_mismatch",
+            "response_line_count_mismatch",
+            "response_line_text_invalid",
+            "response_blank_line_mismatch",
+            "response_source_residual",
+            "response_finish_requires_review",
+            "response_thinking_empty",
+            "response_no_usable_output",
+            "response_all_outputs_rejected",
             "rollback_failed",
             "rules_owner_disabled",
             "rules_invalid_capture_range",
@@ -1806,6 +1874,64 @@ mod tests {
                     "{locale} 缺少诊断摘要 {code}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn thinking_empty_summary_names_the_required_blank_think_field() {
+        for (locale, expected) in [
+            (UiLocale::Arabic, "فارغ أو يحتوي على مسافات بيضاء فقط"),
+            (UiLocale::SimplifiedChinese, "为空或仅含空白"),
+            (UiLocale::TraditionalChinese, "為空或僅含空白"),
+            (UiLocale::English, "empty or contains only whitespace"),
+            (
+                UiLocale::French,
+                "vide ou ne contient que des caractères d'espacement",
+            ),
+            (
+                UiLocale::Russian,
+                "пусто или содержит только пробельные символы",
+            ),
+            (
+                UiLocale::Spanish,
+                "vacío o solo contiene caracteres de espacio en blanco",
+            ),
+            (UiLocale::Japanese, "空か、空白文字のみ"),
+            (UiLocale::Korean, "비어 있거나 공백만"),
+            (UiLocale::Vietnamese, "bị trống hoặc chỉ chứa khoảng trắng"),
+        ] {
+            let rendered = UiLocalizer::new(locale).format(UiMessage::DiagnosticFailureValue {
+                code: "response_thinking_empty",
+            });
+            assert!(rendered.contains("think"), "{locale} 应指明 think 字段");
+            assert!(
+                rendered.contains(expected),
+                "{locale} 应说明 think 为空或仅含空白：{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn finish_review_summary_describes_the_returned_result_without_assuming_acceptance() {
+        for (locale, expected) in [
+            (UiLocale::Arabic, "النتيجة المعادة"),
+            (UiLocale::SimplifiedChinese, "返回结果"),
+            (UiLocale::TraditionalChinese, "傳回結果"),
+            (UiLocale::English, "returned result"),
+            (UiLocale::French, "résultat renvoyé"),
+            (UiLocale::Russian, "возвращённый результат"),
+            (UiLocale::Spanish, "resultado devuelto"),
+            (UiLocale::Japanese, "返された結果"),
+            (UiLocale::Korean, "반환된 결과"),
+            (UiLocale::Vietnamese, "kết quả trả về"),
+        ] {
+            let rendered = UiLocalizer::new(locale).format(UiMessage::DiagnosticFailureValue {
+                code: "response_finish_requires_review",
+            });
+            assert!(
+                rendered.contains(expected),
+                "{locale} 应中性描述返回结果：{rendered}"
+            );
         }
     }
 
@@ -2070,6 +2196,14 @@ mod tests {
                 message: "try later",
             },
             UiMessage::DiagnosticJsonPosition { line: 1, column: 2 },
+            UiMessage::DiagnosticResponseItem { item: 2 },
+            UiMessage::DiagnosticArrayItem { item: 3 },
+            UiMessage::DiagnosticTokenPosition { position: 4 },
+            UiMessage::DiagnosticTextSegment { segment: 5 },
+            UiMessage::DiagnosticExpectedActual {
+                expected: 2,
+                actual: 3,
+            },
             UiMessage::DiagnosticPlaceholderRuleFile {
                 number: 3,
                 path: "placeholders.toml",

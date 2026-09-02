@@ -2514,9 +2514,11 @@ pub(crate) const fn generic_placeholder_multiset_problem(
         PlaceholderMultisetError::Unexpected { .. } => {
             GenericPlaceholderMultisetProblem::Unexpected
         }
-        PlaceholderMultisetError::OrderMismatch { .. }
-        | PlaceholderMultisetError::WrapperTopologyChanged { .. } => {
+        PlaceholderMultisetError::OrderMismatch { .. } => {
             GenericPlaceholderMultisetProblem::OrderMismatch
+        }
+        PlaceholderMultisetError::WrapperTopologyChanged { .. } => {
+            GenericPlaceholderMultisetProblem::WrapperTopologyChanged
         }
     }
 }
@@ -3098,10 +3100,10 @@ where
     let mut observed = HashSet::new();
     let mut reported_duplicates = HashSet::new();
     let mut outputs = task.outputs;
-    for entry in entries {
+    for (item_index, entry) in entries.iter().enumerate() {
         ensure_planning_not_cancelled(&is_cancelled)?;
         let Some(output_id) = entry.canonical_id() else {
-            problems.push(ResponseProblem::InvalidId);
+            problems.push(ResponseProblem::InvalidId { item_index });
             continue;
         };
         if !outputs.contains_key(&output_id) {
@@ -3349,6 +3351,9 @@ fn generic_destination_violation(
                 | GenericPlaceholderMultisetProblem::OrderMismatch => {
                     ProvenInvariantViolation::PlaceholderMismatch
                 }
+                GenericPlaceholderMultisetProblem::WrapperTopologyChanged => {
+                    ProvenInvariantViolation::PlaceholderBoundaryChanged
+                }
             })
         }
         GenericResponseDestinationProblem::PlaceholderProtection { .. }
@@ -3368,7 +3373,6 @@ fn generic_destination_violation(
             Some(generic_text_problem_violation(*problem, &[]))
         }
         GenericResponseDestinationProblem::MissingPlanningFact
-        | GenericResponseDestinationProblem::ValidatorRejected
         | GenericResponseDestinationProblem::InvalidPlaceholderSnapshot { .. }
         | GenericResponseDestinationProblem::PlaceholderCompilation { .. }
         | GenericResponseDestinationProblem::LanguageAnalysisMismatch
@@ -3645,7 +3649,12 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
 
+    use crate::diagnostic::{
+        Diagnostic, DiagnosticReport, GenericDiagnosticStage, GenericIssue, StateEffect,
+        render_diagnostic_fields,
+    };
     use crate::generic::GenericPlaceholderRuleDefinition;
+    use crate::i18n::{UiLocale, UiLocalizer};
     use crate::language::{
         JapaneseLanguageModule, JapaneseResidualPolicy, LanguageId, LanguagePair,
     };
@@ -3668,6 +3677,39 @@ mod tests {
 
     fn unit_locator() -> GenericUnitLocator {
         GenericUnitLocator::new("story.jsonl", "story", "line", "dialogue", 1, 1)
+    }
+
+    #[test]
+    fn placeholder_multiset_diagnostics_preserve_every_failure_kind() {
+        for (source, expected) in [
+            (
+                PlaceholderMultisetError::Mismatch {
+                    token: "secret-missing-token".to_owned(),
+                },
+                GenericPlaceholderMultisetProblem::Mismatch,
+            ),
+            (
+                PlaceholderMultisetError::Unexpected {
+                    token: "secret-unexpected-token".to_owned(),
+                },
+                GenericPlaceholderMultisetProblem::Unexpected,
+            ),
+            (
+                PlaceholderMultisetError::OrderMismatch {
+                    expected_token: "secret-expected-token".to_owned(),
+                    actual_token: "secret-actual-token".to_owned(),
+                },
+                GenericPlaceholderMultisetProblem::OrderMismatch,
+            ),
+            (
+                PlaceholderMultisetError::WrapperTopologyChanged {
+                    token: "secret-wrapper-token".to_owned(),
+                },
+                GenericPlaceholderMultisetProblem::WrapperTopologyChanged,
+            ),
+        ] {
+            assert_eq!(generic_placeholder_multiset_problem(&source), expected);
+        }
     }
 
     fn japanese_language_module() -> JapaneseLanguageModule {
@@ -4479,7 +4521,7 @@ mod tests {
             |key, candidate| {
                 if key.group_id() == "g3" {
                     Ok::<_, GenericPlanningError>(Err(
-                        GenericResponseDestinationProblem::ValidatorRejected,
+                        GenericResponseDestinationProblem::PlaceholderBindingMismatch,
                     ))
                 } else {
                     Ok::<_, GenericPlanningError>(Ok(ValidatedReuse::new(
@@ -4752,6 +4794,60 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_diagnostics_distinguish_multiple_invalid_id_items() {
+        let snapshot = stored_snapshot();
+        let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
+            Ok(candidate.to_owned())
+        })
+        .expect("规划应成功");
+        let acceptance = accept_response(
+            &plan.tasks()[0],
+            r#"{"0":["同文译文"],"bad":["甲"],"1":["独立译文"],"01":["乙"]}"#,
+            TranslationResponseMode::new(false, false),
+            |_, _, candidate| Ok(candidate.to_owned()),
+        )
+        .expect("包含非法 ID 的根对象仍应逐项验收");
+
+        let invalid = acceptance
+            .problems()
+            .iter()
+            .filter_map(|problem| match problem {
+                ResponseProblem::InvalidId { item_index } => Some((*item_index, problem.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invalid.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [1, 3]
+        );
+
+        let reasons = invalid
+            .into_iter()
+            .map(|(_, problem)| {
+                let issue = GenericIssue::project(
+                    GenericDiagnosticStage::Translate,
+                    crate::diagnostic::GenericProblem::TaskResponse {
+                        task_ordinal: 1,
+                        total_tasks: 1,
+                        problem,
+                    },
+                );
+                render_diagnostic_fields(
+                    &DiagnosticReport::new(
+                        StateEffect::ProgressPreserved,
+                        Diagnostic::generic(issue),
+                    ),
+                    &UiLocalizer::new(UiLocale::SimplifiedChinese),
+                )
+                .reason
+                .replace(['\u{2068}', '\u{2069}'], "")
+            })
+            .collect::<Vec<_>>();
+        assert!(reasons[0].contains("响应第 2 项"));
+        assert!(reasons[1].contains("响应第 4 项"));
+    }
+
+    #[test]
     fn response_array_items_reject_embedded_line_delimiters_but_allow_multiple_items() {
         let snapshot = stored_snapshot();
         let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
@@ -4927,7 +5023,7 @@ mod tests {
             TranslationResponseMode::new(false, false),
             |_, key, candidate| {
                 if key.group_id() == "g3" {
-                    Err(GenericResponseDestinationProblem::ValidatorRejected)
+                    Err(GenericResponseDestinationProblem::PlaceholderBindingMismatch)
                 } else {
                     Ok(candidate.to_owned())
                 }
@@ -4956,7 +5052,7 @@ mod tests {
                         Some("dialogue"),
                     )
                     .with_natural_position(1, 1),
-                    problem: GenericResponseDestinationProblem::ValidatorRejected,
+                    problem: GenericResponseDestinationProblem::PlaceholderBindingMismatch,
                 })
         );
         assert_eq!(
@@ -4979,7 +5075,7 @@ mod tests {
             TranslationResponseMode::new(false, false),
             |output_id, _, candidate| {
                 if output_id == task_id(0) {
-                    Err(GenericResponseDestinationProblem::ValidatorRejected)
+                    Err(GenericResponseDestinationProblem::PlaceholderBindingMismatch)
                 } else {
                     Ok(candidate.to_owned())
                 }
@@ -5002,7 +5098,7 @@ mod tests {
                         Some("dialogue"),
                     )
                     .with_natural_position(1, 1),
-                    problem: GenericResponseDestinationProblem::ValidatorRejected,
+                    problem: GenericResponseDestinationProblem::PlaceholderBindingMismatch,
                 },
                 ResponseProblem::InvalidDestination {
                     output_id: 0,
@@ -5013,7 +5109,7 @@ mod tests {
                         Some("dialogue"),
                     )
                     .with_natural_position(1, 1),
-                    problem: GenericResponseDestinationProblem::ValidatorRejected,
+                    problem: GenericResponseDestinationProblem::PlaceholderBindingMismatch,
                 },
             ],
             "消费 destinations 后仍应保持原有目标顺序"

@@ -2246,6 +2246,12 @@ fn proven_violation(
         TranslationUnitRejectionReason::PlaceholderMismatch { .. } => {
             ProvenInvariantViolation::PlaceholderMismatch
         }
+        TranslationUnitRejectionReason::OrderMismatch { .. } => {
+            ProvenInvariantViolation::PlaceholderMismatch
+        }
+        TranslationUnitRejectionReason::WrapperTopologyChanged { .. } => {
+            ProvenInvariantViolation::PlaceholderBoundaryChanged
+        }
         TranslationUnitRejectionReason::UnexpectedPlaceholderToken { .. } => {
             ProvenInvariantViolation::UnexpectedPlaceholderToken
         }
@@ -2885,13 +2891,15 @@ fn multiset_rejection(error: PlaceholderMultisetError) -> TranslationUnitRejecti
         PlaceholderMultisetError::Unexpected { token } => {
             TranslationUnitRejectionReason::UnexpectedPlaceholderToken { token }
         }
-        PlaceholderMultisetError::OrderMismatch { actual_token, .. } => {
-            TranslationUnitRejectionReason::PlaceholderMismatch {
-                token: actual_token,
-            }
-        }
+        PlaceholderMultisetError::OrderMismatch {
+            expected_token,
+            actual_token,
+        } => TranslationUnitRejectionReason::OrderMismatch {
+            expected_token,
+            actual_token,
+        },
         PlaceholderMultisetError::WrapperTopologyChanged { token } => {
-            TranslationUnitRejectionReason::PlaceholderMismatch { token }
+            TranslationUnitRejectionReason::WrapperTopologyChanged { token }
         }
     }
 }
@@ -2927,6 +2935,7 @@ mod tests {
         LanguageText,
     };
     use crate::llm::{ChatMessage, ChatMessageRole};
+    use crate::rpg_maker::RpgMakerEngine;
     use crate::rpg_maker::asset::RpgMakerAssetOwner;
     use crate::rpg_maker::model::{ScalarFieldKey, TextUnitContent, TextUnitRole};
     use crate::rpg_maker::text::{
@@ -2936,6 +2945,9 @@ mod tests {
         AppliedPlaceholder, ExpectedLineShape, ExpectedTranslationOutput,
         ExpectedTranslationValidation, PlaceholderRuleOrigin, PlaceholderSegment,
         RpgMakerTranslationTaskIndex, TranslationStateContext, TranslationUnitIdentity,
+    };
+    use crate::rpg_maker::translate::placeholder::{
+        Pcre2PlaceholderService, PlaceholderRuleDefinition,
     };
     use crate::rpg_maker::translate::profile::{
         ResolvedRpgMakerTranslationResources, RpgMakerSystemPrompt,
@@ -4219,8 +4231,11 @@ mod tests {
                 "甲⟦ATT_ICON_WHOLE_0001⟧乙⟦ATT_ACTOR_NAME_WHOLE_0000⟧",
                 &placeholders,
             ),
-            Err(TranslationUnitRejectionReason::PlaceholderMismatch { token })
-                if token == "⟦ATT_ICON_WHOLE_0001⟧"
+            Err(TranslationUnitRejectionReason::OrderMismatch {
+                expected_token,
+                actual_token,
+            }) if expected_token == "⟦ATT_ACTOR_NAME_WHOLE_0000⟧"
+                && actual_token == "⟦ATT_ICON_WHOLE_0001⟧"
         ));
 
         for text in [
@@ -4264,6 +4279,60 @@ mod tests {
             Err(TranslationUnitRejectionReason::UnexpectedPlaceholderToken { .. })
         ));
         assert!(validate_token_multiset("ATT 说明与 ⟦ATTENTION⟧", &[]).is_ok());
+    }
+
+    #[test]
+    fn multiset_rejection_preserves_order_and_wrapper_topology() {
+        assert!(matches!(
+            multiset_rejection(PlaceholderMultisetError::OrderMismatch {
+                expected_token: "secret-expected-token".to_owned(),
+                actual_token: "secret-actual-token".to_owned(),
+            }),
+            TranslationUnitRejectionReason::OrderMismatch {
+                expected_token,
+                actual_token,
+            } if expected_token == "secret-expected-token"
+                && actual_token == "secret-actual-token"
+        ));
+        assert!(matches!(
+            multiset_rejection(PlaceholderMultisetError::WrapperTopologyChanged {
+                token: "secret-wrapper-token".to_owned(),
+            }),
+            TranslationUnitRejectionReason::WrapperTopologyChanged { token }
+                if token == "secret-wrapper-token"
+        ));
+    }
+
+    #[test]
+    fn token_validation_preserves_a_real_wrapper_topology_failure() {
+        let service = Pcre2PlaceholderService::new().expect("内置 Placeholder 应可编译");
+        let custom = service
+            .compile_custom(vec![PlaceholderRuleDefinition::new(
+                None,
+                r"\\N<(?<text>[^>]*)>",
+            )])
+            .expect("wrapper 规则应可编译");
+        let identity = reflow_value_identity();
+        let protected = service
+            .protect(RpgMakerEngine::Mz, &identity, r"\N<Alice>Hello", &custom)
+            .expect("wrapper 应可保护");
+        let begin = protected
+            .placeholders()
+            .iter()
+            .find(|placeholder| placeholder.segment() == PlaceholderSegment::Begin)
+            .expect("应生成 Begin token")
+            .token();
+        let end = protected
+            .placeholders()
+            .iter()
+            .find(|placeholder| placeholder.segment() == PlaceholderSegment::End)
+            .expect("应生成 End token")
+            .token();
+
+        assert!(matches!(
+            validate_token_multiset(&format!("爱丽丝{begin}{end}你好"), protected.placeholders(),),
+            Err(TranslationUnitRejectionReason::WrapperTopologyChanged { .. })
+        ));
     }
 
     #[test]

@@ -7120,13 +7120,13 @@ mod tests {
             (
                 r#"{"think":"判断"}"#,
                 "generic.translation.response.invalid_shape",
-                "invalid_response_contract",
+                "response_shape_invalid",
                 "shape",
             ),
             (
                 "```json\n{\"0\":[\"first\"]}\n```\n```json\n{\"1\":[\"second\"]}\n```",
                 "generic.translation.response.invalid_json",
-                "response_parsing_failed",
+                "response_json_invalid",
                 "syntax",
             ),
         ] {

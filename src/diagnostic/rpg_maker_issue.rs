@@ -1810,6 +1810,21 @@ pub(crate) enum RpgMakerTaskResponseValueProblem {
 }
 
 impl RpgMakerTaskResponseValueProblem {
+    const fn summary_code(self) -> &'static str {
+        match self {
+            Self::TranslationNotArray => "response_translation_not_array",
+            Self::TranslationNonStringItem { .. } => "response_translation_item_not_string",
+            Self::SourceEchoNotObject
+            | Self::SourceEchoMissingSource
+            | Self::SourceEchoMissingTranslation
+            | Self::SourceEchoDuplicateSource
+            | Self::SourceEchoDuplicateTranslation
+            | Self::SourceEchoUnexpectedField
+            | Self::SourceNotArray => "response_echo_shape_invalid",
+            Self::SourceNonStringItem { .. } => "response_echo_source_item_not_string",
+        }
+    }
+
     const fn code(self) -> &'static str {
         match self {
             Self::TranslationNotArray => {
@@ -1891,6 +1906,8 @@ pub(crate) enum RpgMakerTaskResponseUnitProblem {
     BlankTranslation,
     ContainsByteOrderMark,
     PlaceholderMismatch,
+    OrderMismatch,
+    WrapperTopologyChanged,
     UnexpectedPlaceholderToken,
     PlaceholderNormalizationAmbiguous,
 }
@@ -1917,6 +1934,24 @@ impl RpgMakerTaskResponseReviewProblem {
 }
 
 impl RpgMakerTaskResponseUnitProblem {
+    const fn summary_code(&self) -> &'static str {
+        match self {
+            Self::Missing => "response_id_missing",
+            Self::Duplicate => "response_id_duplicate",
+            Self::InvalidValue { problem } => problem.summary_code(),
+            Self::LineCountMismatch { .. } => "response_line_count_mismatch",
+            Self::InvalidLineText { .. } => "response_line_text_invalid",
+            Self::BlankLineMismatch { .. } => "response_blank_line_mismatch",
+            Self::BlankTranslation => "response_translation_blank",
+            Self::ContainsByteOrderMark => "response_translation_text_invalid",
+            Self::PlaceholderMismatch => "response_placeholder_identity_or_count_mismatch",
+            Self::OrderMismatch => "response_placeholder_order_mismatch",
+            Self::WrapperTopologyChanged => "response_placeholder_boundary_mismatch",
+            Self::UnexpectedPlaceholderToken => "response_placeholder_unexpected",
+            Self::PlaceholderNormalizationAmbiguous => "response_placeholder_ambiguous",
+        }
+    }
+
     const fn code(&self) -> &'static str {
         match self {
             Self::Missing => "rpg_maker.translation.response.unit.missing",
@@ -1934,6 +1969,10 @@ impl RpgMakerTaskResponseUnitProblem {
                 "rpg_maker.translation.response.unit.contains_byte_order_mark"
             }
             Self::PlaceholderMismatch => "rpg_maker.translation.response.unit.placeholder_mismatch",
+            Self::OrderMismatch => "rpg_maker.translation.response.unit.placeholder_order_mismatch",
+            Self::WrapperTopologyChanged => {
+                "rpg_maker.translation.response.unit.placeholder_wrapper_topology_changed"
+            }
             Self::UnexpectedPlaceholderToken => {
                 "rpg_maker.translation.response.unit.unexpected_placeholder_token"
             }
@@ -1954,6 +1993,8 @@ impl RpgMakerTaskResponseUnitProblem {
             Self::BlankTranslation => "blank_translation",
             Self::ContainsByteOrderMark => "contains_byte_order_mark",
             Self::PlaceholderMismatch => "placeholder_mismatch",
+            Self::OrderMismatch => "placeholder_order_mismatch",
+            Self::WrapperTopologyChanged => "placeholder_wrapper_topology_changed",
             Self::UnexpectedPlaceholderToken => "unexpected_placeholder_token",
             Self::PlaceholderNormalizationAmbiguous => "placeholder_normalization_ambiguous",
         }
@@ -1982,6 +2023,8 @@ impl RpgMakerTaskResponseUnitProblem {
             | Self::BlankTranslation
             | Self::ContainsByteOrderMark
             | Self::PlaceholderMismatch
+            | Self::OrderMismatch
+            | Self::WrapperTopologyChanged
             | Self::UnexpectedPlaceholderToken
             | Self::PlaceholderNormalizationAmbiguous => Vec::new(),
         }
@@ -2068,15 +2111,20 @@ impl RpgMakerTaskResponseProblem {
             Self::InvalidJson {
                 category: RpgMakerTaskResponseJsonCategory::Shape,
                 ..
-            } => "invalid_response_contract",
-            Self::InvalidJson { .. } => "response_parsing_failed",
-            Self::NonStopFinish { .. } | Self::UnitReview { .. } => "needs_review",
-            Self::ModelResponseUnusable | Self::AllOutputsRejected => "invalid_response_contract",
-            Self::ThinkingEmpty { .. }
-            | Self::InvalidId { .. }
-            | Self::UnknownId { .. }
-            | Self::UnitRejected { .. }
-            | Self::MissingPlannedOutput { .. } => "invalid_response_contract",
+            } => "response_shape_invalid",
+            Self::InvalidJson { .. } => "response_json_invalid",
+            Self::NonStopFinish { .. } => "response_finish_requires_review",
+            Self::UnitReview {
+                finding: RpgMakerTaskResponseReviewProblem::SourceResidual,
+                ..
+            } => "response_source_residual",
+            Self::ModelResponseUnusable => "response_no_usable_output",
+            Self::AllOutputsRejected => "response_all_outputs_rejected",
+            Self::ThinkingEmpty { .. } => "response_thinking_empty",
+            Self::InvalidId { .. } => "response_id_invalid",
+            Self::UnknownId { .. } => "response_id_unexpected",
+            Self::UnitRejected { problem, .. } => problem.summary_code(),
+            Self::MissingPlannedOutput { .. } => "response_id_missing",
         }
     }
 
@@ -3047,6 +3095,7 @@ pub(crate) enum RpgMakerPlaceholderMultisetViolation {
     Mismatch,
     Unexpected,
     OrderMismatch,
+    WrapperTopologyChanged,
 }
 
 impl RpgMakerPlaceholderMultisetViolation {
@@ -3055,6 +3104,7 @@ impl RpgMakerPlaceholderMultisetViolation {
             Self::Mismatch => "mismatch",
             Self::Unexpected => "unexpected",
             Self::OrderMismatch => "order_mismatch",
+            Self::WrapperTopologyChanged => "wrapper_topology_changed",
         }
     }
 }
@@ -7511,15 +7561,20 @@ mod tests {
             )),
         );
 
-        let object =
-            render_diagnostic_fields(&report, &UiLocalizer::new(UiLocale::SimplifiedChinese))
-                .object;
+        let fields =
+            render_diagnostic_fields(&report, &UiLocalizer::new(UiLocale::SimplifiedChinese));
+        let object = fields.object;
         assert_eq!(
             object,
             "CommonEvents.json:66:choices (translation_task_42); output_id=1"
         );
         assert!(!object.contains("builtin"));
         assert!(!object.contains("event_choices"));
+        let reason = fields.reason.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(reason.contains("translation 数组"));
+        assert!(reason.contains("空槽与非空槽"));
+        assert!(reason.contains("数组第 3 项"));
+        assert!(!reason.contains('行'));
 
         let value = serde_json::to_value(report).expect("诊断必须可序列化");
         assert_eq!(
@@ -7554,7 +7609,7 @@ mod tests {
             &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::rpg_maker(issue)),
             &UiLocalizer::new(UiLocale::SimplifiedChinese),
         );
-        assert_eq!(fields.reason, "译文需要复核");
+        assert!(fields.reason.contains("非最终原因停止"));
         assert!(fields.help.contains("Manual"));
         assert!(!fields.reason.contains("__ATT_FALLBACK__"));
     }
@@ -7574,8 +7629,117 @@ mod tests {
             &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::rpg_maker(issue)),
             &UiLocalizer::new(UiLocale::SimplifiedChinese),
         );
-        assert!(fields.reason.contains("响应契约"));
-        assert!(!fields.reason.contains("有效 JSON"));
+        let reason = fields.reason.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(reason.contains("根结构或响应结构"));
+        assert!(reason.contains("第 1 行，第 1 列"));
+    }
+
+    #[test]
+    fn task_response_leaf_problems_render_direct_reasons_and_natural_positions() {
+        let unit = RpgMakerUnitLocator::new(
+            SafeText::new("Map001.json:event2:page1:dialogue3"),
+            RpgMakerDiagnosticOwner::Builtin,
+            RpgMakerDiagnosticGroupKind::EventDialogue,
+            RpgMakerDiagnosticLocation::new(
+                RpgMakerDiagnosticSource::map(1),
+                vec![RpgMakerDiagnosticLocationStep::array_index(2)],
+            ),
+            RpgMakerDiagnosticRole::DialogueBody,
+        );
+        let cases = vec![
+            (
+                RpgMakerResponseProcessingScope::task(0),
+                RpgMakerTaskResponseProblem::InvalidId { item_index: 1 },
+                "响应第 2 项",
+            ),
+            (
+                RpgMakerResponseProcessingScope::task(0),
+                RpgMakerTaskResponseProblem::UnknownId {
+                    item_index: 0,
+                    output_id: 12,
+                },
+                "未要求的 output ID",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit.clone()),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::LineCountMismatch {
+                        expected: 3,
+                        actual: 2,
+                    },
+                },
+                "要求 3，实际 2",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit.clone()),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::BlankLineMismatch {
+                        line_index: 1,
+                        expected_blank: true,
+                    },
+                },
+                "数组第 2 项",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit.clone()),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::PlaceholderMismatch,
+                },
+                "Placeholder 的身份或数量",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit.clone()),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::OrderMismatch,
+                },
+                "控制 token 的顺序",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit.clone()),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::WrapperTopologyChanged,
+                },
+                "Placeholder 边界",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit.clone()),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::UnexpectedPlaceholderToken,
+                },
+                "计划外的控制 token",
+            ),
+            (
+                RpgMakerResponseProcessingScope::unit(0, unit),
+                RpgMakerTaskResponseProblem::UnitRejected {
+                    output_id: 4,
+                    problem: RpgMakerTaskResponseUnitProblem::PlaceholderNormalizationAmbiguous,
+                },
+                "无法唯一对应",
+            ),
+        ];
+
+        for (scope, problem, expected) in cases {
+            let reason = render_diagnostic_fields(
+                &DiagnosticReport::new(
+                    StateEffect::ProgressPreserved,
+                    Diagnostic::rpg_maker(RpgMakerIssue::task_response(scope, problem)),
+                ),
+                &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            )
+            .reason
+            .replace(['\u{2068}', '\u{2069}'], "");
+            assert!(
+                reason.contains(expected),
+                "诊断原因 {reason:?} 缺少 {expected:?}"
+            );
+            assert!(!reason.contains("响应契约"), "叶子诊断不得退化为总括文案");
+        }
     }
 
     #[test]

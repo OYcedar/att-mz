@@ -296,8 +296,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] Luồng mô hình lặp lại cùng một choice
     [model_stream_output_after_finish] Luồng mô hình tiếp tục xuất sau finish
     [model_stream_unexpected_done] Luồng Responses trả về [DONE] ngoài dự kiến
+    [response_json_invalid] Phản hồi Assistant không phải JSON hợp lệ
+    [response_shape_invalid] Cấu trúc gốc hoặc cấu trúc phản hồi của JSON Assistant không hợp lệ
+    [response_id_invalid] Một mục phản hồi có output ID không hợp lệ
+    [response_id_unexpected] Phản hồi chứa output ID không được yêu cầu
+    [response_id_duplicate] Phản hồi chứa cùng một output ID nhiều lần
+    [response_id_missing] Phản hồi thiếu một output ID được yêu cầu
+    [response_translation_not_array] translation phải là một mảng chuỗi
+    [response_translation_item_not_string] Một mục trong mảng translation không phải chuỗi
+    [response_echo_shape_invalid] Đối tượng source được lặp lại không khớp cấu trúc source/translation đã yêu cầu
+    [response_echo_source_item_not_string] Một mục trong mảng source được lặp lại không phải chuỗi
+    [response_translation_blank] Bản dịch trả về bị trống
+    [response_translation_text_invalid] Bản dịch trả về chứa dấu xuống dòng, NUL hoặc dấu thứ tự byte không được phép
+    [response_placeholder_snapshot_invalid] Bản chụp trạng thái Placeholder dùng để kiểm tra phản hồi không hợp lệ
+    [response_placeholder_identity_or_count_mismatch] Bản dịch đã thay đổi định danh hoặc số lượng Placeholder bắt buộc
+    [response_placeholder_missing] Bản dịch thiếu token điều khiển bắt buộc
+    [response_placeholder_unexpected] Bản dịch chứa token điều khiển ngoài dự kiến
+    [response_placeholder_order_mismatch] Bản dịch đã thay đổi thứ tự token điều khiển bắt buộc
+    [response_placeholder_binding_mismatch] Bản dịch đã thay đổi cách Placeholder bắt buộc liên kết với văn bản
+    [response_placeholder_boundary_mismatch] Bản dịch đã thêm hoặc xóa ranh giới Placeholder bắt buộc
+    [response_placeholder_reserved_token] Bản dịch chứa token Placeholder dành riêng
+    [response_placeholder_ambiguous] Không thể ghép rõ ràng Placeholder trả về với một token bắt buộc
+    [response_control_token_invalid] Cấu trúc token điều khiển trả về không hợp lệ
+    [response_text_segment_count_mismatch] Phản hồi đã thay đổi số lượng phân đoạn văn bản bắt buộc
+    [response_text_segment_shape_mismatch] Phản hồi đã thay đổi cấu trúc phân đoạn văn bản bắt buộc
+    [response_line_count_mismatch] Mảng translation có số mục không đúng
+    [response_line_text_invalid] Một mục trong mảng translation chứa văn bản không thể được chấp nhận
+    [response_blank_line_mismatch] Mảng translation không giữ nguyên các vị trí trống và không trống bắt buộc
+    [response_source_residual] Bản dịch đã được chấp nhận vẫn chứa ngôn ngữ nguồn và cần được xem lại
+    [response_finish_requires_review] Mô hình dừng vì lý do chưa hoàn tất; kết quả trả về cần được xem lại
+    [response_thinking_empty] Trường think bắt buộc bị trống hoặc chỉ chứa khoảng trắng
+    [response_no_usable_output] Phản hồi Assistant không có đầu ra dùng được
+    [response_all_outputs_rejected] Mọi đầu ra trong phản hồi Assistant đều bị từ chối
     [invalid_response_contract] Phản hồi mô hình không đáp ứng hợp đồng phản hồi bắt buộc
-    [needs_review] Bản dịch cần được xem xét
     [lua_compilation_failed] Không thể biên dịch chương trình Lua chính
     [lua_execution_failed] Chương trình Lua chính thất bại trong khi chạy
     [rules_pattern_match_failed] Không thể đánh giá mẫu PCRE2 của Rules
@@ -369,6 +400,11 @@ diagnostic-provider-code = Mã nhà cung cấp: { $code }
 diagnostic-provider-type = Loại nhà cung cấp: { $kind }
 diagnostic-provider-message = Thông báo nhà cung cấp: { $message }
 diagnostic-json-position = dòng { $line }, cột { $column }
+diagnostic-response-item = mục phản hồi { $item }
+diagnostic-array-item = mục trong mảng { $item }
+diagnostic-token-position = vị trí token điều khiển { $position }
+diagnostic-text-segment = phân đoạn văn bản { $segment }
+diagnostic-expected-actual = dự kiến { $expected }, nhận được { $actual }
 diagnostic-placeholder-rule-file = Quy tắc Placeholder { $number } trong { $path }
 diagnostic-placeholder-rule-project = Quy tắc Placeholder { $number } của dự án hiện tại
 manual-exported = Đã xuất { $entries } mục vào { $path }

@@ -301,8 +301,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] Поток модели повторил один и тот же choice
     [model_stream_output_after_finish] Поток модели продолжил вывод после finish
     [model_stream_unexpected_done] Поток Responses вернул неожиданный [DONE]
+    [response_json_invalid] Ответ Assistant не является допустимым JSON
+    [response_shape_invalid] Корневая структура или структура ответа JSON Assistant недопустима
+    [response_id_invalid] Элемент ответа содержит недопустимый output ID
+    [response_id_unexpected] Ответ содержит output ID, который не запрашивался
+    [response_id_duplicate] Ответ содержит один и тот же output ID несколько раз
+    [response_id_missing] В ответе отсутствует запрошенный output ID
+    [response_translation_not_array] translation должен быть массивом строк
+    [response_translation_item_not_string] Элемент массива translation не является строкой
+    [response_echo_shape_invalid] Возвращённый объект source не соответствует требуемой структуре source/translation
+    [response_echo_source_item_not_string] Элемент возвращённого массива source не является строкой
+    [response_translation_blank] Возвращённый перевод пуст
+    [response_translation_text_invalid] Возвращённый перевод содержит запрещённый перенос строки, NUL или метку порядка байтов
+    [response_placeholder_snapshot_invalid] Снимок Placeholder для проверки ответа недопустим
+    [response_placeholder_identity_or_count_mismatch] Перевод изменил идентичность или количество обязательных Placeholders
+    [response_placeholder_missing] В переводе отсутствует обязательный управляющий token
+    [response_placeholder_unexpected] Перевод содержит неожиданный управляющий token
+    [response_placeholder_order_mismatch] Перевод изменил обязательный порядок управляющих tokens
+    [response_placeholder_binding_mismatch] Перевод изменил привязку обязательных Placeholders к тексту
+    [response_placeholder_boundary_mismatch] Перевод добавил или удалил обязательную границу Placeholder
+    [response_placeholder_reserved_token] Перевод содержит зарезервированный Placeholder token
+    [response_placeholder_ambiguous] Возвращённый Placeholder нельзя однозначно сопоставить с обязательным token
+    [response_control_token_invalid] Структура возвращённых управляющих tokens недопустима
+    [response_text_segment_count_mismatch] Ответ изменил обязательное количество текстовых сегментов
+    [response_text_segment_shape_mismatch] Ответ изменил обязательную структуру текстовых сегментов
+    [response_line_count_mismatch] В массиве translation неверное количество элементов
+    [response_line_text_invalid] Элемент массива translation содержит текст, который нельзя принять
+    [response_blank_line_mismatch] Массив translation не сохранил обязательные пустые и непустые позиции
+    [response_source_residual] Принятый перевод всё ещё содержит исходный язык и требует проверки
+    [response_finish_requires_review] Модель остановилась по нефинальной причине; возвращённый результат требует проверки
+    [response_thinking_empty] Обязательное поле think пусто или содержит только пробельные символы
+    [response_no_usable_output] Ответ Assistant не содержит пригодных результатов
+    [response_all_outputs_rejected] Все результаты в ответе Assistant отклонены
     [invalid_response_contract] Ответ модели не соответствует обязательному контракту
-    [needs_review] Перевод требует проверки
     [lua_compilation_failed] Не удалось скомпилировать основную программу Lua
     [lua_execution_failed] Ошибка во время выполнения основной программы Lua
     [rules_pattern_match_failed] Не удалось вычислить шаблон PCRE2 Rules
@@ -374,6 +405,11 @@ diagnostic-provider-code = Код провайдера: { $code }
 diagnostic-provider-type = Тип провайдера: { $kind }
 diagnostic-provider-message = Сообщение провайдера: { $message }
 diagnostic-json-position = строка { $line }, столбец { $column }
+diagnostic-response-item = элемент ответа { $item }
+diagnostic-array-item = элемент массива { $item }
+diagnostic-token-position = позиция управляющего token { $position }
+diagnostic-text-segment = текстовый сегмент { $segment }
+diagnostic-expected-actual = ожидалось { $expected }, получено { $actual }
 diagnostic-placeholder-rule-file = Правило Placeholder { $number } в { $path }
 diagnostic-placeholder-rule-project = Правило Placeholder { $number } текущего проекта
 manual-exported = Экспортировано записей: { $entries }; файл: { $path }

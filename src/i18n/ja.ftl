@@ -296,8 +296,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] モデルストリームが同じ choice を重複して返しました
     [model_stream_output_after_finish] モデルストリームが finish 後も出力を続けました
     [model_stream_unexpected_done] Responses ストリームが予期しない [DONE] を返しました
+    [response_json_invalid] Assistant 応答は有効な JSON ではありません
+    [response_shape_invalid] Assistant JSON のルートまたは応答構造が要件と一致しません
+    [response_id_invalid] 応答項目の output ID が無効です
+    [response_id_unexpected] 応答に要求していない output ID が含まれています
+    [response_id_duplicate] 応答に同じ output ID が複数あります
+    [response_id_missing] 応答に要求した output ID がありません
+    [response_translation_not_array] translation は文字列配列である必要があります
+    [response_translation_item_not_string] translation 配列に文字列でない項目があります
+    [response_echo_shape_invalid] エコーされた source オブジェクトが要求された source/translation 構造と一致しません
+    [response_echo_source_item_not_string] エコーされた source 配列に文字列でない項目があります
+    [response_translation_blank] 返された翻訳が空です
+    [response_translation_text_invalid] 返された翻訳に許可されない改行、NUL、またはバイトオーダーマークがあります
+    [response_placeholder_snapshot_invalid] 応答検証に使用した Placeholder スナップショットが無効です
+    [response_placeholder_identity_or_count_mismatch] 翻訳が必須 Placeholder の識別情報または個数を変更しました
+    [response_placeholder_missing] 翻訳に必須の制御 token がありません
+    [response_placeholder_unexpected] 翻訳に予定外の制御 token があります
+    [response_placeholder_order_mismatch] 翻訳が必須の制御 token 順序を変更しました
+    [response_placeholder_binding_mismatch] 翻訳が必須 Placeholder と本文の対応関係を変更しました
+    [response_placeholder_boundary_mismatch] 翻訳が必須 Placeholder の境界を追加または削除しました
+    [response_placeholder_reserved_token] 翻訳に予約済み Placeholder token があります
+    [response_placeholder_ambiguous] 返された Placeholder を必須 token に一意に対応付けられません
+    [response_control_token_invalid] 返された制御 token の構造が無効です
+    [response_text_segment_count_mismatch] 応答が必須テキストセグメント数を変更しました
+    [response_text_segment_shape_mismatch] 応答が必須テキストセグメント構造を変更しました
+    [response_line_count_mismatch] translation 配列の項目数が要件と一致しません
+    [response_line_text_invalid] translation 配列の項目に受理できないテキストがあります
+    [response_blank_line_mismatch] translation 配列が必須の空スロットと非空スロットの位置を保持していません
+    [response_source_residual] 受理された翻訳に原文言語が残っているため確認が必要です
+    [response_finish_requires_review] モデルが最終状態以外の理由で停止したため、返された結果の確認が必要です
+    [response_thinking_empty] 必須の think フィールドが空か、空白文字のみです
+    [response_no_usable_output] Assistant 応答に使用可能な出力がありません
+    [response_all_outputs_rejected] Assistant 応答のすべての出力が拒否されました
     [invalid_response_contract] モデル応答が必要な応答契約を満たしていません
-    [needs_review] 翻訳内容の確認が必要です
     [lua_compilation_failed] Lua メインプログラムをコンパイルできませんでした
     [lua_execution_failed] Lua メインプログラムの実行中に失敗しました
     [rules_pattern_match_failed] Rules の PCRE2 パターンを評価できませんでした
@@ -369,6 +400,11 @@ diagnostic-provider-code = プロバイダー code：{ $code }
 diagnostic-provider-type = プロバイダー type：{ $kind }
 diagnostic-provider-message = プロバイダーのメッセージ：{ $message }
 diagnostic-json-position = { $line } 行、{ $column } 列
+diagnostic-response-item = 応答項目 { $item }
+diagnostic-array-item = 配列項目 { $item }
+diagnostic-token-position = 制御 token の位置 { $position }
+diagnostic-text-segment = テキストセグメント { $segment }
+diagnostic-expected-actual = 期待値 { $expected }、実際値 { $actual }
 diagnostic-placeholder-rule-file = { $path } の Placeholder ルール { $number }
 diagnostic-placeholder-rule-project = 現在のプロジェクトの Placeholder ルール { $number }
 manual-exported = { $entries } 件を { $path } にエクスポートしました

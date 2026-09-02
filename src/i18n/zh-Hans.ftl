@@ -296,8 +296,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] 模型流重复返回同一 choice
     [model_stream_output_after_finish] 模型流在 finish 后继续输出
     [model_stream_unexpected_done] Responses 模型流意外返回 [DONE]
+    [response_json_invalid] Assistant 响应不是有效 JSON
+    [response_shape_invalid] Assistant JSON 的根结构或响应结构不符合要求
+    [response_id_invalid] 响应项的 output ID 无效
+    [response_id_unexpected] 响应包含本任务未要求的 output ID
+    [response_id_duplicate] 响应重复返回了同一个 output ID
+    [response_id_missing] 响应缺少本任务要求的 output ID
+    [response_translation_not_array] translation 必须是字符串数组
+    [response_translation_item_not_string] translation 数组中存在非字符串项
+    [response_echo_shape_invalid] 回显的 source 对象不符合要求的 source/translation 结构
+    [response_echo_source_item_not_string] 回显的 source 数组中存在非字符串项
+    [response_translation_blank] 返回的译文为空
+    [response_translation_text_invalid] 返回的译文包含不允许的换行、NUL 或字节序标记
+    [response_placeholder_snapshot_invalid] 用于验收响应的 Placeholder 快照无效
+    [response_placeholder_identity_or_count_mismatch] 译文改变了必需 Placeholder 的身份或数量
+    [response_placeholder_missing] 译文缺少必需的控制 token
+    [response_placeholder_unexpected] 译文包含计划外的控制 token
+    [response_placeholder_order_mismatch] 译文改变了必需控制 token 的顺序
+    [response_placeholder_binding_mismatch] 译文改变了必需 Placeholder 与正文的绑定关系
+    [response_placeholder_boundary_mismatch] 译文增加或删除了必需的 Placeholder 边界
+    [response_placeholder_reserved_token] 译文包含保留的 Placeholder token
+    [response_placeholder_ambiguous] 返回的 Placeholder 无法唯一对应到所需 token
+    [response_control_token_invalid] 返回的控制 token 结构无效
+    [response_text_segment_count_mismatch] 响应改变了必需的文本片段数量
+    [response_text_segment_shape_mismatch] 响应改变了必需的文本片段结构
+    [response_line_count_mismatch] translation 数组项数与要求不符
+    [response_line_text_invalid] translation 数组项包含无法验收的文本
+    [response_blank_line_mismatch] translation 数组未保持必需的空槽与非空槽位置
+    [response_source_residual] 已接受的译文仍含源语言文本，需要复核
+    [response_finish_requires_review] 模型因非最终原因停止；返回结果需要复核
+    [response_thinking_empty] 必填的 think 字段为空或仅含空白
+    [response_no_usable_output] Assistant 响应没有可用输出
+    [response_all_outputs_rejected] Assistant 响应中的全部输出都未通过验收
     [invalid_response_contract] 模型响应不符合所需响应契约
-    [needs_review] 译文需要复核
     [lua_compilation_failed] Lua 主程序编译失败
     [lua_execution_failed] Lua 主程序运行失败
     [rules_pattern_match_failed] 无法执行 Rules 的 PCRE2 模式
@@ -369,6 +400,11 @@ diagnostic-provider-code = 服务方 code：{ $code }
 diagnostic-provider-type = 服务方 type：{ $kind }
 diagnostic-provider-message = 服务方消息：{ $message }
 diagnostic-json-position = 第 { $line } 行，第 { $column } 列
+diagnostic-response-item = 响应第 { $item } 项
+diagnostic-array-item = 数组第 { $item } 项
+diagnostic-token-position = 控制 token 第 { $position } 个位置
+diagnostic-text-segment = 文本第 { $segment } 个片段
+diagnostic-expected-actual = 要求 { $expected }，实际 { $actual }
 diagnostic-placeholder-rule-file = { $path } 中的 Placeholder 规则 { $number }
 diagnostic-placeholder-rule-project = 当前项目的 Placeholder 规则 { $number }
 manual-exported = 已导出 { $entries } 条：{ $path }

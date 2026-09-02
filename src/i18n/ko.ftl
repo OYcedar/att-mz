@@ -296,8 +296,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] 모델 스트림이 같은 choice를 중복 반환했습니다
     [model_stream_output_after_finish] 모델 스트림이 finish 뒤에도 출력을 계속했습니다
     [model_stream_unexpected_done] Responses 스트림이 예기치 않은 [DONE]을 반환했습니다
+    [response_json_invalid] Assistant 응답이 올바른 JSON이 아닙니다
+    [response_shape_invalid] Assistant JSON의 루트 또는 응답 구조가 요구 사항과 다릅니다
+    [response_id_invalid] 응답 항목의 output ID가 올바르지 않습니다
+    [response_id_unexpected] 응답에 요청하지 않은 output ID가 있습니다
+    [response_id_duplicate] 응답에 같은 output ID가 두 번 이상 있습니다
+    [response_id_missing] 응답에 요청한 output ID가 없습니다
+    [response_translation_not_array] translation은 문자열 배열이어야 합니다
+    [response_translation_item_not_string] translation 배열에 문자열이 아닌 항목이 있습니다
+    [response_echo_shape_invalid] 에코된 source 객체가 요청한 source/translation 구조와 다릅니다
+    [response_echo_source_item_not_string] 에코된 source 배열에 문자열이 아닌 항목이 있습니다
+    [response_translation_blank] 반환된 번역문이 비어 있습니다
+    [response_translation_text_invalid] 반환된 번역문에 허용되지 않는 줄바꿈, NUL 또는 바이트 순서 표시가 있습니다
+    [response_placeholder_snapshot_invalid] 응답 검증에 사용한 Placeholder 스냅샷이 올바르지 않습니다
+    [response_placeholder_identity_or_count_mismatch] 번역문이 필수 Placeholder의 식별 정보 또는 개수를 변경했습니다
+    [response_placeholder_missing] 번역문에 필수 제어 token이 없습니다
+    [response_placeholder_unexpected] 번역문에 계획되지 않은 제어 token이 있습니다
+    [response_placeholder_order_mismatch] 번역문이 필수 제어 token 순서를 변경했습니다
+    [response_placeholder_binding_mismatch] 번역문이 필수 Placeholder와 본문의 연결 관계를 변경했습니다
+    [response_placeholder_boundary_mismatch] 번역문이 필수 Placeholder 경계를 추가하거나 제거했습니다
+    [response_placeholder_reserved_token] 번역문에 예약된 Placeholder token이 있습니다
+    [response_placeholder_ambiguous] 반환된 Placeholder를 필수 token 하나에 명확히 대응할 수 없습니다
+    [response_control_token_invalid] 반환된 제어 token 구조가 올바르지 않습니다
+    [response_text_segment_count_mismatch] 응답이 필수 텍스트 세그먼트 수를 변경했습니다
+    [response_text_segment_shape_mismatch] 응답이 필수 텍스트 세그먼트 구조를 변경했습니다
+    [response_line_count_mismatch] translation 배열의 항목 수가 요구 사항과 다릅니다
+    [response_line_text_invalid] translation 배열 항목에 허용할 수 없는 텍스트가 있습니다
+    [response_blank_line_mismatch] translation 배열이 필수 빈 슬롯과 비어 있지 않은 슬롯의 위치를 유지하지 않았습니다
+    [response_source_residual] 수락된 번역문에 원문 언어가 남아 있어 검토가 필요합니다
+    [response_finish_requires_review] 모델이 최종 상태가 아닌 이유로 중지되어 반환된 결과를 검토해야 합니다
+    [response_thinking_empty] 필수 think 필드가 비어 있거나 공백만 포함합니다
+    [response_no_usable_output] Assistant 응답에 사용할 수 있는 출력이 없습니다
+    [response_all_outputs_rejected] Assistant 응답의 모든 출력이 거부되었습니다
     [invalid_response_contract] 모델 응답이 필수 응답 계약을 충족하지 않습니다
-    [needs_review] 번역 검토가 필요합니다
     [lua_compilation_failed] Lua 주 프로그램을 컴파일할 수 없습니다
     [lua_execution_failed] Lua 주 프로그램 실행 중 오류가 발생했습니다
     [rules_pattern_match_failed] Rules PCRE2 패턴을 평가할 수 없습니다
@@ -369,6 +400,11 @@ diagnostic-provider-code = 공급자 code: { $code }
 diagnostic-provider-type = 공급자 type: { $kind }
 diagnostic-provider-message = 공급자 메시지: { $message }
 diagnostic-json-position = { $line }행 { $column }열
+diagnostic-response-item = 응답 항목 { $item }
+diagnostic-array-item = 배열 항목 { $item }
+diagnostic-token-position = 제어 token 위치 { $position }
+diagnostic-text-segment = 텍스트 세그먼트 { $segment }
+diagnostic-expected-actual = 예상 { $expected }, 실제 { $actual }
 diagnostic-placeholder-rule-file = { $path }의 Placeholder 규칙 { $number }
 diagnostic-placeholder-rule-project = 현재 프로젝트의 Placeholder 규칙 { $number }
 manual-exported = { $entries }개 항목을 { $path }에 내보냈습니다

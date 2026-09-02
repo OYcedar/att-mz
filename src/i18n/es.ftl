@@ -299,8 +299,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] El flujo del modelo repitió la misma choice
     [model_stream_output_after_finish] El flujo del modelo continuó después de finish
     [model_stream_unexpected_done] El flujo Responses devolvió un [DONE] inesperado
+    [response_json_invalid] La respuesta Assistant no es JSON válido
+    [response_shape_invalid] La raíz o la estructura de respuesta del JSON Assistant no es válida
+    [response_id_invalid] Un elemento de respuesta tiene un output ID no válido
+    [response_id_unexpected] La respuesta contiene un output ID que no se solicitó
+    [response_id_duplicate] La respuesta contiene el mismo output ID más de una vez
+    [response_id_missing] Falta un output ID solicitado en la respuesta
+    [response_translation_not_array] translation debe ser una matriz de cadenas
+    [response_translation_item_not_string] Un elemento de la matriz translation no es una cadena
+    [response_echo_shape_invalid] El objeto source repetido no coincide con la estructura source/translation solicitada
+    [response_echo_source_item_not_string] Un elemento de la matriz source repetida no es una cadena
+    [response_translation_blank] La traducción devuelta está vacía
+    [response_translation_text_invalid] La traducción devuelta contiene un salto de línea, NUL o marca de orden de bytes no permitido
+    [response_placeholder_snapshot_invalid] La instantánea de Placeholder usada para validar la respuesta no es válida
+    [response_placeholder_identity_or_count_mismatch] La traducción cambió la identidad o la cantidad de los Placeholders obligatorios
+    [response_placeholder_missing] Falta un token de control obligatorio en la traducción
+    [response_placeholder_unexpected] La traducción contiene un token de control inesperado
+    [response_placeholder_order_mismatch] La traducción cambió el orden obligatorio de los tokens de control
+    [response_placeholder_binding_mismatch] La traducción cambió cómo se vinculan al texto los Placeholders obligatorios
+    [response_placeholder_boundary_mismatch] La traducción añadió o eliminó un límite de Placeholder obligatorio
+    [response_placeholder_reserved_token] La traducción contiene un token Placeholder reservado
+    [response_placeholder_ambiguous] Un Placeholder devuelto no puede asociarse inequívocamente con un token obligatorio
+    [response_control_token_invalid] La estructura de tokens de control devuelta no es válida
+    [response_text_segment_count_mismatch] La respuesta cambió la cantidad obligatoria de segmentos de texto
+    [response_text_segment_shape_mismatch] La respuesta cambió la estructura obligatoria de los segmentos de texto
+    [response_line_count_mismatch] La matriz translation tiene una cantidad incorrecta de elementos
+    [response_line_text_invalid] Un elemento de la matriz translation contiene texto que no puede aceptarse
+    [response_blank_line_mismatch] La matriz translation no conservó las posiciones obligatorias de los espacios vacíos y no vacíos
+    [response_source_residual] La traducción aceptada aún contiene texto del idioma de origen y debe revisarse
+    [response_finish_requires_review] El modelo se detuvo por un motivo no final; debe revisarse el resultado devuelto
+    [response_thinking_empty] El campo think obligatorio está vacío o solo contiene caracteres de espacio en blanco
+    [response_no_usable_output] La respuesta Assistant no contiene ninguna salida utilizable
+    [response_all_outputs_rejected] Se rechazaron todas las salidas de la respuesta Assistant
     [invalid_response_contract] La respuesta del modelo no cumple el contrato requerido
-    [needs_review] La traducción requiere revisión
     [lua_compilation_failed] No se pudo compilar el programa Lua principal
     [lua_execution_failed] El programa Lua principal falló durante la ejecución
     [rules_pattern_match_failed] No se pudo evaluar el patrón PCRE2 de Rules
@@ -372,6 +403,11 @@ diagnostic-provider-code = Código del proveedor: { $code }
 diagnostic-provider-type = Tipo del proveedor: { $kind }
 diagnostic-provider-message = Mensaje del proveedor: { $message }
 diagnostic-json-position = línea { $line }, columna { $column }
+diagnostic-response-item = elemento de respuesta { $item }
+diagnostic-array-item = elemento de matriz { $item }
+diagnostic-token-position = posición del token de control { $position }
+diagnostic-text-segment = segmento de texto { $segment }
+diagnostic-expected-actual = se esperaban { $expected }, se recibieron { $actual }
 diagnostic-placeholder-rule-file = Regla Placeholder { $number } en { $path }
 diagnostic-placeholder-rule-project = Regla Placeholder { $number } del proyecto actual
 manual-exported = Se exportaron { $entries } entradas a { $path }

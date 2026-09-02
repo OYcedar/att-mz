@@ -914,6 +914,21 @@ pub(crate) enum GenericResponseValueProblem {
 }
 
 impl GenericResponseValueProblem {
+    const fn summary_code(self) -> &'static str {
+        match self {
+            Self::TranslationNotArray => "response_translation_not_array",
+            Self::TranslationNonStringItem { .. } => "response_translation_item_not_string",
+            Self::SourceEchoNotObject
+            | Self::SourceEchoMissingSource
+            | Self::SourceEchoMissingTranslation
+            | Self::SourceEchoDuplicateSource
+            | Self::SourceEchoDuplicateTranslation
+            | Self::SourceEchoUnexpectedField
+            | Self::SourceNotArray => "response_echo_shape_invalid",
+            Self::SourceNonStringItem { .. } => "response_echo_source_item_not_string",
+        }
+    }
+
     const fn code_suffix(self) -> &'static str {
         match self {
             Self::TranslationNotArray => "translation_not_array",
@@ -967,6 +982,15 @@ impl GenericResponseReviewFinding {
 }
 
 impl GenericResponseTextProblem {
+    const fn summary_code(self) -> &'static str {
+        match self {
+            Self::Blank => "response_translation_blank",
+            Self::CarriageReturn | Self::LineFeed | Self::Nul | Self::ByteOrderMark => {
+                "response_translation_text_invalid"
+            }
+        }
+    }
+
     const fn code_suffix(self) -> &'static str {
         match self {
             Self::Blank => "blank",
@@ -1035,7 +1059,6 @@ impl GenericRepairApplicationProblem {
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GenericResponseDestinationProblem {
     MissingPlanningFact,
-    ValidatorRejected,
     InvalidPlaceholderSnapshot {
         category: GenericJsonErrorCategory,
         line: usize,
@@ -1071,10 +1094,44 @@ pub(crate) enum GenericResponseDestinationProblem {
 }
 
 impl GenericResponseDestinationProblem {
+    const fn summary_code(&self) -> &'static str {
+        match self {
+            Self::MissingPlanningFact => "internal_invariant",
+            Self::InvalidPlaceholderSnapshot { .. } => "response_placeholder_snapshot_invalid",
+            Self::PlaceholderCompilation { problem } => match problem {
+                PlaceholderCompilationProblem::WorkerStart { .. } => "worker_spawn_failed",
+                _ => "invalid_value",
+            },
+            Self::PlaceholderProtection { problem } => problem.summary_code(),
+            Self::PlaceholderRestoreProjection { problem }
+            | Self::LanguageProjection { problem } => problem.response_summary_code(),
+            Self::PlaceholderRestoreMultiset { problem } => match problem {
+                GenericPlaceholderMultisetProblem::Mismatch => {
+                    "response_placeholder_identity_or_count_mismatch"
+                }
+                GenericPlaceholderMultisetProblem::Unexpected => "response_placeholder_unexpected",
+                GenericPlaceholderMultisetProblem::OrderMismatch => {
+                    "response_placeholder_order_mismatch"
+                }
+                GenericPlaceholderMultisetProblem::WrapperTopologyChanged => {
+                    "response_placeholder_boundary_mismatch"
+                }
+            },
+            Self::PlaceholderBindingMismatch => "response_placeholder_binding_mismatch",
+            Self::LanguageAnalysisMismatch => "internal_invariant",
+            Self::RepairPlanningMismatch => "internal_invariant",
+            Self::RepairApplication { .. } => "internal_invariant",
+            Self::PlaceholderBoundaryAdded | Self::PlaceholderBoundaryRemoved => {
+                "response_placeholder_boundary_mismatch"
+            }
+            Self::ReservedToken => "response_placeholder_reserved_token",
+            Self::InvalidTranslation { problem } => problem.summary_code(),
+        }
+    }
+
     const fn code_suffix(&self) -> &'static str {
         match self {
             Self::MissingPlanningFact => "missing_planning_fact",
-            Self::ValidatorRejected => "validator_rejected",
             Self::InvalidPlaceholderSnapshot { .. } => "invalid_placeholder_snapshot",
             Self::PlaceholderCompilation { .. } => "placeholder_compilation",
             Self::PlaceholderProtection { .. } => "placeholder_protection",
@@ -1116,7 +1173,9 @@ impl GenericResponseDestinationProblem {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GenericTaskResponseProblem {
-    InvalidId,
+    InvalidId {
+        item_index: usize,
+    },
     UnexpectedId {
         output_id: u64,
     },
@@ -1148,7 +1207,6 @@ pub(crate) enum GenericTaskResponseProblem {
         line: NonZeroUsize,
         column: NonZeroUsize,
     },
-    NonStopFinish,
     ResponseReview {
         finding: GenericResponseReviewFinding,
     },
@@ -1172,10 +1230,9 @@ impl GenericTaskResponseProblem {
             | Self::InvalidTranslation { output_id, .. }
             | Self::InvalidDestination { output_id, .. }
             | Self::DestinationReview { output_id, .. } => Some(*output_id),
-            Self::InvalidId
+            Self::InvalidId { .. }
             | Self::InvalidJson { .. }
             | Self::ThinkingEmpty { .. }
-            | Self::NonStopFinish
             | Self::ResponseReview { .. }
             | Self::CommitConflict { .. } => None,
         }
@@ -1183,7 +1240,7 @@ impl GenericTaskResponseProblem {
 
     fn code(&self) -> &'static str {
         match self {
-            Self::InvalidId => "generic.translation.response.invalid_id",
+            Self::InvalidId { .. } => "generic.translation.response.invalid_id",
             Self::UnexpectedId { .. } => "generic.translation.response.unexpected_id",
             Self::DuplicateId { .. } => "generic.translation.response.duplicate_id",
             Self::MissingId { .. } => "generic.translation.response.missing_id",
@@ -1237,9 +1294,6 @@ impl GenericTaskResponseProblem {
             Self::InvalidDestination { problem, .. } => match problem {
                 GenericResponseDestinationProblem::MissingPlanningFact => {
                     "generic.translation.response.destination.missing_planning_fact"
-                }
-                GenericResponseDestinationProblem::ValidatorRejected => {
-                    "generic.translation.response.destination.validator_rejected"
                 }
                 GenericResponseDestinationProblem::InvalidPlaceholderSnapshot { .. } => {
                     "generic.translation.response.destination.invalid_placeholder_snapshot"
@@ -1306,7 +1360,6 @@ impl GenericTaskResponseProblem {
             } => "generic.translation.response.invalid_shape",
             Self::InvalidJson { .. } => "generic.translation.response.invalid_json",
             Self::ThinkingEmpty { .. } => "generic.translation.response.thinking_empty",
-            Self::NonStopFinish => "generic.translation.response.non_stop_finish",
             Self::ResponseReview { finding } => match finding {
                 GenericResponseReviewFinding::NonStopFinish => {
                     "generic.translation.review.non_stop_finish"
@@ -1332,25 +1385,31 @@ impl GenericTaskResponseProblem {
             Self::InvalidJson {
                 category: GenericTaskResponseJsonCategory::Shape,
                 ..
-            } => "invalid_response_contract",
-            Self::InvalidJson { .. } => "response_parsing_failed",
+            } => "response_shape_invalid",
+            Self::InvalidJson { .. } => "response_json_invalid",
             Self::CommitConflict { .. } => "state_mismatch",
-            Self::ResponseReview { .. } | Self::DestinationReview { .. } => "needs_review",
-            Self::InvalidId
-            | Self::UnexpectedId { .. }
-            | Self::DuplicateId { .. }
-            | Self::MissingId { .. }
-            | Self::InvalidValue { .. }
-            | Self::InvalidTranslation { .. }
-            | Self::InvalidDestination { .. }
-            | Self::ThinkingEmpty { .. }
-            | Self::NonStopFinish => "invalid_response_contract",
+            Self::ResponseReview { finding } | Self::DestinationReview { finding, .. } => {
+                match finding {
+                    GenericResponseReviewFinding::SourceResidual => "response_source_residual",
+                    GenericResponseReviewFinding::NonStopFinish => {
+                        "response_finish_requires_review"
+                    }
+                }
+            }
+            Self::InvalidId { .. } => "response_id_invalid",
+            Self::UnexpectedId { .. } => "response_id_unexpected",
+            Self::DuplicateId { .. } => "response_id_duplicate",
+            Self::MissingId { .. } => "response_id_missing",
+            Self::InvalidValue { problem, .. } => problem.summary_code(),
+            Self::InvalidTranslation { problem, .. } => problem.summary_code(),
+            Self::InvalidDestination { problem, .. } => problem.summary_code(),
+            Self::ThinkingEmpty { .. } => "response_thinking_empty",
         }
     }
 
     fn facts(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::InvalidId | Self::NonStopFinish => Vec::new(),
+            Self::InvalidId { item_index } => vec![("item_index", item_index.to_string())],
             Self::ResponseReview { finding } => {
                 vec![("review", finding.code_suffix().to_owned())]
             }
@@ -1726,6 +1785,21 @@ pub(crate) enum GenericLanguageProjectionProblem {
 }
 
 impl GenericLanguageProjectionProblem {
+    const fn response_summary_code(self) -> &'static str {
+        match self {
+            Self::TokenIndexConstruction
+            | Self::EmptyToken
+            | Self::RepeatedToken
+            | Self::OverlappingToken => "response_control_token_invalid",
+            Self::MissingToken => "response_placeholder_missing",
+            Self::ChangedTokenOrder { .. } => "response_placeholder_order_mismatch",
+            Self::ChangedSegmentCount { .. } => "response_text_segment_count_mismatch",
+            Self::ChangedSegmentKind { .. } => "response_text_segment_shape_mismatch",
+            Self::MissingOrderedToken { .. } => "response_placeholder_missing",
+            Self::UnusedOrderedToken => "response_placeholder_unexpected",
+        }
+    }
+
     fn facts(self) -> Vec<(&'static str, String)> {
         match self {
             Self::ChangedTokenOrder { position } => vec![("position", position.to_string())],
@@ -1748,6 +1822,7 @@ pub(crate) enum GenericPlaceholderMultisetProblem {
     Mismatch,
     Unexpected,
     OrderMismatch,
+    WrapperTopologyChanged,
 }
 
 impl GenericTranslationPreparationProblem {
@@ -1797,6 +1872,9 @@ impl GenericTranslationPreparationProblem {
                 }
                 GenericPlaceholderMultisetProblem::OrderMismatch => {
                     "generic.translation.placeholder_restore.order_mismatch"
+                }
+                GenericPlaceholderMultisetProblem::WrapperTopologyChanged => {
+                    "generic.translation.placeholder_restore.wrapper_topology_changed"
                 }
             },
             Self::ManualTranslationPlaceholderMismatch => {
@@ -2691,8 +2769,188 @@ mod tests {
             &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
             &UiLocalizer::new(UiLocale::SimplifiedChinese),
         );
-        assert!(fields.reason.contains("响应契约"));
-        assert!(!fields.reason.contains("有效 JSON"));
+        let reason = fields.reason.replace(['\u{2068}', '\u{2069}'], "");
+        assert!(reason.contains("根结构或响应结构"));
+        assert!(reason.contains("第 1 行，第 1 列"));
+    }
+
+    #[test]
+    fn response_json_syntax_problem_keeps_its_line_and_column() {
+        let issue = GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskResponse {
+                task_ordinal: 1,
+                total_tasks: 1,
+                problem: GenericTaskResponseProblem::InvalidJson {
+                    category: GenericTaskResponseJsonCategory::Syntax,
+                    line: NonZeroUsize::new(4).expect("测试行号必须非零"),
+                    column: NonZeroUsize::new(7).expect("测试列号必须非零"),
+                },
+            },
+        );
+        let reason = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        )
+        .reason
+        .replace(['\u{2068}', '\u{2069}'], "");
+
+        assert!(reason.contains("不是有效 JSON"));
+        assert!(reason.contains("第 4 行，第 7 列"));
+    }
+
+    #[test]
+    fn empty_think_keeps_internal_root_offset_without_presenting_it_as_field_position() {
+        let issue = GenericIssue::project(
+            GenericDiagnosticStage::Translate,
+            GenericProblem::TaskResponse {
+                task_ordinal: 1,
+                total_tasks: 1,
+                problem: GenericTaskResponseProblem::ThinkingEmpty {
+                    line: NonZeroUsize::new(4).expect("测试行号必须非零"),
+                    column: NonZeroUsize::new(7).expect("测试列号必须非零"),
+                },
+            },
+        );
+        assert!(issue.facts().contains(&("line", "4".to_owned())));
+        assert!(issue.facts().contains(&("column", "7".to_owned())));
+        let reason = render_diagnostic_fields(
+            &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
+            &UiLocalizer::new(UiLocale::SimplifiedChinese),
+        )
+        .reason
+        .replace(['\u{2068}', '\u{2069}'], "");
+
+        assert!(reason.contains("think 字段为空或仅含空白"));
+        assert!(!reason.contains("第 4 行"));
+        assert!(!reason.contains("第 7 列"));
+    }
+
+    #[test]
+    fn response_leaf_problems_render_direct_reasons() {
+        let destination = GenericUnitLocator::new(
+            "story.jsonl",
+            "internal-group",
+            "internal-unit",
+            Some("internal-role"),
+        )
+        .with_natural_position(2, 3);
+        let cases = vec![
+            (
+                GenericTaskResponseProblem::InvalidId { item_index: 0 },
+                "响应第 1 项",
+            ),
+            (
+                GenericTaskResponseProblem::UnexpectedId { output_id: 9 },
+                "未要求的 output ID",
+            ),
+            (
+                GenericTaskResponseProblem::DuplicateId { output_id: 9 },
+                "重复返回了同一个 output ID",
+            ),
+            (
+                GenericTaskResponseProblem::MissingId { output_id: 9 },
+                "缺少本任务要求的 output ID",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidValue {
+                    output_id: 9,
+                    problem: GenericResponseValueProblem::TranslationNotArray,
+                },
+                "translation 必须是字符串数组",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidValue {
+                    output_id: 9,
+                    problem: GenericResponseValueProblem::TranslationNonStringItem {
+                        item: NonZeroUsize::new(2).expect("测试项号必须非零"),
+                    },
+                },
+                "数组第 2 项",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidValue {
+                    output_id: 9,
+                    problem: GenericResponseValueProblem::SourceEchoMissingSource,
+                },
+                "source/translation 结构",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidTranslation {
+                    output_id: 9,
+                    problem: GenericResponseTextProblem::LineFeed,
+                },
+                "包含不允许的换行",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidDestination {
+                    output_id: 9,
+                    destination: destination.clone(),
+                    problem: GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                        problem: GenericPlaceholderMultisetProblem::Mismatch,
+                    },
+                },
+                "Placeholder 的身份或数量",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidDestination {
+                    output_id: 9,
+                    destination: destination.clone(),
+                    problem: GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                        problem: GenericPlaceholderMultisetProblem::Unexpected,
+                    },
+                },
+                "计划外的控制 token",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidDestination {
+                    output_id: 9,
+                    destination,
+                    problem: GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                        problem: GenericPlaceholderMultisetProblem::OrderMismatch,
+                    },
+                },
+                "控制 token 的顺序",
+            ),
+            (
+                GenericTaskResponseProblem::InvalidDestination {
+                    output_id: 9,
+                    destination: GenericUnitLocator::new(
+                        "story.jsonl",
+                        "internal-group",
+                        "internal-unit",
+                        Some("internal-role"),
+                    )
+                    .with_natural_position(2, 3),
+                    problem: GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                        problem: GenericPlaceholderMultisetProblem::WrapperTopologyChanged,
+                    },
+                },
+                "Placeholder 边界",
+            ),
+        ];
+
+        for (problem, expected) in cases {
+            let issue = GenericIssue::project(
+                GenericDiagnosticStage::Translate,
+                GenericProblem::TaskResponse {
+                    task_ordinal: 1,
+                    total_tasks: 1,
+                    problem,
+                },
+            );
+            let reason = render_diagnostic_fields(
+                &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
+                &UiLocalizer::new(UiLocale::SimplifiedChinese),
+            )
+            .reason
+            .replace(['\u{2068}', '\u{2069}'], "");
+            assert!(
+                reason.contains(expected),
+                "诊断原因 {reason:?} 缺少 {expected:?}"
+            );
+            assert!(!reason.contains("响应契约"), "叶子诊断不得退化为总括文案");
+        }
     }
 
     #[test]
@@ -2712,7 +2970,7 @@ mod tests {
             &DiagnosticReport::new(StateEffect::ProgressPreserved, Diagnostic::generic(issue)),
             &UiLocalizer::new(UiLocale::SimplifiedChinese),
         );
-        assert_eq!(fields.reason, "译文需要复核");
+        assert!(fields.reason.contains("仍含源语言文本"));
         assert!(fields.help.contains("Manual"));
         assert!(!fields.reason.contains("__ATT_FALLBACK__"));
     }

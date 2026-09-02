@@ -303,8 +303,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] كرر تدفق النموذج choice نفسه
     [model_stream_output_after_finish] واصل تدفق النموذج الإخراج بعد finish
     [model_stream_unexpected_done] أعاد تدفق Responses علامة [DONE] غير متوقعة
+    [response_json_invalid] استجابة Assistant ليست JSON صالحًا
+    [response_shape_invalid] بنية الجذر أو الاستجابة في JSON الخاص بـ Assistant غير صالحة
+    [response_id_invalid] يحتوي عنصر استجابة على output ID غير صالح
+    [response_id_unexpected] تحتوي الاستجابة على output ID لم يُطلب
+    [response_id_duplicate] تحتوي الاستجابة على output ID نفسه أكثر من مرة
+    [response_id_missing] تفتقد الاستجابة output ID مطلوبًا
+    [response_translation_not_array] يجب أن تكون translation مصفوفة من السلاسل النصية
+    [response_translation_item_not_string] أحد عناصر مصفوفة translation ليس سلسلة نصية
+    [response_echo_shape_invalid] لا يطابق كائن source المعاد بنية source/translation المطلوبة
+    [response_echo_source_item_not_string] أحد عناصر مصفوفة source المعادة ليس سلسلة نصية
+    [response_translation_blank] الترجمة المعادة فارغة
+    [response_translation_text_invalid] تحتوي الترجمة المعادة على فاصل أسطر أو NUL أو علامة ترتيب بايتات غير مسموح بها
+    [response_placeholder_snapshot_invalid] لقطة Placeholder المستخدمة للتحقق من الاستجابة غير صالحة
+    [response_placeholder_identity_or_count_mismatch] غيّرت الترجمة هويات Placeholders المطلوبة أو أعدادها
+    [response_placeholder_missing] تفتقد الترجمة token تحكم مطلوبًا
+    [response_placeholder_unexpected] تحتوي الترجمة على token تحكم غير متوقع
+    [response_placeholder_order_mismatch] غيّرت الترجمة ترتيب tokens التحكم المطلوب
+    [response_placeholder_binding_mismatch] غيّرت الترجمة ارتباط Placeholders المطلوبة بالنص
+    [response_placeholder_boundary_mismatch] أضافت الترجمة حد Placeholder مطلوبًا أو أزالته
+    [response_placeholder_reserved_token] تحتوي الترجمة على token Placeholder محجوز
+    [response_placeholder_ambiguous] لا يمكن مطابقة Placeholder المعاد مع token مطلوب واحد بشكل لا لبس فيه
+    [response_control_token_invalid] بنية tokens التحكم المعادة غير صالحة
+    [response_text_segment_count_mismatch] غيّرت الاستجابة عدد مقاطع النص المطلوبة
+    [response_text_segment_shape_mismatch] غيّرت الاستجابة بنية مقاطع النص المطلوبة
+    [response_line_count_mismatch] عدد عناصر مصفوفة translation غير صحيح
+    [response_line_text_invalid] يحتوي عنصر في مصفوفة translation على نص لا يمكن قبوله
+    [response_blank_line_mismatch] لم تحافظ مصفوفة translation على الخانات الفارغة وغير الفارغة المطلوبة
+    [response_source_residual] لا تزال الترجمة المقبولة تحتوي على نص بلغة المصدر وتحتاج إلى مراجعة
+    [response_finish_requires_review] توقف النموذج لسبب غير نهائي؛ تحتاج النتيجة المعادة إلى مراجعة
+    [response_thinking_empty] حقل think المطلوب فارغ أو يحتوي على مسافات بيضاء فقط
+    [response_no_usable_output] لا تحتوي استجابة Assistant على إخراج قابل للاستخدام
+    [response_all_outputs_rejected] رُفضت كل المخرجات في استجابة Assistant
     [invalid_response_contract] استجابة النموذج لا تستوفي عقد الاستجابة المطلوب
-    [needs_review] تحتاج الترجمة إلى مراجعة
     [lua_compilation_failed] تعذر تجميع برنامج Lua الرئيسي
     [lua_execution_failed] فشل برنامج Lua الرئيسي أثناء التشغيل
     [rules_pattern_match_failed] تعذر تقييم نمط PCRE2 في Rules
@@ -376,6 +407,11 @@ diagnostic-provider-code = رمز المزوّد: { $code }
 diagnostic-provider-type = نوع المزوّد: { $kind }
 diagnostic-provider-message = رسالة المزوّد: { $message }
 diagnostic-json-position = السطر { $line }، العمود { $column }
+diagnostic-response-item = عنصر الاستجابة { $item }
+diagnostic-array-item = عنصر المصفوفة { $item }
+diagnostic-token-position = موضع token التحكم { $position }
+diagnostic-text-segment = مقطع النص { $segment }
+diagnostic-expected-actual = المتوقع { $expected }، والمستلم { $actual }
 diagnostic-placeholder-rule-file = قاعدة Placeholder رقم { $number } في { $path }
 diagnostic-placeholder-rule-project = قاعدة Placeholder رقم { $number } في المشروع الحالي
 manual-exported = تم تصدير { $entries } إدخالات إلى { $path }

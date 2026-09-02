@@ -299,8 +299,39 @@ diagnostic-failure-value = { $code ->
     [model_stream_duplicate_choice] The model stream repeated the same choice
     [model_stream_output_after_finish] The model stream continued after finish
     [model_stream_unexpected_done] The Responses model stream returned an unexpected [DONE]
+    [response_json_invalid] The assistant response is not valid JSON
+    [response_shape_invalid] The assistant JSON has an invalid root or response shape
+    [response_id_invalid] A response item has an invalid output ID
+    [response_id_unexpected] The response contains an output ID that was not requested
+    [response_id_duplicate] The response contains the same output ID more than once
+    [response_id_missing] The response is missing a requested output ID
+    [response_translation_not_array] The translation value must be an array of strings
+    [response_translation_item_not_string] A translation array item is not a string
+    [response_echo_shape_invalid] The echoed source object does not match the requested source/translation shape
+    [response_echo_source_item_not_string] An echoed source array item is not a string
+    [response_translation_blank] The returned translation is blank
+    [response_translation_text_invalid] The returned translation contains a disallowed line break, NUL, or byte-order mark
+    [response_placeholder_snapshot_invalid] The Placeholder snapshot used to validate this response is invalid
+    [response_placeholder_identity_or_count_mismatch] The translation changed the required Placeholder identities or counts
+    [response_placeholder_missing] The translation is missing a required control token
+    [response_placeholder_unexpected] The translation contains an unexpected control token
+    [response_placeholder_order_mismatch] The translation changed the required control-token order
+    [response_placeholder_binding_mismatch] The translation changed how required Placeholders bind to the text
+    [response_placeholder_boundary_mismatch] The translation added or removed a required Placeholder boundary
+    [response_placeholder_reserved_token] The translation contains a reserved Placeholder token
+    [response_placeholder_ambiguous] A returned Placeholder cannot be matched to one required token unambiguously
+    [response_control_token_invalid] The returned control-token structure is invalid
+    [response_text_segment_count_mismatch] The response changed the required number of text segments
+    [response_text_segment_shape_mismatch] The response changed the required text-segment structure
+    [response_line_count_mismatch] The translation array has the wrong number of items
+    [response_line_text_invalid] A translation array item contains text that cannot be accepted
+    [response_blank_line_mismatch] The translation did not preserve the required blank and non-blank array slots
+    [response_source_residual] The accepted translation still contains source-language text and needs review
+    [response_finish_requires_review] The model stopped for a non-final reason; the returned result needs review
+    [response_thinking_empty] The required think field is empty or contains only whitespace
+    [response_no_usable_output] The assistant response contains no usable output
+    [response_all_outputs_rejected] Every output in the assistant response was rejected
     [invalid_response_contract] The model response does not satisfy the required response contract
-    [needs_review] The translation needs review
     [lua_compilation_failed] the Lua main program could not be compiled
     [lua_execution_failed] The Lua main program failed while it was running
     [rules_pattern_match_failed] The Rules PCRE2 pattern could not be evaluated
@@ -372,6 +403,11 @@ diagnostic-provider-code = Provider code: { $code }
 diagnostic-provider-type = Provider type: { $kind }
 diagnostic-provider-message = Provider message: { $message }
 diagnostic-json-position = line { $line }, column { $column }
+diagnostic-response-item = response item { $item }
+diagnostic-array-item = array item { $item }
+diagnostic-token-position = control-token position { $position }
+diagnostic-text-segment = text segment { $segment }
+diagnostic-expected-actual = expected { $expected }, received { $actual }
 diagnostic-placeholder-rule-file = Placeholder rule { $number } in { $path }
 diagnostic-placeholder-rule-project = Placeholder rule { $number } in the current project
 manual-exported = Exported { $entries } entries to { $path }
