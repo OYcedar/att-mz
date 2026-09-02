@@ -35,6 +35,15 @@ RPG Maker 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、�
 - Rules：能够确定、可逆提取和写回的位置；
 - Generic：已经建立外部 JSONL 往返映射的其他可见文本来源。
 
+随包 Python 程序属于 ATT 统一维护的可执行工具。普通翻译任务使用当前发行副本，或项目发布者提供
+的完整替换文件。程序输出的消费者推断、关系分组、Rules 和 Placeholder 建议都是候选；Agent 用
+真实游戏消费者以及能区分边界的正反例审核候选，再写入当前项目决策。`analysis_status=confirmed`
+只确认扫描所得的结构观察，玩家可见正文边界和最终所有者仍由消费者证据确定。
+
+项目选择或消费者证据有误时，修改生成的 decisions、Rules 和 Placeholder Rules。Manual 只编辑
+译文字段；Manual ID、scan/finalize 产物以及 audit/preflight 结果使用相应工具重新生成，以生成结果
+完成对账。
+
 暂时缺少消费者证据的位置标记为 `unresolved`，并列入人工实机检查清单。用户提供的截图、场景和
 触发步骤可以用于补充消费者证据和定位遗漏来源。
 
@@ -42,6 +51,16 @@ RPG Maker 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、�
 
 按引擎规格执行 Init，保存本轮实际采用的 dialogue rules、Extract Rules 和 Generic 输入，然后
 执行 Extract。导出 ownership 并运行 Survey audit，确认每个已纳入位置只有一个所有者。
+
+Survey 生成的 Manual ID、ownership 投影、audit 和 preflight 集合必须与同目录 `att.exe` 的实际
+导出逐项一致。出现缺失、多出或不匹配时，以首个不一致的物理位置为反例，追溯分类和编号规则，
+并判断 Survey 或 `att.exe` 哪一侧偏离现行规格。`att.exe` 符合现行规格而 Survey 偏离时，维护者在
+仓库统一源 `skills/translate-with-att/scripts` 修复脚本、验证受影响来源并通过发行资源同步交付；
+普通任务继续使用完整发行文件，不建立游戏私有脚本分支。`att.exe` 与现行规格冲突时，暂停翻译
+流水线并在 ATT 语义所有者处修复根因，脚本随后对齐修复后的正确投影。
+
+辅助程序更新后，从最早受影响的 Survey 阶段重新生成 decisions、Rules、Placeholder Rules、Manual
+ID、audit 和 preflight 结果，然后重新执行 Extract、ownership export、audit 和 preflight。
 
 Extract 完成后导出完整 Manual：
 
