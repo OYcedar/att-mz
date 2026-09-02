@@ -99,6 +99,11 @@ unavailable、failed、not committed after an earlier failure 或 cancelled；�
 任务只在第一次真实外部 HTTP attempt 开始时写 `task.started`。请求构造失败、准入前取消
 或服务停发门拒绝仍是 not_started，不会产生伪造的 attempt、started 或 `task.finished`。
 `task.finished.attempts` 必须大于零，并只计算该任务真实开始的 HTTP attempt。
+`task.finished.payload.provider` 固定存在：上游在最终一次实际 HTTP attempt 中提供了可用的
+路由元数据时保存安全的服务方名称，否则保存 `null`。发生重试时仅以最终 attempt 为准；新的
+attempt 开始后不沿用上一次归因。元数据先于流式包络错误到达时仍属于该 attempt 的已确认事实。
+`task.finished.message` 使用同一名称；`provider` 为 `null` 时显示本地化的“未提供”。供应商名称
+只用于诊断实际路由，不参与任务验收、重试、提交或恢复。
 
 发生重试时，`retry.summary` 的 attempted、recovered 与 exhausted 都以第一次请求之后的
 实际 HTTP attempt 为单位。recovered 统计未耗尽重试过程中的额外 attempt，exhausted

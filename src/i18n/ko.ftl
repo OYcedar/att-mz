@@ -148,7 +148,10 @@ log-plan-resolved = 명령 { $command }의 계획 출처: { $source }.
 log-phase-started = 단계 시작: { $phase }.
 log-retry-summary = { $count }회 재시도했습니다.
 log-translation-task-started = 번역 작업 { $index }/{ $total } 시작.
-log-translation-task-finished = 번역 작업 { $index }이 결과 { $outcome }으로 종료되었습니다.
+log-translation-task-finished = 번역 작업 { $index }이 결과 { $outcome }으로 종료되었습니다. { $provider_status ->
+    [present] 업스트림 제공자: { $provider }.
+   *[missing] 업스트림 제공자: 제공되지 않음.
+}
 log-run-recovery-required = 명령 { $command }이 복구가 필요한 상태로 끝났습니다. 진단에 표시된 복구 위치를 확인하십시오.
 log-phase-completed = 단계 완료: { $phase }.
 log-phase-stopped = { $outcome ->
@@ -294,7 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Responses 스트림에 종료 이벤트가 없습니다
     [model_stream_event_type_mismatch] SSE 이벤트 이름과 JSON type이 일치하지 않습니다
     [model_stream_duplicate_choice] 모델 스트림이 같은 choice를 중복 반환했습니다
-    [model_stream_output_after_finish] 모델 스트림이 finish 뒤에도 출력을 계속했습니다
+    [model_stream_choice_after_finish] Chat 스트림이 finish 뒤에 응답을 변경하는 필드를 보냈습니다
     [model_stream_unexpected_done] Responses 스트림이 예기치 않은 [DONE]을 반환했습니다
     [response_json_invalid] Assistant 응답이 올바른 JSON이 아닙니다
     [response_shape_invalid] Assistant JSON의 루트 또는 응답 구조가 요구 사항과 다릅니다
@@ -404,6 +407,7 @@ diagnostic-response-item = 응답 항목 { $item }
 diagnostic-array-item = 배열 항목 { $item }
 diagnostic-token-position = 제어 token 위치 { $position }
 diagnostic-text-segment = 텍스트 세그먼트 { $segment }
+diagnostic-post-finish-fields = finish 뒤의 필드: { $fields }
 diagnostic-expected-actual = 예상 { $expected }, 실제 { $actual }
 diagnostic-placeholder-rule-file = { $path }의 Placeholder 규칙 { $number }
 diagnostic-placeholder-rule-project = 현재 프로젝트의 Placeholder 규칙 { $number }
@@ -438,6 +442,8 @@ task-record-final-status = 상태: { $state ->
     [cancelled] 취소됨, 미커밋
    *[other] { $state }
 }
+task-record-provider = 업스트림 제공자: { $provider }
+task-record-provider-unavailable = 업스트림 제공자: 제공되지 않음
 task-record-requested = 요청된 번역: { $requested }개
 task-record-accepted-written = 수락: { $accepted }개 항목(ID: { $ids }), 실제 위치 { $written }곳에 기록
 task-record-accepted-outcome-unknown = 검수 완료: { $accepted }개 항목(ID: { $ids }); 데이터베이스 커밋 결과를 확인할 수 없음

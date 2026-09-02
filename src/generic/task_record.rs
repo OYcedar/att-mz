@@ -10,7 +10,7 @@ use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
 use crate::llm::ApiKeyRedactor;
 use crate::translation::task_record::{
     TranslationTaskRecordArtifact, TranslationTaskRecordOutputSummary, markdown_fence,
-    markdown_json_fence, task_record_output_ids, task_record_text,
+    markdown_inline_text, markdown_json_fence, task_record_output_ids, task_record_text,
 };
 
 #[derive(Clone, Debug)]
@@ -110,6 +110,7 @@ pub(crate) struct GenericTaskRecordDocument {
     requested_outputs: usize,
     user_message: String,
     raw_assistant: Option<String>,
+    provider: Option<String>,
     state: GenericTaskRecordState,
 }
 
@@ -119,6 +120,7 @@ impl GenericTaskRecordDocument {
         requested_outputs: usize,
         user_message: String,
         raw_assistant: Option<String>,
+        provider: Option<String>,
         state: GenericTaskRecordState,
     ) -> Self {
         Self {
@@ -126,6 +128,7 @@ impl GenericTaskRecordDocument {
             requested_outputs,
             user_message,
             raw_assistant,
+            provider,
             state,
         }
     }
@@ -168,6 +171,15 @@ fn render_generic_task_record(
             }
         )
     );
+    let provider = document
+        .provider
+        .as_deref()
+        .map(|provider| markdown_inline_text(&redactor.redact(provider)));
+    let provider = match provider.as_deref() {
+        Some(provider) => task_record_text(&localizer, UiMessage::TaskRecordProvider { provider }),
+        None => task_record_text(&localizer, UiMessage::TaskRecordProviderUnavailable),
+    };
+    let _ = writeln!(output, "- {provider}");
     let _ = writeln!(
         output,
         "- {}",
@@ -242,6 +254,7 @@ mod tests {
             1,
             r#"{"units":[{"text":"原文"}]}"#.to_owned(),
             Some(r#"{"translations":{"0":["译文"]}}"#.to_owned()),
+            Some("SiliconFlow".to_owned()),
             GenericTaskRecordState::committed(true, vec![0], 1, Vec::new()),
         );
         let rendered = document.render(
@@ -253,6 +266,7 @@ mod tests {
         assert!(rendered.contains("## Assistant"));
         assert!(rendered.contains("# 翻译任务"));
         assert!(rendered.contains("## 最终结果"));
+        assert!(rendered.contains("SiliconFlow"));
         assert!(rendered.contains("要求译文：1 项"));
         assert!(rendered.contains("已接受：1 项（ID：0）"));
         assert!(rendered.contains("未接受：0 项（ID：—）"));
@@ -268,12 +282,13 @@ mod tests {
     }
 
     #[test]
-    fn record_redacts_user_and_raw_assistant() {
+    fn record_redacts_user_raw_assistant_and_provider() {
         let document = GenericTaskRecordDocument::new(
             0,
             1,
             r#"{"text":"secret"}"#.to_owned(),
             Some(r#"{"translation":"secret"}"#.to_owned()),
+            Some("secret".to_owned()),
             GenericTaskRecordState::committed(true, vec![0], 1, Vec::new()),
         );
         let rendered = document.render(
@@ -282,6 +297,43 @@ mod tests {
         );
 
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn record_without_provider_still_renders_the_final_attempt_field() {
+        let document = GenericTaskRecordDocument::new(
+            0,
+            1,
+            r#"{"text":"原文"}"#.to_owned(),
+            None,
+            None,
+            GenericTaskRecordState::cancelled(),
+        );
+        let rendered = document.render(
+            &ApiKeyRedactor::new(SecretString::from("secret")),
+            UiLocale::SimplifiedChinese,
+        );
+
+        assert!(rendered.contains("上游服务方：未提供"));
+    }
+
+    #[test]
+    fn record_renders_provider_as_markdown_plain_text() {
+        let document = GenericTaskRecordDocument::new(
+            0,
+            1,
+            r#"{"text":"原文"}"#.to_owned(),
+            None,
+            Some("[OpenAI](https://example.invalid)".to_owned()),
+            GenericTaskRecordState::cancelled(),
+        );
+        let rendered = document.render(
+            &ApiKeyRedactor::new(SecretString::from("secret")),
+            UiLocale::SimplifiedChinese,
+        );
+
+        assert!(rendered.contains(r"\[OpenAI\]\(https\:\/\/example\.invalid\)"));
+        assert!(!rendered.contains("[OpenAI](https://example.invalid)"));
     }
 
     #[test]

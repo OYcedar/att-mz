@@ -62,6 +62,10 @@ Responses 的 `input`，role 与字符串 content 保持不变。Client 的严�
 的 `background` 固定为 `false`，这些字段都不得由 parameters 覆盖。ATT 不执行后台任务轮询。
 供应商私有字段原样发给供应商，ATT 自己不解释。API key 只以 Bearer Header 的形式发送。
 
+当完成后的 Endpoint host 精确为 `openrouter.ai` 时，ATT 同时发送
+`X-OpenRouter-Metadata: enabled`，让 OpenRouter 在响应中提供本次请求的路由结果。其他 host
+沿用基础 Header 集合；不通过路径、模型名或请求参数猜测服务身份。
+
 `connect_timeout_ms` 管 DNS、TCP 与 TLS 建连，`read_timeout_ms` 管每次响应头、完整 JSON、
 错误正文或 SSE chunk 的读取，`request_timeout_ms` 是从开始发送到完整响应终止的外围总
 deadline。总 deadline 覆盖建连、发送、响应头、错误正文、完整 JSON 和整个 SSE；本地许可、
@@ -71,6 +75,14 @@ deadline。总 deadline 覆盖建连、发送、响应头、错误正文、完�
 
 HTTP 200 后按 Client 的 `stream` 选择唯一响应格式。`false` 要求正文是一个完整 JSON
 object；`true` 按 SSE 事件读取。ATT 不根据 `Content-Type` 改变或猜测格式。
+
+对上述 OpenRouter Endpoint，非流式 Chat 和 Responses 从响应 object、流式 Chat 从每个 chunk
+object、流式 Responses 从终态 event 的 `response` object 读取
+`openrouter_metadata.endpoints.available`，取得唯一 `selected = true` 项的字符串 `provider`。
+名称先执行当前 Client 的 API key 精确替换，再收敛为单行并去除首尾空白；结果必须包含可见内容
+且不超过 128 UTF-8 字节。元数据缺失、结构错误、没有或存在多个 selected、名称无效，以及同一
+Chat 流内出现冲突名称时，本 attempt 的服务方记为“未提供”，核心成功信封继续独立验收。新字段
+和其他路由细节按扩展字段忽略；裸顶层 `provider` 不属于这条投影契约。
 
 ### 3.1 非流式 JSON
 
@@ -114,9 +126,12 @@ Chat Completions 的每条 `data`（终止标记除外）必须是 JSON：
   并映射到 ContentFilter；
 - `finish_reason` 按 3.1 节的同一规则映射。取得该字符串及正文后，独立的 `[DONE]` 立即
   结束响应；如果供应商省略 `[DONE]`，只有 HTTP body 正常完整结束、SSE decoder 没有残留
-  半个事件时，才以同一个明确 finish 建立响应。第二个 finish reason、finish reason 后再次
-  出现 `index = 0`、缺少正文或 finish、终态字段类型错误时失败；传输截断永远不能借正常
-  EOF 规则成为成功。
+  半个事件时，才以同一个明确 finish 建立响应。首个 finish 后仍逐帧验证信封：`choices = []`、
+  没有 `index = 0`，以及 `index = 0` 的空 delta、role-only delta、null 或空字符串
+  content/refusal 都是不会改变已完成响应的中性尾帧，继续等待 `[DONE]` 或干净 EOF；非空
+  content、非空 refusal 或第二个字符串 finish reason 以 `choice_after_finish` 失败，并在诊断
+  事实中按固定顺序列出 `delta.content`、`delta.refusal`、`finish_reason`。缺少 delta object 或
+  字段类型错误继续按对应信封问题失败；传输截断永远不能借正常 EOF 规则成为成功。
 
 Responses 的每条 `data` 必须是带字符串 `type` 的 JSON event：
 
@@ -150,6 +165,12 @@ SSE 事件或成功信封。
 
 attempt 只在真实外部 HTTP 发送开始时计数。等待许可、限速、请求构造失败、发送前取消和
 已关闭准入门的拒绝都是零 attempt；调用方不得据此记录 Task started 或补造模型证据。
+一次真实 attempt 后，如果下一次重试在发送前遇到已关闭的共享准入门，前一次 attempt 仍是
+该任务的最终实际 attempt；任务以已开始但 unavailable 收尾，并保留该 attempt 已确认的服务方。
+每次真实 attempt 开始时清空上一 attempt 的服务方归因；终态从本次统一响应或响应信封失败中
+记录已经确认的名称。重试成功使用最终成功 attempt，重试耗尽使用最后一个 attempt；合法 Router
+Metadata 一经读取，后续流式信封错误、读取传输失败或总超时仍保留该名称。这个证据只用于项目
+日志和任务记录，不参与重试、验收、提交或服务状态分类。
 
 请求层和 Translate 调度层共享同一次运行的停止事实：
 
@@ -172,7 +193,7 @@ Fatal 包含请求构造失败、TLS/证书问题、其他不可重试 HTTP 状�
 状态、`Retry-After`、供应商 code/type，以及标准 `error` 信封中经过闭集替换和单行清理的
 `message`；流式失败分别说明无效 UTF-8、事件 JSON、未以空行闭合的 SSE 事件、服务错误事件、
 Chat 缺少 `finish_reason`、Responses 缺少终态、event/type 不一致、重复 choice、finish 后继续
-输出或 Responses 意外出现 `[DONE]`，不回显事件正文。完整错误正文不落盘。
+输出的具体字段或 Responses 意外出现 `[DONE]`，不回显事件正文。完整错误正文不落盘。
 
 内部错误区分 DNS、TCP 连接、发送、读取、TLS、连接超时、读取超时、总超时、HTTP status、
 响应 JSON 和成功信封错误。进入 CLI、项目日志和任务记录前，只呈现 Endpoint 对象、直连或
@@ -226,6 +247,7 @@ Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处
 
 替换器只碰命中的闭集值：所在字段、段落和相邻正文保持原样，替换标记本身也不再处理。
 配置、Endpoint、Model、parameters、Header、Provider 外层信封和非 200 原始 body 不进入
-任务记录。`Authorization` 是一个字段和一种认证方案，不是另一类敏感信息；诊断需要说明
-认证事实时，保留字段名和方案就够了。任务记录的其余格式契约见
+任务记录；只有按第 3 节规则投影的最终 attempt 服务方名称进入最终结果。`Authorization` 是一个
+字段和一种认证方案，不是另一类敏感信息；诊断需要说明认证事实时，保留字段名和方案就够了。
+任务记录的其余格式契约见
 [模型任务记录现行规格](../translation/task-records.md)。

@@ -148,7 +148,10 @@ log-plan-resolved = 命令 { $command } 的方案來自{ $source }。
 log-phase-started = 階段開始：{ $phase }。
 log-retry-summary = 共執行 { $count } 次重試。
 log-translation-task-started = 翻譯工作 { $index }/{ $total } 已開始。
-log-translation-task-finished = 翻譯工作 { $index } 已結束，結果為 { $outcome }。
+log-translation-task-finished = 翻譯工作 { $index } 已結束，結果為 { $outcome }。{ $provider_status ->
+    [present] 上游服務方：{ $provider }。
+   *[missing] 上游服務方：未提供。
+}
 log-run-recovery-required = 命令 { $command } 結束時需要復原；請依診斷中的復原位置處理。
 log-phase-completed = 階段已完成：{ $phase }。
 log-phase-stopped = { $outcome ->
@@ -294,7 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Responses 模型串流缺少終態事件
     [model_stream_event_type_mismatch] 模型串流的 SSE event 與 JSON type 不一致
     [model_stream_duplicate_choice] 模型串流重複傳回同一 choice
-    [model_stream_output_after_finish] 模型串流在 finish 後繼續輸出
+    [model_stream_choice_after_finish] Chat 模型串流在 finish 後又傳送了會改變回應的欄位
     [model_stream_unexpected_done] Responses 模型串流意外傳回 [DONE]
     [response_json_invalid] Assistant 回應不是有效的 JSON
     [response_shape_invalid] Assistant JSON 的根結構或回應結構不符合要求
@@ -404,6 +407,7 @@ diagnostic-response-item = 回應第 { $item } 項
 diagnostic-array-item = 陣列第 { $item } 項
 diagnostic-token-position = 控制 token 第 { $position } 個位置
 diagnostic-text-segment = 文字第 { $segment } 個片段
+diagnostic-post-finish-fields = finish 後的欄位：{ $fields }
 diagnostic-expected-actual = 要求 { $expected }，實際 { $actual }
 diagnostic-placeholder-rule-file = { $path } 中的 Placeholder 規則 { $number }
 diagnostic-placeholder-rule-project = 目前專案的 Placeholder 規則 { $number }
@@ -438,6 +442,8 @@ task-record-final-status = 狀態：{ $state ->
     [cancelled] 已取消，未提交
    *[other] { $state }
 }
+task-record-provider = 上游服務方：{ $provider }
+task-record-provider-unavailable = 上游服務方：未提供
 task-record-requested = 要求譯文：{ $requested } 項
 task-record-accepted-written = 已接受：{ $accepted } 項（ID：{ $ids }），寫入 { $written } 個實際位置
 task-record-accepted-outcome-unknown = 已驗收：{ $accepted } 項（ID：{ $ids }）；無法確認資料庫提交終態

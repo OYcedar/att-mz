@@ -1184,6 +1184,7 @@ pub(crate) enum ProjectLogEvent {
     TaskFinished {
         task: TaskPosition,
         attempts: u64,
+        provider: Option<SafeText>,
         outcome: TaskFinishedOutcome,
     },
     TranslationFinished {
@@ -1434,13 +1435,19 @@ impl ProjectLogEvent {
                 index: task.ordinal,
                 total: task.total,
             }),
-            Self::TaskFinished { task, outcome, .. } => {
+            Self::TaskFinished {
+                task,
+                provider,
+                outcome,
+                ..
+            } => {
                 let outcome = localizer.format(UiMessage::LogTaskOutcomeValue {
                     outcome: outcome.as_str(),
                 });
                 localizer.format(UiMessage::LogTranslationTaskFinished {
                     index: task.ordinal,
                     outcome: &outcome,
+                    provider: provider.as_ref().map(SafeText::as_str),
                 })
             }
             Self::TranslationFinished { result } => {
@@ -1862,6 +1869,7 @@ enum ProjectLogPayloadRef<'a> {
     TaskFinished {
         task: &'a TaskPosition,
         attempts: &'a u64,
+        provider: &'a Option<SafeText>,
         outcome: &'a TaskFinishedOutcome,
     },
     TranslationFinished {
@@ -1918,10 +1926,12 @@ impl<'a> ProjectLogPayloadRef<'a> {
             ProjectLogEvent::TaskFinished {
                 task,
                 attempts,
+                provider,
                 outcome,
             } => Self::TaskFinished {
                 task,
                 attempts,
+                provider,
                 outcome,
             },
             ProjectLogEvent::TranslationFinished { result } => Self::TranslationFinished { result },
@@ -4284,6 +4294,7 @@ mod tests {
             ProjectLogEvent::TaskFinished {
                 task: TaskPosition::new(1, 1).expect("任务位置必须有效"),
                 attempts: 1,
+                provider: None,
                 outcome: TaskFinishedOutcome::Failed { diagnostic },
             }
             .level(),
@@ -4293,6 +4304,7 @@ mod tests {
             ProjectLogEvent::TaskFinished {
                 task: TaskPosition::new(1, 1).expect("任务位置必须有效"),
                 attempts: 1,
+                provider: None,
                 outcome: TaskFinishedOutcome::NotCommittedAfterEarlierFailure { diagnostic },
             }
             .level(),
@@ -4582,11 +4594,13 @@ mod tests {
                 ProjectLogEvent::TaskFinished {
                     task: TaskPosition::new(1, 1).expect("任务位置必须有效"),
                     attempts: 1,
+                    provider: None,
                     outcome: TaskFinishedOutcome::Complete,
                 },
                 ProjectLogEvent::TaskFinished {
                     task: TaskPosition::new(1, 1).expect("任务位置必须有效"),
                     attempts: 1,
+                    provider: None,
                     outcome: TaskFinishedOutcome::NotCommittedAfterEarlierFailure { diagnostic },
                 },
                 ProjectLogEvent::TranslationFinished {
@@ -4716,6 +4730,7 @@ mod tests {
             logger.emit(ProjectLogEvent::TaskFinished {
                 task,
                 attempts: 0,
+                provider: None,
                 outcome: TaskFinishedOutcome::Partial { diagnostic },
             }),
             Err(EmitError::InvalidTaskAttempts {
@@ -4728,6 +4743,7 @@ mod tests {
             .emit(ProjectLogEvent::TaskFinished {
                 task,
                 attempts: 1,
+                provider: None,
                 outcome: TaskFinishedOutcome::Partial { diagnostic },
             })
             .expect("任务必须有终态");
@@ -4877,6 +4893,7 @@ mod tests {
             .emit(ProjectLogEvent::TaskFinished {
                 task: first,
                 attempts: 1,
+                provider: None,
                 outcome: TaskFinishedOutcome::Failed { diagnostic },
             })
             .expect("首个任务必须失败");
@@ -4887,6 +4904,7 @@ mod tests {
             .emit(ProjectLogEvent::TaskFinished {
                 task: second,
                 attempts: 1,
+                provider: None,
                 outcome: TaskFinishedOutcome::NotCommittedAfterEarlierFailure { diagnostic },
             })
             .expect("后续任务必须明确表示未提交");
@@ -5817,6 +5835,7 @@ mod tests {
             translate_logger.emit(ProjectLogEvent::TaskFinished {
                 task,
                 attempts: 1,
+                provider: None,
                 outcome: TaskFinishedOutcome::Failed {
                     diagnostic: run_diagnostic,
                 },

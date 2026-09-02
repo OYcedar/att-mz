@@ -151,7 +151,10 @@ log-retry-summary = { $count ->
    *[other] { $count } retries were performed.
 }
 log-translation-task-started = Translation task { $index }/{ $total } started.
-log-translation-task-finished = Translation task { $index } finished with outcome { $outcome }.
+log-translation-task-finished = Translation task { $index } finished with outcome { $outcome }. { $provider_status ->
+    [present] Upstream provider: { $provider }.
+   *[missing] Upstream provider: not provided.
+}
 log-run-recovery-required = Command { $command } ended in a state that requires recovery; follow the recovery locations in the diagnostic.
 log-phase-completed = Phase completed: { $phase }.
 log-phase-stopped = { $outcome ->
@@ -297,7 +300,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] The Responses model stream is missing its terminal event
     [model_stream_event_type_mismatch] The SSE event name and JSON type do not match
     [model_stream_duplicate_choice] The model stream repeated the same choice
-    [model_stream_output_after_finish] The model stream continued after finish
+    [model_stream_choice_after_finish] The Chat stream sent response-changing fields after finish
     [model_stream_unexpected_done] The Responses model stream returned an unexpected [DONE]
     [response_json_invalid] The assistant response is not valid JSON
     [response_shape_invalid] The assistant JSON has an invalid root or response shape
@@ -407,6 +410,7 @@ diagnostic-response-item = response item { $item }
 diagnostic-array-item = array item { $item }
 diagnostic-token-position = control-token position { $position }
 diagnostic-text-segment = text segment { $segment }
+diagnostic-post-finish-fields = fields after finish: { $fields }
 diagnostic-expected-actual = expected { $expected }, received { $actual }
 diagnostic-placeholder-rule-file = Placeholder rule { $number } in { $path }
 diagnostic-placeholder-rule-project = Placeholder rule { $number } in the current project
@@ -441,6 +445,8 @@ task-record-final-status = Status: { $state ->
     [cancelled] cancelled; not committed
    *[other] { $state }
 }
+task-record-provider = Upstream provider: { $provider }
+task-record-provider-unavailable = Upstream provider: not provided
 task-record-requested = Requested translations: { $requested }
 task-record-accepted-written = Accepted: { $accepted } items (IDs: { $ids }); written to { $written } actual locations
 task-record-accepted-outcome-unknown = Validated: { $accepted } items (IDs: { $ids }); database commit outcome cannot be confirmed

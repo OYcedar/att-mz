@@ -2290,13 +2290,52 @@ pub(crate) enum HttpEnvelopeViolation {
     InvalidStreamEvent,
     StreamErrorEvent,
     DuplicateChoice,
-    ChoiceAfterFinish,
+    ChoiceAfterFinish {
+        post_finish_fields: HttpPostFinishFields,
+    },
     InvalidFieldType,
     EventTypeMismatch,
     UnclosedSseEvent,
     MissingResponsesTerminal,
     UnexpectedDoneMarker,
     InvalidContract,
+}
+
+/// Chat 流在首个 finish 后仍携带了哪些会改变响应终态的字段。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HttpPostFinishFields {
+    content: bool,
+    refusal: bool,
+    finish_reason: bool,
+}
+
+impl HttpPostFinishFields {
+    pub(crate) const fn new(content: bool, refusal: bool, finish_reason: bool) -> Option<Self> {
+        if content || refusal || finish_reason {
+            Some(Self {
+                content,
+                refusal,
+                finish_reason,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn fact_value(self) -> String {
+        let mut fields = Vec::with_capacity(3);
+        if self.content {
+            fields.push("delta.content");
+        }
+        if self.refusal {
+            fields.push("delta.refusal");
+        }
+        if self.finish_reason {
+            fields.push("finish_reason");
+        }
+        fields.join(",")
+    }
 }
 
 impl HttpEnvelopeViolation {
@@ -2313,7 +2352,7 @@ impl HttpEnvelopeViolation {
             Self::InvalidStreamEvent => "invalid_stream_event",
             Self::StreamErrorEvent => "stream_error_event",
             Self::DuplicateChoice => "duplicate_choice",
-            Self::ChoiceAfterFinish => "choice_after_finish",
+            Self::ChoiceAfterFinish { .. } => "choice_after_finish",
             Self::InvalidFieldType => "invalid_field_type",
             Self::EventTypeMismatch => "event_type_mismatch",
             Self::UnclosedSseEvent => "unclosed_sse_event",
@@ -2506,9 +2545,9 @@ impl HttpIssue {
                 ..
             } => "model_stream_duplicate_choice",
             Self::InvalidEnvelope {
-                violation: HttpEnvelopeViolation::ChoiceAfterFinish,
+                violation: HttpEnvelopeViolation::ChoiceAfterFinish { .. },
                 ..
-            } => "model_stream_output_after_finish",
+            } => "model_stream_choice_after_finish",
             Self::InvalidEnvelope {
                 violation: HttpEnvelopeViolation::UnexpectedDoneMarker,
                 ..
@@ -2614,6 +2653,9 @@ impl HttpIssue {
             } => {
                 facts.push(("endpoint", endpoint.to_string()));
                 facts.push(("violation", violation.as_str().to_owned()));
+                if let HttpEnvelopeViolation::ChoiceAfterFinish { post_finish_fields } = violation {
+                    facts.push(("post_finish_fields", post_finish_fields.fact_value()));
+                }
             }
             Self::WaitCancelled { endpoint } | Self::ExecutorClosed { endpoint } => {
                 facts.push(("endpoint", endpoint.to_string()))
@@ -2808,6 +2850,37 @@ mod http_tests {
                     .contains(&("violation", violation.as_str().to_owned()))
             );
         }
+    }
+
+    #[test]
+    fn post_finish_failure_keeps_the_changed_fields_in_protocol_order() {
+        let endpoint = HttpEndpoint::new(HttpScheme::Https, "api.example.test", None);
+        assert_eq!(HttpPostFinishFields::new(false, false, false), None);
+        let post_finish_fields =
+            HttpPostFinishFields::new(true, true, true).expect("至少一个字段时必须形成事实");
+        let issue = HttpIssue::InvalidEnvelope {
+            endpoint,
+            violation: HttpEnvelopeViolation::ChoiceAfterFinish { post_finish_fields },
+        };
+
+        assert_eq!(issue.summary_code(), "model_stream_choice_after_finish");
+        assert!(issue.facts().contains(&(
+            "post_finish_fields",
+            "delta.content,delta.refusal,finish_reason".to_owned(),
+        )));
+
+        let report = crate::diagnostic::DiagnosticReport::new(
+            crate::diagnostic::StateEffect::ProgressPreserved,
+            crate::diagnostic::Diagnostic::http(issue),
+        );
+        let reason = crate::diagnostic::render_diagnostic_fields(
+            &report,
+            &crate::i18n::UiLocalizer::new(crate::i18n::UiLocale::English),
+        )
+        .reason
+        .replace(['\u{2068}', '\u{2069}'], "");
+        assert!(reason.contains("response-changing fields after finish"));
+        assert!(reason.contains("delta.content,delta.refusal,finish_reason"));
     }
 
     #[test]

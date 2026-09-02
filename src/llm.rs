@@ -75,6 +75,7 @@ impl fmt::Display for LlmFinishReason {
 pub(crate) struct LlmResponse {
     content: Arc<String>,
     finish_reason: LlmFinishReason,
+    provider: Option<String>,
 }
 
 impl LlmResponse {
@@ -82,7 +83,14 @@ impl LlmResponse {
         Self {
             content: Arc::new(content.into()),
             finish_reason,
+            provider: None,
         }
+    }
+
+    /// 附加当前 HTTP attempt 已由上游明确报告的实际服务方。
+    pub(crate) fn with_provider(mut self, provider: Option<String>) -> Self {
+        self.provider = provider;
+        self
     }
 
     pub(crate) fn content(&self) -> &str {
@@ -95,6 +103,10 @@ impl LlmResponse {
 
     pub(crate) fn finish_reason(&self) -> &LlmFinishReason {
         &self.finish_reason
+    }
+
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 
     pub(crate) fn into_content_and_finish_reason(self) -> (String, LlmFinishReason) {
@@ -224,6 +236,11 @@ pub(crate) trait LlmRequestFailure {
     /// `Display` 或供应商 message 猜测是否应停止后续请求。
     fn service_status(&self) -> LlmServiceStatus {
         LlmServiceStatus::Other
+    }
+
+    /// 当前 HTTP attempt 已由上游明确报告的实际服务方。
+    fn provider(&self) -> Option<&str> {
+        None
     }
 }
 

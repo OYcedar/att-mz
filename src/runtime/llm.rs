@@ -18,14 +18,18 @@ use url::Url;
 
 use crate::diagnostic::{
     Diagnostic, DiagnosticReport, HttpEndpoint, HttpEnvelopeViolation, HttpIssue, HttpJsonCategory,
-    HttpResponseReadFailure, HttpRoute, HttpTransportKind, HttpTransportPhase, SafeIdentifier,
-    SafeText, StateEffect,
+    HttpPostFinishFields, HttpResponseReadFailure, HttpRoute, HttpTransportKind,
+    HttpTransportPhase, SafeIdentifier, SafeText, StateEffect,
 };
 use crate::llm::{
     ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmClientConcurrency, LlmFinishReason,
     LlmRequestError, LlmRequestExecutor, LlmRequestFailure, LlmResponse, LlmServiceStatus,
 };
 use crate::user_text::sanitize_user_text;
+
+const OPENROUTER_METADATA_HEADER: &str = "X-OpenRouter-Metadata";
+const OPENROUTER_METADATA_ENABLED: &str = "enabled";
+const MAX_PROVIDER_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenAiProtocol {
@@ -90,6 +94,11 @@ impl OpenAiEndpoint {
     }
 }
 
+fn is_openrouter_endpoint(url: &Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai"))
+}
+
 /// 一个可被不同翻译引擎共享的受信 LLM Client。
 pub(crate) struct OpenAiCompatibleClient {
     url: Url,
@@ -97,6 +106,7 @@ pub(crate) struct OpenAiCompatibleClient {
     api_key: SecretString,
     model: Arc<str>,
     stream: bool,
+    openrouter_metadata: bool,
     max_concurrent_requests: NonZeroUsize,
     request_timeout: Duration,
     parameters: Arc<Map<String, Value>>,
@@ -127,6 +137,7 @@ impl OpenAiCompatibleClient {
             protocol,
             stream,
         } = endpoint;
+        let openrouter_metadata = is_openrouter_endpoint(&url);
         let api_key_redactor = Arc::new(ApiKeyRedactor::new(api_key.clone()));
         Self {
             url,
@@ -134,6 +145,7 @@ impl OpenAiCompatibleClient {
             api_key,
             model,
             stream,
+            openrouter_metadata,
             max_concurrent_requests,
             request_timeout,
             parameters,
@@ -160,6 +172,11 @@ impl OpenAiCompatibleClient {
     #[cfg(test)]
     pub(crate) const fn stream(&self) -> bool {
         self.stream
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn openrouter_metadata(&self) -> bool {
+        self.openrouter_metadata
     }
 
     #[cfg(test)]
@@ -361,6 +378,24 @@ impl OpenAiCompatibleExecutor {
         self.lifecycle.wait_until_idle().await;
     }
 
+    fn request_builder(
+        &self,
+        client: &OpenAiCompatibleClient,
+        request_body: Vec<u8>,
+    ) -> reqwest::RequestBuilder {
+        let request = self
+            .client
+            .post(client.url.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .bearer_auth(client.api_key.expose_secret())
+            .body(request_body);
+        if client.openrouter_metadata {
+            request.header(OPENROUTER_METADATA_HEADER, OPENROUTER_METADATA_ENABLED)
+        } else {
+            request
+        }
+    }
+
     async fn execute_request(
         &self,
         client: &OpenAiCompatibleClient,
@@ -380,15 +415,17 @@ impl OpenAiCompatibleExecutor {
 
         on_attempt_started();
         let network_phase = AtomicU8::new(encode_network_phase(HttpTransportPhase::Request));
+        let mut provider = RouterProviderAttribution::default();
         let result = match tokio::time::timeout(
             client.request_timeout,
-            self.execute_network_attempt(client, request_body, &network_phase),
+            self.execute_network_attempt(client, request_body, &network_phase, &mut provider),
         )
         .await
         {
             Ok(result) => result,
             Err(_) => Err(retryable(OpenAiCompatibleError::TotalTimeout {
                 phase: decode_network_phase(network_phase.load(Ordering::Acquire)),
+                provider: provider.cloned_provider(),
             })),
         };
         drop(active_permit);
@@ -401,13 +438,9 @@ impl OpenAiCompatibleExecutor {
         client: &OpenAiCompatibleClient,
         request_body: Vec<u8>,
         network_phase: &AtomicU8,
+        provider: &mut RouterProviderAttribution,
     ) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
-        let request = self
-            .client
-            .post(client.url.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .bearer_auth(client.api_key.expose_secret())
-            .body(request_body);
+        let request = self.request_builder(client, request_body);
         let response = match request.send().await {
             Ok(response) => response,
             Err(source) => return Err(classify_transport_error(HttpTransportPhase::Send, source)),
@@ -506,7 +539,17 @@ impl OpenAiCompatibleExecutor {
         }
 
         if client.stream {
-            match parse_streaming_success_response(client.protocol, response).await {
+            let provider_redactor = client
+                .openrouter_metadata
+                .then_some(client.api_key_redactor.as_ref());
+            match parse_streaming_success_response(
+                client.protocol,
+                response,
+                provider,
+                provider_redactor,
+            )
+            .await
+            {
                 Err(LlmRequestError::Fatal(source @ OpenAiCompatibleError::ParseResponse(_)))
                 | Err(LlmRequestError::Fatal(
                     source @ OpenAiCompatibleError::InvalidResponseWire { .. },
@@ -518,7 +561,13 @@ impl OpenAiCompatibleExecutor {
             }
         } else {
             match response.bytes().await {
-                Ok(body) => parse_success_response(client.protocol, &body),
+                Ok(body) => parse_success_response_with_provider(
+                    client.protocol,
+                    &body,
+                    client
+                        .openrouter_metadata
+                        .then_some(client.api_key_redactor.as_ref()),
+                ),
                 Err(source) => Err(classify_transport_error(
                     HttpTransportPhase::ReadSuccessResponse,
                     source,
@@ -593,9 +642,11 @@ pub(crate) enum OpenAiCompatibleError {
     Transport {
         phase: HttpTransportPhase,
         source: reqwest::Error,
+        provider: Option<String>,
     },
     TotalTimeout {
         phase: HttpTransportPhase,
+        provider: Option<String>,
     },
     HttpStatus {
         status: u16,
@@ -608,6 +659,7 @@ pub(crate) enum OpenAiCompatibleError {
     ParseResponse(serde_json::Error),
     InvalidResponseWire {
         violation: HttpEnvelopeViolation,
+        provider: Option<String>,
     },
 }
 
@@ -621,7 +673,7 @@ impl fmt::Display for OpenAiCompatibleError {
             Self::TotalTimeout { .. } => formatter.write_str("LLM HTTP 请求超过总超时"),
             Self::HttpStatus { status, .. } => write!(formatter, "LLM HTTP 状态 {status}"),
             Self::ParseResponse(_) => formatter.write_str("LLM 成功响应不是有效 JSON"),
-            Self::InvalidResponseWire { violation } => {
+            Self::InvalidResponseWire { violation, .. } => {
                 write!(formatter, "LLM 成功响应不符合所选协议契约：{violation:?}")
             }
         }
@@ -644,6 +696,22 @@ impl Error for OpenAiCompatibleError {
 }
 
 impl OpenAiCompatibleError {
+    fn with_response_provider(mut self, provider: Option<String>) -> Self {
+        match &mut self {
+            Self::Transport {
+                provider: current, ..
+            }
+            | Self::TotalTimeout {
+                provider: current, ..
+            }
+            | Self::InvalidResponseWire {
+                provider: current, ..
+            } => *current = provider,
+            _ => {}
+        }
+        self
+    }
+
     /// 只公开 endpoint 的 scheme/host/port；路径、查询、请求和响应正文不会进入诊断。
     #[cfg(test)]
     pub(crate) fn diagnostic(&self, endpoint: &Url, retry_after: Option<Duration>) -> Diagnostic {
@@ -665,7 +733,7 @@ impl OpenAiCompatibleError {
                 line: source.line(),
                 column: source.column(),
             },
-            Self::Transport { phase, source } => {
+            Self::Transport { phase, source, .. } => {
                 let io = error_chain_io(source);
                 HttpIssue::Transport {
                     endpoint,
@@ -676,7 +744,7 @@ impl OpenAiCompatibleError {
                     raw_os_code: io.and_then(std::io::Error::raw_os_error),
                 }
             }
-            Self::TotalTimeout { phase } => HttpIssue::Transport {
+            Self::TotalTimeout { phase, .. } => HttpIssue::Transport {
                 endpoint,
                 route,
                 phase: *phase,
@@ -721,7 +789,7 @@ impl OpenAiCompatibleError {
                 line: source.line(),
                 column: source.column(),
             },
-            Self::InvalidResponseWire { violation } => HttpIssue::InvalidEnvelope {
+            Self::InvalidResponseWire { violation, .. } => HttpIssue::InvalidEnvelope {
                 endpoint,
                 violation: *violation,
             },
@@ -750,6 +818,15 @@ impl LlmRequestFailure for OpenAiCompatibleError {
         match self {
             Self::HttpStatus { service_status, .. } => *service_status,
             _ => LlmServiceStatus::Other,
+        }
+    }
+
+    fn provider(&self) -> Option<&str> {
+        match self {
+            Self::Transport { provider, .. }
+            | Self::TotalTimeout { provider, .. }
+            | Self::InvalidResponseWire { provider, .. } => provider.as_deref(),
+            _ => None,
         }
     }
 }
@@ -789,6 +866,96 @@ fn provider_identifier(value: String) -> Option<String> {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
         }))
     .then_some(value)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProviderMetadataObservation {
+    Absent,
+    Selected(String),
+    Invalid,
+}
+
+#[derive(Default)]
+enum RouterProviderAttribution {
+    #[default]
+    Unobserved,
+    Selected(String),
+    Invalid,
+}
+
+impl RouterProviderAttribution {
+    fn observe(&mut self, object: &Map<String, Value>, redactor: Option<&ApiKeyRedactor>) {
+        let Some(redactor) = redactor else {
+            return;
+        };
+        match selected_openrouter_provider(object, redactor) {
+            ProviderMetadataObservation::Absent => {}
+            ProviderMetadataObservation::Invalid => *self = Self::Invalid,
+            ProviderMetadataObservation::Selected(provider) => match self {
+                Self::Unobserved => *self = Self::Selected(provider),
+                Self::Selected(current) if *current == provider => {}
+                Self::Selected(_) | Self::Invalid => *self = Self::Invalid,
+            },
+        }
+    }
+
+    fn provider(&self) -> Option<&str> {
+        match self {
+            Self::Selected(provider) => Some(provider),
+            Self::Unobserved | Self::Invalid => None,
+        }
+    }
+
+    fn cloned_provider(&self) -> Option<String> {
+        self.provider().map(str::to_owned)
+    }
+}
+
+fn selected_openrouter_provider(
+    object: &Map<String, Value>,
+    redactor: &ApiKeyRedactor,
+) -> ProviderMetadataObservation {
+    let Some(metadata) = object.get("openrouter_metadata") else {
+        return ProviderMetadataObservation::Absent;
+    };
+    let Some(available) = metadata
+        .as_object()
+        .and_then(|metadata| metadata.get("endpoints"))
+        .and_then(Value::as_object)
+        .and_then(|endpoints| endpoints.get("available"))
+        .and_then(Value::as_array)
+    else {
+        return ProviderMetadataObservation::Invalid;
+    };
+
+    let mut selected = None;
+    for endpoint in available {
+        let Some(endpoint) = endpoint.as_object() else {
+            return ProviderMetadataObservation::Invalid;
+        };
+        let Some(is_selected) = endpoint.get("selected").and_then(Value::as_bool) else {
+            return ProviderMetadataObservation::Invalid;
+        };
+        if !is_selected {
+            continue;
+        }
+        if selected.is_some() {
+            return ProviderMetadataObservation::Invalid;
+        }
+        let Some(provider) = endpoint.get("provider").and_then(Value::as_str) else {
+            return ProviderMetadataObservation::Invalid;
+        };
+        let provider = sanitize_user_text(&redactor.redact(provider));
+        let provider = provider.trim();
+        if provider.is_empty() || provider.len() > MAX_PROVIDER_NAME_BYTES {
+            return ProviderMetadataObservation::Invalid;
+        }
+        selected = Some(provider.to_owned());
+    }
+
+    selected.map_or(ProviderMetadataObservation::Invalid, |provider| {
+        ProviderMetadataObservation::Selected(provider)
+    })
 }
 
 #[derive(Serialize)]
@@ -1025,9 +1192,19 @@ impl ChatCompletionsStream {
         Err(invalid_response(HttpEnvelopeViolation::MissingContent))
     }
 
+    #[cfg(test)]
     fn accept(
         &mut self,
         event: SseEvent,
+    ) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
+        self.accept_with_provider(event, &mut RouterProviderAttribution::default(), None)
+    }
+
+    fn accept_with_provider(
+        &mut self,
+        event: SseEvent,
+        provider: &mut RouterProviderAttribution,
+        provider_redactor: Option<&ApiKeyRedactor>,
     ) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
         if trim_ascii_whitespace(&event.data) == b"[DONE]" {
             return self
@@ -1039,6 +1216,7 @@ impl ChatCompletionsStream {
         let object = wire
             .as_object()
             .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
+        provider.observe(object, provider_redactor);
         if object.contains_key("error")
             || object.get("type").and_then(Value::as_str) == Some("error")
         {
@@ -1065,10 +1243,6 @@ impl ChatCompletionsStream {
         if matching_choices.next().is_some() {
             return Err(invalid_response(HttpEnvelopeViolation::DuplicateChoice));
         }
-        if self.finish_reason.is_some() {
-            return Err(invalid_response(HttpEnvelopeViolation::ChoiceAfterFinish));
-        }
-        self.saw_index_zero = true;
         let choice = choice
             .as_object()
             .expect("index 0 choice 已经确认是 JSON 对象");
@@ -1078,6 +1252,24 @@ impl ChatCompletionsStream {
             .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingMessage))?;
         let content = optional_wire_string(delta, "content")?;
         let refusal = optional_wire_string(delta, "refusal")?;
+        let finish_reason = match choice.get("finish_reason") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(reason)) => Some(reason.as_str()),
+            Some(_) => return Err(invalid_response(HttpEnvelopeViolation::InvalidFieldType)),
+        };
+        if self.finish_reason.is_some() {
+            if let Some(post_finish_fields) = HttpPostFinishFields::new(
+                content.is_some_and(|value| !value.is_empty()),
+                refusal.is_some_and(|value| !value.is_empty()),
+                finish_reason.is_some(),
+            ) {
+                return Err(invalid_response(HttpEnvelopeViolation::ChoiceAfterFinish {
+                    post_finish_fields,
+                }));
+            }
+            return Ok(None);
+        }
+        self.saw_index_zero = true;
         if let Some(content) = content {
             self.content.push_str(content);
             self.saw_content = true;
@@ -1086,12 +1278,8 @@ impl ChatCompletionsStream {
             self.refusal.push_str(refusal);
             self.saw_refusal = true;
         }
-        match choice.get("finish_reason") {
-            None | Some(Value::Null) => {}
-            Some(Value::String(reason)) => {
-                self.finish_reason = Some(llm_finish_reason(reason));
-            }
-            Some(_) => return Err(invalid_response(HttpEnvelopeViolation::InvalidFieldType)),
+        if let Some(finish_reason) = finish_reason {
+            self.finish_reason = Some(llm_finish_reason(finish_reason));
         }
         Ok(None)
     }
@@ -1100,27 +1288,56 @@ impl ChatCompletionsStream {
 async fn parse_streaming_success_response(
     protocol: OpenAiProtocol,
     mut response: reqwest::Response,
+    provider: &mut RouterProviderAttribution,
+    provider_redactor: Option<&ApiKeyRedactor>,
 ) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
     let mut sse = SseDecoder::default();
     let mut chat = ChatCompletionsStream::default();
     loop {
-        let Some(chunk) = response.chunk().await.map_err(|source| {
-            classify_transport_error(HttpTransportPhase::ReadSuccessResponse, source)
-        })?
-        else {
-            for event in sse.finish()? {
+        let chunk = match response.chunk().await {
+            Ok(chunk) => chunk,
+            Err(source) => {
+                return Err(error_with_response_provider(
+                    classify_transport_error(HttpTransportPhase::ReadSuccessResponse, source),
+                    provider.cloned_provider(),
+                ));
+            }
+        };
+        let Some(chunk) = chunk else {
+            let events = match sse.finish() {
+                Ok(events) => events,
+                Err(error) => {
+                    return Err(error_with_response_provider(
+                        error,
+                        provider.cloned_provider(),
+                    ));
+                }
+            };
+            for event in events {
                 let completed = match protocol {
-                    OpenAiProtocol::ChatCompletions => chat.accept(event)?,
-                    OpenAiProtocol::Responses => parse_responses_stream_event(event)?,
+                    OpenAiProtocol::ChatCompletions => {
+                        chat.accept_with_provider(event, provider, provider_redactor)
+                    }
+                    OpenAiProtocol::Responses => parse_responses_stream_event_with_provider(
+                        event,
+                        provider,
+                        provider_redactor,
+                    ),
                 };
+                let completed = completed.map_err(|error| {
+                    error_with_response_provider(error, provider.cloned_provider())
+                })?;
                 if let Some(response) = completed {
-                    return Ok(response);
+                    return Ok(response.with_provider(provider.cloned_provider()));
                 }
             }
             if !sse.is_idle() {
-                return Err(invalid_response(HttpEnvelopeViolation::UnclosedSseEvent));
+                return Err(error_with_response_provider(
+                    invalid_response(HttpEnvelopeViolation::UnclosedSseEvent),
+                    provider.cloned_provider(),
+                ));
             }
-            return match protocol {
+            let completed = match protocol {
                 OpenAiProtocol::ChatCompletions => {
                     chat.complete(HttpEnvelopeViolation::MissingFinishReason)
                 }
@@ -1128,14 +1345,36 @@ async fn parse_streaming_success_response(
                     HttpEnvelopeViolation::MissingResponsesTerminal,
                 )),
             };
-        };
-        for event in sse.push(&chunk)? {
-            let completed = match protocol {
-                OpenAiProtocol::ChatCompletions => chat.accept(event)?,
-                OpenAiProtocol::Responses => parse_responses_stream_event(event)?,
+            return match completed {
+                Ok(response) => Ok(response.with_provider(provider.cloned_provider())),
+                Err(error) => Err(error_with_response_provider(
+                    error,
+                    provider.cloned_provider(),
+                )),
             };
+        };
+        let events = match sse.push(&chunk) {
+            Ok(events) => events,
+            Err(error) => {
+                return Err(error_with_response_provider(
+                    error,
+                    provider.cloned_provider(),
+                ));
+            }
+        };
+        for event in events {
+            let completed = match protocol {
+                OpenAiProtocol::ChatCompletions => {
+                    chat.accept_with_provider(event, provider, provider_redactor)
+                }
+                OpenAiProtocol::Responses => {
+                    parse_responses_stream_event_with_provider(event, provider, provider_redactor)
+                }
+            };
+            let completed = completed
+                .map_err(|error| error_with_response_provider(error, provider.cloned_provider()))?;
             if let Some(response) = completed {
-                return Ok(response);
+                return Ok(response.with_provider(provider.cloned_provider()));
             }
         }
     }
@@ -1167,8 +1406,21 @@ fn parse_stream_json(data: &[u8]) -> Result<Value, LlmRequestError<OpenAiCompati
         .map_err(|_| invalid_response(HttpEnvelopeViolation::InvalidStreamEvent))
 }
 
+#[cfg(test)]
 fn parse_responses_stream_event(
     event: SseEvent,
+) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
+    parse_responses_stream_event_with_provider(
+        event,
+        &mut RouterProviderAttribution::default(),
+        None,
+    )
+}
+
+fn parse_responses_stream_event_with_provider(
+    event: SseEvent,
+    provider: &mut RouterProviderAttribution,
+    provider_redactor: Option<&ApiKeyRedactor>,
 ) -> Result<Option<LlmResponse>, LlmRequestError<OpenAiCompatibleError>> {
     if event.data == b"[DONE]" {
         return Err(invalid_response(
@@ -1183,6 +1435,12 @@ fn parse_responses_stream_event(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
+    let terminal_response = matches!(event_type, "response.completed" | "response.incomplete")
+        .then(|| object.get("response").and_then(Value::as_object))
+        .flatten();
+    if let Some(response) = terminal_response {
+        provider.observe(response, provider_redactor);
+    }
     if let Some(explicit_event_type) = event.event_type {
         let explicit_event_type = std::str::from_utf8(&explicit_event_type)
             .map_err(|_| invalid_response(HttpEnvelopeViolation::InvalidStreamEncoding))?;
@@ -1198,9 +1456,7 @@ fn parse_responses_stream_event(
             let expected_status = event_type
                 .strip_prefix("response.")
                 .expect("已匹配的 Responses 终态事件必须有固定前缀");
-            let response = object
-                .get("response")
-                .and_then(Value::as_object)
+            let response = terminal_response
                 .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
             if response.get("status").and_then(Value::as_str) != Some(expected_status) {
                 return Err(invalid_response(HttpEnvelopeViolation::InvalidContract));
@@ -1296,9 +1552,17 @@ fn classify_transport_error(
             error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
         });
     if retry {
-        retryable(OpenAiCompatibleError::Transport { phase, source })
+        retryable(OpenAiCompatibleError::Transport {
+            phase,
+            source,
+            provider: None,
+        })
     } else {
-        LlmRequestError::Fatal(OpenAiCompatibleError::Transport { phase, source })
+        LlmRequestError::Fatal(OpenAiCompatibleError::Transport {
+            phase,
+            source,
+            provider: None,
+        })
     }
 }
 
@@ -1538,18 +1802,36 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dur
     )
 }
 
+#[cfg(test)]
 fn parse_success_response(
     protocol: OpenAiProtocol,
     body: &[u8],
+) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
+    parse_success_response_with_provider(protocol, body, None)
+}
+
+fn parse_success_response_with_provider(
+    protocol: OpenAiProtocol,
+    body: &[u8],
+    provider_redactor: Option<&ApiKeyRedactor>,
 ) -> Result<LlmResponse, LlmRequestError<OpenAiCompatibleError>> {
     let wire: Value = serde_json::from_slice(body)
         .map_err(|source| LlmRequestError::Fatal(OpenAiCompatibleError::ParseResponse(source)))?;
     let object = wire
         .as_object()
         .ok_or_else(|| invalid_response(HttpEnvelopeViolation::InvalidContract))?;
-    match protocol {
+    let mut provider = RouterProviderAttribution::default();
+    provider.observe(object, provider_redactor);
+    let result = match protocol {
         OpenAiProtocol::ChatCompletions => parse_chat_completions_response(object),
         OpenAiProtocol::Responses => parse_responses_response(object),
+    };
+    match result {
+        Ok(response) => Ok(response.with_provider(provider.cloned_provider())),
+        Err(error) => Err(error_with_response_provider(
+            error,
+            provider.cloned_provider(),
+        )),
     }
 }
 
@@ -1568,18 +1850,10 @@ fn parse_chat_completions_response(
             == Some(0)
     });
     let Some(choice) = matching_choices.next() else {
-        return Err(LlmRequestError::Fatal(
-            OpenAiCompatibleError::InvalidResponseWire {
-                violation: HttpEnvelopeViolation::EmptyChoices,
-            },
-        ));
+        return Err(invalid_response(HttpEnvelopeViolation::EmptyChoices));
     };
     if matching_choices.next().is_some() {
-        return Err(LlmRequestError::Fatal(
-            OpenAiCompatibleError::InvalidResponseWire {
-                violation: HttpEnvelopeViolation::InvalidContract,
-            },
-        ));
+        return Err(invalid_response(HttpEnvelopeViolation::InvalidContract));
     }
     let choice = choice
         .as_object()
@@ -1687,7 +1961,31 @@ fn parse_responses_response(
 }
 
 fn invalid_response(violation: HttpEnvelopeViolation) -> LlmRequestError<OpenAiCompatibleError> {
-    LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire { violation })
+    LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire {
+        violation,
+        provider: None,
+    })
+}
+
+fn error_with_response_provider(
+    error: LlmRequestError<OpenAiCompatibleError>,
+    provider: Option<String>,
+) -> LlmRequestError<OpenAiCompatibleError> {
+    match error {
+        LlmRequestError::Retryable {
+            source,
+            retry_after,
+        } => LlmRequestError::Retryable {
+            source: source.with_response_provider(provider),
+            retry_after,
+        },
+        LlmRequestError::Fatal(source) => {
+            LlmRequestError::Fatal(source.with_response_provider(provider))
+        }
+        LlmRequestError::AdmissionStopped { diagnostic } => {
+            LlmRequestError::AdmissionStopped { diagnostic }
+        }
+    }
 }
 
 /// 非成功响应读取正文期间也可能被总超时取消；守卫确保取消不会永久堵住共享准入。
@@ -2353,6 +2651,33 @@ mod tests {
         }
     }
 
+    fn spawn_partial_sse_then_delay_server(body: Vec<u8>, delay: Duration) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("测试监听应成功");
+        let address = listener.local_addr().expect("测试监听地址应可读");
+        let (request_sender, requests) = mpsc::channel();
+        let (seen_sender, first_request_seen) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("llm-partial-sse-delay-server".to_owned())
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("测试请求应可接受");
+                let request = read_http_request(&mut stream);
+                request_sender.send(request).expect("测试请求应可记录");
+                seen_sender.send(()).expect("测试请求应可通知");
+                let response = sse_response(&body, body.len() + 32);
+                stream.write_all(&response).expect("部分 SSE 响应应可写入");
+                stream.flush().expect("部分 SSE 响应应可刷新");
+                thread::sleep(delay);
+            })
+            .expect("部分 SSE 超时测试服务器应创建成功");
+        TestServer {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            requests,
+            first_request_seen,
+            release_first: None,
+            worker,
+        }
+    }
+
     fn spawn_slow_error_body_then_success_server(delay: Duration) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("测试监听应成功");
         let address = listener.local_addr().expect("测试监听地址应可读");
@@ -2491,6 +2816,25 @@ mod tests {
         response
     }
 
+    fn chat_stream_finish_with_router_provider(provider: &str) -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "complete"},
+                    "finish_reason": "stop"
+                }],
+                "openrouter_metadata": {
+                    "endpoints": {"available": [
+                        {"provider": provider, "selected": true}
+                    ]}
+                }
+            })
+        )
+        .into_bytes()
+    }
+
     fn core_success_body() -> &'static str {
         r#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":"stop"}]}"#
     }
@@ -2580,6 +2924,33 @@ mod tests {
                     .url
                     .as_str(),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn only_openrouter_host_enables_router_metadata_header() {
+        let executor = executor(1);
+        for (url, expected) in [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://OPENROUTER.AI/api/v1/responses", true),
+            ("https://api.openrouter.ai/api/v1", false),
+            ("https://openrouter.ai.example.test/api/v1", false),
+            ("https://example.test/openrouter.ai/api/v1", false),
+        ] {
+            let client = client(url, Map::new());
+            assert_eq!(client.openrouter_metadata(), expected, "endpoint={url}");
+            let request = executor
+                .request_builder(&client, Vec::new())
+                .build()
+                .expect("测试请求应可建立");
+            assert_eq!(
+                request
+                    .headers()
+                    .get(OPENROUTER_METADATA_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                expected.then_some(OPENROUTER_METADATA_ENABLED),
+                "endpoint={url}"
             );
         }
     }
@@ -2805,6 +3176,121 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_metadata_records_the_unique_selected_provider_for_both_protocols() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+        let metadata = serde_json::json!({
+            "requested": "test-model",
+            "endpoints": {
+                "available": [
+                    {"provider": "ignored", "selected": false},
+                    {"provider": "  SiliconFlow\n\u{202e}test-secret  ", "selected": true}
+                ]
+            },
+            "future_extension": {"ignored": true}
+        });
+        let mut chat = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"content": "[]"},
+                "finish_reason": "stop"
+            }]
+        });
+        chat["openrouter_metadata"] = metadata.clone();
+        let chat = serde_json::to_vec(&chat).expect("Chat 测试响应应可序列化");
+        let chat = parse_success_response_with_provider(
+            OpenAiProtocol::ChatCompletions,
+            &chat,
+            Some(&redactor),
+        )
+        .expect("Chat 核心响应与 Router Metadata 应可解析");
+        assert_eq!(chat.provider(), Some("SiliconFlow [REDACTED API KEY]"));
+
+        let mut responses = serde_json::json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "[]"}]
+            }]
+        });
+        responses["openrouter_metadata"] = metadata;
+        let responses = serde_json::to_vec(&responses).expect("Responses 测试响应应可序列化");
+        let responses = parse_success_response_with_provider(
+            OpenAiProtocol::Responses,
+            &responses,
+            Some(&redactor),
+        )
+        .expect("Responses 核心响应与 Router Metadata 应可解析");
+        assert_eq!(responses.provider(), Some("SiliconFlow [REDACTED API KEY]"));
+    }
+
+    #[test]
+    fn invalid_or_legacy_provider_metadata_never_invalidates_core_response() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+        let invalid_metadata = [
+            Value::Null,
+            serde_json::json!({"endpoints": null}),
+            serde_json::json!({"endpoints": {"available": [null]}}),
+            serde_json::json!({"endpoints": {"available": [
+                {"provider": "One", "selected": true},
+                {"provider": "Two", "selected": true}
+            ]}}),
+            serde_json::json!({"endpoints": {"available": [
+                {"provider": "", "selected": true}
+            ]}}),
+            serde_json::json!({"endpoints": {"available": [
+                {"provider": "x".repeat(MAX_PROVIDER_NAME_BYTES + 1), "selected": true}
+            ]}}),
+            serde_json::json!({"endpoints": {"available": [
+                {"provider": "One", "selected": false}
+            ]}}),
+        ];
+        for metadata in invalid_metadata {
+            let mut wire = serde_json::json!({
+                "provider": "legacy-must-not-be-read",
+                "choices": [{
+                    "index": 0,
+                    "message": {"content": "[]"},
+                    "finish_reason": "stop"
+                }]
+            });
+            wire["openrouter_metadata"] = metadata;
+            let wire = serde_json::to_vec(&wire).expect("测试响应应可序列化");
+            let response = parse_success_response_with_provider(
+                OpenAiProtocol::ChatCompletions,
+                &wire,
+                Some(&redactor),
+            )
+            .expect("无效可选元数据不得否定核心响应");
+            assert_eq!(response.provider(), None);
+        }
+    }
+
+    #[test]
+    fn provider_survives_a_later_core_envelope_error_in_the_same_response() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+        let wire = serde_json::json!({
+            "choices": null,
+            "openrouter_metadata": {
+                "endpoints": {"available": [
+                    {"provider": "SiliconFlow", "selected": true}
+                ]}
+            }
+        });
+        let wire = serde_json::to_vec(&wire).expect("测试响应应可序列化");
+        let error = parse_success_response_with_provider(
+            OpenAiProtocol::ChatCompletions,
+            &wire,
+            Some(&redactor),
+        )
+        .expect_err("核心响应信封无效时必须失败");
+        assert!(matches!(
+            error,
+            LlmRequestError::Fatal(source) if source.provider() == Some("SiliconFlow")
+        ));
+    }
+
+    #[test]
     fn successful_wire_selects_unique_index_zero_and_ignores_other_choices_and_role() {
         let response = parse_success_response(
             br#"{
@@ -2936,6 +3422,143 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_accepts_only_neutral_index_zero_choices_after_finish() {
+        let mut finished = ChatCompletionsStream::default();
+        finished
+            .accept(SseEvent {
+                event_type: None,
+                data: br#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_vec(),
+            })
+            .expect("首个 finish 应合法");
+        for data in [
+            r#"{"choices":[]}"#,
+            r#"{"choices":[{"index":1,"delta":{"content":"ignored"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":null,"refusal":""},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"","refusal":null}}]}"#,
+        ] {
+            assert!(
+                finished
+                    .accept(SseEvent {
+                        event_type: None,
+                        data: data.as_bytes().to_vec(),
+                    })
+                    .expect("finish 后的中性 choice 应忽略")
+                    .is_none()
+            );
+        }
+        let response = finished
+            .accept(SseEvent {
+                event_type: None,
+                data: b"[DONE]".to_vec(),
+            })
+            .expect("中性尾帧后的 DONE 应成功")
+            .expect("DONE 应建立统一响应");
+        assert_eq!(response.content(), "done");
+        assert_eq!(response.finish_reason(), &LlmFinishReason::Stop);
+    }
+
+    #[test]
+    fn chat_stream_validates_post_finish_fields_and_reports_every_body_field() {
+        for (delta, finish_reason, expected_fields) in [
+            (
+                serde_json::json!({"content": " "}),
+                Value::Null,
+                (true, false, false),
+            ),
+            (
+                serde_json::json!({"refusal": "late"}),
+                Value::Null,
+                (false, true, false),
+            ),
+            (
+                serde_json::json!({}),
+                Value::String("stop".to_owned()),
+                (false, false, true),
+            ),
+            (
+                serde_json::json!({"content": "late", "refusal": "blocked"}),
+                Value::Null,
+                (true, true, false),
+            ),
+            (
+                serde_json::json!({"content": "late"}),
+                Value::String("length".to_owned()),
+                (true, false, true),
+            ),
+            (
+                serde_json::json!({"refusal": "blocked"}),
+                Value::String("content_filter".to_owned()),
+                (false, true, true),
+            ),
+            (
+                serde_json::json!({"content": "late", "refusal": "blocked"}),
+                Value::String("stop".to_owned()),
+                (true, true, true),
+            ),
+        ] {
+            let expected =
+                HttpPostFinishFields::new(expected_fields.0, expected_fields.1, expected_fields.2)
+                    .expect("每个测试组合都必须至少包含一个 finish 后字段");
+            let mut finished = ChatCompletionsStream::default();
+            finished
+                .accept(SseEvent {
+                    event_type: None,
+                    data: br#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_vec(),
+                })
+                .expect("首个 finish 应合法");
+            let event = serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason
+                }]
+            });
+            let error = finished.accept(SseEvent {
+                event_type: None,
+                data: serde_json::to_vec(&event).expect("尾帧测试事件应可序列化"),
+            });
+            assert!(matches!(
+                error,
+                Err(LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::ChoiceAfterFinish {
+                        post_finish_fields,
+                    },
+                    ..
+                })) if post_finish_fields == expected
+            ));
+        }
+
+        for data in [
+            r#"{"choices":[{"index":0,"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":[]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":7}]}"#,
+        ] {
+            let mut finished = ChatCompletionsStream::default();
+            finished
+                .accept(SseEvent {
+                    event_type: None,
+                    data: br#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_vec(),
+                })
+                .expect("首个 finish 应合法");
+            assert!(matches!(
+                finished.accept(SseEvent {
+                    event_type: None,
+                    data: data.as_bytes().to_vec(),
+                }),
+                Err(LlmRequestError::Fatal(
+                    OpenAiCompatibleError::InvalidResponseWire {
+                        violation: HttpEnvelopeViolation::MissingMessage
+                            | HttpEnvelopeViolation::InvalidFieldType,
+                        ..
+                    }
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn chat_stream_reports_duplicate_choice_and_output_after_finish_precisely() {
         let duplicate = ChatCompletionsStream::default().accept(SseEvent {
             event_type: None,
@@ -2946,6 +3569,7 @@ mod tests {
             Err(LlmRequestError::Fatal(
                 OpenAiCompatibleError::InvalidResponseWire {
                     violation: HttpEnvelopeViolation::DuplicateChoice,
+                    ..
                 }
             ))
         ));
@@ -2966,10 +3590,94 @@ mod tests {
             }),
             Err(LlmRequestError::Fatal(
                 OpenAiCompatibleError::InvalidResponseWire {
-                    violation: HttpEnvelopeViolation::ChoiceAfterFinish,
+                    violation: HttpEnvelopeViolation::ChoiceAfterFinish {
+                        post_finish_fields,
+                    },
+                    ..
                 }
-            ))
+            )) if post_finish_fields
+                == HttpPostFinishFields::new(true, false, false)
+                    .expect("正文字段必须建立 finish 后事实")
         ));
+    }
+
+    #[test]
+    fn streaming_router_metadata_is_projected_before_early_returns_and_errors() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+        let metadata = serde_json::json!({
+            "endpoints": {"available": [
+                {"provider": "SiliconFlow", "selected": true}
+            ]}
+        });
+        let mut provider = RouterProviderAttribution::default();
+        let mut chat = ChatCompletionsStream::default();
+        chat.accept_with_provider(
+            SseEvent {
+                event_type: None,
+                data: br#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#.to_vec(),
+            },
+            &mut provider,
+            Some(&redactor),
+        )
+        .expect("首个 finish 应合法");
+        let metadata_event = serde_json::json!({
+            "choices": [],
+            "openrouter_metadata": metadata
+        });
+        chat.accept_with_provider(
+            SseEvent {
+                event_type: None,
+                data: serde_json::to_vec(&metadata_event).expect("元数据事件应可序列化"),
+            },
+            &mut provider,
+            Some(&redactor),
+        )
+        .expect("choices 为空的 Router Metadata 尾帧应忽略");
+        assert_eq!(provider.provider(), Some("SiliconFlow"));
+
+        let error = chat
+            .accept_with_provider(
+                SseEvent {
+                    event_type: None,
+                    data: br#"{"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}"#.to_vec(),
+                },
+                &mut provider,
+                Some(&redactor),
+            )
+            .expect_err("finish 后的正文必须失败");
+        let error = error_with_response_provider(error, provider.cloned_provider());
+        assert!(matches!(
+            error,
+            LlmRequestError::Fatal(source) if source.provider() == Some("SiliconFlow")
+        ));
+    }
+
+    #[test]
+    fn streaming_conflicting_router_provider_names_abandon_attribution() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+        let mut provider = RouterProviderAttribution::default();
+        let mut chat = ChatCompletionsStream::default();
+        for name in ["FirstProvider", "SecondProvider"] {
+            let event = serde_json::json!({
+                "choices": [],
+                "openrouter_metadata": {
+                    "endpoints": {"available": [
+                        {"provider": name, "selected": true}
+                    ]}
+                }
+            });
+            chat.accept_with_provider(
+                SseEvent {
+                    event_type: None,
+                    data: serde_json::to_vec(&event).expect("元数据事件应可序列化"),
+                },
+                &mut provider,
+                Some(&redactor),
+            )
+            .expect("冲突元数据不应否定核心流");
+        }
+
+        assert_eq!(provider.provider(), None);
     }
 
     #[test]
@@ -3166,7 +3874,103 @@ mod tests {
                 parse_responses_stream_event(event),
                 Err(LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire {
                     violation,
+                    ..
                 })) if violation == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn responses_stream_projects_router_metadata_from_the_terminal_event() {
+        let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+        let mut provider = RouterProviderAttribution::default();
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "[]"}]
+                }],
+                "openrouter_metadata": {
+                    "endpoints": {"available": [
+                        {"provider": "OpenAI", "selected": true}
+                    ]}
+                }
+            }
+        });
+        let response = parse_responses_stream_event_with_provider(
+            SseEvent {
+                event_type: Some(b"response.completed".to_vec()),
+                data: serde_json::to_vec(&event).expect("Responses 终态事件应可序列化"),
+            },
+            &mut provider,
+            Some(&redactor),
+        )
+        .expect("Responses 终态事件应合法")
+        .expect("Responses 终态应建立统一响应");
+
+        assert_eq!(response.content(), "[]");
+        assert_eq!(provider.provider(), Some("OpenAI"));
+    }
+
+    #[test]
+    fn responses_terminal_errors_keep_the_observed_router_provider() {
+        for (explicit_event_type, event_type, status, output, expected) in [
+            (
+                "response.completed",
+                "response.incomplete",
+                "incomplete",
+                serde_json::json!([]),
+                HttpEnvelopeViolation::EventTypeMismatch,
+            ),
+            (
+                "response.completed",
+                "response.completed",
+                "incomplete",
+                serde_json::json!([]),
+                HttpEnvelopeViolation::InvalidContract,
+            ),
+            (
+                "response.completed",
+                "response.completed",
+                "completed",
+                Value::Null,
+                HttpEnvelopeViolation::MissingOutput,
+            ),
+        ] {
+            let redactor = ApiKeyRedactor::new(SecretString::from("test-secret"));
+            let mut provider = RouterProviderAttribution::default();
+            let event = serde_json::json!({
+                "type": event_type,
+                "response": {
+                    "status": status,
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": output,
+                    "openrouter_metadata": {
+                        "endpoints": {"available": [
+                            {"provider": "OpenAI", "selected": true}
+                        ]}
+                    }
+                }
+            });
+            let error = parse_responses_stream_event_with_provider(
+                SseEvent {
+                    event_type: Some(explicit_event_type.as_bytes().to_vec()),
+                    data: serde_json::to_vec(&event).expect("Responses 错误事件应可序列化"),
+                },
+                &mut provider,
+                Some(&redactor),
+            )
+            .expect_err("Responses 终态信封错误必须失败");
+            let error = error_with_response_provider(error, provider.cloned_provider());
+            assert!(matches!(
+                error,
+                LlmRequestError::Fatal(OpenAiCompatibleError::InvalidResponseWire {
+                    violation,
+                    provider: Some(provider),
+                }) if violation == expected && provider == "OpenAI"
             ));
         }
     }
@@ -3539,6 +4343,8 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"译\"},\"finish_reason\":null}]}\r\n\r\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"文\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
             "data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"refusal\":\"\"},\"finish_reason\":null}]}\r\n\r\n",
             "data: [DONE]\r\r",
         );
         let server = spawn_test_server(vec![sse_response(body.as_bytes(), body.len())], false);
@@ -3628,6 +4434,7 @@ mod tests {
             Err(LlmRequestError::Retryable {
                 source: OpenAiCompatibleError::InvalidResponseWire {
                     violation: HttpEnvelopeViolation::MissingResponsesTerminal,
+                    ..
                 },
                 retry_after: None,
             })
@@ -3673,6 +4480,7 @@ mod tests {
             Err(LlmRequestError::Retryable {
                 source: OpenAiCompatibleError::InvalidResponseWire {
                     violation: HttpEnvelopeViolation::MissingFinishReason,
+                    ..
                 },
                 retry_after: None,
             })
@@ -3683,6 +4491,7 @@ mod tests {
             Err(LlmRequestError::Retryable {
                 source: OpenAiCompatibleError::InvalidResponseWire {
                     violation: HttpEnvelopeViolation::UnclosedSseEvent,
+                    ..
                 },
                 retry_after: None,
             })
@@ -3705,6 +4514,73 @@ mod tests {
         for _ in 0..4 {
             assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
         }
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn router_provider_survives_truncation_after_the_metadata_frame() {
+        let body = chat_stream_finish_with_router_provider("SiliconFlow");
+        let server = spawn_test_server(vec![sse_response(&body, body.len() + 32)], false);
+        let mut client = client_with_protocol_and_stream(
+            &server.endpoint,
+            OpenAiProtocol::ChatCompletions,
+            true,
+            Map::new(),
+        );
+        client.openrouter_metadata = true;
+        let executor = executor(1);
+
+        let result = executor.request(&client, &[]).await;
+        assert!(matches!(
+            result,
+            Err(LlmRequestError::Retryable {
+                source: OpenAiCompatibleError::Transport {
+                    phase: HttpTransportPhase::ReadSuccessResponse,
+                    provider: Some(provider),
+                    ..
+                },
+                retry_after: None,
+            }) if provider == "SiliconFlow"
+        ));
+
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn router_provider_survives_total_timeout_after_the_metadata_frame() {
+        let body = chat_stream_finish_with_router_provider("SiliconFlow");
+        let server = spawn_partial_sse_then_delay_server(body, Duration::from_secs(1));
+        let mut client = client_with_protocol_and_stream(
+            &server.endpoint,
+            OpenAiProtocol::ChatCompletions,
+            true,
+            Map::new(),
+        );
+        client.openrouter_metadata = true;
+        client.request_timeout = Duration::from_millis(300);
+        let executor = executor_with_network(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            LlmProxyConfiguration::Disabled,
+        );
+
+        let result = executor.request(&client, &[]).await;
+        assert!(matches!(
+            result,
+            Err(LlmRequestError::Retryable {
+                source: OpenAiCompatibleError::TotalTimeout {
+                    phase: HttpTransportPhase::ReadSuccessResponse,
+                    provider: Some(provider),
+                },
+                retry_after: None,
+            }) if provider == "SiliconFlow"
+        ));
+
+        assert!(server.requests.recv_timeout(Duration::from_secs(1)).is_ok());
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");
     }
@@ -3734,7 +4610,7 @@ mod tests {
             assert!(matches!(
                 executor.request(&client, &[]).await,
                 Err(LlmRequestError::Retryable {
-                    source: OpenAiCompatibleError::InvalidResponseWire { violation },
+                    source: OpenAiCompatibleError::InvalidResponseWire { violation, .. },
                     retry_after: None,
                 }) if violation == expected
             ));
@@ -4733,6 +5609,7 @@ mod tests {
             Err(LlmRequestError::Retryable {
                 source: OpenAiCompatibleError::TotalTimeout {
                     phase: HttpTransportPhase::ReadErrorResponse,
+                    ..
                 },
                 retry_after: None,
             })

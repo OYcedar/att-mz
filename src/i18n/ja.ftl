@@ -148,7 +148,10 @@ log-plan-resolved = コマンド { $command } のプラン元: { $source }。
 log-phase-started = フェーズ開始: { $phase }。
 log-retry-summary = { $count } 回再試行しました。
 log-translation-task-started = 翻訳タスク { $index }/{ $total } を開始しました。
-log-translation-task-finished = 翻訳タスク { $index } は結果 { $outcome } で終了しました。
+log-translation-task-finished = 翻訳タスク { $index } は結果 { $outcome } で終了しました。{ $provider_status ->
+    [present] 上流プロバイダー：{ $provider }。
+   *[missing] 上流プロバイダー：未提供。
+}
 log-run-recovery-required = コマンド { $command } は復旧が必要な状態で終了しました。診断に示された復旧場所を確認してください。
 log-phase-completed = フェーズ完了: { $phase }。
 log-phase-stopped = { $outcome ->
@@ -294,7 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Responses ストリームに終端イベントがありません
     [model_stream_event_type_mismatch] SSE イベント名と JSON type が一致しません
     [model_stream_duplicate_choice] モデルストリームが同じ choice を重複して返しました
-    [model_stream_output_after_finish] モデルストリームが finish 後も出力を続けました
+    [model_stream_choice_after_finish] Chat ストリームが finish 後に応答を変更するフィールドを送信しました
     [model_stream_unexpected_done] Responses ストリームが予期しない [DONE] を返しました
     [response_json_invalid] Assistant 応答は有効な JSON ではありません
     [response_shape_invalid] Assistant JSON のルートまたは応答構造が要件と一致しません
@@ -404,6 +407,7 @@ diagnostic-response-item = 応答項目 { $item }
 diagnostic-array-item = 配列項目 { $item }
 diagnostic-token-position = 制御 token の位置 { $position }
 diagnostic-text-segment = テキストセグメント { $segment }
+diagnostic-post-finish-fields = finish 後のフィールド：{ $fields }
 diagnostic-expected-actual = 期待値 { $expected }、実際値 { $actual }
 diagnostic-placeholder-rule-file = { $path } の Placeholder ルール { $number }
 diagnostic-placeholder-rule-project = 現在のプロジェクトの Placeholder ルール { $number }
@@ -438,6 +442,8 @@ task-record-final-status = 状態：{ $state ->
     [cancelled] キャンセル済み、未コミット
    *[other] { $state }
 }
+task-record-provider = 上流プロバイダー：{ $provider }
+task-record-provider-unavailable = 上流プロバイダー：未提供
 task-record-requested = 要求された翻訳：{ $requested } 項目
 task-record-accepted-written = 受理：{ $accepted } 項目（ID：{ $ids }）、実位置 { $written } 箇所へ書き込み
 task-record-accepted-outcome-unknown = 検収済み：{ $accepted } 項目（ID：{ $ids }）；データベースのコミット結果を確認できません

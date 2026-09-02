@@ -570,6 +570,11 @@ fn append_response_details(
     localizer: &UiLocalizer,
 ) {
     match summary_code {
+        "model_stream_choice_after_finish" => {
+            if let Some(fields) = text_fact(facts, "post_finish_fields") {
+                details.push(localizer.format(UiMessage::DiagnosticPostFinishFields { fields }));
+            }
+        }
         "response_json_invalid"
         | "response_shape_invalid"
         | "response_placeholder_snapshot_invalid" => {
@@ -631,6 +636,12 @@ fn append_response_details(
         }
         _ => {}
     }
+}
+
+fn text_fact<'a>(facts: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+    facts
+        .iter()
+        .find_map(|(candidate, value)| (*candidate == name).then_some(value.as_str()))
 }
 
 fn numeric_fact(facts: &[(&'static str, String)], name: &str) -> Option<u64> {

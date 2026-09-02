@@ -148,7 +148,10 @@ log-plan-resolved = 命令 { $command } 的方案来自{ $source }。
 log-phase-started = 阶段开始：{ $phase }。
 log-retry-summary = 共执行 { $count } 次重试。
 log-translation-task-started = 翻译任务 { $index }/{ $total } 已开始。
-log-translation-task-finished = 翻译任务 { $index } 已结束，结果为 { $outcome }。
+log-translation-task-finished = 翻译任务 { $index } 已结束，结果为 { $outcome }。{ $provider_status ->
+    [present] 上游服务方：{ $provider }。
+   *[missing] 上游服务方：未提供。
+}
 log-run-recovery-required = 命令 { $command } 结束时需要恢复；请按诊断中的恢复位置处理。
 log-phase-completed = 阶段已完成：{ $phase }。
 log-phase-stopped = { $outcome ->
@@ -294,7 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Responses 模型流缺少终态事件
     [model_stream_event_type_mismatch] 模型流的 SSE event 与 JSON type 不一致
     [model_stream_duplicate_choice] 模型流重复返回同一 choice
-    [model_stream_output_after_finish] 模型流在 finish 后继续输出
+    [model_stream_choice_after_finish] Chat 模型流在 finish 后又发送了会改变响应的字段
     [model_stream_unexpected_done] Responses 模型流意外返回 [DONE]
     [response_json_invalid] Assistant 响应不是有效 JSON
     [response_shape_invalid] Assistant JSON 的根结构或响应结构不符合要求
@@ -404,6 +407,7 @@ diagnostic-response-item = 响应第 { $item } 项
 diagnostic-array-item = 数组第 { $item } 项
 diagnostic-token-position = 控制 token 第 { $position } 个位置
 diagnostic-text-segment = 文本第 { $segment } 个片段
+diagnostic-post-finish-fields = finish 后的字段：{ $fields }
 diagnostic-expected-actual = 要求 { $expected }，实际 { $actual }
 diagnostic-placeholder-rule-file = { $path } 中的 Placeholder 规则 { $number }
 diagnostic-placeholder-rule-project = 当前项目的 Placeholder 规则 { $number }
@@ -438,6 +442,8 @@ task-record-final-status = 状态：{ $state ->
     [cancelled] 已取消，未提交
    *[other] { $state }
 }
+task-record-provider = 上游服务方：{ $provider }
+task-record-provider-unavailable = 上游服务方：未提供
 task-record-requested = 要求译文：{ $requested } 项
 task-record-accepted-written = 已接受：{ $accepted } 项（ID：{ $ids }），写入 { $written } 个实际位置
 task-record-accepted-outcome-unknown = 已验收：{ $accepted } 项（ID：{ $ids }）；数据库提交终态无法确认

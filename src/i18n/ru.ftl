@@ -153,7 +153,10 @@ log-retry-summary = { $count ->
    *[other] Выполнено { $count } повтора.
 }
 log-translation-task-started = Задача перевода { $index }/{ $total } запущена.
-log-translation-task-finished = Задача перевода { $index } завершена с результатом { $outcome }.
+log-translation-task-finished = Задача перевода { $index } завершена с результатом { $outcome }. { $provider_status ->
+    [present] Вышестоящий провайдер: { $provider }.
+   *[missing] Вышестоящий провайдер: не указан.
+}
 log-run-recovery-required = Команда { $command } завершилась в состоянии, требующем восстановления; используйте пути из диагностики.
 log-phase-completed = Этап завершён: { $phase }.
 log-phase-stopped = { $outcome ->
@@ -299,7 +302,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] В потоке Responses отсутствует конечное событие
     [model_stream_event_type_mismatch] Имя события SSE не совпадает с типом JSON
     [model_stream_duplicate_choice] Поток модели повторил один и тот же choice
-    [model_stream_output_after_finish] Поток модели продолжил вывод после finish
+    [model_stream_choice_after_finish] Поток Chat отправил изменяющие ответ поля после finish
     [model_stream_unexpected_done] Поток Responses вернул неожиданный [DONE]
     [response_json_invalid] Ответ Assistant не является допустимым JSON
     [response_shape_invalid] Корневая структура или структура ответа JSON Assistant недопустима
@@ -409,6 +412,7 @@ diagnostic-response-item = элемент ответа { $item }
 diagnostic-array-item = элемент массива { $item }
 diagnostic-token-position = позиция управляющего token { $position }
 diagnostic-text-segment = текстовый сегмент { $segment }
+diagnostic-post-finish-fields = поля после finish: { $fields }
 diagnostic-expected-actual = ожидалось { $expected }, получено { $actual }
 diagnostic-placeholder-rule-file = Правило Placeholder { $number } в { $path }
 diagnostic-placeholder-rule-project = Правило Placeholder { $number } текущего проекта
@@ -443,6 +447,8 @@ task-record-final-status = Состояние: { $state ->
     [cancelled] отменена, без фиксации
    *[other] { $state }
 }
+task-record-provider = Вышестоящий провайдер: { $provider }
+task-record-provider-unavailable = Вышестоящий провайдер: не указан
 task-record-requested = Запрошено переводов: { $requested }
 task-record-accepted-written = Принято: { $accepted } элементов (ID: { $ids }), записано в { $written } фактических позиций
 task-record-accepted-outcome-unknown = Проверено: { $accepted } элементов (ID: { $ids }); результат фиксации базы данных невозможно подтвердить

@@ -552,6 +552,18 @@ pub(crate) fn markdown_json_fence(content: &str) -> String {
     markdown_fence(body, "json")
 }
 
+/// 把外部单行值收敛为 CommonMark 行内纯文本。
+pub(crate) fn markdown_inline_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_punctuation() {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    output
+}
+
 fn canonical_json_fence_body(content: &str) -> Option<&str> {
     let trimmed = content.trim();
     let body = trimmed
@@ -642,6 +654,14 @@ mod tests {
         let rendered = markdown_json_fence("```json\n{\"0\":[\"译文\"]}\n```");
 
         assert_eq!(rendered, "```json\n{\"0\":[\"译文\"]}\n```\n");
+    }
+
+    #[test]
+    fn inline_text_escapes_links_backslashes_and_html_delimiters() {
+        assert_eq!(
+            markdown_inline_text(r#"[OpenAI](https://example.invalid) \ <img>"#),
+            r#"\[OpenAI\]\(https\:\/\/example\.invalid\) \\ \<img\>"#
+        );
     }
 
     #[test]

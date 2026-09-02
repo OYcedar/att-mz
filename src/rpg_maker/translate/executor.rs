@@ -780,15 +780,20 @@ fn cancelled_response_processing_failure(
 
 struct TranslationTaskEvidenceBuilder {
     attempt_count: usize,
+    provider: Option<String>,
 }
 
 impl TranslationTaskEvidenceBuilder {
     const fn new() -> Self {
-        Self { attempt_count: 0 }
+        Self {
+            attempt_count: 0,
+            provider: None,
+        }
     }
 
     fn absorb_request_evidence(&mut self, evidence: LlmRequestAttemptEvidence) {
         self.attempt_count = self.attempt_count.max(evidence.attempt_count());
+        self.provider = evidence.provider().map(str::to_owned);
     }
 
     const fn attempt_count(&self) -> usize {
@@ -799,7 +804,11 @@ impl TranslationTaskEvidenceBuilder {
         self,
         response: Option<TranslationTaskResponseRecord>,
     ) -> TranslationTaskExecutionEvidence {
-        TranslationTaskExecutionEvidence::from_execution(self.attempt_count, response)
+        TranslationTaskExecutionEvidence::from_execution(
+            self.attempt_count,
+            self.provider,
+            response,
+        )
     }
 }
 
@@ -949,8 +958,19 @@ where
                     diagnostic,
                 ));
             }
-            LlmRequestExecutionOutcome::AdmissionStopped { .. } => {
-                return Ok(TranslationTaskExecution::admission_stopped(
+            LlmRequestExecutionOutcome::AdmissionStopped { diagnostic } => {
+                let Some(attempt) = NonZeroUsize::new(evidence.attempt_count()) else {
+                    return Ok(TranslationTaskExecution::admission_stopped(
+                        evidence.finish(None),
+                    ));
+                };
+                let outcome = unavailable_after_request_failure(
+                    task,
+                    attempt,
+                    TranslationTaskUnavailableReason::RequestAdmissionStopped { diagnostic },
+                );
+                return Ok(TranslationTaskExecution::new(
+                    outcome,
                     evidence.finish(None),
                 ));
             }
@@ -3022,6 +3042,10 @@ mod tests {
         fn request_was_sent(&self) -> bool {
             self.0 != "cancelled-wait"
         }
+
+        fn provider(&self) -> Option<&str> {
+            self.0.strip_prefix("provider:")
+        }
     }
 
     fn fake_request_diagnostic(retry_after: Option<Duration>) -> crate::diagnostic::Diagnostic {
@@ -4932,6 +4956,24 @@ mod tests {
                 .expect("测试应准备足够响应")
         }
 
+        async fn request_with_attempt_observer<'a>(
+            &'a self,
+            client: &'a Self::Client,
+            messages: &'a [ChatMessage],
+            on_attempt_started: Box<dyn FnOnce() + Send + 'a>,
+        ) -> Result<LlmResponse, LlmRequestError<Self::Error>> {
+            let result = self.request(client, messages).await;
+            let was_sent = match &result {
+                Ok(_) | Err(LlmRequestError::Retryable { .. }) => true,
+                Err(LlmRequestError::Fatal(source)) => source.request_was_sent(),
+                Err(LlmRequestError::AdmissionStopped { .. }) => false,
+            };
+            if was_sent {
+                on_attempt_started();
+            }
+            result
+        }
+
         fn request_diagnostic(
             &self,
             _client: &Self::Client,
@@ -5101,7 +5143,8 @@ mod tests {
                 responses: Arc::new(Mutex::new(VecDeque::from([Ok(LlmResponse::new(
                     r#"{"0":["炎之剑⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
                     LlmFinishReason::Stop,
-                ))]))),
+                )
+                .with_provider(Some("SiliconFlow".to_owned())))]))),
                 messages: Arc::new(Mutex::new(Vec::new())),
             },
             FakeDelay {
@@ -5127,6 +5170,7 @@ mod tests {
         };
 
         assert_eq!(evidence.attempt_count(), outcome.attempts().get());
+        assert_eq!(evidence.provider(), Some("SiliconFlow"));
         assert!(
             evidence.response().is_none(),
             "关闭记录时不得保留原始 Assistant"
@@ -5265,6 +5309,60 @@ mod tests {
         ));
         assert_eq!(evidence.attempt_count(), 0);
         assert!(!started.load(Ordering::Acquire));
+        assert!(evidence.response().is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_admission_after_a_retry_is_a_started_unavailable_task() {
+        let started = Arc::new(AtomicBool::new(false));
+        let service = RpgMakerTranslationTaskExecutionService::<_, _, _, _>::new(
+            FakeLlm {
+                responses: Arc::new(Mutex::new(VecDeque::from([
+                    Err(LlmRequestError::Retryable {
+                        source: FakeError("provider:First"),
+                        retry_after: None,
+                    }),
+                    Err(LlmRequestError::AdmissionStopped {
+                        diagnostic: crate::diagnostic::DiagnosticReport::new(
+                            StateEffect::ProgressPreserved,
+                            fake_request_diagnostic(None),
+                        ),
+                    }),
+                ]))),
+                messages: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeDelay {
+                waits: Arc::new(Mutex::new(Vec::new())),
+            },
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources()),
+            CooperativeCancellation::default(),
+        );
+        let task = task();
+        let profile = profile();
+
+        let observed_started = Arc::clone(&started);
+        let execution = RpgMakerTranslationTaskExecutor::execute(
+            &service,
+            &profile,
+            &task,
+            Box::new(move || observed_started.store(true, Ordering::Release)),
+        )
+        .await
+        .expect("已有 HTTP attempt 的任务在重试准入停止后应形成不可用终态");
+        let (state, evidence) = execution.into_parts();
+
+        assert!(matches!(
+            state,
+            TranslationTaskExecutionState::Started(TranslationTaskOutcome::Unavailable {
+                reason: TranslationTaskUnavailableReason::RequestAdmissionStopped {
+                    diagnostic,
+                },
+                ..
+            }) if diagnostic.primary().code() == "http.status"
+        ));
+        assert_eq!(evidence.attempt_count(), 1);
+        assert_eq!(evidence.provider(), Some("First"));
+        assert!(started.load(Ordering::Acquire));
         assert!(evidence.response().is_none());
     }
 

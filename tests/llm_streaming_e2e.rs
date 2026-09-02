@@ -54,6 +54,7 @@ impl StreamingProtocol {
 
 struct ObservedRequest {
     request_line: String,
+    headers: String,
     body: Value,
 }
 
@@ -162,14 +163,23 @@ fn chat_and_responses_streams_commit_translation_and_record_one_aggregated_assis
         assert_eq!(task_record.matches("## Assistant").count(), 1);
         assert_eq!(task_record.matches(&assistant).count(), 1);
         assert!(task_record.contains(protocol.thinking()));
+        assert!(task_record.contains("Upstream provider: not provided"));
         assert!(!task_record.contains("data:"));
         assert!(!task_record.contains("response.output_text.delta"));
         assert!(!task_record.contains("[DONE]"));
+
+        let log = read_latest_project_log(&workspace);
+        let finished = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("日志行必须是 JSON"))
+            .find(|record| record["event"] == "task.finished")
+            .expect("流式任务必须有终态");
+        assert_eq!(finished["payload"]["provider"], Value::Null);
     }
 }
 
 #[test]
-fn chat_stream_contract_failure_retries_and_clean_finish_eof_commits() {
+fn chat_stream_late_content_retries_and_records_the_final_openrouter_provider() {
     let temporary = tempfile::tempdir().expect("应可建立流式重试 E2E 临时目录");
     let root = temporary.path();
     let input = root.join("input");
@@ -188,11 +198,12 @@ fn chat_stream_contract_failure_retries_and_clean_finish_eof_commits() {
     .expect("应可写入 Generic JSONL");
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("流式重试 Provider 应可绑定");
-    let endpoint = format!(
-        "http://{}/v1/chat/completions",
+    let proxy = format!(
+        "http://{}",
         listener.local_addr().expect("Provider 地址应可读取")
     );
-    write_distribution_with_retries(root, StreamingProtocol::Chat, &endpoint, "[1]");
+    let endpoint = "http://openrouter.ai/v1/chat/completions";
+    write_distribution_with_retries(root, StreamingProtocol::Chat, endpoint, "[1]", Some(&proxy));
     let project = "stream-chat-retry";
     assert_success(
         "Generic retry Init",
@@ -223,20 +234,25 @@ fn chat_stream_contract_failure_retries_and_clean_finish_eof_commits() {
     })
     .to_string();
     let server_assistant = assistant.clone();
-    let server = thread::spawn(move || {
-        serve_invalid_then_finished_chat_without_done(listener, &server_assistant)
-    });
+    let server = thread::spawn(move || serve_late_then_valid_chat(listener, &server_assistant));
     assert_success(
         "Generic retry streaming Translate",
         &run_att(root, &["generic", "translate", "--name", project, "local"]),
     );
-    assert_eq!(
-        server
-            .join()
-            .expect("流式重试 Provider 线程不得 panic")
-            .expect("两次流式 attempt 都必须完成"),
-        2
-    );
+    let requests = server
+        .join()
+        .expect("流式重试 Provider 线程不得 panic")
+        .expect("两次流式 attempt 都必须完成");
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("x-openrouter-metadata: enabled"),
+            "OpenRouter attempt 必须显式请求 Router Metadata"
+        );
+    }
 
     let workspace = distribution_root(root)
         .join("projects/generic")
@@ -247,25 +263,30 @@ fn chat_stream_contract_failure_retries_and_clean_finish_eof_commits() {
         .expect("应可读取唯一 Generic 译文");
     assert_eq!(translation.as_deref(), Some("重试后的流式译文"));
 
-    let log = fs::read_to_string(
-        fs::read_dir(workspace.join("logs"))
-            .expect("日志目录应可读取")
-            .map(|entry| entry.expect("日志目录项应可读取").path())
-            .max()
-            .expect("Translate 日志必须存在"),
-    )
-    .expect("Translate 日志应可读取");
+    let log = read_latest_project_log(&workspace);
     let finished = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("日志行必须是 JSON"))
         .find(|record| record["event"] == "task.finished")
         .expect("流式重试任务必须有终态");
     assert_eq!(finished["payload"]["attempts"], 2);
+    assert_eq!(finished["payload"]["provider"], "FinalProvider");
     assert_eq!(finished["payload"]["outcome"]["kind"], "complete");
+    let message = finished["message"]
+        .as_str()
+        .expect("task.finished message 应为字符串");
+    assert!(message.contains("Upstream provider:"));
+    assert!(message.contains("FinalProvider"));
+    assert!(!log.contains("FirstProvider"));
+
+    let task_record = read_single_task_record(&workspace);
+    assert!(task_record.contains("Upstream provider:"));
+    assert!(task_record.contains("FinalProvider"));
+    assert!(!task_record.contains("FirstProvider"));
 }
 
 fn write_distribution(root: &Path, protocol: StreamingProtocol, endpoint: &str) {
-    write_distribution_with_retries(root, protocol, endpoint, "[]");
+    write_distribution_with_retries(root, protocol, endpoint, "[]", None);
 }
 
 fn write_distribution_with_retries(
@@ -273,11 +294,13 @@ fn write_distribution_with_retries(
     protocol: StreamingProtocol,
     endpoint: &str,
     retry_delays: &str,
+    proxy: Option<&str>,
 ) {
     let protocol_line = match protocol {
         StreamingProtocol::Chat => String::new(),
         StreamingProtocol::Responses => "protocol = \"responses\"\n".to_owned(),
     };
+    let proxy = proxy.map_or_else(|| "false".to_owned(), |url| format!("\"{url}\""));
     let distribution = distribution_root(root);
     fs::create_dir_all(&distribution).expect("发行目录应可建立");
     fs::write(
@@ -296,7 +319,7 @@ max_concurrent_requests = 1
 connect_timeout_ms = 5000
 read_timeout_ms = 10000
 request_timeout_ms = 10000
-proxy = false
+proxy = {proxy}
 additional_pem_files = []
 retry_delays_ms = {retry_delays}
 max_retry_after_ms = 1000
@@ -361,29 +384,35 @@ fn serve_streaming_response(
     Ok(request)
 }
 
-fn serve_invalid_then_finished_chat_without_done(
+fn serve_late_then_valid_chat(
     listener: TcpListener,
     assistant: &str,
-) -> Result<usize, String> {
+) -> Result<Vec<ObservedRequest>, String> {
     let (mut first, _) = listener
         .accept()
         .map_err(|error| format!("接受首次流式请求失败：{error}"))?;
-    read_http_request(&mut first)?;
-    write_chunked_sse(&mut first, b"data: {not-json}\n\n")?;
+    let first_request = read_http_request(&mut first)?;
+    write_chunked_sse(
+        &mut first,
+        &chat_sse_with_provider(assistant, Some("FirstProvider"), true),
+    )?;
 
     let (mut second, _) = listener
         .accept()
         .map_err(|error| format!("接受重试流式请求失败：{error}"))?;
-    read_http_request(&mut second)?;
-    let mut sse = chat_sse(assistant);
-    let done = b"data: [DONE]\n\n";
-    assert!(sse.ends_with(done));
-    sse.truncate(sse.len() - done.len());
-    write_chunked_sse(&mut second, &sse)?;
-    Ok(2)
+    let second_request = read_http_request(&mut second)?;
+    write_chunked_sse(
+        &mut second,
+        &chat_sse_with_provider(assistant, Some("FinalProvider"), false),
+    )?;
+    Ok(vec![first_request, second_request])
 }
 
 fn chat_sse(assistant: &str) -> Vec<u8> {
+    chat_sse_with_provider(assistant, None, false)
+}
+
+fn chat_sse_with_provider(assistant: &str, provider: Option<&str>, late_content: bool) -> Vec<u8> {
     let split_a = utf8_boundary_at_or_after(assistant, assistant.len() / 3);
     let split_b = utf8_boundary_at_or_after(assistant, assistant.len() * 2 / 3);
     let mut payload = Vec::new();
@@ -414,6 +443,50 @@ fn chat_sse(assistant: &str) -> Vec<u8> {
         )
         .as_bytes(),
     );
+    payload.extend_from_slice(
+        format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": null, "refusal": ""},
+                    "finish_reason": null,
+                }],
+            })
+        )
+        .as_bytes(),
+    );
+    if let Some(provider) = provider {
+        payload.extend_from_slice(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [],
+                    "openrouter_metadata": {
+                        "endpoints": {"available": [
+                            {"provider": provider, "selected": true}
+                        ]}
+                    }
+                })
+            )
+            .as_bytes(),
+        );
+    }
+    if late_content {
+        payload.extend_from_slice(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "late"},
+                        "finish_reason": null,
+                    }],
+                })
+            )
+            .as_bytes(),
+        );
+    }
     payload.extend_from_slice(b"data: [DONE]\n\n");
     payload
 }
@@ -498,7 +571,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<ObservedRequest, String> 
         }
     };
     let header = std::str::from_utf8(&bytes[..header_end - 4])
-        .map_err(|error| format!("HTTP header 不是 UTF-8：{error}"))?;
+        .map_err(|error| format!("HTTP header 不是 UTF-8：{error}"))?
+        .to_owned();
     let request_line = header
         .lines()
         .next()
@@ -524,7 +598,22 @@ fn read_http_request(stream: &mut TcpStream) -> Result<ObservedRequest, String> 
     }
     let body = serde_json::from_slice(&bytes[header_end..header_end + content_length])
         .map_err(|error| format!("HTTP 请求 body 不是 JSON：{error}"))?;
-    Ok(ObservedRequest { request_line, body })
+    Ok(ObservedRequest {
+        request_line,
+        headers: header,
+        body,
+    })
+}
+
+fn read_latest_project_log(workspace: &Path) -> String {
+    fs::read_to_string(
+        fs::read_dir(workspace.join("logs"))
+            .expect("日志目录应可读取")
+            .map(|entry| entry.expect("日志目录项应可读取").path())
+            .max()
+            .expect("Translate 日志必须存在"),
+    )
+    .expect("Translate 日志应可读取")
 }
 
 fn read_single_task_record(workspace: &Path) -> String {

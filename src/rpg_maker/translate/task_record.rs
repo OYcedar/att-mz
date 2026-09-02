@@ -16,7 +16,7 @@ pub(crate) use crate::translation::task_record::{
 };
 use crate::translation::task_record::{
     TranslationTaskRecordArtifact, TranslationTaskRecordOutputSummary, markdown_fence,
-    markdown_json_fence, task_record_output_ids, task_record_text,
+    markdown_inline_text, markdown_json_fence, task_record_output_ids, task_record_text,
 };
 
 use super::pipeline::{
@@ -64,16 +64,19 @@ impl TranslationTaskResponseRecord {
 #[derive(Debug)]
 pub(crate) struct TranslationTaskExecutionEvidence {
     attempt_count: usize,
+    provider: Option<String>,
     response: Option<TranslationTaskResponseRecord>,
 }
 
 impl TranslationTaskExecutionEvidence {
     pub(crate) fn from_execution(
         attempt_count: usize,
+        provider: Option<String>,
         response: Option<TranslationTaskResponseRecord>,
     ) -> Self {
         Self {
             attempt_count,
+            provider,
             response,
         }
     }
@@ -82,6 +85,7 @@ impl TranslationTaskExecutionEvidence {
     pub(crate) fn synthetic(attempts: NonZeroUsize) -> Self {
         Self {
             attempt_count: attempts.get(),
+            provider: None,
             response: None,
         }
     }
@@ -90,14 +94,21 @@ impl TranslationTaskExecutionEvidence {
         self.attempt_count
     }
 
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn response(&self) -> Option<&TranslationTaskResponseRecord> {
         self.response.as_ref()
     }
 
-    fn into_raw_assistant(self) -> Option<Arc<String>> {
-        self.response
-            .map(TranslationTaskResponseRecord::into_raw_assistant)
+    fn into_record_parts(self) -> (Option<Arc<String>>, Option<String>) {
+        (
+            self.response
+                .map(TranslationTaskResponseRecord::into_raw_assistant),
+            self.provider,
+        )
     }
 }
 
@@ -384,6 +395,7 @@ pub(crate) struct TranslationTaskRecordDocument {
     requested_outputs: usize,
     user_message: String,
     raw_assistant: Option<Arc<String>>,
+    provider: Option<String>,
     state: TranslationTaskRecordFinalState,
     /// 与项目日志共用、已在仍掌握 Unit/Task 事实的边界建立的安全诊断。
     ///
@@ -409,11 +421,13 @@ impl TranslationTaskRecordDocument {
             .expect("RPG Maker 模型任务必须包含 User 消息")
             .content()
             .to_owned();
+        let (raw_assistant, provider) = evidence.into_record_parts();
         Self {
             task_index: task.index(),
             requested_outputs,
             user_message,
-            raw_assistant: evidence.into_raw_assistant(),
+            raw_assistant,
+            provider,
             state,
             outcome_diagnostics: Vec::new(),
         }
@@ -429,6 +443,11 @@ impl TranslationTaskRecordDocument {
 
     pub(crate) const fn task_index(&self) -> RpgMakerTranslationTaskIndex {
         self.task_index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 
     #[cfg(test)]
@@ -540,6 +559,15 @@ fn render_final_result(
             }
         )
     );
+    let provider = document
+        .provider
+        .as_deref()
+        .map(|provider| markdown_inline_text(&api_key_redactor.redact(provider)));
+    let provider = match provider.as_deref() {
+        Some(provider) => task_record_text(localizer, UiMessage::TaskRecordProvider { provider }),
+        None => task_record_text(localizer, UiMessage::TaskRecordProviderUnavailable),
+    };
+    let _ = writeln!(output, "- {provider}");
 
     let _ = writeln!(
         output,
@@ -625,24 +653,61 @@ fn render_final_result(
 
 #[cfg(test)]
 mod tests {
+    use secrecy::SecretString;
+
     use super::*;
+    use crate::diagnostic::{
+        Diagnostic, RuntimeComponent, RuntimeIssue, RuntimeOperation, StateEffect,
+    };
 
     #[test]
-    fn execution_evidence_keeps_only_attempt_count_and_raw_assistant() {
+    fn execution_evidence_keeps_final_attempt_provider_and_raw_assistant() {
         let evidence = TranslationTaskExecutionEvidence::from_execution(
             2,
+            Some("SiliconFlow".to_owned()),
             Some(TranslationTaskResponseRecord::new(
                 "raw response".to_owned(),
             )),
         );
 
         assert_eq!(evidence.attempt_count(), 2);
+        assert_eq!(evidence.provider(), Some("SiliconFlow"));
         assert_eq!(
             evidence
-                .into_raw_assistant()
+                .into_record_parts()
+                .0
                 .expect("应保留原始 Assistant")
                 .as_str(),
             "raw response"
         );
+    }
+
+    #[test]
+    fn task_record_renders_the_final_attempt_provider_as_markdown_plain_text() {
+        let document = TranslationTaskRecordDocument {
+            task_index: RpgMakerTranslationTaskIndex::new(0),
+            requested_outputs: 1,
+            user_message: "request".to_owned(),
+            raw_assistant: None,
+            provider: Some("<SiliconFlow>[route]".to_owned()),
+            state: TranslationTaskRecordFinalState::ExecutionFailedNoChanges {
+                diagnostic: DiagnosticReport::new(
+                    StateEffect::ProgressPreserved,
+                    Diagnostic::runtime(RuntimeIssue::Cancelled {
+                        component: RuntimeComponent::Process,
+                        operation: RuntimeOperation::ExecuteTask,
+                    }),
+                ),
+            },
+            outcome_diagnostics: Vec::new(),
+        };
+
+        let rendered = document.render(
+            &ApiKeyRedactor::new(SecretString::from("secret")),
+            UiLocale::SimplifiedChinese,
+        );
+
+        assert!(rendered.contains(r"上游服务方：\<SiliconFlow\>\[route\]"));
+        assert!(!rendered.contains("<SiliconFlow>[route]"));
     }
 }

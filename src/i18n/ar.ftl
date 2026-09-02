@@ -155,7 +155,10 @@ log-retry-summary = { $count ->
    *[other] نُفذت { $count } محاولة.
 }
 log-translation-task-started = بدأت مهمة الترجمة { $index }/{ $total }.
-log-translation-task-finished = انتهت مهمة الترجمة { $index } بالنتيجة { $outcome }.
+log-translation-task-finished = انتهت مهمة الترجمة { $index } بالنتيجة { $outcome }. { $provider_status ->
+    [present] المزوّد الأعلى: { $provider }.
+   *[missing] المزوّد الأعلى: لم يُقدَّم.
+}
 log-run-recovery-required = انتهى الأمر { $command } بحالة تتطلب الاسترداد؛ اتبع مواقع الاسترداد الواردة في التشخيص.
 log-phase-completed = اكتملت المرحلة: { $phase }.
 log-phase-stopped = { $outcome ->
@@ -301,7 +304,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] يفتقد تدفق Responses إلى حدث نهائي
     [model_stream_event_type_mismatch] لا يتطابق اسم حدث SSE مع نوع JSON
     [model_stream_duplicate_choice] كرر تدفق النموذج choice نفسه
-    [model_stream_output_after_finish] واصل تدفق النموذج الإخراج بعد finish
+    [model_stream_choice_after_finish] أرسل تدفق Chat حقولًا تغيّر الاستجابة بعد finish
     [model_stream_unexpected_done] أعاد تدفق Responses علامة [DONE] غير متوقعة
     [response_json_invalid] استجابة Assistant ليست JSON صالحًا
     [response_shape_invalid] بنية الجذر أو الاستجابة في JSON الخاص بـ Assistant غير صالحة
@@ -411,6 +414,7 @@ diagnostic-response-item = عنصر الاستجابة { $item }
 diagnostic-array-item = عنصر المصفوفة { $item }
 diagnostic-token-position = موضع token التحكم { $position }
 diagnostic-text-segment = مقطع النص { $segment }
+diagnostic-post-finish-fields = الحقول بعد finish: { $fields }
 diagnostic-expected-actual = المتوقع { $expected }، والمستلم { $actual }
 diagnostic-placeholder-rule-file = قاعدة Placeholder رقم { $number } في { $path }
 diagnostic-placeholder-rule-project = قاعدة Placeholder رقم { $number } في المشروع الحالي
@@ -445,6 +449,8 @@ task-record-final-status = الحالة: { $state ->
     [cancelled] ملغاة؛ لم تُثبَّت
    *[other] { $state }
 }
+task-record-provider = المزوّد الأعلى: { $provider }
+task-record-provider-unavailable = المزوّد الأعلى: لم يُقدَّم
 task-record-requested = الترجمات المطلوبة: { $requested }
 task-record-accepted-written = المقبول: { $accepted } عناصر (المعرّفات: { $ids })، كُتبت في { $written } مواضع فعلية
 task-record-accepted-outcome-unknown = تم التحقق من { $accepted } عناصر (المعرّفات: { $ids })؛ تعذّر تأكيد نتيجة تثبيت قاعدة البيانات

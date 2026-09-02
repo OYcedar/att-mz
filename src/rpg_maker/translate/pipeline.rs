@@ -2630,6 +2630,9 @@ pub(crate) enum TranslationProtocolDiagnostic {
 pub(crate) enum TranslationTaskUnavailableReason {
     ModelResponseUnusable,
     AllOutputsRejected,
+    RequestAdmissionStopped {
+        diagnostic: DiagnosticReport,
+    },
     RecoverableRequestExhausted {
         diagnostic: DiagnosticReport,
         service_status: LlmServiceStatus,
@@ -2645,6 +2648,7 @@ pub(crate) enum TranslationTaskUnavailableReason {
 impl TranslationTaskUnavailableReason {
     fn stops_admission(&self) -> bool {
         match self {
+            Self::RequestAdmissionStopped { .. } => true,
             Self::RecoverableRequestExhausted { service_status, .. }
             | Self::RetryAfterExceedsConfiguredMaximum { service_status, .. } => {
                 service_status.stops_admission_after_unavailable() || service_status.is_permanent()
@@ -3086,7 +3090,8 @@ fn task_outcome_diagnostics(
             reports
         }
         TranslationTaskOutcome::Unavailable { reason, .. } => match reason {
-            TranslationTaskUnavailableReason::RecoverableRequestExhausted {
+            TranslationTaskUnavailableReason::RequestAdmissionStopped { diagnostic }
+            | TranslationTaskUnavailableReason::RecoverableRequestExhausted {
                 diagnostic, ..
             }
             | TranslationTaskUnavailableReason::RetryAfterExceedsConfiguredMaximum {
@@ -3512,6 +3517,7 @@ pub(crate) enum RpgMakerTranslationLogEvent {
         task_index: RpgMakerTranslationTaskIndex,
         outcome: RpgMakerTranslationLogTaskOutcome,
         attempts: Option<NonZeroUsize>,
+        provider: Option<String>,
         retry_exhausted: bool,
         report: RpgMakerTranslationRunReport,
     },
@@ -3938,6 +3944,7 @@ where
                                 diagnostic: diagnostic.clone(),
                             },
                             attempts,
+                            provider: evidence.provider().map(str::to_owned),
                             retry_exhausted: false,
                             report: report.clone(),
                         });
@@ -3970,6 +3977,7 @@ where
                             task_index: scheduled_task_index,
                             outcome: RpgMakerTranslationLogTaskOutcome::Cancelled,
                             attempts,
+                            provider: evidence.provider().map(str::to_owned),
                             retry_exhausted: false,
                             report: report.clone(),
                         });
@@ -4001,6 +4009,7 @@ where
                                 diagnostic: diagnostic.clone(),
                             },
                             attempts: NonZeroUsize::new(evidence.attempt_count()),
+                            provider: evidence.provider().map(str::to_owned),
                             retry_exhausted: false,
                             report: report.clone(),
                         });
@@ -4201,6 +4210,7 @@ where
                 task_index,
                 outcome: observed_outcome,
                 attempts: Some(outcome.attempts()),
+                provider: evidence.provider().map(str::to_owned),
                 retry_exhausted: false,
                 report: report.clone(),
             });
@@ -4241,6 +4251,7 @@ where
                     diagnostic: diagnostic.clone(),
                 },
                 attempts: Some(outcome.attempts()),
+                provider: evidence.provider().map(str::to_owned),
                 retry_exhausted: false,
                 report: report.clone(),
             });
@@ -4314,6 +4325,7 @@ where
                 task_index,
                 outcome: observed_outcome,
                 attempts: Some(outcome.attempts()),
+                provider: evidence.provider().map(str::to_owned),
                 retry_exhausted,
                 report: report.clone(),
             });
@@ -4973,6 +4985,7 @@ mod tests {
         Complete,
         Partial,
         Unavailable,
+        RequestAdmissionStopped,
         RetryExhausted,
         RateLimitExhausted,
     }
@@ -4992,9 +5005,12 @@ mod tests {
         CancelledNoChanges,
     }
 
+    type RecordedTaskProviders = Arc<Mutex<Vec<(usize, Option<String>)>>>;
+
     #[derive(Clone)]
     struct FakeTaskRecordSink {
         records: Arc<Mutex<Vec<(usize, RecordedTaskState)>>>,
+        providers: RecordedTaskProviders,
     }
 
     fn recorded_task_state(document: &TranslationTaskRecordDocument) -> RecordedTaskState {
@@ -5040,6 +5056,13 @@ mod tests {
     impl TranslationTaskRecordSink for FakeTaskRecordSink {
         fn submit(&self, document: TranslationTaskRecordDocument) {
             let state = recorded_task_state(&document);
+            self.providers
+                .lock()
+                .expect("任务记录服务方锁不应中毒")
+                .push((
+                    document.task_index().get(),
+                    document.provider().map(str::to_owned),
+                ));
             self.records
                 .lock()
                 .expect("任务记录锁不应中毒")
@@ -5166,7 +5189,7 @@ mod tests {
             record(&self.events, Event::Execute(index));
             if self.admission_stopped_at.contains(&index) {
                 return Ok(TranslationTaskExecution::admission_stopped(
-                    TranslationTaskExecutionEvidence::from_execution(0, None),
+                    TranslationTaskExecutionEvidence::from_execution(0, None, None),
                 ));
             }
             on_task_started();
@@ -5220,14 +5243,25 @@ mod tests {
                     .map_or(task_index, |(_, outcome_index)| {
                         RpgMakerTranslationTaskIndex::new(outcome_index)
                     });
-                Ok(TranslationTaskExecution::synthetic(fake_outcome(
-                    outcome_task_index,
-                    task.expected_outputs(),
-                    self.outcome_kinds
-                        .get(index)
-                        .copied()
-                        .unwrap_or(FakeOutcomeKind::Complete),
-                )))
+                let outcome_kind = self
+                    .outcome_kinds
+                    .get(index)
+                    .copied()
+                    .unwrap_or(FakeOutcomeKind::Complete);
+                let outcome =
+                    fake_outcome(outcome_task_index, task.expected_outputs(), outcome_kind);
+                if outcome_kind == FakeOutcomeKind::RequestAdmissionStopped {
+                    Ok(TranslationTaskExecution::new(
+                        outcome,
+                        TranslationTaskExecutionEvidence::from_execution(
+                            1,
+                            Some("First".to_owned()),
+                            None,
+                        ),
+                    ))
+                } else {
+                    Ok(TranslationTaskExecution::synthetic(outcome))
+                }
             }
         }
     }
@@ -5407,6 +5441,7 @@ mod tests {
         max_started_not_finalized: Arc<AtomicUsize>,
         finalizations: Arc<AtomicUsize>,
         task_records: Arc<Mutex<Vec<(usize, RecordedTaskState)>>>,
+        task_record_providers: RecordedTaskProviders,
         cancellation: CooperativeCancellation,
     }
 
@@ -5482,6 +5517,7 @@ mod tests {
         let max_started_not_finalized = Arc::new(AtomicUsize::new(0));
         let finalizations = Arc::new(AtomicUsize::new(0));
         let task_records = Arc::new(Mutex::new(Vec::new()));
+        let task_record_providers = Arc::new(Mutex::new(Vec::new()));
         let cancellation = CooperativeCancellation::default();
         Harness {
             service: RpgMakerTranslationService::new(
@@ -5532,6 +5568,7 @@ mod tests {
             )
             .with_task_record_sink(FakeTaskRecordSink {
                 records: Arc::clone(&task_records),
+                providers: Arc::clone(&task_record_providers),
             }),
             events,
             planner_inputs,
@@ -5542,6 +5579,7 @@ mod tests {
             max_started_not_finalized,
             finalizations,
             task_records,
+            task_record_providers,
             cancellation,
         }
     }
@@ -6644,6 +6682,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admission_stop_after_attempt_records_one_unavailable_task_with_provider() {
+        let harness = harness_with_behavior(
+            1,
+            vec![1],
+            false,
+            false,
+            false,
+            None,
+            None,
+            empty_preparation(),
+            vec![FakeOutcomeKind::RequestAdmissionStopped],
+        );
+
+        let report = expect_completed(
+            harness
+                .service
+                .run(&project(), &profile(1), input())
+                .await
+                .expect("重试准入停止应保留已开始任务的不可用终态"),
+        );
+        assert_eq!(report.started_tasks(), 1);
+        assert_eq!(report.unavailable_tasks(), 1);
+        assert_eq!(report.recoverable_request_exhaustions(), 0);
+        assert!(report.request_admission_stopped());
+
+        let records = harness.log_records.lock().expect("日志事件记录锁不应中毒");
+        let finished = records
+            .iter()
+            .find_map(|event| match event {
+                RpgMakerTranslationLogEvent::TaskFinished {
+                    outcome: RpgMakerTranslationLogTaskOutcome::Unavailable { diagnostics },
+                    attempts: Some(attempts),
+                    provider,
+                    retry_exhausted: false,
+                    ..
+                } if attempts.get() == 1 && provider.as_deref() == Some("First") => {
+                    Some(diagnostics)
+                }
+                _ => None,
+            })
+            .expect("已开始任务必须记录不可用终态和最后一次 attempt 的服务方");
+        assert_eq!(
+            finished.reports().next().unwrap().primary().code(),
+            "http.status"
+        );
+        drop(records);
+
+        assert_eq!(
+            *harness.task_records.lock().expect("任务记录锁不应中毒"),
+            vec![(0, RecordedTaskState::UnavailableNoChanges)]
+        );
+        assert_eq!(
+            *harness
+                .task_record_providers
+                .lock()
+                .expect("任务记录服务方锁不应中毒"),
+            vec![(0, Some("First".to_owned()))]
+        );
+        assert_all_started_tasks_observed(&harness.log_records, &harness.task_records);
+    }
+
+    #[tokio::test]
     async fn rate_limit_exhaustion_stops_admission_before_slow_earlier_task_finishes() {
         let mut harness = harness_with_behavior(
             8,
@@ -7061,6 +7161,22 @@ mod tests {
                         .map(|output| {
                             unresolved(output, TranslationUnitRejectionReason::InvalidResponse)
                         })
+                        .collect(),
+                ),
+            },
+            FakeOutcomeKind::RequestAdmissionStopped => TranslationTaskOutcome::Unavailable {
+                context: TranslationTaskOutcomeContext::new(
+                    task_index,
+                    NonZeroUsize::MIN,
+                    Vec::new(),
+                ),
+                reason: TranslationTaskUnavailableReason::RequestAdmissionStopped {
+                    diagnostic: test_retry_exhausted_report(),
+                },
+                unresolved: test_non_empty(
+                    expected
+                        .iter()
+                        .map(|output| unresolved(output, TranslationUnitRejectionReason::Missing))
                         .collect(),
                 ),
             },

@@ -148,7 +148,10 @@ log-plan-resolved = Lệnh { $command } lấy kế hoạch từ { $source }.
 log-phase-started = Bắt đầu giai đoạn: { $phase }.
 log-retry-summary = Đã thực hiện { $count } lần thử lại.
 log-translation-task-started = Tác vụ dịch { $index }/{ $total } đã bắt đầu.
-log-translation-task-finished = Tác vụ dịch { $index } kết thúc với kết quả { $outcome }.
+log-translation-task-finished = Tác vụ dịch { $index } kết thúc với kết quả { $outcome }. { $provider_status ->
+    [present] Nhà cung cấp thượng nguồn: { $provider }.
+   *[missing] Nhà cung cấp thượng nguồn: không được cung cấp.
+}
 log-run-recovery-required = Lệnh { $command } kết thúc ở trạng thái cần khôi phục; hãy làm theo các vị trí khôi phục trong chẩn đoán.
 log-phase-completed = Giai đoạn đã hoàn tất: { $phase }.
 log-phase-stopped = { $outcome ->
@@ -294,7 +297,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Luồng Responses thiếu sự kiện kết thúc
     [model_stream_event_type_mismatch] Tên sự kiện SSE không khớp với kiểu JSON
     [model_stream_duplicate_choice] Luồng mô hình lặp lại cùng một choice
-    [model_stream_output_after_finish] Luồng mô hình tiếp tục xuất sau finish
+    [model_stream_choice_after_finish] Luồng Chat gửi các trường làm thay đổi phản hồi sau finish
     [model_stream_unexpected_done] Luồng Responses trả về [DONE] ngoài dự kiến
     [response_json_invalid] Phản hồi Assistant không phải JSON hợp lệ
     [response_shape_invalid] Cấu trúc gốc hoặc cấu trúc phản hồi của JSON Assistant không hợp lệ
@@ -404,6 +407,7 @@ diagnostic-response-item = mục phản hồi { $item }
 diagnostic-array-item = mục trong mảng { $item }
 diagnostic-token-position = vị trí token điều khiển { $position }
 diagnostic-text-segment = phân đoạn văn bản { $segment }
+diagnostic-post-finish-fields = các trường sau finish: { $fields }
 diagnostic-expected-actual = dự kiến { $expected }, nhận được { $actual }
 diagnostic-placeholder-rule-file = Quy tắc Placeholder { $number } trong { $path }
 diagnostic-placeholder-rule-project = Quy tắc Placeholder { $number } của dự án hiện tại
@@ -438,6 +442,8 @@ task-record-final-status = Trạng thái: { $state ->
     [cancelled] đã hủy, chưa commit
    *[other] { $state }
 }
+task-record-provider = Nhà cung cấp thượng nguồn: { $provider }
+task-record-provider-unavailable = Nhà cung cấp thượng nguồn: không được cung cấp
 task-record-requested = Bản dịch được yêu cầu: { $requested }
 task-record-accepted-written = Đã nhận: { $accepted } mục (ID: { $ids }), ghi vào { $written } vị trí thực tế
 task-record-accepted-outcome-unknown = Đã kiểm tra: { $accepted } mục (ID: { $ids }); không thể xác nhận kết quả commit cơ sở dữ liệu

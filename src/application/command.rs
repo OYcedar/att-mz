@@ -42,9 +42,9 @@ use crate::diagnostic::{
     BoxedError, Diagnostic, DiagnosticIssue, DiagnosticReport, IoFailure, PromptProblem,
     RelatedFailureRelation, ReportedFailure, RpgMakerDiagnosticStage, RpgMakerIssue,
     RpgMakerProjectProblem, RuntimeComponent, RuntimeEngine, RuntimeIssue, RuntimeOperation,
-    RuntimePanicBoundary, SafeIdentifier, SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage,
-    SqliteDriverFailure, SqliteIssue, SqliteOperation, SqliteProblem, SqliteTransactionState,
-    StateEffect, TranslationIssue, public_path, render_diagnostic_report,
+    RuntimePanicBoundary, SafeIdentifier, SafePath, SafeText, SqliteDiagnosticContext,
+    SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue, SqliteOperation, SqliteProblem,
+    SqliteTransactionState, StateEffect, TranslationIssue, public_path, render_diagnostic_report,
     render_state_effect_impact,
 };
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -4073,6 +4073,7 @@ mod progress_lifecycle_tests {
                         }
                     },
                     attempts: NonZeroUsize::new(attempts),
+                    provider: Some("SiliconFlow".to_owned()),
                     retry_exhausted,
                     report: RpgMakerTranslationRunReport::from_summary_for_test(
                         if retry_exhausted {
@@ -4115,6 +4116,17 @@ mod progress_lifecycle_tests {
                 "recovered": 3,
                 "exhausted": 2,
             })
+        );
+        let task_finished = records
+            .iter()
+            .find(|record| record["event"] == "task.finished")
+            .expect("任务终态应独立于 Markdown 任务记录写入 JSONL");
+        assert_eq!(task_finished["payload"]["provider"], "SiliconFlow");
+        assert!(
+            task_finished["message"]
+                .as_str()
+                .expect("任务终态 message 应为文本")
+                .contains("SiliconFlow")
         );
     }
 
@@ -4178,6 +4190,7 @@ mod progress_lifecycle_tests {
                     diagnostics: RpgMakerTaskDiagnosticReports::for_test(retry_exhausted_report()),
                 },
                 attempts: NonZeroUsize::new(3),
+                provider: None,
                 retry_exhausted: true,
                 report: RpgMakerTranslationRunReport::from_summary_for_test(final_summary),
             },
@@ -4221,6 +4234,9 @@ mod progress_lifecycle_tests {
         assert!(records.iter().any(|record| {
             record["event"] == "translation.finished"
                 && record["payload"]["result"]["kind"] == "incomplete"
+        }));
+        assert!(records.iter().any(|record| {
+            record["event"] == "task.finished" && record["payload"]["provider"].is_null()
         }));
         assert!(records.iter().any(|record| {
             record["event"] == "run.finished" && record["payload"]["result"]["kind"] == "succeeded"
@@ -4903,6 +4919,7 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                 task_index,
                 outcome,
                 attempts,
+                provider,
                 retry_exhausted,
                 report,
             } => {
@@ -5011,6 +5028,7 @@ impl RpgMakerTranslationLog for ProductionBusinessLog {
                     self.handle.emit(ProjectLogEvent::TaskFinished {
                         task,
                         attempts,
+                        provider: provider.map(SafeText::new),
                         outcome: log_outcome,
                     });
                 }

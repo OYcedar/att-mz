@@ -459,9 +459,10 @@ fn generic_fixed_http_503_is_unavailable_and_preserves_the_structured_status() {
         serde_json::json!({
             "task": {"ordinal": 1, "total": 1},
             "attempts": 1,
+            "provider": null,
             "outcome": {"kind": "unavailable"},
         }),
-        "task.finished 只需说明当前任务结果：{log}"
+        "task.finished 必须说明当前任务结果和最终 attempt 的服务方归属：{log}"
     );
 
     let translation_finished = records

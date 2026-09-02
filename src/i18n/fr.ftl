@@ -151,7 +151,10 @@ log-retry-summary = { $count ->
    *[other] { $count } nouvelles tentatives ont été effectuées.
 }
 log-translation-task-started = Tâche de traduction { $index }/{ $total } démarrée.
-log-translation-task-finished = Tâche de traduction { $index } terminée avec le résultat { $outcome }.
+log-translation-task-finished = Tâche de traduction { $index } terminée avec le résultat { $outcome }. { $provider_status ->
+    [present] Fournisseur en amont : { $provider }.
+   *[missing] Fournisseur en amont : non fourni.
+}
 log-run-recovery-required = La commande { $command } s’est terminée dans un état nécessitant une récupération ; suivez les emplacements indiqués dans le diagnostic.
 log-phase-completed = Phase terminée : { $phase }.
 log-phase-stopped = { $outcome ->
@@ -297,7 +300,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Le flux Responses ne contient pas d’événement terminal
     [model_stream_event_type_mismatch] Le nom d’événement SSE et le type JSON ne correspondent pas
     [model_stream_duplicate_choice] Le flux du modèle a répété la même choice
-    [model_stream_output_after_finish] Le flux du modèle a continué après finish
+    [model_stream_choice_after_finish] Le flux Chat a envoyé des champs modifiant la réponse après finish
     [model_stream_unexpected_done] Le flux Responses a renvoyé un [DONE] inattendu
     [response_json_invalid] La réponse Assistant n'est pas un JSON valide
     [response_shape_invalid] La racine ou la structure de réponse du JSON Assistant est incorrecte
@@ -407,6 +410,7 @@ diagnostic-response-item = élément de réponse { $item }
 diagnostic-array-item = élément de tableau { $item }
 diagnostic-token-position = position du token de contrôle { $position }
 diagnostic-text-segment = segment de texte { $segment }
+diagnostic-post-finish-fields = champs après finish : { $fields }
 diagnostic-expected-actual = attendu { $expected }, reçu { $actual }
 diagnostic-placeholder-rule-file = Règle Placeholder { $number } dans { $path }
 diagnostic-placeholder-rule-project = Règle Placeholder { $number } du projet actuel
@@ -441,6 +445,8 @@ task-record-final-status = État : { $state ->
     [cancelled] annulée, non validée
    *[other] { $state }
 }
+task-record-provider = Fournisseur en amont : { $provider }
+task-record-provider-unavailable = Fournisseur en amont : non fourni
 task-record-requested = Traductions demandées : { $requested }
 task-record-accepted-written = Acceptées : { $accepted } entrées (ID : { $ids }), écrites à { $written } emplacements réels
 task-record-accepted-outcome-unknown = Validées : { $accepted } entrées (ID : { $ids }) ; résultat du commit de base de données impossible à confirmer

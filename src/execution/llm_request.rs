@@ -50,11 +50,17 @@ impl<'a> LlmRequestRetryPolicy<'a> {
 #[derive(Debug)]
 pub(crate) struct LlmRequestAttemptEvidence {
     attempt_count: usize,
+    provider: Option<String>,
 }
 
 impl LlmRequestAttemptEvidence {
     pub(crate) const fn attempt_count(&self) -> usize {
         self.attempt_count
+    }
+
+    /// 最后一次实际 HTTP attempt 已明确报告的服务方。
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 }
 
@@ -102,20 +108,30 @@ impl<E> LlmRequestExecution<E> {
 
 struct AttemptEvidenceBuilder {
     attempt_count: usize,
+    provider: Option<String>,
 }
 
 impl AttemptEvidenceBuilder {
     const fn new() -> Self {
-        Self { attempt_count: 0 }
+        Self {
+            attempt_count: 0,
+            provider: None,
+        }
     }
 
     fn begin_attempt(&mut self, attempt: NonZeroUsize) {
         self.attempt_count = self.attempt_count.max(attempt.get());
+        self.provider = None;
+    }
+
+    fn record_provider(&mut self, provider: Option<&str>) {
+        self.provider = provider.map(str::to_owned);
     }
 
     fn finish(self) -> LlmRequestAttemptEvidence {
         LlmRequestAttemptEvidence {
             attempt_count: self.attempt_count,
+            provider: self.provider,
         }
     }
 }
@@ -233,6 +249,7 @@ where
                         on_started();
                     }
                 }
+                evidence.record_provider(response.provider());
                 return finish(
                     LlmRequestExecutionOutcome::Response { response, attempt },
                     evidence,
@@ -244,6 +261,9 @@ where
                     if let Some(on_started) = on_first_attempt_started.take() {
                         on_started();
                     }
+                }
+                if source.request_was_sent() {
+                    evidence.record_provider(source.provider());
                 }
                 let cancelled = cancellation.is_requested() && source.is_cancelled_wait();
                 if cancelled {
@@ -279,6 +299,9 @@ where
                     if let Some(on_started) = on_first_attempt_started.take() {
                         on_started();
                     }
+                }
+                if source.request_was_sent() {
+                    evidence.record_provider(source.provider());
                 }
                 if cancellation.is_requested() && source.is_cancelled_wait() {
                     return finish(LlmRequestExecutionOutcome::Cancelled, evidence);
@@ -384,6 +407,10 @@ mod tests {
         fn request_was_sent(&self) -> bool {
             !matches!(self.0, "cancelled-wait" | "not-sent")
         }
+
+        fn provider(&self) -> Option<&str> {
+            self.0.strip_prefix("provider:")
+        }
     }
 
     type FakeResponse = Result<LlmResponse, LlmRequestError<FakeError>>;
@@ -473,7 +500,10 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let llm = FakeLlm {
             responses: Arc::new(Mutex::new(VecDeque::from([
-                retryable(),
+                Err(LlmRequestError::Retryable {
+                    source: FakeError("provider:First"),
+                    retry_after: None,
+                }),
                 Ok(LlmResponse::new("{}", LlmFinishReason::Stop)),
             ]))),
             calls: Arc::clone(&calls),
@@ -499,6 +529,7 @@ mod tests {
             1,
             "未开始的下一请求不得虚增 attempt"
         );
+        assert_eq!(evidence.provider(), Some("First"));
     }
 
     #[tokio::test]
@@ -579,6 +610,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_evidence_uses_only_the_final_http_attempt_provider() {
+        let llm = FakeLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                Err(LlmRequestError::Retryable {
+                    source: FakeError("provider:First"),
+                    retry_after: None,
+                }),
+                Ok(LlmResponse::new("{}", LlmFinishReason::Stop)
+                    .with_provider(Some("Second".to_owned()))),
+            ]))),
+            calls: Arc::new(Mutex::new(0)),
+        };
+
+        let execution = execute_llm_request_with_retry(
+            &llm,
+            &(),
+            &[],
+            LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &CooperativeCancellation::default(),
+        )
+        .await;
+        let (_, evidence) = execution.into_parts();
+
+        assert_eq!(evidence.attempt_count(), 2);
+        assert_eq!(evidence.provider(), Some("Second"));
+    }
+
+    #[tokio::test]
+    async fn retry_budget_exhaustion_keeps_only_the_final_attempt_provider() {
+        let llm = FakeLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                Err(LlmRequestError::Retryable {
+                    source: FakeError("provider:First"),
+                    retry_after: None,
+                }),
+                Err(LlmRequestError::Retryable {
+                    source: FakeError("provider:Second"),
+                    retry_after: None,
+                }),
+            ]))),
+            calls: Arc::new(Mutex::new(0)),
+        };
+
+        let execution = execute_llm_request_with_retry(
+            &llm,
+            &(),
+            &[],
+            LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &CooperativeCancellation::default(),
+        )
+        .await;
+        let (outcome, evidence) = execution.into_parts();
+
+        assert!(matches!(
+            outcome,
+            LlmRequestExecutionOutcome::RetryBudgetExhausted { attempt, .. }
+                if attempt.get() == 2
+        ));
+        assert_eq!(evidence.attempt_count(), 2);
+        assert_eq!(evidence.provider(), Some("Second"));
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_http_attempt_clears_the_previous_provider() {
+        let llm = FakeLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                Err(LlmRequestError::Retryable {
+                    source: FakeError("provider:First"),
+                    retry_after: None,
+                }),
+                retryable(),
+            ]))),
+            calls: Arc::new(Mutex::new(0)),
+        };
+
+        let execution = execute_llm_request_with_retry(
+            &llm,
+            &(),
+            &[],
+            LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &CooperativeCancellation::default(),
+        )
+        .await;
+        let (_, evidence) = execution.into_parts();
+
+        assert_eq!(evidence.attempt_count(), 2);
+        assert_eq!(evidence.provider(), None);
+    }
+
+    #[tokio::test]
     async fn admission_stop_without_http_has_zero_attempts() {
         let started = Arc::new(AtomicBool::new(false));
         let llm = FakeLlm {
@@ -615,6 +739,46 @@ mod tests {
         ));
         assert_eq!(evidence.attempt_count(), 0);
         assert!(!started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn admission_stop_after_retry_keeps_the_last_started_attempt_evidence() {
+        let llm = FakeLlm {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                Err(LlmRequestError::Retryable {
+                    source: FakeError("provider:First"),
+                    retry_after: None,
+                }),
+                Err(LlmRequestError::AdmissionStopped {
+                    diagnostic: DiagnosticReport::new(
+                        StateEffect::ProgressPreserved,
+                        Diagnostic::runtime(RuntimeIssue::ExecutorClosed {
+                            component: RuntimeComponent::Process,
+                            operation: RuntimeOperation::ExecuteTask,
+                        }),
+                    ),
+                }),
+            ]))),
+            calls: Arc::new(Mutex::new(0)),
+        };
+
+        let execution = execute_llm_request_with_retry(
+            &llm,
+            &(),
+            &[],
+            LlmRequestRetryPolicy::new(&[Duration::ZERO], Duration::from_secs(1)),
+            &ImmediateDelay,
+            &CooperativeCancellation::default(),
+        )
+        .await;
+        let (outcome, evidence) = execution.into_parts();
+
+        assert!(matches!(
+            outcome,
+            LlmRequestExecutionOutcome::AdmissionStopped { .. }
+        ));
+        assert_eq!(evidence.attempt_count(), 1);
+        assert_eq!(evidence.provider(), Some("First"));
     }
 
     #[tokio::test]

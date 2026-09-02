@@ -50,9 +50,9 @@ use crate::diagnostic::{
     PlaceholderWorkerOperation as DiagnosticPlaceholderWorkerOperation, PublicationIssue,
     PublicationProblem, PublicationRequestViolation, PublicationStep, RelatedFailureRelation,
     ReportedFailure, RuntimeComponent, RuntimeIssue, RuntimeOperation, SafeIdentifier, SafeIoKind,
-    SafePath, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure, SqliteIssue,
-    SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect, TranslationIssue,
-    TranslationPlanningResourceOrigin, TranslationTaskPlanningProblem,
+    SafePath, SafeText, SqliteDiagnosticContext, SqliteDiagnosticStage, SqliteDriverFailure,
+    SqliteIssue, SqliteOperation, SqliteProblem, SqliteTransactionState, StateEffect,
+    TranslationIssue, TranslationPlanningResourceOrigin, TranslationTaskPlanningProblem,
 };
 use crate::execution::CooperativeCancellation;
 use crate::execution::cpu::{CpuTaskExecutionError, CpuTaskExecutor};
@@ -3466,6 +3466,7 @@ impl GenericTaskProjectLog {
         &self,
         task_index: usize,
         attempts: usize,
+        provider: Option<&str>,
         terminal: GenericTaskTerminal,
         diagnostics: impl IntoIterator<Item = DiagnosticReport>,
     ) {
@@ -3552,6 +3553,7 @@ impl GenericTaskProjectLog {
         self.handle.emit(ProjectLogEvent::TaskFinished {
             task,
             attempts: generic_count(attempts),
+            provider: provider.map(SafeText::new),
             outcome,
         });
     }
@@ -3594,7 +3596,13 @@ impl GenericTaskProjectLog {
             .collect::<Vec<_>>();
         in_flight.sort_unstable();
         for task_index in in_flight {
-            self.finished(task_index, 1, GenericTaskTerminal::Failed, [report.clone()]);
+            self.finished(
+                task_index,
+                1,
+                None,
+                GenericTaskTerminal::Failed,
+                [report.clone()],
+            );
         }
     }
 
@@ -3643,6 +3651,7 @@ struct GenericTaskRecordDraft {
     requested_outputs: usize,
     user_message: String,
     raw_assistant: Option<Arc<String>>,
+    provider: Option<String>,
 }
 
 struct GenericTaskRecordInFlight {
@@ -3652,12 +3661,17 @@ struct GenericTaskRecordInFlight {
 }
 
 impl GenericTaskRecordInFlight {
-    fn finish(self, raw_assistant: Option<Arc<String>>) -> GenericTaskRecordDraft {
+    fn finish(
+        self,
+        raw_assistant: Option<Arc<String>>,
+        provider: Option<String>,
+    ) -> GenericTaskRecordDraft {
         GenericTaskRecordDraft {
             task_index: self.task_index,
             requested_outputs: self.requested_outputs,
             user_message: self.user_message,
             raw_assistant,
+            provider,
         }
     }
 }
@@ -3671,6 +3685,7 @@ impl GenericTaskRecordDraft {
             self.raw_assistant.map(|assistant| {
                 Arc::try_unwrap(assistant).unwrap_or_else(|value| (*value).clone())
             }),
+            self.provider,
             state,
         )
     }
@@ -3719,6 +3734,7 @@ struct GenericPreparedTask {
     outcome: GenericPreparedTaskOutcome,
     record: Option<GenericTaskRecordDraft>,
     attempt_count: usize,
+    provider: Option<String>,
 }
 
 fn cancelled_generic_prepared_task(
@@ -3726,12 +3742,14 @@ fn cancelled_generic_prepared_task(
     record: Option<GenericTaskRecordInFlight>,
     raw_assistant: Option<Arc<String>>,
     attempt_count: usize,
+    provider: Option<String>,
 ) -> GenericPreparedTask {
     GenericPreparedTask {
         task_index,
         outcome: GenericPreparedTaskOutcome::Cancelled,
-        record: record.map(|record| record.finish(raw_assistant)),
+        record: record.map(|record| record.finish(raw_assistant, provider.clone())),
         attempt_count,
+        provider,
     }
 }
 
@@ -3890,6 +3908,7 @@ async fn execute_generic_tasks(
             outcome,
             record,
             attempt_count,
+            provider,
         } = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -3898,6 +3917,7 @@ async fn execute_generic_tasks(
                 project_log.finished(
                     scheduled_task_index,
                     0,
+                    None,
                     if error.is_cancelled() {
                         GenericTaskTerminal::Cancelled
                     } else {
@@ -3927,18 +3947,21 @@ async fn execute_generic_tasks(
                 GenericPreparedTaskOutcome::Cancelled => project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     GenericTaskTerminal::Cancelled,
                     std::iter::empty(),
                 ),
                 GenericPreparedTaskOutcome::Unavailable { diagnostic, .. } => project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     GenericTaskTerminal::Unavailable,
                     [diagnostic.clone()],
                 ),
                 GenericPreparedTaskOutcome::Accepted { .. } => project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     if prior_was_cancelled {
                         GenericTaskTerminal::Cancelled
                     } else {
@@ -3949,6 +3972,7 @@ async fn execute_generic_tasks(
                 GenericPreparedTaskOutcome::Failed { error, .. } => project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     GenericTaskTerminal::Failed,
                     [generic_task_execution_error_report(
                         error,
@@ -4049,6 +4073,7 @@ async fn execute_generic_tasks(
                         project_log.finished(
                             task_index,
                             attempt_count,
+                            provider.as_deref(),
                             GenericTaskTerminal::Failed,
                             [report.clone()],
                         );
@@ -4137,6 +4162,7 @@ async fn execute_generic_tasks(
                 project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     final_result.terminal,
                     final_result.diagnostics.clone(),
                 );
@@ -4152,6 +4178,7 @@ async fn execute_generic_tasks(
                 project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     GenericTaskTerminal::Unavailable,
                     [diagnostic.clone()],
                 );
@@ -4182,6 +4209,7 @@ async fn execute_generic_tasks(
                 project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     GenericTaskTerminal::Failed,
                     [diagnostic.clone()],
                 );
@@ -4204,6 +4232,7 @@ async fn execute_generic_tasks(
                 project_log.finished(
                     task_index,
                     attempt_count,
+                    provider.as_deref(),
                     GenericTaskTerminal::Cancelled,
                     std::iter::empty(),
                 );
@@ -4300,6 +4329,7 @@ async fn execute_generic_task(
         admission_stopped.store(true, Ordering::Release);
     }
     let attempt_count = evidence.attempt_count();
+    let provider = evidence.provider().map(str::to_owned);
     let record = (attempt_count > 0)
         .then_some(recorded_user_message)
         .flatten()
@@ -4433,6 +4463,7 @@ async fn execute_generic_task(
                 record,
                 response_record,
                 attempt_count,
+                provider,
             ));
         }
         Err(source) => {
@@ -4443,8 +4474,9 @@ async fn execute_generic_task(
                     error,
                     preserve_admitted_results: false,
                 },
-                record: record.map(|record| record.finish(response_record)),
+                record: record.map(|record| record.finish(response_record, provider.clone())),
                 attempt_count,
+                provider,
             });
         }
         Ok(Err(source)) if source.is_cancelled() => {
@@ -4453,6 +4485,7 @@ async fn execute_generic_task(
                 record,
                 response_record,
                 attempt_count,
+                provider,
             ));
         }
         Ok(Err(source)) => {
@@ -4463,8 +4496,9 @@ async fn execute_generic_task(
                     error,
                     preserve_admitted_results: false,
                 },
-                record: record.map(|record| record.finish(response_record)),
+                record: record.map(|record| record.finish(response_record, provider.clone())),
                 attempt_count,
+                provider,
             });
         }
         Ok(Ok(processed)) => processed,
@@ -4472,8 +4506,9 @@ async fn execute_generic_task(
     Ok(GenericPreparedTask {
         task_index,
         outcome,
-        record: record.map(|record| record.finish(response_record)),
+        record: record.map(|record| record.finish(response_record, provider.clone())),
         attempt_count,
+        provider,
     })
 }
 
@@ -7182,6 +7217,7 @@ mod tests {
             }),
             None,
             1,
+            Some("SiliconFlow".to_owned()),
         );
 
         assert_eq!(prepared.task_index, 1);
@@ -7194,6 +7230,7 @@ mod tests {
         assert_eq!(record.requested_outputs, 1);
         assert_eq!(record.user_message, "request");
         assert!(record.raw_assistant.is_none());
+        assert_eq!(record.provider.as_deref(), Some("SiliconFlow"));
     }
 
     #[test]
@@ -7207,6 +7244,7 @@ mod tests {
             }),
             Some(Arc::new(r#"{"0":["译文"]}"#.to_owned())),
             1,
+            None,
         );
 
         let record = prepared.record.expect("收到响应后的取消必须保留任务记录");

@@ -560,6 +560,9 @@ pub(crate) enum UiMessage<'a> {
     DiagnosticTextSegment {
         segment: u64,
     },
+    DiagnosticPostFinishFields {
+        fields: &'a str,
+    },
     DiagnosticExpectedActual {
         expected: u64,
         actual: u64,
@@ -835,6 +838,7 @@ pub(crate) enum UiMessage<'a> {
     LogTranslationTaskFinished {
         index: u64,
         outcome: &'a str,
+        provider: Option<&'a str>,
     },
     LogTaskOutcomeValue {
         outcome: &'a str,
@@ -844,6 +848,10 @@ pub(crate) enum UiMessage<'a> {
     TaskRecordFinalStatus {
         state: &'a str,
     },
+    TaskRecordProvider {
+        provider: &'a str,
+    },
+    TaskRecordProviderUnavailable,
     TaskRecordRequested {
         requested: u64,
     },
@@ -947,6 +955,7 @@ impl UiMessage<'_> {
             Self::DiagnosticArrayItem { .. } => "diagnostic-array-item",
             Self::DiagnosticTokenPosition { .. } => "diagnostic-token-position",
             Self::DiagnosticTextSegment { .. } => "diagnostic-text-segment",
+            Self::DiagnosticPostFinishFields { .. } => "diagnostic-post-finish-fields",
             Self::DiagnosticExpectedActual { .. } => "diagnostic-expected-actual",
             Self::DiagnosticPlaceholderRuleFile { .. } => "diagnostic-placeholder-rule-file",
             Self::DiagnosticPlaceholderRuleProject { .. } => "diagnostic-placeholder-rule-project",
@@ -1044,6 +1053,8 @@ impl UiMessage<'_> {
             Self::TaskRecordTitle => "task-record-title",
             Self::TaskRecordFinalResultHeading => "task-record-final-result-heading",
             Self::TaskRecordFinalStatus { .. } => "task-record-final-status",
+            Self::TaskRecordProvider { .. } => "task-record-provider",
+            Self::TaskRecordProviderUnavailable => "task-record-provider-unavailable",
             Self::TaskRecordRequested { .. } => "task-record-requested",
             Self::TaskRecordAcceptedWritten { .. } => "task-record-accepted-written",
             Self::TaskRecordAcceptedOutcomeUnknown { .. } => "task-record-accepted-outcome-unknown",
@@ -1289,15 +1300,32 @@ impl UiMessage<'_> {
                 set_number(&mut arguments, "index", index);
                 set_number(&mut arguments, "total", total);
             }
-            Self::LogTranslationTaskFinished { index, outcome } => {
+            Self::LogTranslationTaskFinished {
+                index,
+                outcome,
+                provider,
+            } => {
                 set_number(&mut arguments, "index", index);
                 set_text(&mut arguments, "outcome", outcome);
+                set_text(&mut arguments, "provider", provider.unwrap_or_default());
+                set_text(
+                    &mut arguments,
+                    "provider_status",
+                    if provider.is_some() {
+                        "present"
+                    } else {
+                        "missing"
+                    },
+                );
             }
             Self::LogTaskOutcomeValue { outcome } => {
                 set_text(&mut arguments, "outcome", outcome);
             }
             Self::TaskRecordFinalStatus { state } => {
                 set_text(&mut arguments, "state", state);
+            }
+            Self::TaskRecordProvider { provider } => {
+                set_text(&mut arguments, "provider", provider);
             }
             Self::TaskRecordRequested { requested } => {
                 set_number(&mut arguments, "requested", requested);
@@ -1375,6 +1403,9 @@ impl UiMessage<'_> {
             }
             Self::DiagnosticTextSegment { segment } => {
                 set_number(&mut arguments, "segment", segment);
+            }
+            Self::DiagnosticPostFinishFields { fields } => {
+                set_text(&mut arguments, "fields", fields);
             }
             Self::DiagnosticExpectedActual { expected, actual } => {
                 set_number(&mut arguments, "expected", expected);
@@ -1554,7 +1585,8 @@ impl UiMessage<'_> {
             | Self::TranslateIncompleteHelp
             | Self::TranslateIncompleteRejectedHelp
             | Self::TaskRecordTitle
-            | Self::TaskRecordFinalResultHeading => {}
+            | Self::TaskRecordFinalResultHeading
+            | Self::TaskRecordProviderUnavailable => {}
         }
         arguments
     }
@@ -1772,7 +1804,7 @@ mod tests {
             "model_stream_invalid_utf8",
             "model_stream_missing_finish",
             "model_stream_missing_responses_terminal",
-            "model_stream_output_after_finish",
+            "model_stream_choice_after_finish",
             "model_stream_unclosed_event",
             "model_stream_unexpected_done",
             "invalid_syntax",
@@ -2200,6 +2232,9 @@ mod tests {
             UiMessage::DiagnosticArrayItem { item: 3 },
             UiMessage::DiagnosticTokenPosition { position: 4 },
             UiMessage::DiagnosticTextSegment { segment: 5 },
+            UiMessage::DiagnosticPostFinishFields {
+                fields: "delta.content,finish_reason",
+            },
             UiMessage::DiagnosticExpectedActual {
                 expected: 2,
                 actual: 3,
@@ -2414,6 +2449,12 @@ mod tests {
             UiMessage::LogTranslationTaskFinished {
                 index: 1,
                 outcome: "complete",
+                provider: Some("provider"),
+            },
+            UiMessage::LogTranslationTaskFinished {
+                index: 2,
+                outcome: "unavailable",
+                provider: None,
             },
             UiMessage::LogTaskOutcomeValue {
                 outcome: "complete",
@@ -2421,6 +2462,10 @@ mod tests {
             UiMessage::TaskRecordTitle,
             UiMessage::TaskRecordFinalResultHeading,
             UiMessage::TaskRecordFinalStatus { state: "complete" },
+            UiMessage::TaskRecordProvider {
+                provider: "provider",
+            },
+            UiMessage::TaskRecordProviderUnavailable,
             UiMessage::TaskRecordRequested { requested: 5 },
             UiMessage::TaskRecordAcceptedWritten {
                 accepted: 4,

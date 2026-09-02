@@ -151,7 +151,10 @@ log-retry-summary = { $count ->
    *[other] Se realizaron { $count } reintentos.
 }
 log-translation-task-started = Tarea de traducción { $index }/{ $total } iniciada.
-log-translation-task-finished = Tarea de traducción { $index } terminada con resultado { $outcome }.
+log-translation-task-finished = Tarea de traducción { $index } terminada con resultado { $outcome }. { $provider_status ->
+    [present] Proveedor ascendente: { $provider }.
+   *[missing] Proveedor ascendente: no indicado.
+}
 log-run-recovery-required = El comando { $command } terminó en un estado que requiere recuperación; siga las ubicaciones indicadas en el diagnóstico.
 log-phase-completed = Fase completada: { $phase }.
 log-phase-stopped = { $outcome ->
@@ -297,7 +300,7 @@ diagnostic-failure-value = { $code ->
     [model_stream_missing_responses_terminal] Al flujo Responses le falta el evento terminal
     [model_stream_event_type_mismatch] El nombre del evento SSE no coincide con el tipo JSON
     [model_stream_duplicate_choice] El flujo del modelo repitió la misma choice
-    [model_stream_output_after_finish] El flujo del modelo continuó después de finish
+    [model_stream_choice_after_finish] El flujo Chat envió campos que cambian la respuesta después de finish
     [model_stream_unexpected_done] El flujo Responses devolvió un [DONE] inesperado
     [response_json_invalid] La respuesta Assistant no es JSON válido
     [response_shape_invalid] La raíz o la estructura de respuesta del JSON Assistant no es válida
@@ -407,6 +410,7 @@ diagnostic-response-item = elemento de respuesta { $item }
 diagnostic-array-item = elemento de matriz { $item }
 diagnostic-token-position = posición del token de control { $position }
 diagnostic-text-segment = segmento de texto { $segment }
+diagnostic-post-finish-fields = campos después de finish: { $fields }
 diagnostic-expected-actual = se esperaban { $expected }, se recibieron { $actual }
 diagnostic-placeholder-rule-file = Regla Placeholder { $number } en { $path }
 diagnostic-placeholder-rule-project = Regla Placeholder { $number } del proyecto actual
@@ -441,6 +445,8 @@ task-record-final-status = Estado: { $state ->
     [cancelled] cancelada; sin commit
    *[other] { $state }
 }
+task-record-provider = Proveedor ascendente: { $provider }
+task-record-provider-unavailable = Proveedor ascendente: no indicado
 task-record-requested = Traducciones solicitadas: { $requested }
 task-record-accepted-written = Aceptadas: { $accepted } entradas (ID: { $ids }), escritas en { $written } ubicaciones reales
 task-record-accepted-outcome-unknown = Validadas: { $accepted } entradas (ID: { $ids }); no se puede confirmar el resultado del commit de la base de datos
