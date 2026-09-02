@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 
 from att_skill_tools import JsonValue
 
-from .rpg import PluginInfo
+from .rpg import STANDARD_DATA_FILES, PluginInfo, canonical_map_number
 
 
 def readable_component(value: str) -> str:
@@ -25,18 +25,28 @@ def _append_location_steps(
     output: str,
     steps: Sequence[str | int | None],
     *,
-    standard_data: bool,
+    source_kind: str,
 ) -> str:
     for position, step in enumerate(steps):
         if step is None:
             continue
         if isinstance(step, int):
-            number = step if position == 0 and standard_data else step + 1
+            is_database_id = position == 0 and source_kind == "data"
+            is_map_event_id = source_kind == "map" and position > 0 and steps[position - 1] == "events"
+            number = step if is_database_id or is_map_event_id else step + 1
             output += f":{number}"
         else:
             component = readable_component(step)
             output += f":{component}" if component == step else f"[{component}]"
     return output
+
+
+def _data_source_kind(source_file: str) -> str:
+    if source_file in STANDARD_DATA_FILES:
+        return "data"
+    if canonical_map_number(source_file) is not None:
+        return "map"
+    return "data_file"
 
 
 def manual_id(
@@ -56,7 +66,7 @@ def manual_id(
             f"plugins.js:plugin{plugin.index + 1}:"
             f"{readable_component(plugin.name)}:{readable_component(parameter_name)}"
         )
-        output = _append_location_steps(output, group_steps, standard_data=False)
+        output = _append_location_steps(output, group_steps, source_kind="plugin")
     elif source_kind == "map":
         output = source_file
         if (
@@ -77,12 +87,12 @@ def manual_id(
             }
             output += f":event{group_steps[1]}:page{group_steps[3] + 1}:{labels[kind]}{group_steps[5] + 1}"
         else:
-            output = _append_location_steps(output, group_steps, standard_data=False)
+            output = _append_location_steps(output, group_steps, source_kind="map")
     else:
         output = _append_location_steps(
             source_file,
             group_steps,
-            standard_data=source_kind == "data",
+            source_kind=source_kind,
         )
     if role is not None:
         output += f":{readable_component(role)}"
@@ -160,7 +170,7 @@ def rule_manual_id(
             parameter_name=parameter,
         )
     return manual_id(
-        source_kind="data_file",
+        source_kind=_data_source_kind(source_file),
         source_file=source_file,
         group_steps=group_steps,
         kind="event_command" if command_group_steps is not None else "database_entry",

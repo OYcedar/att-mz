@@ -57,7 +57,16 @@ def capture_pattern(value: str) -> tuple[str | None, dict[str, JsonValue] | None
     punctuation = _PUNCTUATION_WRAPPER.fullmatch(value)
     if punctuation is not None:
         prefix, body, suffix = punctuation.groups()
-        if body.strip() and (prefix or suffix) and "]" not in body and ">" not in body:
+        if (
+            body.strip()
+            and (prefix or suffix)
+            and not prefix.endswith(("\\", "\x1b"))
+            and not (prefix.endswith("%") and body[0].isdigit())
+            and "]" not in body
+            and ">" not in body
+            and "]" not in suffix
+            and ">" not in suffix
+        ):
             pattern = rf"\A{re.escape(prefix)}(?<text>(?s:.+?)){re.escape(suffix)}\z"
             return pattern, {
                 "kind": "generated_rule_pattern",
