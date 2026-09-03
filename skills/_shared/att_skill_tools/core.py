@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -166,6 +167,44 @@ def _is_reparse_point(path: Path) -> bool:
     return path.is_symlink() or bool(attributes & 0x400)
 
 
+def _lexical_absolute(path: Path) -> Path:
+    """建立绝对自然路径，不解析链接或重解析点。"""
+
+    return Path(os.path.abspath(path))
+
+
+def _output_target(path: Path, description: str) -> Path:
+    """返回输出的自然绝对路径，并拒绝现有重解析链。"""
+
+    target = _lexical_absolute(path)
+    current = target
+    while True:
+        if _is_reparse_point(current):
+            location = "本身是" if current == target else "经过"
+            fail(
+                str(current),
+                f"{description}{location}链接或重解析点",
+                "为输出选择由普通目录组成的自然路径",
+            )
+        parent = current.parent
+        if parent == current:
+            return target
+        current = parent
+
+
+def _reject_hard_link(path: Path, description: str) -> None:
+    try:
+        link_count = path.lstat().st_nlink
+    except OSError:
+        fail(str(path), f"{description}无法读取元数据", "恢复文件或目录权限后重新完整扫描")
+    if link_count != 1:
+        fail(
+            str(path),
+            f"{description}是硬链接，无法证明唯一物理来源",
+            "为扫描范围中的每个逻辑路径使用独立普通文件",
+        )
+
+
 def _reject_reparse_chain(path: Path, root: Path, description: str) -> None:
     lexical_root = root.absolute()
     lexical_path = path.absolute()
@@ -284,6 +323,7 @@ def safe_walk_files(root: Path) -> Iterator[Path]:
                     "扫描文件是链接或重解析点，无法保留唯一自然来源",
                     "移除链接，或把链接目标作为精确来源单独调查",
                 )
+            _reject_hard_link(candidate, "扫描文件")
             yield require_file_within(candidate, resolved_root, "扫描文件")
 
 
@@ -296,37 +336,42 @@ def protect_outputs(
 ) -> None:
     """拒绝覆盖输入、写进游戏树或用目录替换吞掉输入。"""
 
-    resolved_outputs = [path.resolve(strict=False) for path in outputs]
-    if len(set(resolved_outputs)) != len(resolved_outputs):
+    lexical_outputs = [_output_target(path, "输出路径") for path in outputs]
+    comparison_outputs = [path.resolve(strict=False) for path in lexical_outputs]
+    if len(set(comparison_outputs)) != len(comparison_outputs):
         fail("输出路径", "同一次命令的多个输出指向同一位置", "为不同输出使用不同路径")
-    for index, output in enumerate(resolved_outputs):
-        for other in resolved_outputs[index + 1 :]:
+    for index, output in enumerate(comparison_outputs):
+        for other in comparison_outputs[index + 1 :]:
             if _is_within(output, other) or _is_within(other, output):
                 fail("输出路径", "同一次命令的输出路径互相包含", "为每个输出使用互不包含的独立路径")
     resolved_inputs = [path.resolve(strict=True) for path in inputs]
     roots = [path.resolve(strict=True) for path in forbidden_roots]
-    for output in resolved_outputs:
+    for lexical_output, output in zip(lexical_outputs, comparison_outputs, strict=True):
         for root in roots:
-            if output == root or _is_within(output, root):
-                fail(str(output), f"输出位于受保护目录 {root} 中", "把输出放到游戏和输入目录之外的工作目录")
+            if output == root or _is_within(output, root) or _is_within(root, output):
+                fail(
+                    str(lexical_output),
+                    f"输出与受保护目录 {root} 重叠",
+                    "把输出放到游戏和输入目录之外的独立工作目录",
+                )
         for input_path in resolved_inputs:
-            input_is_directory = input_path.is_dir()
-            if (
-                output == input_path
-                or _is_within(input_path, output)
-                or (input_is_directory and _is_within(output, input_path))
-            ):
-                fail(str(output), f"输出与输入 {input_path} 重叠", "为输出使用不包含任何输入的独立路径")
-        if output.exists() and not replace:
-            fail(str(output), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
+            if output == input_path or _is_within(input_path, output) or _is_within(output, input_path):
+                fail(
+                    str(lexical_output),
+                    f"输出与输入 {input_path} 重叠",
+                    "为输出使用不包含任何输入的独立路径",
+                )
+        if lexical_output.exists() and not replace:
+            fail(str(lexical_output), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
 
 
 def preflight_atomic_text_outputs(outputs: Sequence[Path], *, replace: bool) -> None:
     """在多文件命令写入前检查每个固定目标和临时文件。"""
 
     for output in outputs:
-        target = output.resolve(strict=False)
+        target = _output_target(output, "输出路径")
         temporary = target.with_name(f".{target.name}.tmp")
+        _output_target(temporary, "固定临时文件")
         if target.exists() and not replace:
             fail(str(target), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
         if temporary.exists():
@@ -351,6 +396,13 @@ def _reject_constant(value: str) -> NoReturn:
     raise _StrictJsonError(f"非有限数字：{value}")
 
 
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise _StrictJsonError("JSON number 超出本工具可表示的有限范围")
+    return parsed
+
+
 def parse_json_prefix(text: str, object_name: str) -> tuple[JsonValue, int]:
     try:
         start = len(text) - len(text.lstrip(" \t\r\n"))
@@ -359,6 +411,7 @@ def parse_json_prefix(text: str, object_name: str) -> tuple[JsonValue, int]:
             json.JSONDecoder(
                 object_pairs_hook=_strict_object,
                 parse_constant=_reject_constant,
+                parse_float=_finite_float,
             ).raw_decode(text, start),
         )
     except json.JSONDecodeError as error:
@@ -368,7 +421,7 @@ def parse_json_prefix(text: str, object_name: str) -> tuple[JsonValue, int]:
             "修正 JSON 后重试",
         )
     except _StrictJsonError as error:
-        fail(object_name, str(error), "删除重复 key 或非有限数字后重试")
+        fail(object_name, str(error), "修正重复 key，或把数字改为本工具可表示的有限 JSON number")
 
 
 def parse_json_text(text: str, object_name: str) -> JsonValue:
@@ -384,7 +437,35 @@ def parse_json_text(text: str, object_name: str) -> JsonValue:
             "修正 JSON 后重试",
         )
     except _StrictJsonError as error:
-        fail(object_name, str(error), "删除重复 key 或非有限数字后重试")
+        fail(object_name, str(error), "修正重复 key，或把数字改为本工具可表示的有限 JSON number")
+
+
+def physical_jsonl_lines(text: str, object_name: str) -> Iterator[tuple[int, str]]:
+    """按物理 LF/CRLF 行枚举 JSONL 正文，并保留自然行号。"""
+
+    start = 0
+    line_number = 1
+    while start < len(text):
+        end = text.find("\n", start)
+        if end == -1:
+            line = text[start:]
+            next_start = len(text)
+        else:
+            line = text[start:end]
+            next_start = end + 1
+        if end != -1:
+            line = line.removesuffix("\r")
+        if "\r" in line:
+            fail(
+                object_name,
+                f"第 {line_number} 行包含未与 LF 配对的 CR",
+                "使用 LF 或 CRLF 保存每条物理 JSONL 行",
+            )
+        yield line_number, line
+        if end == -1:
+            return
+        start = next_start
+        line_number += 1
 
 
 def read_json(path: Path, description: str = "JSON 文件", *, allowed_root: Path | None = None) -> JsonValue:
@@ -436,9 +517,11 @@ def _raise_file_failure(
 
 
 def atomic_write_text(path: Path, text: str, *, replace: bool) -> None:
-    target = path.resolve(strict=False)
+    target = _output_target(path, "输出文件")
     target.parent.mkdir(parents=True, exist_ok=True)
+    _output_target(target, "输出文件")
     temporary = target.with_name(f".{target.name}.tmp")
+    _output_target(temporary, "固定临时文件")
     if target.exists() and not replace:
         fail(str(target), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
     if temporary.exists():
@@ -458,6 +541,7 @@ def atomic_write_text(path: Path, text: str, *, replace: bool) -> None:
             temporary=temporary,
         )
     try:
+        _output_target(target, "输出文件")
         if replace:
             os.replace(temporary, target)
         else:
@@ -482,9 +566,13 @@ def atomic_write_text(path: Path, text: str, *, replace: bool) -> None:
 
 
 def write_json(path: Path, value: JsonValue, *, replace: bool) -> None:
+    try:
+        text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    except ValueError:
+        fail(str(path), "输出 JSON 包含非有限数字", "把数值改为有限 JSON number 后重新生成输出")
     atomic_write_text(
         path,
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        text,
         replace=replace,
     )
 
@@ -547,10 +635,15 @@ def atomic_write_directory(
 ) -> None:
     """原子发布由 UTF-8 文本、原始字节或普通源文件组成的目录。"""
 
-    target = target_path.resolve(strict=False)
+    target = _output_target(target_path, "输出目录")
     target.parent.mkdir(parents=True, exist_ok=True)
+    _output_target(target, "输出目录")
     stage = target.with_name(f".{target.name}.tmp")
     previous = target.with_name(f".{target.name}.previous")
+    _output_target(stage, "固定临时目录")
+    _output_target(previous, "固定恢复目录")
+    if target.exists() and not target.is_dir():
+        fail(str(target), "目标已存在且不是普通目录", "为目录输出选择不存在的路径或已有普通目录")
     if target.exists() and not replace:
         fail(str(target), "目标目录已存在", "换一个输出目录，或在确认可替换后传入 --replace")
     if stage.exists() or previous.exists():
@@ -596,6 +689,34 @@ def atomic_write_directory(
         raise
 
     moved_previous = False
+    try:
+        _output_target(target, "输出目录")
+        _output_target(previous, "固定恢复目录")
+    except BaseException as primary:
+        cleanup = _remove_tree(stage)
+        if cleanup is not None:
+            _raise_directory_cleanup_failure(primary, cleanup, target=target, stage=stage, restored=False)
+        raise
+    if target.exists() and not replace:
+        cleanup = _remove_tree(stage)
+        if cleanup is not None:
+            raise ToolError(
+                object_name=str(target),
+                reason=f"目标在写入期间已由其他进程建立；临时目录清理也失败：{_failure_text(cleanup)}",
+                impact=f"后来建立的目标保持原样；临时目录 {stage} 仍可能存在；输入原件没有修改",
+                help_text="保留目标，处理占用或权限后删除指出的 .tmp 目录",
+            ) from None
+        fail(str(target), "目标在写入期间已由其他进程建立", "保留该目录并重新选择输出路径")
+    if target.exists() and not target.is_dir():
+        cleanup = _remove_tree(stage)
+        if cleanup is not None:
+            raise ToolError(
+                object_name=str(target),
+                reason=f"目标在写入期间变成非目录；临时目录清理也失败：{_failure_text(cleanup)}",
+                impact=f"目标保持原样；临时目录 {stage} 仍可能存在；输入原件没有修改",
+                help_text="保留目标，处理占用或权限后删除指出的 .tmp 目录",
+            ) from None
+        fail(str(target), "目标在写入期间变成非目录", "保留该文件并重新选择目录输出路径")
     if target.exists():
         try:
             os.replace(target, previous)
