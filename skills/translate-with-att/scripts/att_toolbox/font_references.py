@@ -15,7 +15,7 @@ from att_skill_tools import fail, safe_walk_files
 
 from att_toolbox.font_metadata import FontCoverage, check_font_coverage
 from att_toolbox.font_transaction import ByteMutation, sha256_bytes
-from att_toolbox.js import loader_call_on_line, scan_javascript, static_code_targets
+from att_toolbox.js import loader_call_for_literal, scan_javascript, static_code_targets
 from att_toolbox.rpg import plugin_script_path, read_plugins
 
 FONT_SUFFIXES = frozenset({".eot", ".otf", ".ttf", ".woff", ".woff2"})
@@ -377,7 +377,7 @@ def _runtime_javascript_paths(
         relative = path.relative_to(content_root).as_posix()
         scan = scan_javascript(text)
         for literal in scan.literals:
-            if literal.dynamic_template or not loader_call_on_line(scan.code, literal.line):
+            if literal.dynamic_template or not loader_call_for_literal(scan.code, literal):
                 continue
             for target_name in static_code_targets(literal.value, relative):
                 target = code_paths.get(target_name.casefold())

@@ -11,6 +11,7 @@ from att_skill_tools import (
     JsonValue,
     fail,
     parse_json_text,
+    physical_jsonl_lines,
     read_json_object,
     require_directory,
     require_file,
@@ -19,6 +20,8 @@ from att_skill_tools import (
 )
 
 from .survey_model import FileSnapshot
+
+CODE_SOURCE_SUFFIXES = frozenset({".js", ".mjs"})
 
 
 def file_bytes(path: Path, game_root: Path) -> tuple[bytes, FileSnapshot]:
@@ -43,7 +46,7 @@ def read_jsonl(path: Path, description: str) -> list[dict[str, JsonValue]]:
 
     source = require_file(path, description)
     output: list[dict[str, JsonValue]] = []
-    for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
+    for line_number, line in physical_jsonl_lines(source.read_text(encoding="utf-8-sig"), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", "重新生成该机器管理文件")
         value = parse_json_text(line, f"{source} 第 {line_number} 行")
@@ -70,49 +73,61 @@ def load_survey(
     return survey, locations, groups, baseline
 
 
+def survey_game_root(survey: Mapping[str, JsonValue]) -> Path:
+    """返回 survey 绑定的原版游戏根。"""
+
+    value = survey.get("game_root")
+    if not isinstance(value, str) or not value:
+        fail("survey.json", "缺少游戏根", "使用当前工具重新执行 scan")
+    return require_directory(Path(value), "survey 记录的游戏根")
+
+
 def verify_source_baseline(survey: Mapping[str, JsonValue], baseline: Mapping[str, JsonValue]) -> None:
     """只按 scan 保存的字节数和摘要确认游戏来源未变，不重复解析。"""
 
-    game_root_value = survey.get("game_root")
     files_value = baseline.get("files")
     selection_value = baseline.get("selection")
-    if (
-        not isinstance(game_root_value, str)
-        or not isinstance(files_value, list)
-        or not isinstance(selection_value, dict)
-    ):
+    if not isinstance(files_value, list) or not isinstance(selection_value, dict):
         fail("source-baseline.json", "缺少游戏根、文件清单或来源选择范围", "使用当前工具重新执行 scan")
-    game_root = require_directory(Path(game_root_value), "survey 记录的游戏根")
+    game_root = survey_game_root(survey)
     selection = selection_value
     validate_object_keys(
         selection,
         "source-baseline.selection",
-        {"data_directory", "plugins_file", "external_suffixes", "paths"},
+        {"data_directory", "plugins_file", "external_suffixes", "code_suffixes", "paths"},
     )
     data_directory = selection.get("data_directory")
     plugins_file = selection.get("plugins_file")
     suffixes_value = selection.get("external_suffixes")
+    code_suffixes_value = selection.get("code_suffixes")
     paths_value = selection.get("paths")
     if (
         not isinstance(data_directory, str)
         or not isinstance(plugins_file, str)
         or not isinstance(suffixes_value, list)
+        or not isinstance(code_suffixes_value, list)
         or not isinstance(paths_value, list)
         or any(not isinstance(value, str) or not value for value in suffixes_value)
+        or any(not isinstance(value, str) or not value for value in code_suffixes_value)
         or any(not isinstance(value, str) or not value for value in paths_value)
     ):
         fail("source-baseline.json", "来源选择范围字段无效", "使用当前工具重新执行 scan")
     suffixes = set(cast(list[str], suffixes_value))
+    code_suffixes = set(cast(list[str], code_suffixes_value))
+    if code_suffixes != set(CODE_SOURCE_SUFFIXES):
+        fail("source-baseline.json", "活动代码后缀范围与当前 Survey 不一致", "对当前游戏重新执行 scan")
     expected_paths = set(cast(list[str], paths_value))
     if len(expected_paths) != len(paths_value):
         fail("source-baseline.json", "来源选择路径重复", "使用当前工具重新执行 scan")
     data_root = game_root.joinpath(*data_directory.split("/")).resolve(strict=True)
+    content_root = data_root.parent
     current_paths = {
         path.relative_to(game_root).as_posix()
         for path in safe_walk_files(game_root)
         if path.relative_to(game_root).as_posix() == plugins_file
         or (path.parent == data_root and path.suffix.lower() == ".json")
         or path.suffix.lower() in suffixes
+        or (path.is_relative_to(content_root) and path.suffix.lower() in code_suffixes)
     }
     if current_paths != expected_paths:
         added = sorted(current_paths - expected_paths)

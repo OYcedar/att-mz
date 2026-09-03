@@ -16,7 +16,6 @@ from att_skill_tools import (
     ensure_inside,
     fail,
     json_type,
-    parse_json_prefix,
     parse_json_text,
     read_json,
     require_directory,
@@ -54,14 +53,14 @@ BUILTIN_EVENT_CODES = frozenset({101, 102, 105, 320, 324, 325, 401, 402, 404, 40
 _SYSTEM_ARRAYS = {"elements", "skillTypes", "weaponTypes", "armorTypes", "equipTypes"}
 _MAP_NAME = re.compile(r"Map([0-9]+)\.json\Z")
 _BARE_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_PLUGINS_ASSIGNMENT = re.compile(r"(?:\b(?:var|let|const)\s+)?\$plugins\s*=")
+_PLUGINS_DECLARATION = "var $plugins"
 
 
 @dataclass(frozen=True, slots=True)
 class GameInfo:
     supplied_root: Path
     content_root: Path
-    game_root: Path | None
+    game_root: Path
     engine: str
 
 
@@ -169,7 +168,6 @@ def discover_game(path: Path) -> GameInfo:
             "缺少 rpg_core.js 与 rmmz_core.js，无法确认 MV 或 MZ",
             "使用包含权威核心脚本的未损坏游戏内容根；不要用插件描述或参数猜测引擎",
         )
-    game_root: Path | None
     if supplied != content:
         # 使用者明确给出了包含内容根的安装根；它本身就是本次允许调查的范围。
         game_root = supplied
@@ -189,7 +187,9 @@ def discover_game(path: Path) -> GameInfo:
         require_file_within(content / "package.json", content, "游戏 package.json")
         game_root = content
     else:
-        game_root = None
+        # 使用者直接传入已由 data/System.json 与引擎核心脚本确认的内容根时，
+        # 该目录本身就是本次调查的完整且唯一范围。
+        game_root = content
     return GameInfo(
         supplied_root=supplied,
         content_root=content,
@@ -201,27 +201,40 @@ def discover_game(path: Path) -> GameInfo:
 def require_game_root(game: GameInfo) -> Path:
     """返回已经由显式范围或标准运行入口确认的完整游戏根。"""
 
-    if game.game_root is None:
-        fail(
-            str(game.supplied_root),
-            "只确认了 RPG Maker 内容根，无法完整调查游戏安装根中的文本来源",
-            "传入包含该内容根的实际游戏安装根；标准 Windows MV 也可直接传入同时具有父级 Game.exe 和本目录 package.json 的 www",
-        )
     return game.game_root
 
 
 def _extract_json_array(text: str, object_name: str) -> list[JsonValue]:
-    assignment = _PLUGINS_ASSIGNMENT.search(text)
-    if assignment is None:
+    declaration_offset: int | None = None
+    line_start = 0
+    for line in text.split("\n"):
+        trimmed = line.lstrip()
+        if trimmed.startswith(_PLUGINS_DECLARATION):
+            declaration_offset = line_start + len(line) - len(trimmed)
+            break
+        if not trimmed.strip() or trimmed.startswith("//"):
+            line_start += len(line) + 1
+            continue
+        reason = (
+            "plugins.js 的 var $plugins 声明前存在非空白、非行注释内容"
+            if _PLUGINS_DECLARATION in text[line_start:]
+            else "plugins.js 缺少 var $plugins 声明"
+        )
+        fail(object_name, reason, "恢复 RPG Maker 生成的 plugins.js 外壳")
+    if declaration_offset is None:
+        fail(object_name, "plugins.js 缺少 var $plugins 声明", "恢复 RPG Maker 生成的 plugins.js 外壳")
+
+    assignment = text[declaration_offset + len(_PLUGINS_DECLARATION) :].lstrip()
+    if not assignment.startswith("="):
         fail(
             object_name,
-            "plugins.js 中没有找到 $plugins 赋值",
-            "检查 plugins.js 是否为完整的 RPG Maker 插件配置",
+            "plugins.js 的 var $plugins 声明后缺少 = assignment",
+            "恢复 RPG Maker 生成的 plugins.js 外壳",
         )
-    start = text.find("[", assignment.end())
-    if start < 0:
-        fail(object_name, "plugins.js 中没有找到插件数组", "检查 plugins.js 是否为完整的 RPG Maker 插件配置")
-    raw, _ = parse_json_prefix(text[start:], f"{object_name} 中的 $plugins 数组")
+    terminated = assignment[1:].strip()
+    if not terminated.endswith(";"):
+        fail(object_name, "plugins.js 的 assignment 缺少结尾分号", "恢复 RPG Maker 生成的 plugins.js 外壳")
+    raw = parse_json_text(terminated[:-1].strip(), f"{object_name} 中的 $plugins 数组")
     if not isinstance(raw, list):
         fail(object_name, "plugins.js 中的 $plugins 不是 array", "恢复 RPG Maker 生成的插件数组")
     return raw

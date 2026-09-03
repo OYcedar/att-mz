@@ -1,6 +1,6 @@
 """RPG Maker 调查的稳定入口。"""
 
-from .survey_io import load_survey, read_jsonl, verify_source_baseline
+from .survey_io import load_survey, read_jsonl, survey_game_root, verify_source_baseline
 from .survey_model import SurveyBundle
 from .survey_sources import (
     GENERIC_EVIDENCE_FIELDS,
@@ -15,5 +15,6 @@ __all__ = [
     "load_survey",
     "read_jsonl",
     "scan_game",
+    "survey_game_root",
     "verify_source_baseline",
 ]

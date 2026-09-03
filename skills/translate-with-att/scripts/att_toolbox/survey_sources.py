@@ -24,7 +24,7 @@ from .rpg import (
 from .rpg_control_codes import is_structural_blank, split_rpg_text_lines
 from .survey_code import bootstrap_title_consumers, scan_code_sources
 from .survey_identity import rule_manual_id
-from .survey_io import decode_text, file_bytes
+from .survey_io import CODE_SOURCE_SUFFIXES, decode_text, file_bytes
 from .survey_model import FileSnapshot, LocationFact, SurveyBundle
 from .survey_relations import review_groups as build_review_groups
 from .survey_rpg_data import (
@@ -79,7 +79,9 @@ def scan_game(game_path: Path) -> SurveyBundle:
     files = list(safe_walk_files(game_root))
     files.sort(key=lambda path: path.relative_to(game_root).as_posix().encode("utf-8"))
     data_root = (game.content_root / "data").resolve(strict=True)
-    data_paths = [path for path in files if path.parent == data_root and path.suffix.lower() == ".json"]
+    # ATT Rules 的 DataFile 名称只接受精确小写 `.json`；其他大小写仍由
+    # 外部来源调查保留，但不会获得 Rules/Manual 投影。
+    data_paths = [path for path in files if path.parent == data_root and path.suffix == ".json"]
     snapshots: dict[str, FileSnapshot] = {}
     raw_files: dict[str, bytes] = {}
     files_read = 0
@@ -560,6 +562,7 @@ def scan_game(game_path: Path) -> SurveyBundle:
         if path == plugins_js
         or (path.parent == data_root and path.suffix.lower() == ".json")
         or path.suffix.lower() in _EXTERNAL_TEXT_SUFFIXES
+        or (path.is_relative_to(game.content_root) and path.suffix.lower() in CODE_SOURCE_SUFFIXES)
     )
     source_baseline: dict[str, JsonValue] = {
         "scope": "本次调查实际读取的 RPG Maker 数据、活动代码和文本容器",
@@ -568,6 +571,7 @@ def scan_game(game_path: Path) -> SurveyBundle:
             "data_directory": data_root.relative_to(game_root).as_posix(),
             "plugins_file": plugins_js.relative_to(game_root).as_posix(),
             "external_suffixes": sorted(_EXTERNAL_TEXT_SUFFIXES),
+            "code_suffixes": sorted(CODE_SOURCE_SUFFIXES),
             "paths": selection_paths,
         },
     }

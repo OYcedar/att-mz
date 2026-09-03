@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from att_skill_tools import JsonValue
 
@@ -193,6 +193,100 @@ def _same_source_domain_relation(facts: Sequence[LocationFact]) -> bool:
     return any(bool(_domain_tokens(values) & _reference_tokens(values)) for values in by_source.values())
 
 
+def _posting_choice_cost(choice: tuple[Mapping[str, set[int]], set[str]]) -> int:
+    postings, keys = choice
+    return sum(len(postings[key]) for key in keys if key in postings)
+
+
+def _smallest_posting_union(
+    choices: Sequence[tuple[Mapping[str, set[int]], set[str]]],
+) -> set[int]:
+    postings, keys = min(choices, key=_posting_choice_cost)
+    candidates: set[int] = set()
+    for key in keys:
+        if (posting := postings.get(key)) is not None:
+            candidates.update(posting)
+    return candidates
+
+
+def _union_related_groups(
+    dsu: DisjointSet,
+    domains: Sequence[set[str]],
+    references: Sequence[set[str]],
+    sources: Sequence[set[str]],
+    packets: Sequence[set[str]],
+) -> None:
+    """按来源、packet 与 token 倒排关系连通候选组。"""
+
+    domain_tokens: dict[str, set[int]] = defaultdict(set)
+    for index, domain in enumerate(domains):
+        if len(domain) < 2:
+            continue
+        for token in domain:
+            domain_tokens[token].add(index)
+
+    domain_members = {index for members in domain_tokens.values() for index in members}
+    domain_source_index: dict[str, set[int]] = defaultdict(set)
+    domain_packet_index: dict[str, set[int]] = defaultdict(set)
+    for index in domain_members:
+        for source in sources[index]:
+            domain_source_index[source].add(index)
+        for packet in packets[index]:
+            domain_packet_index[packet].add(index)
+
+    # 每个 reference 只从 token、来源、packet 三套独立 domain 倒排中选择最小候选集，
+    # 再验证另外两维；任何一维都不会与另一维物化笛卡尔积。
+    for index, reference in enumerate(references):
+        if not reference:
+            continue
+        reference_candidates = _smallest_posting_union(
+            (
+                (domain_tokens, reference),
+                (domain_source_index, sources[index]),
+                (domain_packet_index, packets[index]),
+            )
+        )
+        for other in reference_candidates - {index}:
+            if (
+                not domains[other].isdisjoint(reference)
+                and not sources[index].isdisjoint(sources[other])
+                and not packets[index].isdisjoint(packets[other])
+                and dsu.find(index) != dsu.find(other)
+            ):
+                dsu.union(index, other)
+
+    # 两个 domain 至少共享两个 token 时连通。频率顺序的 overlap-2 prefix
+    # 保证真实相交组至少共享一个 prefix token，同时把只共享一次的高频 token
+    # 排到末尾；逐个候选再校验来源、packet 和完整 token 交集。
+    prefix_token_index: dict[str, set[int]] = defaultdict(set)
+    prefix_source_index: dict[str, set[int]] = defaultdict(set)
+    prefix_packet_index: dict[str, set[int]] = defaultdict(set)
+    token_frequency = {token: len(members) for token, members in domain_tokens.items()}
+    for index in sorted(domain_members):
+        ordered_tokens = sorted(domains[index], key=lambda token: (token_frequency[token], token))
+        prefix = set(ordered_tokens[:-1])
+        prefix_candidates = _smallest_posting_union(
+            (
+                (prefix_token_index, prefix),
+                (prefix_source_index, sources[index]),
+                (prefix_packet_index, packets[index]),
+            )
+        )
+        for other in prefix_candidates:
+            if (
+                not sources[index].isdisjoint(sources[other])
+                and not packets[index].isdisjoint(packets[other])
+                and len(domains[index] & domains[other]) >= 2
+            ):
+                dsu.union(index, other)
+        for token in prefix:
+            prefix_token_index[token].add(index)
+        for source in sources[index]:
+            prefix_source_index[source].add(index)
+        for packet in packets[index]:
+            prefix_packet_index[packet].add(index)
+
+
 def review_groups(
     locations: Sequence[LocationFact],
 ) -> list[dict[str, JsonValue]]:
@@ -210,18 +304,7 @@ def review_groups(
     references = [_reference_tokens(fact.source_text for fact in group) for group in base]
     sources = [{fact.source for fact in group} for group in base]
     packets = [{_review_packet_key(fact) for fact in group} for group in base]
-    for left, domain in enumerate(domains):
-        if len(domain) < 2:
-            continue
-        for right, reference in enumerate(references):
-            if left == right:
-                continue
-            same_source = bool(sources[left] & sources[right])
-            same_packet = bool(packets[left] & packets[right])
-            shared = domain & reference
-            matching_domains = len(domains[right]) >= 2 and len(domain & domains[right]) >= 2
-            if same_source and same_packet and (shared or matching_domains):
-                dsu.union(left, right)
+    _union_related_groups(dsu, domains, references, sources, packets)
     components: dict[int, list[LocationFact]] = defaultdict(list)
     component_indexes: dict[int, list[int]] = defaultdict(list)
     for index, group in enumerate(base):
@@ -230,7 +313,8 @@ def review_groups(
         component_indexes[root].append(index)
 
     result: list[dict[str, JsonValue]] = []
-    for group_number, root in enumerate(sorted(components), start=1):
+    ordered_roots = sorted(components, key=lambda root: component_indexes[root][0])
+    for group_number, root in enumerate(ordered_roots, start=1):
         facts = components[root]
         group_id = f"group-{group_number:06d}"
         component_packets = {_review_packet_key(fact) for fact in facts}

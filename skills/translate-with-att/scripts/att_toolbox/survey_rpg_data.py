@@ -233,13 +233,21 @@ def builtin_event_locations(
                     lines.append(text)
                     physical.append((*next_command.command_steps, "parameters", 0))
                     next_index += 1
-                if not lines:
-                    continue
                 if engine == "mz" and len(command.parameters) > 4:
                     speaker = command.parameters[4]
-                    if not isinstance(speaker, str):
+                    speaker_is_falsy = (
+                        speaker is None
+                        or speaker is False
+                        or (
+                            isinstance(speaker, (int, float))
+                            and not isinstance(speaker, bool)
+                            and speaker == 0
+                        )
+                        or speaker == ""
+                    )
+                    if not speaker_is_falsy and not isinstance(speaker, str):
                         fail(command.source_file, "MZ Speaker 不是 string", "修正损坏的 101 参数")
-                    if not is_structural_blank(speaker):
+                    if isinstance(speaker, str) and not is_structural_blank(speaker):
                         output.append(
                             LocationFact(
                                 source=f"data/{command.source_file}:builtin-events",

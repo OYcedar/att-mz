@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import unquote, urlsplit
 
@@ -19,7 +19,7 @@ from att_skill_tools import JsonValue, ToolError, parse_json_text
 from .js import (
     JavaScriptScan,
     function_scope_hints,
-    loader_call_on_line,
+    loader_call_for_literal,
     scan_javascript,
     static_code_targets,
 )
@@ -356,7 +356,7 @@ def _direct_html_code_roots(
     game: GameInfo,
     game_root: Path,
     files: Sequence[Path],
-    code_paths: Mapping[str, Path],
+    code_lookup: Mapping[str, str],
     read_once: ReadOnce,
 ) -> tuple[str, ...]:
     html = _main_html(game, game_root, files, read_once)
@@ -371,21 +371,24 @@ def _direct_html_code_roots(
         if split.scheme or split.netloc or not split.path:
             continue
         decoded = unquote(split.path)
-        target = (
-            game.content_root / decoded.lstrip("/") if decoded.startswith("/") else html.parent / decoded
-        ).resolve(strict=False)
+        target = game.content_root / decoded.lstrip("/") if decoded.startswith("/") else html.parent / decoded
+        try:
+            target = target.resolve(strict=True)
+        except OSError:
+            continue
         if not target.is_relative_to(game.content_root):
             continue
-        relative = target.relative_to(game.content_root).as_posix()
-        if relative not in code_paths:
+        actual_relative = code_lookup.get(str(target))
+        if actual_relative is None:
             continue
-        parts = Path(relative).parts
+        relative = actual_relative
+        normalized = relative.casefold()
+        parts = normalized.split("/")
         name = parts[-1]
         standard = (
-            relative == "js/plugins.js"
+            normalized == "js/plugins.js"
             or (len(parts) >= 2 and parts[0] == "js" and parts[1] == "libs")
             or (parts and parts[0] == "js" and name.startswith(("rpg_", "rmmz_")))
-            or relative == "js/main.js"
         )
         if not standard:
             roots.add(relative)
@@ -734,12 +737,21 @@ def scan_code_sources(
     plugin_sources: dict[str, str] = {}
     code_scans: dict[str, JavaScriptScan] = {}
     code_paths: dict[str, Path] = {}
+    code_lookup: dict[str, str] = {}
     for path in files:
         if not path.is_relative_to(resolved_content) or path.suffix.lower() not in {".js", ".mjs"}:
             continue
         relative_content = path.relative_to(game.content_root).as_posix()
+        physical_identity = str(path.resolve(strict=True))
+        code_lookup[physical_identity] = relative_content
         code_paths[relative_content] = path
-    for relative in _direct_html_code_roots(game, game_root, files, code_paths, read_once):
+    for relative in _direct_html_code_roots(
+        game,
+        game_root,
+        files,
+        code_lookup,
+        read_once,
+    ):
         script = code_paths[relative]
         raw, _snapshot = read_once(script)
         code_scans[relative] = scan_javascript(decode_text(raw, script))
@@ -749,12 +761,16 @@ def scan_code_sources(
         script = plugin_script_path(game.content_root, plugin.name)
         if script is None:
             continue
+        actual_relative = code_lookup.get(str(script.resolve(strict=True)))
+        if actual_relative is None:
+            continue
+        script = code_paths[actual_relative]
         raw, _snapshot = read_once(script)
         source = decode_text(raw, script)
         scan = scan_javascript(source)
         plugin_scans[plugin.name] = scan
         plugin_sources[plugin.name] = source
-        code_scans[script.relative_to(game.content_root).as_posix()] = scan
+        code_scans[actual_relative] = scan
 
     # 参数值及其通用消费者证据。
     for plugin in plugins:
@@ -971,16 +987,22 @@ def scan_code_sources(
         _sort_key, relative = heappop(pending_code)
         scan = code_scans[relative]
         for literal in scan.literals:
-            if literal.dynamic_template:
+            if literal.dynamic_template or not loader_call_for_literal(scan.code, literal):
                 continue
             for target in static_code_targets(literal.value, relative):
-                if target not in code_paths or target in active_code:
+                candidate_path = game.content_root.joinpath(*PurePosixPath(target).parts)
+                try:
+                    physical_identity = str(candidate_path.resolve(strict=True))
+                except OSError:
                     continue
-                target_path = code_paths[target]
+                actual_target = code_lookup.get(physical_identity)
+                if actual_target is None or actual_target in active_code:
+                    continue
+                target_path = code_paths[actual_target]
                 raw, _snapshot = read_once(target_path)
-                code_scans[target] = scan_javascript(decode_text(raw, target_path))
-                active_code.add(target)
-                heappush(pending_code, (target.encode("utf-8"), target))
+                code_scans[actual_target] = scan_javascript(decode_text(raw, target_path))
+                active_code.add(actual_target)
+                heappush(pending_code, (actual_target.encode("utf-8"), actual_target))
     for relative in sorted(active_code):
         path = code_paths.get(relative)
         if path is None:
@@ -1035,8 +1057,8 @@ def scan_code_sources(
                 )
                 continue
             near_display = _has_line_within(display_lines, literal.line, 4)
-            path_reference = bool(static_code_targets(literal.value, relative)) and loader_call_on_line(
-                scan.code, literal.line
+            path_reference = bool(static_code_targets(literal.value, relative)) and loader_call_for_literal(
+                scan.code, literal
             )
             line_text = code_lines[literal.line - 1] if literal.line <= len(code_lines) else ""
             direct_sinks = sorted({match.group(0) for match in _DISPLAY_CALL.finditer(line_text)})

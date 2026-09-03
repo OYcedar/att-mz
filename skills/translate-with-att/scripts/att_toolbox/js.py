@@ -26,7 +26,12 @@ class JavaScriptScan:
 
 
 _FUNCTION_MARKER = re.compile(r"\bfunction\b|=>")
-_SCRIPT_LOADER = re.compile(r"\b(?:require|import|loadScript|loadPlugin|PluginManager\.[A-Za-z0-9_]+)\b")
+_STATIC_LOADER_LITERAL_PREFIX = re.compile(
+    r"(?:\brequire(?:\.resolve)?|\bimport|\bloadScript|\bloadPlugin|"
+    r"\bPluginManager\.(?:loadScript|loadPlugin))"
+    r"\s*(?:\(\s*)+\Z"
+)
+_STATIC_MODULE_LITERAL_PREFIX = re.compile(r"\b(?:import|from)\s*\Z")
 _REGEX_PREFIX_KEYWORDS = {
     "await",
     "case",
@@ -51,7 +56,7 @@ def _hex_value(text: str) -> str | None:
     except ValueError:
         return None
     try:
-        return chr(value)
+        return chr(value) if not 0xD800 <= value <= 0xDFFF else "\ufffd"
     except ValueError:
         return None
 
@@ -89,9 +94,24 @@ def _escaped(text: str, index: int) -> tuple[str, int]:
                 if decoded is not None:
                     return decoded, end + 1
         elif index + 4 < len(text):
-            decoded = _hex_value(text[index + 1 : index + 5])
-            if decoded is not None:
-                return decoded, index + 5
+            digits = text[index + 1 : index + 5]
+            try:
+                code_unit = int(digits, 16)
+            except ValueError:
+                code_unit = -1
+            next_index = index + 5
+            if 0xD800 <= code_unit <= 0xDBFF and text.startswith("\\u", next_index):
+                low_digits = text[next_index + 2 : next_index + 6]
+                if len(low_digits) == 4:
+                    try:
+                        low = int(low_digits, 16)
+                    except ValueError:
+                        low = -1
+                    if 0xDC00 <= low <= 0xDFFF:
+                        scalar = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00)
+                        return chr(scalar), next_index + 6
+            if code_unit >= 0:
+                return ("\ufffd" if 0xD800 <= code_unit <= 0xDFFF else chr(code_unit)), next_index
     return character, index + 1
 
 
@@ -159,17 +179,29 @@ def static_code_targets(value: str, script_relative: str) -> tuple[str, ...]:
     """把静态 JS 路径字面量解析为范围内候选自然路径，不访问文件系统。"""
 
     normalized = value.replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
-    if (
-        not normalized
-        or normalized.startswith("/")
-        or re.match(r"\A[A-Za-z]:", normalized) is not None
-        or posixpath.splitext(normalized)[1].lower() not in {".js", ".mjs"}
-    ):
+    if not normalized or normalized.startswith("/") or re.match(r"\A[A-Za-z]:", normalized) is not None:
         return ()
+    suffix = posixpath.splitext(normalized)[1].lower()
+    if suffix and suffix not in {".js", ".mjs"}:
+        return ()
+    names = (
+        (normalized,)
+        if suffix
+        else (
+            f"{normalized}.js",
+            f"{normalized}.mjs",
+            posixpath.join(normalized, "index.js"),
+            posixpath.join(normalized, "index.mjs"),
+        )
+    )
     parent = posixpath.dirname(script_relative)
     candidates = {
-        posixpath.normpath(posixpath.join(parent, normalized)),
-        posixpath.normpath(normalized),
+        candidate
+        for name in names
+        for candidate in (
+            posixpath.normpath(posixpath.join(parent, name)),
+            posixpath.normpath(name),
+        )
     }
     return tuple(
         sorted(
@@ -180,9 +212,16 @@ def static_code_targets(value: str, script_relative: str) -> tuple[str, ...]:
     )
 
 
-def loader_call_on_line(code: str, line_number: int) -> bool:
-    lines = code.splitlines()
-    return 0 < line_number <= len(lines) and _SCRIPT_LOADER.search(lines[line_number - 1]) is not None
+def loader_call_for_literal(code: str, literal: JavaScriptLiteral) -> bool:
+    """确认该具体静态字面量是 loader/import 的直接路径参数。"""
+
+    if literal.start is None:
+        return False
+    prefix = code[: literal.start]
+    return (
+        _STATIC_LOADER_LITERAL_PREFIX.search(prefix) is not None
+        or _STATIC_MODULE_LITERAL_PREFIX.search(prefix) is not None
+    )
 
 
 def _skip_template_expression(text: str, start: int) -> tuple[int, bool]:
@@ -313,6 +352,9 @@ def scan_javascript(text: str) -> JavaScriptScan:
                             line=fragment_line,
                             kind="template_static",
                             dynamic_template=dynamic,
+                            start=start if not dynamic else None,
+                            end=end if not dynamic else None,
+                            quote="`" if not dynamic else None,
                         )
                     )
             if dynamic:
