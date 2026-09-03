@@ -8,7 +8,10 @@
 只在可丢弃的完整游戏副本上运行。工具会为这个副本正常启动自己的 `Game.exe`，给它使用独立的
 NW.js 用户数据目录，通过仅监听本机回环地址的 Chrome DevTools Protocol 读取实际绘制，
 结束时只关闭自己启动并持有的进程。工具不重新加载页面，不发送键盘事件，也不查找或终止其他
-NW.js 进程。
+NW.js 进程。同一输出目标通过旁边的固定 `.<output-name>.runtime.lock` 串行建立运行现场。
+清理会先把已确认身份的对象原子认领到对应的 `.runtime.cleanup` 或 `.lock.cleanup` 固定路径；
+遇到保留现场时，先确认对应观察任务已经结束，再按诊断指出的精确路径处理。CDP 正常关闭失败时，
+工具会继续等待并通过操作系统关闭自有进程；观察或关闭已经失败时，诊断同时保留这些关闭事实。
 
 自动检查已知场景：
 
@@ -34,8 +37,12 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
   --confirm-isolated-copy
 ```
 
-`observe` 不自动切换场景。省略 `--duration` 时持续到游戏窗口关闭或按 Ctrl+C；传入秒数时才
-定时结束。应使用鼠标或游戏本身支持的正常控制方式游玩。
+`observe` 不自动切换场景。省略 `--duration` 时持续到游戏窗口关闭；传入秒数时按时结束并发布
+报告。按 Ctrl+C 会取消本次观察、关闭工具启动的进程、清理未发布现场并返回退出码 130；若取消
+恰好在报告目录交换完成后到达，诊断会明确说明报告已经发布并保留该报告。应使用鼠标或游戏本身
+支持的正常控制方式游玩；需要保留报告时让游戏正常关闭或预先设置观察时长。
+报告目录发布后，即使运行现场清理或最终终端提示失败，诊断仍以“报告已经发布”为终态并给出
+报告与残留现场的精确位置；此时直接保留并检查报告，不必重复观察。
 
 输出目录包含 `report.json`、按递增序列记录的完整 `events.jsonl`、实际绘制 `draws.jsonl`、英文候选、像素越界、字体加载检查、
 `runtime-errors.jsonl` 和截图。工具会记录页面未捕获异常、未处理 Promise rejection、
@@ -80,8 +87,10 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py inspect `
 ```
 
 工具递归建立“字体资产 → 已声明 family/stem → 静态消费者”关系。带字体后缀的完整资源路径、
-CSS 字体声明、已识别的加载 API、MV/MZ 标准字体字段，以及键名明确表示字体的完整配置值，
-都属于已证明引用。`apply` 会一次处理这些引用，包括数字、图标和展示字体，不要求逐项确认。
+CSS 字体声明、已识别的加载 API、MV/MZ 标准字体字段、JSON/XML 中键名明确表示字体的完整值，
+以及 TOML 中由裸键直接赋值的单行字符串，都属于已证明引用。TOML 注释和多行字符串作为独立
+非代码区域跳过，同文件的其余单行赋值继续调查。`apply` 会一次处理这些引用，包括数字、图标和
+展示字体，不要求逐项确认。INI 候选会进入 Review，由操作者按对应程序的 INI 语法确认。
 CSS `@font-face` 和字体加载 API 已注册的运行时别名会原样保留，只把它们指向的字体资源换成
 选中字体；未注册、只由旧字体文件 stem 推导出的名称仍随文件名更新。这样引擎和插件继续使用
 `GameFont` 等既有契约，不会因为更换字体文件而失去已注册 family。
@@ -100,7 +109,9 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
   --output D:\review\font-apply.json
 ```
 
-`apply` 每次都按当前游戏和字体输入重新扫描、生成计划并验证，不依赖之前的 `inspect` 结果。它先建立
+`inspect` 与 `apply` 都先按自然游戏根取得同一固定任务锁，再在锁内重新发现内容根、完整扫描并
+生成计划；`restore` 使用同一把锁，因此扫描不会读到并发恢复产生的中间状态。`apply` 不依赖之前的
+`inspect` 结果。它先建立
 包含每项替换前后完整字节和摘要的 `state`，再原子写入。`--translations` 必须是 ATT 当前
 `translation export`：工具严格校验自然 ID、状态和字段组合，并按 WriteBack 行为投影字符——
 current 使用译文，pending/rejected 使用仍会写回的原文。完整字体消费者范围由操作者联合核对
@@ -122,9 +133,18 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py restore `
   --output D:\review\font-restore.json
 ```
 
-`restore` 逐项接受 state 中记录的 apply 前或 apply 后字节，因此进程在部分写入后中断也能
-恢复；遇到第三种字节时拒绝覆盖。写入中途失败只回滚已经尝试的文件，不会删除或覆盖尚未
-尝试位置上由其他进程建立的内容。`state/status.json` 记录 `prepared`、`applied`、
+`restore` 逐项接受 state 中记录的 apply 前或 apply 后字节，并在每次实际写入或删除前即时重读：
+before 直接跳过，after 恢复，第三种字节停止且保持原样。因此进程在部分写入后中断也能恢复；
+写入中途失败只回滚已经尝试的文件，不会删除或覆盖尚未尝试位置上由其他进程建立的内容。
+清单预检、提交、回滚和最终验收都按项读取快照，内存中只保留当前项的前后字节；restore 开始时
+同时绑定 state 目录与 `manifest.json`，运行中发生替换或漂移会停止提交并进入可核对终态。
+每个游戏目标都保留其自然逻辑路径，并从游戏根逐层拒绝符号链接和 Windows reparse point，
+因此 apply/restore 只会修改游戏根内的普通路径。
+字体文件和机器状态使用同一套固定临时文件发布规则；发布调用在文件已生效后发生取消或清理错误时，
+诊断会保留已发布事实和精确 `.att-font.tmp` 残留位置。最终终端提示失败不改变已经完成的 inspect
+报告、apply 游戏与 state，或 restore 游戏、state 与结果 JSON；按诊断中的完成事实继续即可。
+按 Ctrl+C 取消 apply/restore 时，工具先完成可行回滚并确认 state 事实，再以退出码 130 返回。
+`state/status.json` 记录 `prepared`、`applied`、
 `rolled_back`、`restored` 或 `recovery_required`；出现 `recovery_required` 时必须停止使用该
 游戏目录，并根据 `manifest.json` 和前后快照恢复，不得重试 apply。
 

@@ -23,6 +23,7 @@ from att_skill_tools import (
     atomic_write_text,
     display_path,
     fail,
+    print_published_completion,
     protect_outputs,
     require_directory,
     require_file,
@@ -151,6 +152,7 @@ def _scan(args: argparse.Namespace) -> int:
     )
     survey = dict(bundle.summary)
     survey.pop("agent_work_metrics", None)
+    output_display = display_path(args.output)
     atomic_write_directory(
         args.output,
         {
@@ -163,13 +165,22 @@ def _scan(args: argparse.Namespace) -> int:
         },
         replace=args.replace,
     )
-    print(
-        f"已完成一次 {str(survey['engine']).upper()} 调查："
-        f"位置 {survey['locations']} 个，阅读 packet {survey['review_packets']} 个，"
-        f"可决定关系组 {survey['review_groups']} 个。"
+    print_published_completion(
+        "\n".join(
+            [
+                (
+                    f"已完成一次 {str(survey['engine']).upper()} 调查："
+                    f"位置 {survey['locations']} 个，阅读 packet {survey['review_packets']} 个，"
+                    f"可决定关系组 {survey['review_groups']} 个。"
+                ),
+                f"调查目录：{output_display}",
+                "所有权决定模板：ownership-decisions.jsonl（默认 unresolved，只修改已经确认的组）",
+            ]
+        ),
+        object_name=f"Survey 调查目录 {output_display}",
+        impact="Survey 调查目录已经完整发布并可直接审核；最终完成提示未能显示",
+        help_text="直接打开该 Survey 调查目录继续审核，无需重新运行 scan",
     )
-    print(f"调查目录：{display_path(args.output)}")
-    print("所有权决定模板：ownership-decisions.jsonl（默认 unresolved，只修改已经确认的组）")
     return 0
 
 
@@ -333,9 +344,19 @@ def _members(args: argparse.Namespace) -> int:
         }
         for location in members
     ]
+    output_display = display_path(args.output)
     atomic_write_text(args.output, json_lines(candidate_decisions), replace=args.replace)
-    print(f"关系组 {group_id}：已导出 {len(members)} 条可填写的 candidate 决定。")
-    print(f"候选决定文件：{display_path(args.output)}")
+    print_published_completion(
+        "\n".join(
+            [
+                f"关系组 {group_id}：已导出 {len(members)} 条可填写的 candidate 决定。",
+                f"候选决定文件：{output_display}",
+            ]
+        ),
+        object_name=f"candidate 决定文件 {output_display}",
+        impact="candidate 决定文件已经完整发布并可直接填写；最终完成提示未能显示",
+        help_text="直接填写该 candidate 决定文件，无需重新运行 members",
+    )
     return 0
 
 
@@ -647,6 +668,7 @@ def _finalize(args: argparse.Namespace) -> int:
         "external_request_wait_ms": 0,
     }
     generic_files, generic_manifest = generic_materials(generic_plan)
+    output_display = display_path(args.output)
     atomic_write_directory(
         args.output,
         {
@@ -661,8 +683,17 @@ def _finalize(args: argparse.Namespace) -> int:
         replace=args.replace,
     )
     state = "完整" if complete else "待继续审核"
-    print(f"调查决定已生成：{state}；Rules {len(rules)} 条，未确认 {len(unresolved)} 项。")
-    print(f"计划目录：{display_path(args.output)}")
+    print_published_completion(
+        "\n".join(
+            [
+                f"调查决定已生成：{state}；Rules {len(rules)} 条，未确认 {len(unresolved)} 项。",
+                f"计划目录：{output_display}",
+            ]
+        ),
+        object_name=f"Survey 计划目录 {output_display}",
+        impact="Survey 计划目录已经完整发布并可直接使用；最终完成提示未能显示",
+        help_text="直接使用该计划目录继续后续步骤，无需重新运行 finalize",
+    )
     return 0
 
 
@@ -795,10 +826,20 @@ def _audit(args: argparse.Namespace) -> int:
             "external_request_wait_ms": 0,
         },
     }
+    output_display = display_path(args.output)
     write_json(args.output, report, replace=args.replace)
     state = "完整" if complete else "覆盖不完整；Translate 可运行，但不能宣称来源覆盖完整"
-    print(f"所有权审计：{state}；精确核对 {len(actual)} 个 Manual ID。")
-    print(f"审计报告：{display_path(args.output)}")
+    print_published_completion(
+        "\n".join(
+            [
+                f"所有权审计：{state}；精确核对 {len(actual)} 个 Manual ID。",
+                f"审计报告：{output_display}",
+            ]
+        ),
+        object_name=f"Survey 所有权审计报告 {output_display}",
+        impact="Survey 所有权审计报告已经完整发布并可直接查看；最终完成提示未能显示",
+        help_text="直接查看该审计报告并按结果继续，无需重新运行 audit",
+    )
     return 0
 
 

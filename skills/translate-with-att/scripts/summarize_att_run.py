@@ -24,6 +24,7 @@ from att_skill_tools import (
     fail,
     parse_json_text,
     physical_jsonl_lines,
+    print_published_completion,
     protect_outputs,
     read_physical_text,
     require_directory,
@@ -951,6 +952,7 @@ def _summarize(args: argparse.Namespace) -> int:
             "task-records 不参与覆盖率、恢复、重放或数据库状态推断。",
         ],
     }
+    output_display = display_path(args.output)
     write_json(args.output, result, replace=args.replace)
     incomplete = 0
     failed_plans = 0
@@ -965,11 +967,20 @@ def _summarize(args: argparse.Namespace) -> int:
             "cancelled",
         }:
             incomplete += 1
-    print(
-        f"已汇总 {len(summaries)} 次 ATT 运行；规划失败 {failed_plans} 次，"
-        f"翻译未完整/失败/取消 {incomplete} 次。"
+    print_published_completion(
+        "\n".join(
+            [
+                (
+                    f"已汇总 {len(summaries)} 次 ATT 运行；规划失败 {failed_plans} 次，"
+                    f"翻译未完整/失败/取消 {incomplete} 次。"
+                ),
+                f"汇总结果：{output_display}",
+            ]
+        ),
+        object_name=f"ATT 运行汇总 {output_display}",
+        impact="ATT 运行汇总已经完整发布并可直接查看；最终完成提示未能显示",
+        help_text="直接查看该汇总文件，无需重新运行汇总命令",
     )
-    print(f"汇总结果：{display_path(args.output)}")
     return 0
 
 

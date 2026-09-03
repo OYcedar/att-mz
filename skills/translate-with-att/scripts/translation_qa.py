@@ -31,6 +31,7 @@ from att_skill_tools import (
     fail,
     parse_json_text,
     physical_jsonl_lines,
+    print_published_completion,
     protect_outputs,
     read_json_object,
     read_physical_text,
@@ -2004,6 +2005,7 @@ def _scan(args: argparse.Namespace) -> int:
         "local_command_elapsed_ms": round((time.perf_counter() - started) * 1000),
         "external_request_wait_ms": 0,
     }
+    output_display = display_path(args.output)
     atomic_write_directory(
         args.output,
         {
@@ -2014,11 +2016,20 @@ def _scan(args: argparse.Namespace) -> int:
         },
         replace=args.replace,
     )
-    print(
-        f"译后 QA：{status}；确定问题涉及 {len(revision_ids)} 个自然 Unit，"
-        f"{heuristic_findings} 项启发式结果已压缩为 {len(review_groups)} 个 Review 组。"
+    print_published_completion(
+        "\n".join(
+            [
+                (
+                    f"译后 QA：{status}；确定问题涉及 {len(revision_ids)} 个自然 Unit，"
+                    f"{heuristic_findings} 项启发式结果已压缩为 {len(review_groups)} 个 Review 组。"
+                ),
+                f"QA 目录：{output_display}",
+            ]
+        ),
+        object_name=f"QA 作业目录 {output_display}",
+        impact="QA 作业目录已经完整发布并可直接审核；最终完成提示未能显示",
+        help_text="直接打开该 QA 作业目录继续审核，无需重新运行 QA scan",
     )
-    print(f"QA 目录：{display_path(args.output)}")
     return 0
 
 
@@ -2111,9 +2122,19 @@ def _manual(args: argparse.Namespace) -> int:
         for row in translation_rows
         if row["manual_id"] in requested_ids
     ]
+    output_display = display_path(args.output)
     atomic_write_text(args.output, _json_lines(rows), replace=args.replace)
-    print(f"已输出 {len(rows)} 个自然 ID：{display_path(args.output)}")
-    print("下一步：把该文件交给 att mv|mz|generic manual export --ids，取得数据库当前译文的预填 Manual。")
+    print_published_completion(
+        "\n".join(
+            [
+                f"已输出 {len(rows)} 个自然 ID：{output_display}",
+                "下一步：把该文件交给 att mv|mz|generic manual export --ids，取得数据库当前译文的预填 Manual。",
+            ]
+        ),
+        object_name=f"QA Manual candidate 文件 {output_display}",
+        impact="QA Manual candidate 文件已经完整发布并可直接导出 Manual；最终完成提示未能显示",
+        help_text="直接把该 candidate 文件交给 ATT manual export，无需重新运行 QA manual",
+    )
     return 0
 
 

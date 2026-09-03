@@ -26,6 +26,7 @@ from att_skill_tools import (
     fail,
     parse_json_text,
     physical_jsonl_lines,
+    print_published_completion,
     protect_outputs,
     read_json_object,
     read_manual,
@@ -877,6 +878,7 @@ def _run(args: argparse.Namespace) -> int:
         "local_command_elapsed_ms": round((time.perf_counter() - started) * 1000),
         "external_request_wait_ms": 0,
     }
+    output_display = display_path(args.output)
     atomic_write_directory(
         args.output,
         {
@@ -889,10 +891,20 @@ def _run(args: argparse.Namespace) -> int:
         replace=args.replace,
     )
     state = "完整" if complete else "仍有需审核或未覆盖项；Translate 可运行，但不能宣称译前检查完整"
-    print(
-        f"译前检查：{state}。候选 {len(candidates)} 组，固定空槽 {facts['fixed_blank_slots']} 个，已生成规则 {len(rules)} 条。"
+    print_published_completion(
+        "\n".join(
+            [
+                (
+                    f"译前检查：{state}。候选 {len(candidates)} 组，"
+                    f"固定空槽 {facts['fixed_blank_slots']} 个，已生成规则 {len(rules)} 条。"
+                ),
+                f"检查目录：{output_display}",
+            ]
+        ),
+        object_name=f"preflight 作业目录 {output_display}",
+        impact="preflight 作业目录已经完整发布并可直接使用；最终完成提示未能显示",
+        help_text="直接查看该 preflight 作业目录并按检查结果继续，无需重新运行 preflight",
     )
-    print(f"检查目录：{display_path(args.output)}")
     return 0
 
 

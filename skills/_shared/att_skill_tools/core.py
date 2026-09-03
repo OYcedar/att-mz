@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import sys
 import tomllib
 import unicodedata
@@ -14,7 +15,7 @@ from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import NoReturn, TypeAlias, cast
+from typing import Literal, NoReturn, TypeAlias, cast
 
 JsonScalar: TypeAlias = None | bool | int | float | str
 JsonValue: TypeAlias = JsonScalar | Sequence["JsonValue"] | Mapping[str, "JsonValue"]
@@ -29,6 +30,27 @@ class ToolError(Exception):
 
     def __str__(self) -> str:
         return self.reason
+
+
+@dataclass(slots=True)
+class DirectoryPublishedError(ToolError):
+    """目录已经完整发布，但发布调用以错误或取消结束。"""
+
+    cause: BaseException
+
+
+@dataclass(slots=True)
+class FilePublishedError(ToolError):
+    """文件已经完整发布，但发布或后续清理调用以错误或取消结束。"""
+
+    cause: BaseException
+
+
+@dataclass(slots=True)
+class ToolCancelledError(ToolError):
+    """命令已经取消，并携带取消期间发现的清理事实。"""
+
+    cause: KeyboardInterrupt
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,14 +90,15 @@ def display_path(path: Path) -> str:
 
 
 def _os_reason(error: OSError) -> str:
-    return sanitize_line(error.strerror or type(error).__name__)
+    return sanitize_line(error.strerror or str(error) or type(error).__name__)
 
 
 def _failure_text(error: BaseException) -> str:
     if isinstance(error, ToolError):
         return sanitize_line(error.reason)
     if isinstance(error, KeyboardInterrupt):
-        return "使用者取消了命令"
+        detail = str(error).strip()
+        return f"使用者取消了命令：{sanitize_line(detail)}" if detail else "使用者取消了命令"
     if isinstance(error, OSError):
         return _os_reason(error)
     if isinstance(error, UnicodeError):
@@ -116,6 +139,12 @@ class ToolArgumentParser(argparse.ArgumentParser):
 def run_cli(main: Callable[[], int]) -> None:
     try:
         status = main()
+    except ToolCancelledError as error:
+        print_error(error)
+        raise SystemExit(130) from None
+    except (DirectoryPublishedError, FilePublishedError) as error:
+        print_error(error)
+        raise SystemExit(130 if isinstance(error.cause, KeyboardInterrupt) else 1) from None
     except ToolError as error:
         print_error(error)
         raise SystemExit(1) from None
@@ -154,6 +183,29 @@ def run_cli(main: Callable[[], int]) -> None:
         )
         raise SystemExit(1) from None
     raise SystemExit(status)
+
+
+def print_published_completion(
+    message: str,
+    *,
+    object_name: str,
+    impact: str,
+    help_text: str,
+) -> None:
+    """输出最终完成提示；输出失败时保留已经完成的业务事实。"""
+
+    try:
+        print(message, flush=True)
+    except (OSError, UnicodeError, ValueError, KeyboardInterrupt) as error:
+        details = {
+            "object_name": object_name,
+            "reason": f"结果已经完成，但最终完成提示输出失败：{_failure_text(error)}",
+            "impact": impact,
+            "help_text": help_text,
+        }
+        if isinstance(error, KeyboardInterrupt):
+            raise ToolCancelledError(**details, cause=error) from None
+        raise ToolError(**details) from None
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -493,12 +545,92 @@ def read_json_object(
     return value
 
 
-def _remove_temporary(path: Path) -> BaseException | None:
+_FileIdentity = tuple[int, int]
+
+
+class _ForeignFileTypeError(OSError):
+    """路径元数据可读取，但对象不是普通文件。"""
+
+
+def _ordinary_file_identity(path: Path) -> _FileIdentity:
+    metadata = path.lstat()
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & 0x400):
+        raise _ForeignFileTypeError(f"{path} 不是普通文件")
+    if metadata.st_ino == 0:
+        raise OSError(f"{path} 所在文件系统没有提供稳定文件身份")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _file_identity_at(path: Path) -> tuple[_FileIdentity | None, BaseException | None]:
     try:
-        path.unlink(missing_ok=True)
-    except BaseException as error:  # noqa: BLE001 - 清理失败不能覆盖主失败或取消。
-        return error
-    return None
+        return _ordinary_file_identity(path), None
+    except FileNotFoundError:
+        return None, None
+    except BaseException as error:  # noqa: BLE001 - 发布与清理终态必须保留无法确认的文件事实。
+        return None, error
+
+
+def _candidate_file_cleanup(
+    path: Path,
+    expected_identity: _FileIdentity | None,
+) -> tuple[BaseException | None, tuple[str, ...]]:
+    """只删除身份匹配的候选文件，并返回清理调用与实际残留位置。"""
+
+    actual_identity, inspection_error = _file_identity_at(path)
+    if inspection_error is not None:
+        return inspection_error, (f"{path}（状态无法确认：{type(inspection_error).__name__}）",)
+    if actual_identity is None:
+        return None, ()
+    if expected_identity is None or actual_identity != expected_identity:
+        return OSError(f"固定临时文件身份已经变化，已保留于 {path}"), (str(path),)
+    try:
+        path.unlink()
+    except BaseException as error:  # noqa: BLE001 - unlink 返回异常后仍以后验身份判断实际结果。
+        remaining_identity, remaining_error = _file_identity_at(path)
+        if remaining_error is not None:
+            return error, (f"{path}（状态无法确认：{type(remaining_error).__name__}）",)
+        if remaining_identity is None:
+            return error, ()
+        return error, (str(path),)
+    return None, ()
+
+
+def _file_publish_state(
+    temporary: Path,
+    target: Path,
+    expected_identity: _FileIdentity,
+) -> tuple[
+    Literal["published", "not_published", "unknown"],
+    tuple[str, ...],
+    KeyboardInterrupt | None,
+]:
+    temporary_identity, temporary_error = _file_identity_at(temporary)
+    target_identity, target_error = _file_identity_at(target)
+    facts: list[str] = []
+    if temporary_error is not None:
+        label = "不是普通文件" if isinstance(temporary_error, _ForeignFileTypeError) else "状态无法读取"
+        facts.append(f"固定临时文件 {temporary} {label}：{_failure_text(temporary_error)}")
+    if target_error is not None:
+        label = "不是普通文件" if isinstance(target_error, _ForeignFileTypeError) else "状态无法读取"
+        facts.append(f"目标文件 {target} {label}：{_failure_text(target_error)}")
+    if target_error is None and target_identity == expected_identity:
+        if temporary_error is None and temporary_identity not in {None, expected_identity}:
+            facts.append(f"固定临时路径已由其他文件占用，保留于 {temporary}")
+        return "published", tuple(facts), _cancellation_from(temporary_error, target_error)
+    if temporary_identity == expected_identity and (
+        target_error is None or isinstance(target_error, _ForeignFileTypeError)
+    ):
+        return "not_published", tuple(facts), _cancellation_from(temporary_error, target_error)
+    if facts:
+        return "unknown", tuple(facts), _cancellation_from(temporary_error, target_error)
+    if temporary_identity is not None:
+        facts.append(f"固定临时路径已由其他文件占用，保留于 {temporary}")
+    return "unknown", tuple(facts), _cancellation_from(temporary_error, target_error)
+
+
+def _cancellation_from(*errors: BaseException | None) -> KeyboardInterrupt | None:
+    return next((error for error in errors if isinstance(error, KeyboardInterrupt)), None)
 
 
 def _raise_file_failure(
@@ -506,70 +638,223 @@ def _raise_file_failure(
     cleanup: BaseException | None,
     *,
     target: Path,
-    temporary: Path,
+    retained_sites: tuple[str, ...] = (),
+    facts: tuple[str, ...] = (),
 ) -> NoReturn:
-    if cleanup is None:
-        raise ToolError(
-            object_name=str(target),
-            reason=f"目标写入或发布失败：{_failure_text(primary)}",
-            impact="目标没有发布，固定临时文件已经清理；输入原件没有修改",
-            help_text="检查目标目录权限、占用和剩余空间后重试",
-        ) from None
-    raise ToolError(
+    reason = f"目标写入或发布失败：{_failure_text(primary)}"
+    if facts:
+        reason += f"；{'；'.join(facts)}"
+    if cleanup is not None:
+        reason += f"；固定临时文件清理调用发生异常：{_failure_text(cleanup)}"
+    if retained_sites:
+        impact = f"目标没有发布；临时文件保留于或需确认于 {' 与 '.join(retained_sites)}；输入原件没有修改"
+        help_text = "保留并检查指出的精确 .tmp 文件，处理占用或权限后再重新运行"
+    else:
+        impact = "目标没有发布，固定临时文件已经清理；输入原件没有修改"
+        help_text = "检查目标目录权限、占用和剩余空间后重试"
+    details = {
+        "object_name": str(target),
+        "reason": reason,
+        "impact": impact,
+        "help_text": help_text,
+    }
+    cancellation = _cancellation_from(primary, cleanup)
+    if cancellation is not None:
+        raise ToolCancelledError(**details, cause=cancellation) from None
+    raise ToolError(**details) from None
+
+
+def _raise_file_published(
+    primary: BaseException,
+    *,
+    target: Path,
+    cleanup: BaseException | None = None,
+    retained_sites: tuple[str, ...] = (),
+    facts: tuple[str, ...] = (),
+    cancellation: KeyboardInterrupt | None = None,
+) -> NoReturn:
+    reason_parts = [f"目标文件已经发布，但完成流程发生：{_failure_text(primary)}", *facts]
+    if cleanup is not None:
+        reason_parts.append(f"固定临时文件清理调用发生异常：{_failure_text(cleanup)}")
+    if retained_sites:
+        impact = f"目标 {target} 已经生效；临时文件保留于或需确认于 {' 与 '.join(retained_sites)}"
+        help_text = "保留已发布目标，处理原因中指出的精确 .tmp 文件"
+    else:
+        impact = f"目标 {target} 已经生效；固定临时文件已经清理"
+        help_text = "保留已发布目标并继续后续流程"
+    raise FilePublishedError(
         object_name=str(target),
-        reason=f"目标写入失败：{_failure_text(primary)}；固定临时文件清理也失败：{_failure_text(cleanup)}",
-        impact=f"目标没有发布；临时文件 {temporary} 仍可能存在；输入原件没有修改",
-        help_text="保留并检查指出的 .tmp 文件，处理占用或权限后再重新运行",
+        reason="；".join(reason_parts),
+        impact=impact,
+        help_text=help_text,
+        cause=_cancellation_from(primary, cleanup, cancellation) or primary,
     ) from None
 
 
-def atomic_write_text(path: Path, text: str, *, replace: bool) -> None:
+def _raise_unknown_file_publish(
+    primary: BaseException,
+    *,
+    target: Path,
+    temporary: Path,
+    facts: tuple[str, ...],
+    cancellation: KeyboardInterrupt | None = None,
+) -> NoReturn:
+    details = [f"文件发布调用发生：{_failure_text(primary)}", *facts]
+    error = ToolError(
+        object_name=str(target),
+        reason="；".join(details),
+        impact=f"无法确认目标文件是否已经发布；保留 {target} 与 {temporary} 作为核对现场",
+        help_text="停止重试并核对指出的目标与固定 .tmp 文件内容后再处理",
+    )
+    cancelled = _cancellation_from(primary, cancellation)
+    if cancelled is not None:
+        raise ToolCancelledError(
+            object_name=error.object_name,
+            reason=error.reason,
+            impact=error.impact,
+            help_text=error.help_text,
+            cause=cancelled,
+        ) from None
+    raise error from None
+
+
+def _atomic_write_bytes(
+    path: Path,
+    body: bytes,
+    *,
+    replace: bool,
+    temporary_suffix: str,
+) -> None:
     target = _output_target(path, "输出文件")
     target.parent.mkdir(parents=True, exist_ok=True)
     _output_target(target, "输出文件")
-    temporary = target.with_name(f".{target.name}.tmp")
+    if (
+        not temporary_suffix.startswith(".")
+        or temporary_suffix in {".", ".."}
+        or "/" in temporary_suffix
+        or "\\" in temporary_suffix
+        or ":" in temporary_suffix
+        or any(ord(character) < 32 or ord(character) == 127 for character in temporary_suffix)
+    ):
+        fail(
+            "固定临时文件后缀",
+            "固定临时文件后缀不是同目录内的安全文件名片段",
+            "使用以点开头且不含路径分隔符、盘符或控制字符的后缀",
+        )
+    temporary = target.with_name(f".{target.name}{temporary_suffix}")
     _output_target(temporary, "固定临时文件")
     if target.exists() and not replace:
         fail(str(target), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
     if temporary.exists():
         fail(str(temporary), "存在上次未清理的固定临时文件", "检查并处理该 .tmp 文件后重试")
-    created = False
+    candidate_identity: _FileIdentity | None = None
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-            created = True
-            handle.write(text)
+        with temporary.open("xb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_ino == 0:
+                raise OSError("固定临时文件没有可验证的普通文件身份")
+            candidate_identity = (metadata.st_dev, metadata.st_ino)
+            handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
+    except FileExistsError:
+        fail(str(temporary), "固定临时文件已由其他进程建立", "检查并处理该精确 .tmp 文件后重试")
     except BaseException as primary:  # noqa: BLE001 - 所有失败都必须清理已经建立的临时文件。
+        cleanup, retained_sites = _candidate_file_cleanup(temporary, candidate_identity)
         _raise_file_failure(
             primary,
-            _remove_temporary(temporary) if created else None,
+            cleanup,
             target=target,
-            temporary=temporary,
+            retained_sites=retained_sites,
         )
     try:
         _output_target(target, "输出文件")
+    except BaseException as primary:  # noqa: BLE001 - 发布前元数据失败也必须清理候选文件。
+        cleanup, retained_sites = _candidate_file_cleanup(temporary, candidate_identity)
+        _raise_file_failure(
+            primary,
+            cleanup,
+            target=target,
+            retained_sites=retained_sites,
+        )
+    try:
         if replace:
             os.replace(temporary, target)
         else:
             os.link(temporary, target)
-    except FileExistsError as primary:
-        cleanup = _remove_temporary(temporary)
-        if cleanup is None:
-            fail(str(target), "目标在写入期间已由其他进程建立", "保留该文件并重新选择输出路径")
-        _raise_file_failure(primary, cleanup, target=target, temporary=temporary)
     except BaseException as primary:  # noqa: BLE001 - 发布失败必须保留主失败与清理结果。
-        _raise_file_failure(primary, _remove_temporary(temporary), target=target, temporary=temporary)
-    if replace:
-        return
-    cleanup = _remove_temporary(temporary)
-    if cleanup is not None:
-        raise ToolError(
-            object_name=str(temporary),
-            reason=f"目标已经完整建立，但固定临时文件清理失败：{_failure_text(cleanup)}",
-            impact=f"目标 {target} 已经生效；输入原件没有修改",
-            help_text="保留目标，处理占用或权限后删除指出的 .tmp 文件",
+        assert candidate_identity is not None
+        state, facts, cancellation = _file_publish_state(temporary, target, candidate_identity)
+        if state == "published":
+            cleanup, retained_sites = _candidate_file_cleanup(temporary, candidate_identity)
+            _raise_file_published(
+                primary,
+                target=target,
+                cleanup=cleanup,
+                retained_sites=retained_sites,
+                facts=facts,
+                cancellation=cancellation,
+            )
+        if state == "unknown":
+            _raise_unknown_file_publish(
+                primary,
+                target=target,
+                temporary=temporary,
+                facts=facts,
+                cancellation=cancellation,
+            )
+        cleanup, retained_sites = _candidate_file_cleanup(temporary, candidate_identity)
+        if isinstance(primary, FileExistsError) and cleanup is None:
+            fail(str(target), "目标在写入期间已由其他进程建立", "保留该文件并重新选择输出路径")
+        _raise_file_failure(
+            primary,
+            cleanup,
+            target=target,
+            retained_sites=retained_sites,
+            facts=facts,
         )
+    assert candidate_identity is not None
+    state, facts, cancellation = _file_publish_state(temporary, target, candidate_identity)
+    if state != "published":
+        _raise_unknown_file_publish(
+            OSError("文件发布返回成功，但候选文件身份未到达目标路径"),
+            target=target,
+            temporary=temporary,
+            facts=facts,
+            cancellation=cancellation,
+        )
+    cleanup, retained_sites = _candidate_file_cleanup(temporary, candidate_identity)
+    if cleanup is not None or retained_sites or facts:
+        _raise_file_published(
+            cleanup or OSError("文件发布后固定临时路径出现其他文件"),
+            target=target,
+            retained_sites=retained_sites,
+            facts=facts,
+            cancellation=cancellation,
+        )
+
+
+def atomic_write_bytes(
+    path: Path,
+    body: bytes,
+    *,
+    replace: bool,
+    temporary_suffix: str = ".tmp",
+) -> None:
+    """用可核对身份的同目录候选文件原子发布原始字节。"""
+
+    _atomic_write_bytes(
+        path,
+        body,
+        replace=replace,
+        temporary_suffix=temporary_suffix,
+    )
+
+
+def atomic_write_text(path: Path, text: str, *, replace: bool) -> None:
+    """以无 BOM 的精确 UTF-8 字节发布文本，不做平台换行转换。"""
+
+    atomic_write_bytes(path, text.encode("utf-8"), replace=replace)
 
 
 def write_json(path: Path, value: JsonValue, *, replace: bool) -> None:
@@ -584,40 +869,359 @@ def write_json(path: Path, value: JsonValue, *, replace: bool) -> None:
     )
 
 
-def write_json_with_optional_text(
-    json_path: Path,
-    value: JsonValue,
-    *,
-    text_path: Path | None,
-    text: str | None,
-    replace: bool,
-) -> None:
-    """发布候选 JSON，并准确保留随后可选文本输出的结果。"""
+_DirectoryIdentity = tuple[int, int]
 
-    if (text_path is None) != (text is None):
-        fail("工具输出", "可选文本的路径和正文没有同时提供", "报告当前脚本实现错误")
-    outputs = [json_path] if text_path is None else [json_path, text_path]
-    preflight_atomic_text_outputs(outputs, replace=replace)
-    write_json(json_path, value, replace=replace)
-    if text_path is None or text is None:
-        return
+
+class _ForeignDirectoryTypeError(OSError):
+    """路径元数据可读取，但对象不是普通目录。"""
+
+
+def _ordinary_directory_identity(path: Path) -> _DirectoryIdentity:
+    metadata = path.lstat()
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & 0x400):
+        raise _ForeignDirectoryTypeError(f"{path} 不是普通目录")
+    if metadata.st_ino == 0:
+        raise OSError(f"{path} 所在文件系统没有提供稳定目录身份")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _directory_identity_at(path: Path) -> tuple[_DirectoryIdentity | None, BaseException | None]:
     try:
-        atomic_write_text(text_path, text, replace=replace)
-    except ToolError as error:
-        raise ToolError(
+        return _ordinary_directory_identity(path), None
+    except FileNotFoundError:
+        return None, None
+    except BaseException as error:  # noqa: BLE001 - 发布终态必须保留无法确认的文件系统事实。
+        return None, error
+
+
+def _retained_directory_sites(
+    *paths: Path,
+) -> tuple[tuple[str, ...], KeyboardInterrupt | None]:
+    sites: list[str] = []
+    cancellation: KeyboardInterrupt | None = None
+    for path in paths:
+        identity, error = _directory_identity_at(path)
+        if error is not None:
+            sites.append(f"{path}（状态无法确认：{_failure_text(error)}）")
+            cancellation = cancellation or _cancellation_from(error)
+        elif identity is not None:
+            sites.append(str(path))
+    return tuple(sites), cancellation
+
+
+def _restore_claimed_directory(
+    claimed: Path,
+    original: Path,
+    claimed_identity: _DirectoryIdentity,
+) -> tuple[Path, BaseException | None]:
+    original_identity, original_error = _directory_identity_at(original)
+    if original_error is not None or original_identity is not None:
+        return claimed, original_error
+    try:
+        os.rename(claimed, original)
+    except BaseException as error:  # noqa: BLE001 - 恢复操作的实际结果必须另行核对。
+        restored_identity, inspection_error = _directory_identity_at(original)
+        if restored_identity == claimed_identity:
+            return original, error
+        return claimed, inspection_error or error
+    restored_identity, inspection_error = _directory_identity_at(original)
+    if restored_identity == claimed_identity:
+        return original, None
+    return claimed, inspection_error or OSError("恢复后的目录身份与被认领对象不一致")
+
+
+def remove_owned_directory(
+    path: Path,
+    expected_identity: _DirectoryIdentity,
+    cleanup_path: Path,
+) -> BaseException | None:
+    """原子认领已知目录后删除，不按可能被替换的原路径递归。"""
+
+    cleanup_identity, cleanup_error = _directory_identity_at(cleanup_path)
+    if cleanup_error is not None:
+        if isinstance(cleanup_error, KeyboardInterrupt):
+            detail = str(cleanup_error).strip()
+            suffix = f"（{sanitize_line(detail)}）" if detail else ""
+            return KeyboardInterrupt(f"固定清理路径状态确认被取消：{cleanup_path}{suffix}")
+        return OSError(f"固定清理路径 {cleanup_path} 状态无法确认：{_failure_text(cleanup_error)}")
+    if cleanup_identity is not None:
+        return OSError(f"固定清理路径已经存在，已保留现场：{path}；{cleanup_path}")
+
+    source_identity, source_error = _directory_identity_at(path)
+    if source_error is not None:
+        return source_error
+    if source_identity is None:
+        return None
+    if source_identity != expected_identity:
+        return OSError(f"待清理目录的身份已经变化，已保留于 {path}")
+
+    try:
+        os.rename(path, cleanup_path)
+    except BaseException as error:  # noqa: BLE001 - 认领返回错误时仍需要核对实际位置。
+        state, facts, cancellation = _directory_move_state(path, cleanup_path, expected_identity)
+        if state == "moved":
+            return cancellation or error
+        if state == "not_moved":
+            return cancellation or error
+        detail = f"；{'；'.join(facts)}" if facts else ""
+        cancelled = _cancellation_from(error, cancellation)
+        if cancelled is not None:
+            return KeyboardInterrupt(
+                f"取消发生后无法确认待清理目录的位置；需确认 {path} 与 {cleanup_path}{detail}"
+            )
+        return OSError(f"原子认领待清理目录失败（{type(error).__name__}）{detail}")
+
+    claimed_identity, identity_error = _directory_identity_at(cleanup_path)
+    if identity_error is not None or claimed_identity != expected_identity:
+        identity_for_restore = claimed_identity or expected_identity
+        residual, restore_error = _restore_claimed_directory(
+            cleanup_path,
+            path,
+            identity_for_restore,
+        )
+        suffix = f"；恢复时发生 {type(restore_error).__name__}" if restore_error else ""
+        reason = (
+            f"无法确认被认领目录的身份（{type(identity_error).__name__}）"
+            if identity_error is not None
+            else "被认领目录的身份已经变化"
+        )
+        if isinstance(identity_error, KeyboardInterrupt):
+            return identity_error
+        if isinstance(restore_error, KeyboardInterrupt):
+            return restore_error
+        return OSError(f"{reason}，已保留于 {residual}{suffix}")
+
+    try:
+        shutil.rmtree(cleanup_path)
+    except BaseException as error:  # noqa: BLE001 - 清理结果必须与主失败分开保存。
+        remaining_identity, inspection_error = _directory_identity_at(cleanup_path)
+        if inspection_error is not None:
+            if isinstance(inspection_error, KeyboardInterrupt):
+                detail = str(inspection_error).strip()
+                suffix = f"（{sanitize_line(detail)}）" if detail else ""
+                return KeyboardInterrupt(
+                    f"清理调用失败后，固定清理路径状态确认被取消：{cleanup_path}{suffix}"
+                )
+            if isinstance(error, KeyboardInterrupt):
+                return KeyboardInterrupt(
+                    f"清理固定路径时命令被取消，且后验状态无法确认：{cleanup_path}"
+                    f"（{_failure_text(inspection_error)}）"
+                )
+            return OSError(
+                f"清理目录时发生 {_failure_text(error)}；固定清理路径 {cleanup_path} "
+                f"的后验状态无法确认：{_failure_text(inspection_error)}"
+            )
+        if remaining_identity is None and inspection_error is None:
+            return error
+        if remaining_identity != expected_identity:
+            if isinstance(error, KeyboardInterrupt):
+                return KeyboardInterrupt(
+                    f"清理固定路径时命令被取消，且清理边界的目录身份已经变化：{cleanup_path}"
+                )
+            return OSError(f"清理边界的目录身份已经变化，已保留于 {cleanup_path}")
+        residual, restore_error = _restore_claimed_directory(
+            cleanup_path,
+            path,
+            expected_identity,
+        )
+        suffix = f"；恢复时发生 {type(restore_error).__name__}" if restore_error else ""
+        if isinstance(error, KeyboardInterrupt):
+            return error
+        if isinstance(restore_error, KeyboardInterrupt):
+            return restore_error
+        if restore_error is None:
+            return error
+        return OSError(f"清理目录时发生 {type(error).__name__}，已保留于 {residual}{suffix}")
+    return None
+
+
+def _directory_move_state(
+    source: Path,
+    destination: Path,
+    expected_identity: _DirectoryIdentity,
+) -> tuple[
+    Literal["moved", "not_moved", "unknown"],
+    tuple[str, ...],
+    KeyboardInterrupt | None,
+]:
+    source_identity, source_error = _directory_identity_at(source)
+    destination_identity, destination_error = _directory_identity_at(destination)
+    facts: list[str] = []
+    if source_error is not None:
+        label = "不是普通目录" if isinstance(source_error, _ForeignDirectoryTypeError) else "状态无法读取"
+        facts.append(f"源目录 {source} {label}：{_failure_text(source_error)}")
+    if destination_error is not None:
+        label = (
+            "不是普通目录" if isinstance(destination_error, _ForeignDirectoryTypeError) else "状态无法读取"
+        )
+        facts.append(f"目标目录 {destination} {label}：{_failure_text(destination_error)}")
+    cancellation = _cancellation_from(source_error, destination_error)
+    if destination_error is None and destination_identity == expected_identity:
+        if source_error is None and source_identity == expected_identity:
+            facts.append("源目录与目标目录同时具有预期身份")
+            return "unknown", tuple(facts), cancellation
+        if source_error is None and source_identity is not None:
+            facts.append(f"源固定目录已由其他对象占用，保留于 {source}")
+        return "moved", tuple(facts), cancellation
+    if source_identity == expected_identity and (
+        destination_error is None or isinstance(destination_error, _ForeignDirectoryTypeError)
+    ):
+        return "not_moved", tuple(facts), cancellation
+    if facts:
+        return "unknown", tuple(facts), cancellation
+    return "unknown", (), cancellation
+
+
+def _raise_unknown_directory_move(
+    primary: BaseException,
+    *,
+    source: Path,
+    destination: Path,
+    facts: tuple[str, ...],
+    cancellation: KeyboardInterrupt | None = None,
+) -> NoReturn:
+    details = [f"目录交换返回错误：{_failure_text(primary)}", *facts]
+    error = ToolError(
+        object_name=str(destination.parent),
+        reason="；".join(details),
+        impact=f"无法确认目录交换结果；{source} 与 {destination} 保持为恢复现场",
+        help_text="停止重试并保留指出的固定路径，确认两个目录的内容和身份后再处理",
+    )
+    cancelled = _cancellation_from(primary, cancellation)
+    if cancelled is not None:
+        raise ToolCancelledError(
             object_name=error.object_name,
             reason=error.reason,
-            impact=f"候选 JSON {json_path.resolve(strict=False)} 已经生效；{error.impact}",
+            impact=error.impact,
             help_text=error.help_text,
+            cause=cancelled,
         ) from None
+    raise error from None
 
 
-def _remove_tree(path: Path) -> BaseException | None:
+def _restore_previous_directory(
+    previous: Path,
+    target: Path,
+    expected_identity: _DirectoryIdentity,
+    *,
+    publish_error: BaseException,
+) -> BaseException | None:
     try:
-        shutil.rmtree(path)
-    except BaseException as error:  # noqa: BLE001 - 清理结果必须与主失败分开保存。
-        return error
-    return None
+        os.replace(previous, target)
+    except BaseException as restore_error:  # noqa: BLE001 - 恢复移动也必须确认实际终态。
+        state, facts, cancellation = _directory_move_state(previous, target, expected_identity)
+        if state == "moved":
+            return cancellation or restore_error
+        if state == "unknown":
+            _raise_unknown_directory_move(
+                restore_error,
+                source=previous,
+                destination=target,
+                facts=(f"新目录发布失败：{_failure_text(publish_error)}", *facts),
+                cancellation=cancellation,
+            )
+        details = {
+            "object_name": str(target.parent),
+            "reason": (
+                f"新目录发布失败：{_failure_text(publish_error)}；"
+                f"旧目录恢复失败：{_failure_text(restore_error)}" + (f"；{'；'.join(facts)}" if facts else "")
+            ),
+            "impact": f"旧目录仍位于 {previous}；完整临时目录保持原样；目标尚未恢复",
+            "help_text": "停止重试并保留 .tmp/.previous，处理权限或占用后恢复旧目录",
+        }
+        cancelled = _cancellation_from(publish_error, restore_error, cancellation)
+        if cancelled is not None:
+            raise ToolCancelledError(**details, cause=cancelled) from None
+        raise ToolError(**details) from None
+    state, facts, cancellation = _directory_move_state(previous, target, expected_identity)
+    if state == "moved":
+        if cancellation is not None:
+            return cancellation
+        if facts:
+            return OSError(f"旧目录已经恢复；{'；'.join(facts)}")
+        return None
+    _raise_unknown_directory_move(
+        OSError("旧目录恢复返回成功，但目录身份未到达目标位置"),
+        source=previous,
+        destination=target,
+        facts=(f"新目录发布失败：{_failure_text(publish_error)}", *facts),
+        cancellation=cancellation,
+    )
+
+
+def _raise_published_directory_error(
+    primary: BaseException,
+    *,
+    target: Path,
+    previous: Path,
+    previous_identity: _DirectoryIdentity | None,
+    previous_cleanup: Path,
+    move_facts: tuple[str, ...] = (),
+    cancellation: KeyboardInterrupt | None = None,
+) -> NoReturn:
+    cleanup = (
+        remove_owned_directory(previous, previous_identity, previous_cleanup)
+        if previous_identity is not None
+        else None
+    )
+    details = f"目录已经发布，但发布调用返回前发生：{_failure_text(primary)}"
+    impact = f"新目录 {target} 已经生效"
+    help_text = "保留已经发布的目标；确认内容后继续后续流程"
+    if move_facts:
+        details += f"；{'；'.join(move_facts)}"
+        impact += "；源固定路径的现场保持原样"
+        help_text = "保留已经发布的目标和原因中指出的源固定路径，确认内容后继续后续流程"
+    previous_after, previous_error = _directory_identity_at(previous)
+    cleanup_after, cleanup_error = _directory_identity_at(previous_cleanup)
+    for path, inspection_error in (
+        (previous, previous_error),
+        (previous_cleanup, cleanup_error),
+    ):
+        if inspection_error is not None:
+            details += f"；固定路径 {path} 状态无法确认：{_failure_text(inspection_error)}"
+    if cleanup is not None:
+        if (
+            previous_after is None
+            and previous_error is None
+            and cleanup_after is None
+            and cleanup_error is None
+        ):
+            details += f"；旧目录清理完成前发生：{_failure_text(cleanup)}"
+        else:
+            details += f"；旧目录清理失败：{_failure_text(cleanup)}"
+            retained = [
+                str(path)
+                for path, identity, inspection_error in (
+                    (previous, previous_after, previous_error),
+                    (previous_cleanup, cleanup_after, cleanup_error),
+                )
+                if identity is not None or inspection_error is not None
+            ]
+            impact += f"；旧目录仍位于或需确认于 {' 与 '.join(retained)}"
+            help_text = "保留已经发布的目标和原因中指出的固定路径，处理 .previous/.cleanup 目录"
+    else:
+        retained = [
+            str(path)
+            for path, identity, inspection_error in (
+                (previous, previous_after, previous_error),
+                (previous_cleanup, cleanup_after, cleanup_error),
+            )
+            if identity is not None or inspection_error is not None
+        ]
+        if retained:
+            impact += f"；旧目录仍位于或需确认于 {' 与 '.join(retained)}"
+            help_text = "保留已经发布的目标和原因中指出的固定路径，处理 .previous/.cleanup 目录"
+    cause: BaseException = (
+        _cancellation_from(primary, cancellation, cleanup, previous_error, cleanup_error) or primary
+    )
+    raise DirectoryPublishedError(
+        object_name=str(target),
+        reason=details,
+        impact=impact,
+        help_text=help_text,
+        cause=cause,
+    ) from None
 
 
 def _raise_directory_cleanup_failure(
@@ -626,15 +1230,174 @@ def _raise_directory_cleanup_failure(
     *,
     target: Path,
     stage: Path,
+    stage_cleanup: Path,
     restored: bool,
+    related_error: BaseException | None = None,
+    facts: tuple[str, ...] = (),
 ) -> NoReturn:
-    restored_text = "原目标已经恢复" if restored else "目标没有由本工具发布"
+    restored_text = "原目标仍位于目标路径" if restored else "目标没有由本工具发布"
+    retained_sites, probe_cancellation = _retained_directory_sites(stage, stage_cleanup)
+    if retained_sites:
+        cleanup_impact = f"临时目录保留于或需确认于 {' 与 '.join(retained_sites)}"
+        help_text = "保留并检查指出的精确 .tmp/.cleanup 目录，处理占用或权限后再重新运行"
+    else:
+        cleanup_impact = "后验确认固定临时目录已经清理"
+        help_text = "检查目标目录权限、占用和剩余空间后重试"
+    reason_parts = [f"目录写入或发布失败：{_failure_text(primary)}", *facts]
+    if related_error is not None:
+        reason_parts.append(f"恢复调用发生：{_failure_text(related_error)}")
+    reason_parts.append(f"临时目录清理也失败：{_failure_text(cleanup)}")
+    details = {
+        "object_name": str(target),
+        "reason": "；".join(reason_parts),
+        "impact": f"{restored_text}；{cleanup_impact}；输入原件没有修改",
+        "help_text": help_text,
+    }
+    cancellation = _cancellation_from(primary, related_error, cleanup, probe_cancellation)
+    if cancellation is not None:
+        raise ToolCancelledError(
+            **details,
+            cause=cancellation,
+        ) from None
     raise ToolError(
-        object_name=str(target),
-        reason=f"目录写入或发布失败：{_failure_text(primary)}；临时目录清理也失败：{_failure_text(cleanup)}",
-        impact=f"{restored_text}；临时目录 {stage} 仍可能存在；输入原件没有修改",
-        help_text="保留并检查指出的 .tmp 目录，处理占用或权限后再重新运行",
+        **details,
     ) from None
+
+
+def _raise_known_directory_failure(
+    primary: BaseException,
+    *,
+    target: Path,
+    restored: bool,
+    related_error: BaseException | None = None,
+    facts: tuple[str, ...] = (),
+) -> NoReturn:
+    reason_parts = [f"目录写入或发布失败：{_failure_text(primary)}", *facts]
+    if related_error is not None:
+        reason_parts.append(f"恢复调用发生：{_failure_text(related_error)}")
+    details = {
+        "object_name": str(target),
+        "reason": "；".join(reason_parts),
+        "impact": (
+            ("原目标仍位于目标路径" if restored else "目标没有由本工具发布")
+            + "；固定临时目录已经清理；输入原件没有修改"
+        ),
+        "help_text": "检查目标目录权限、占用和剩余空间后重试",
+    }
+    cancellation = _cancellation_from(primary, related_error)
+    if cancellation is not None:
+        raise ToolCancelledError(**details, cause=cancellation) from None
+    raise ToolError(**details) from None
+
+
+def _raise_stage_setup_failure(
+    primary: BaseException,
+    *,
+    target: Path,
+    stage: Path,
+    stage_cleanup: Path,
+    cleaned: bool = False,
+) -> NoReturn:
+    retained_sites, probe_cancellation = _retained_directory_sites(stage, stage_cleanup)
+    if retained_sites:
+        impact = f"目标没有发布；固定临时目录保留于或需确认于 {' 与 '.join(retained_sites)}；输入原件没有修改"
+    elif cleaned:
+        impact = "目标没有发布；固定临时目录已经清理；输入原件没有修改"
+    else:
+        impact = "目标没有发布；后验确认固定临时目录不存在；输入原件没有修改"
+    help_text = (
+        "保留并检查指出的精确 .tmp/.cleanup 目录，处理占用或权限后再重新运行"
+        if retained_sites
+        else "检查目标目录权限、占用和剩余空间后重试"
+    )
+    details = {
+        "object_name": str(target),
+        "reason": f"固定临时目录建立或身份确认失败：{_failure_text(primary)}",
+        "impact": impact,
+        "help_text": help_text,
+    }
+    cancellation = _cancellation_from(primary, probe_cancellation)
+    if cancellation is not None:
+        raise ToolCancelledError(**details, cause=cancellation) from None
+    raise ToolError(**details) from None
+
+
+def _create_directory_stage(target: Path, stage: Path, stage_cleanup: Path) -> _DirectoryIdentity:
+    try:
+        stage.mkdir()
+    except FileExistsError:
+        fail(
+            str(stage),
+            "固定临时目录已由其他进程建立",
+            "检查并处理该精确 .tmp 目录后重试",
+        )
+    except BaseException as primary:  # noqa: BLE001 - mkdir 返回异常后需核对实际固定现场。
+        _raise_stage_setup_failure(
+            primary,
+            target=target,
+            stage=stage,
+            stage_cleanup=stage_cleanup,
+        )
+    try:
+        return _ordinary_directory_identity(stage)
+    except BaseException as primary:  # noqa: BLE001 - 身份探测取消也必须清理已建立的候选目录。
+        recovered_identity, identity_error = _directory_identity_at(stage)
+        if recovered_identity is None:
+            _raise_stage_setup_failure(
+                identity_error or primary,
+                target=target,
+                stage=stage,
+                stage_cleanup=stage_cleanup,
+            )
+        cleanup = remove_owned_directory(stage, recovered_identity, stage_cleanup)
+        if cleanup is not None:
+            _raise_directory_cleanup_failure(
+                primary,
+                cleanup,
+                target=target,
+                stage=stage,
+                stage_cleanup=stage_cleanup,
+                restored=False,
+            )
+        _raise_stage_setup_failure(
+            primary,
+            target=target,
+            stage=stage,
+            stage_cleanup=stage_cleanup,
+            cleaned=True,
+        )
+
+
+def _cleanup_directory_stage_after_failure(
+    primary: BaseException,
+    *,
+    target: Path,
+    stage: Path,
+    stage_identity: _DirectoryIdentity,
+    stage_cleanup: Path,
+    restored: bool,
+    related_error: BaseException | None = None,
+    facts: tuple[str, ...] = (),
+) -> NoReturn:
+    cleanup = remove_owned_directory(stage, stage_identity, stage_cleanup)
+    if cleanup is not None:
+        _raise_directory_cleanup_failure(
+            primary,
+            cleanup,
+            target=target,
+            stage=stage,
+            stage_cleanup=stage_cleanup,
+            restored=restored,
+            related_error=related_error,
+            facts=facts,
+        )
+    _raise_known_directory_failure(
+        primary,
+        target=target,
+        restored=restored,
+        related_error=related_error,
+        facts=facts,
+    )
 
 
 def atomic_write_directory(
@@ -647,15 +1410,24 @@ def atomic_write_directory(
     _output_target(target, "输出目录")
     stage = target.with_name(f".{target.name}.tmp")
     previous = target.with_name(f".{target.name}.previous")
+    stage_cleanup = target.with_name(f".{target.name}.tmp.cleanup")
+    previous_cleanup = target.with_name(f".{target.name}.previous.cleanup")
     _output_target(stage, "固定临时目录")
     _output_target(previous, "固定恢复目录")
+    _output_target(stage_cleanup, "固定临时清理目录")
+    _output_target(previous_cleanup, "固定恢复清理目录")
     if target.exists() and not target.is_dir():
         fail(str(target), "目标已存在且不是普通目录", "为目录输出选择不存在的路径或已有普通目录")
     if target.exists() and not replace:
         fail(str(target), "目标目录已存在", "换一个输出目录，或在确认可替换后传入 --replace")
-    if stage.exists() or previous.exists():
-        fail(str(target.parent), "存在上次未清理的固定临时目录", "检查并处理 .tmp/.previous 目录后重试")
-    stage.mkdir()
+    retained = [path for path in (stage, previous, stage_cleanup, previous_cleanup) if path.exists()]
+    if retained:
+        fail(
+            str(target.parent),
+            f"存在上次未清理的固定现场：{'; '.join(str(path) for path in retained)}",
+            "检查并处理指出的 .tmp/.previous/.cleanup 目录后重试",
+        )
+    stage_identity = _create_directory_stage(target, stage, stage_cleanup)
     try:
         for relative_text, body in sorted(files.items()):
             relative = PurePosixPath(relative_text)
@@ -689,80 +1461,154 @@ def atomic_write_directory(
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())
-    except BaseException as primary:
-        cleanup = _remove_tree(stage)
-        if cleanup is not None:
-            _raise_directory_cleanup_failure(primary, cleanup, target=target, stage=stage, restored=False)
-        raise
+    except BaseException as primary:  # noqa: BLE001 - 所有失败都必须清理已建立的候选目录。
+        _cleanup_directory_stage_after_failure(
+            primary,
+            target=target,
+            stage=stage,
+            stage_identity=stage_identity,
+            stage_cleanup=stage_cleanup,
+            restored=False,
+        )
 
     moved_previous = False
+    previous_identity: _DirectoryIdentity | None = None
     try:
         _output_target(target, "输出目录")
         _output_target(previous, "固定恢复目录")
-    except BaseException as primary:
-        cleanup = _remove_tree(stage)
-        if cleanup is not None:
-            _raise_directory_cleanup_failure(primary, cleanup, target=target, stage=stage, restored=False)
-        raise
-    if target.exists() and not replace:
-        cleanup = _remove_tree(stage)
-        if cleanup is not None:
-            raise ToolError(
-                object_name=str(target),
-                reason=f"目标在写入期间已由其他进程建立；临时目录清理也失败：{_failure_text(cleanup)}",
-                impact=f"后来建立的目标保持原样；临时目录 {stage} 仍可能存在；输入原件没有修改",
-                help_text="保留目标，处理占用或权限后删除指出的 .tmp 目录",
-            ) from None
-        fail(str(target), "目标在写入期间已由其他进程建立", "保留该目录并重新选择输出路径")
-    if target.exists() and not target.is_dir():
-        cleanup = _remove_tree(stage)
-        if cleanup is not None:
-            raise ToolError(
-                object_name=str(target),
-                reason=f"目标在写入期间变成非目录；临时目录清理也失败：{_failure_text(cleanup)}",
-                impact=f"目标保持原样；临时目录 {stage} 仍可能存在；输入原件没有修改",
-                help_text="保留目标，处理占用或权限后删除指出的 .tmp 目录",
-            ) from None
-        fail(str(target), "目标在写入期间变成非目录", "保留该文件并重新选择目录输出路径")
-    if target.exists():
+        target_exists = target.exists()
+        if target_exists and not replace:
+            fail(str(target), "目标在写入期间已由其他进程建立", "保留该目录并重新选择输出路径")
+        if target_exists and not target.is_dir():
+            fail(str(target), "目标在写入期间变成非目录", "保留该文件并重新选择目录输出路径")
+        if target_exists:
+            previous_identity = _ordinary_directory_identity(target)
+    except BaseException as primary:  # noqa: BLE001 - 发布前元数据失败也必须清理候选目录。
+        _cleanup_directory_stage_after_failure(
+            primary,
+            target=target,
+            stage=stage,
+            stage_identity=stage_identity,
+            stage_cleanup=stage_cleanup,
+            restored=False,
+        )
+    if target_exists:
+        assert previous_identity is not None
         try:
             os.replace(target, previous)
-            moved_previous = True
-        except BaseException as primary:
-            cleanup = _remove_tree(stage)
-            if cleanup is not None:
-                _raise_directory_cleanup_failure(primary, cleanup, target=target, stage=stage, restored=True)
-            raise
+        except BaseException as primary:  # noqa: BLE001 - 移动取消也必须核对并恢复实际终态。
+            state, facts, cancellation = _directory_move_state(target, previous, previous_identity)
+            if state == "unknown":
+                _raise_unknown_directory_move(
+                    primary,
+                    source=target,
+                    destination=previous,
+                    facts=facts,
+                    cancellation=cancellation,
+                )
+            restore_error = None
+            if state == "moved":
+                restore_error = _restore_previous_directory(
+                    previous,
+                    target,
+                    previous_identity,
+                    publish_error=primary,
+                )
+            _cleanup_directory_stage_after_failure(
+                primary,
+                target=target,
+                stage=stage,
+                stage_identity=stage_identity,
+                stage_cleanup=stage_cleanup,
+                restored=True,
+                related_error=restore_error,
+                facts=facts,
+            )
+        state, facts, cancellation = _directory_move_state(target, previous, previous_identity)
+        if state != "moved" or facts:
+            _raise_unknown_directory_move(
+                OSError("旧目标移动返回成功，但目录身份未到达恢复位置"),
+                source=target,
+                destination=previous,
+                facts=facts,
+                cancellation=cancellation,
+            )
+        moved_previous = True
     try:
         if replace:
             os.replace(stage, target)
         else:
             os.rename(stage, target)
-    except BaseException as primary:
-        if moved_previous:
-            try:
-                os.replace(previous, target)
-            except BaseException as rollback:  # noqa: BLE001 - 恢复失败决定结果未知。
-                raise ToolError(
-                    object_name=str(target.parent),
-                    reason=f"新目录发布失败：{_failure_text(primary)}；恢复旧目录也失败：{_failure_text(rollback)}",
-                    impact="无法确认目标目录状态；完整 .tmp/.previous 现场已经保留",
-                    help_text="不要删除或重试；先检查目标、.tmp 和 .previous 三个自然路径并恢复旧目录",
-                ) from None
-        cleanup = _remove_tree(stage)
-        if cleanup is not None:
-            _raise_directory_cleanup_failure(
-                primary, cleanup, target=target, stage=stage, restored=moved_previous
+    except BaseException as primary:  # noqa: BLE001 - 发布取消也必须核对并恢复实际终态。
+        state, facts, cancellation = _directory_move_state(stage, target, stage_identity)
+        if state == "moved":
+            _raise_published_directory_error(
+                primary,
+                target=target,
+                previous=previous,
+                previous_identity=previous_identity if moved_previous else None,
+                previous_cleanup=previous_cleanup,
+                move_facts=facts,
+                cancellation=cancellation,
             )
-        raise
+        if state == "unknown":
+            _raise_unknown_directory_move(
+                primary,
+                source=stage,
+                destination=target,
+                facts=facts,
+                cancellation=cancellation,
+            )
+        restore_error = None
+        if moved_previous:
+            if previous_identity is None:
+                raise AssertionError("移动旧目录后缺少目录身份") from None
+            restore_error = _restore_previous_directory(
+                previous,
+                target,
+                previous_identity,
+                publish_error=primary,
+            )
+        _cleanup_directory_stage_after_failure(
+            primary,
+            target=target,
+            stage=stage,
+            stage_identity=stage_identity,
+            stage_cleanup=stage_cleanup,
+            restored=moved_previous,
+            related_error=restore_error,
+            facts=facts,
+        )
+    state, facts, cancellation = _directory_move_state(stage, target, stage_identity)
+    if state == "moved" and facts:
+        _raise_published_directory_error(
+            OSError("新目录发布后源固定路径出现其他对象"),
+            target=target,
+            previous=previous,
+            previous_identity=previous_identity if moved_previous else None,
+            previous_cleanup=previous_cleanup,
+            move_facts=facts,
+            cancellation=cancellation,
+        )
+    if state != "moved":
+        _raise_unknown_directory_move(
+            OSError("新目录发布返回成功，但候选目录身份未到达目标位置"),
+            source=stage,
+            destination=target,
+            facts=facts,
+            cancellation=cancellation,
+        )
     if moved_previous:
-        cleanup = _remove_tree(previous)
+        if previous_identity is None:
+            raise AssertionError("移动旧目录后缺少目录身份") from None
+        cleanup = remove_owned_directory(previous, previous_identity, previous_cleanup)
         if cleanup is not None:
-            raise ToolError(
-                object_name=str(previous),
-                reason=f"新目录已经发布，但旧目录清理失败：{_failure_text(cleanup)}",
-                impact=f"新目录 {target} 已经生效；旧目录仍保留在指出的位置",
-                help_text="保留新目录，处理占用或权限后删除 .previous 目录",
+            _raise_published_directory_error(
+                cleanup,
+                target=target,
+                previous=previous,
+                previous_identity=None,
+                previous_cleanup=previous_cleanup,
             )
 
 
