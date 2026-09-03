@@ -18,6 +18,7 @@ from att_skill_tools import (
     parse_json_text,
     physical_jsonl_lines,
     protect_outputs,
+    read_physical_text,
     safe_walk_files,
     write_json,
 )
@@ -157,6 +158,14 @@ class CoreBoundaryTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.object_name, "records.jsonl")
             self.assertIn(f"第 {line_number} 行", raised.exception.reason)
+
+    def test_physical_text_reader_does_not_normalize_lone_cr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "records.jsonl"
+            path.write_bytes(b"{}\r{}\n")
+
+            with self.assertRaises(ToolError):
+                list(physical_jsonl_lines(read_physical_text(path), str(path)))
 
     def _make_directory_link(self, link: Path, target: Path) -> None:
         if os.name != "nt":

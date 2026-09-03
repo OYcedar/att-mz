@@ -468,6 +468,13 @@ def physical_jsonl_lines(text: str, object_name: str) -> Iterator[tuple[int, str
         line_number += 1
 
 
+def read_physical_text(path: Path, *, encoding: str = "utf-8-sig") -> str:
+    """读取文本并保留原始换行序列，供物理行协议自行校验。"""
+
+    with path.open("r", encoding=encoding, newline="") as handle:
+        return handle.read()
+
+
 def read_json(path: Path, description: str = "JSON 文件", *, allowed_root: Path | None = None) -> JsonValue:
     source = (
         require_file(path, description)

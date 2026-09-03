@@ -114,10 +114,10 @@ def validate_generic_evidence(
         raw_candidates = raw_group.get("candidate_ids")
         if (
             not isinstance(group_id, str)
-            or not group_id.strip()
+            or group_id == ""
             or group_id in group_ids
             or not isinstance(kind, str)
-            or not kind.strip()
+            or kind == ""
             or not isinstance(raw_candidates, list)
             or not raw_candidates
             or any(not isinstance(item, str) or not item for item in raw_candidates)

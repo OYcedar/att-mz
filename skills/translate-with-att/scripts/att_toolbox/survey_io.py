@@ -13,6 +13,7 @@ from att_skill_tools import (
     parse_json_text,
     physical_jsonl_lines,
     read_json_object,
+    read_physical_text,
     require_directory,
     require_file,
     safe_walk_files,
@@ -46,7 +47,7 @@ def read_jsonl(path: Path, description: str) -> list[dict[str, JsonValue]]:
 
     source = require_file(path, description)
     output: list[dict[str, JsonValue]] = []
-    for line_number, line in physical_jsonl_lines(source.read_text(encoding="utf-8-sig"), str(source)):
+    for line_number, line in physical_jsonl_lines(read_physical_text(source), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", "重新生成该机器管理文件")
         value = parse_json_text(line, f"{source} 第 {line_number} 行")
