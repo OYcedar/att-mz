@@ -123,6 +123,11 @@ _INDEXED_CONTROL = re.compile(
     r"(?:\\|\x1b)(?P<command>PX|PY|FS|V|N|P|C|I)\[(?P<argument>[0-9]+)\]",
     re.IGNORECASE | re.ASCII,
 )
+_MV_BARE_EXTENDED_CONTROL = re.compile(r"(?:\\|\x1b)(?:C|I)(?![A-Za-z])", re.IGNORECASE | re.ASCII)
+_MZ_BARE_EXTENDED_CONTROL = re.compile(
+    r"(?:\\|\x1b)(?:C|I|PX|PY|FS)(?![A-Za-z])",
+    re.IGNORECASE | re.ASCII,
+)
 _RPG_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
@@ -236,6 +241,14 @@ def builtin_control_spans(
                 spans.append((position, indexed.end(), "indexed_control"))
                 position = indexed.end()
                 continue
+
+        bare = (_MZ_BARE_EXTENDED_CONTROL if engine == "mz" else _MV_BARE_EXTENDED_CONTROL).match(
+            text, position
+        )
+        if bare is not None:
+            spans.append((position, bare.end(), "extended_control"))
+            position = bare.end()
+            continue
 
         if position + 1 < len(text):
             command = text[position + 1]

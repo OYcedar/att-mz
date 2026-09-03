@@ -331,6 +331,12 @@ class MzSpeakerTests(unittest.TestCase):
                 if item.get("expected_manual_id") and str(item["expected_manual_id"]).endswith(":speaker")
             ]
             self.assertEqual([item["source_text"] for item in speakers], ["名字"])
+            dialogue = [
+                item for item in locations if item.get("expected_manual_id") and item["source_text"] == "正文"
+            ]
+            self.assertEqual(len(dialogue), 5)
+            self.assertTrue(all(item["content_kind"] == "lines" for item in dialogue))
+            self.assertTrue(all(item["content_kind"] == "value" for item in speakers))
 
     def test_speaker_only_truthy_non_string_is_rejected(self) -> None:
         with TemporaryDirectory() as temporary:

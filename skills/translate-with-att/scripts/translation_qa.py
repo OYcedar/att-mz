@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import string
 import sys
 import time
 import tomllib
@@ -29,8 +30,10 @@ from att_skill_tools import (
     display_path,
     fail,
     parse_json_text,
+    physical_jsonl_lines,
     protect_outputs,
     read_json_object,
+    read_physical_text,
     require_directory,
     require_file,
     require_file_within,
@@ -38,14 +41,12 @@ from att_skill_tools import (
     safe_walk_files,
     validate_object_keys,
 )
+from att_toolbox.coverage import coverage_projection
+from att_toolbox.generic_mapping import generic_materials
 from att_toolbox.png import decode_png_size
 from att_toolbox.rpg_control_codes import is_structural_blank
-from att_toolbox.survey import GENERIC_EVIDENCE_FIELDS, load_survey, verify_source_baseline
-from att_toolbox.survey_projection import (
-    project_builtin_units,
-    project_rule_units,
-    read_rules_manifest,
-)
+from att_toolbox.survey import load_survey, survey_game_root, verify_source_baseline
+from att_toolbox.survey_projection import read_rules_manifest
 from att_toolbox.translation_export import read_translation_export
 
 _CONTROL_SHAPE = re.compile(
@@ -53,8 +54,23 @@ _CONTROL_SHAPE = re.compile(
     r"\{\{[^{}\r\n]+\}\}|\$\{[^{}\r\n]+\}|%[A-Za-z_][A-Za-z0-9_]*%|%[0-9]+|"
     r"</?[A-Za-z][^>\r\n]*>|\f"
 )
+_ANGLE_LABEL = re.compile(
+    r"<(?P<name>[A-Za-z][A-Za-z0-9_-]*):(?P<body>[^>\r\n]+)>\Z",
+    re.ASCII,
+)
+_MODEL_EXPLANATION = re.compile(
+    r"(?i)^\s*(?:(?P<translation>translation\s+(?:complete|completed)|"
+    r"(?:here(?:'s|\s+is)\s+)?(?:the\s+)?translation(?:\s+is)?|"
+    r"translated\s+(?:text|output))|(?P<note>note\s*:)|(?P<explanation>explanation\s*:))",
+    re.ASCII,
+)
 _REVIEW_EXAMPLE_LIMIT = 5
 _RUNTIME_SMOKE_SCENARIOS = ("title", "new_game", "dialogue", "menu", "quest_log", "options", "save")
+
+
+def _model_explanation_cue(value: str) -> str | None:
+    match = _MODEL_EXPLANATION.search(value)
+    return match.lastgroup if match is not None else None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -104,7 +120,7 @@ def _json_lines(values: Sequence[Mapping[str, JsonValue]]) -> str:
 def _read_jsonl_objects(path: Path, description: str) -> list[dict[str, JsonValue]]:
     source = require_file(path, description)
     rows: list[dict[str, JsonValue]] = []
-    for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
+    for line_number, line in physical_jsonl_lines(read_physical_text(source), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", f"重新运行 {description}")
         raw = parse_json_text(line, f"{source} 第 {line_number} 行")
@@ -180,6 +196,13 @@ class _GenericTree:
     fact: dict[str, JsonValue]
 
 
+@dataclass(frozen=True)
+class _TerminologyEntry:
+    term: str
+    translation: str
+    triggers: tuple[str, ...]
+
+
 def _generic_jsonl_lines(path: Path, description: str) -> tuple[list[str], bytes]:
     raw = path.read_bytes()
     try:
@@ -203,13 +226,6 @@ def _read_generic_tree(root_path: Path, description: str, *, only_jsonl: bool) -
         safe_walk_files(root),
         key=lambda path: path.relative_to(root).as_posix().encode("utf-8"),
     )
-    for path in all_files:
-        try:
-            link_count = path.stat().st_nlink
-        except OSError as error:
-            fail(str(path), f"无法读取文件身份：{error}", "修正文件系统错误后重新运行 QA")
-        if link_count != 1:
-            fail(str(path), f"文件有 {link_count} 个硬链接", "使用没有硬链接的当前 Generic 输入或输出")
     non_jsonl = [path for path in all_files if path.suffix != ".jsonl"]
     if only_jsonl and non_jsonl:
         fail(
@@ -330,7 +346,7 @@ def _standalone_generic_recipes(tree: _GenericTree) -> dict[str, dict[str, JsonV
         unit.manual_id: {
             "input_file": f"generic/input/{unit.relative_path}",
             "group_id": unit.group_id,
-            "kind": unit.kind,
+            "group_kind": unit.kind,
             "unit_id": unit.unit_id,
             "source": unit.text,
         }
@@ -361,12 +377,19 @@ def _bind_generic_export_to_input(rows: Sequence[Mapping[str, JsonValue]], tree:
             )
 
 
-def _generic_manifest(path: Path | None) -> dict[str, dict[str, JsonValue]] | None:
+def _generic_manifest(
+    path: Path | None,
+    *,
+    expected_files: Mapping[str, str] | None = None,
+    expected_manifest: Mapping[str, JsonValue] | None = None,
+) -> dict[str, dict[str, JsonValue]] | None:
     if path is None:
         return None
     source = require_file(path, "Generic 精确映射 manifest")
     root = read_json_object(source, "Generic 精确映射 manifest")
     validate_object_keys(root, str(source), {"sources", "decisions", "recipes"})
+    if expected_manifest is not None and root != expected_manifest:
+        fail(str(source), "Generic manifest 不能由当前 coverage 与 survey 重建", "重新运行 survey finalize")
     recipes = root.get("recipes")
     if not isinstance(recipes, list):
         fail(str(source), "recipes 不是 array", "重新运行 rpg_maker_survey.py finalize")
@@ -391,6 +414,46 @@ def _generic_manifest(path: Path | None) -> dict[str, dict[str, JsonValue]] | No
         typed = dict(raw)
         output[manual_id] = typed
         seen_candidates.add(candidate_id)
+    if expected_files is not None:
+        input_root = source.parent / "input"
+        actual_files: set[str]
+        if input_root.exists():
+            actual_files = {
+                path.relative_to(input_root).as_posix()
+                for path in safe_walk_files(require_directory(input_root, "Survey Generic JSONL 输入"))
+            }
+        else:
+            actual_files = set()
+        expected_tree_files = {
+            key.removeprefix("generic/input/") for key in expected_files if key.startswith("generic/input/")
+        }
+        if actual_files != expected_tree_files:
+            fail(str(input_root), "Generic 输入文件集合与当前映射不一致", "重新运行 survey finalize")
+        plan_root = source.parent.parent
+        for relative, expected_text in expected_files.items():
+            parts = PurePosixPath(relative).parts
+            actual_path = require_file(plan_root.joinpath(*parts), "Survey Generic JSONL 输入")
+            if actual_path.read_text(encoding="utf-8-sig") != expected_text:
+                fail(str(actual_path), "Generic 输入内容与当前映射不一致", "重新运行 survey finalize")
+    if output:
+        tree = _read_generic_tree(source.parent / "input", "Survey Generic JSONL 输入", only_jsonl=True)
+        actual_units = {unit.manual_id: unit for unit in tree.units}
+        if set(actual_units) != set(output):
+            fail(
+                str(source),
+                "manifest recipes 与实际 Generic 输入 Unit 集合不一致",
+                "重新运行 survey finalize",
+            )
+        for manual_id, recipe in output.items():
+            unit = actual_units[manual_id]
+            if (
+                unit.relative_path != _generic_recipe_relative_path(recipe, "Generic manifest")
+                or unit.group_id != recipe.get("group_id")
+                or unit.kind != recipe.get("group_kind")
+                or unit.unit_id != recipe.get("unit_id")
+                or unit.text != recipe.get("source")
+            ):
+                fail(str(source), f"{manual_id} 与实际 Generic 输入不一致", "重新运行 survey finalize")
     return output
 
 
@@ -410,312 +473,6 @@ def _generic_recipe_relative_path(recipe: Mapping[str, JsonValue], description: 
     if not relative.endswith(".jsonl"):
         fail(description, "Generic recipe input_file 不是 JSONL", "重新运行 finalize")
     return relative
-
-
-def _coverage_projection(
-    path: Path,
-    survey: Mapping[str, JsonValue],
-    locations: Sequence[Mapping[str, JsonValue]],
-    groups: Sequence[Mapping[str, JsonValue]],
-    rules_manifest: Sequence[Mapping[str, JsonValue]],
-) -> tuple[dict[str, dict[str, JsonValue]], set[str], bool]:
-    coverage = read_json_object(path, "finalize coverage.json")
-    engine = survey.get("engine")
-    if engine not in {"mv", "mz"} or coverage.get("engine") != engine:
-        fail(str(path), "coverage 与 survey 引擎不一致", "使用同一次 survey finalize 生成的 coverage.json")
-    counts = coverage.get("counts")
-    if (
-        not isinstance(counts, dict)
-        or counts.get("locations") != len(locations)
-        or counts.get("review_groups") != len(groups)
-        or counts.get("rules") != len(rules_manifest)
-    ):
-        fail(
-            str(path),
-            "coverage 与 survey 的位置总数不一致",
-            "使用同一次 survey finalize 生成的 coverage.json",
-        )
-
-    locations_by_id = {
-        cast(str, item["candidate_id"]): item
-        for item in locations
-        if isinstance(item.get("candidate_id"), str)
-    }
-    if len(locations_by_id) != len(locations):
-        fail(str(path), "survey 候选身份缺失或重复", "重新运行 survey scan/finalize")
-    expected_projection_rows = [
-        *project_builtin_units(locations),
-        *project_rule_units(rules_manifest, locations_by_id),
-    ]
-    expected_projection = {cast(str, item["manual_id"]): item for item in expected_projection_rows}
-    if len(expected_projection) != len(expected_projection_rows):
-        fail(str(path), "Survey 与 Rules manifest 投影出重复 Unit", "重新运行 survey finalize")
-    classified_candidates = {
-        classification: {
-            cast(str, item["candidate_id"])
-            for item in locations
-            if item.get("classification") == classification and isinstance(item.get("candidate_id"), str)
-        }
-        for classification in ("builtin", "resource_reference", "structural_whitespace")
-    }
-    for field, classification in (
-        ("builtin_candidate_ids", "builtin"),
-        ("resource_reference_candidate_ids", "resource_reference"),
-        ("structural_whitespace_candidate_ids", "structural_whitespace"),
-    ):
-        raw_values = coverage.get(field)
-        if (
-            not isinstance(raw_values, list)
-            or any(not isinstance(value, str) for value in raw_values)
-            or len(raw_values) != len(set(cast(list[str], raw_values)))
-            or set(cast(list[str], raw_values)) != classified_candidates[classification]
-        ):
-            fail(
-                str(path),
-                f"{field} 与 survey 完整分类不一致",
-                "使用同一次 survey finalize 生成的 coverage.json",
-            )
-    projection_value = coverage.get("unit_projection")
-    ownership_value = coverage.get("expected_ownership")
-    if not isinstance(projection_value, list) or not isinstance(ownership_value, list):
-        fail(str(path), "coverage 缺少 Unit 投影或预期所有权", "重新运行 rpg_maker_survey.py finalize")
-
-    projection: dict[str, dict[str, JsonValue]] = {}
-    for number, raw in enumerate(projection_value, start=1):
-        if not isinstance(raw, dict):
-            fail(str(path), f"unit_projection 第 {number} 项不是 object", "重新运行 finalize")
-        item = dict(raw)
-        manual_id = item.get("manual_id")
-        candidate_id = item.get("candidate_id")
-        owner = item.get("owner")
-        rule_number = item.get("rule_number")
-        if (
-            not isinstance(manual_id, str)
-            or not manual_id
-            or manual_id in projection
-            or not isinstance(candidate_id, str)
-            or candidate_id not in locations_by_id
-            or owner not in {"builtin", "rules"}
-            or not isinstance(item.get("source_text"), str)
-            or not isinstance(item.get("source"), str)
-        ):
-            fail(str(path), f"unit_projection 第 {number} 项身份或字段无效", "重新运行 finalize")
-        if owner == "rules":
-            if not isinstance(rule_number, int) or isinstance(rule_number, bool) or rule_number <= 0:
-                fail(str(path), f"{manual_id} 缺少自然 rule_number", "重新运行 finalize")
-        elif rule_number is not None:
-            fail(str(path), f"{manual_id} 不应包含 rule_number", "重新运行 finalize")
-        location = locations_by_id[candidate_id]
-        if location.get("source") != item["source"] or (
-            owner == "builtin" and location.get("source_text") != item["source_text"]
-        ):
-            fail(str(path), f"{manual_id} 与 survey 候选内容不一致", "使用同一次 survey 生成的 finalize 计划")
-        projection[manual_id] = item
-
-    ownership: dict[str, tuple[str, int | None]] = {}
-    for number, raw in enumerate(ownership_value, start=1):
-        if not isinstance(raw, dict):
-            fail(str(path), f"expected_ownership 第 {number} 项不是 object", "重新运行 finalize")
-        manual_id = raw.get("manual_id")
-        owner = raw.get("owner")
-        rule_number = raw.get("rule_number")
-        if not isinstance(manual_id, str) or manual_id in ownership or owner not in {"builtin", "rules"}:
-            fail(str(path), f"expected_ownership 第 {number} 项无效", "重新运行 finalize")
-        normalized_rule = (
-            rule_number
-            if isinstance(rule_number, int) and not isinstance(rule_number, bool) and rule_number > 0
-            else None
-        )
-        if (owner == "rules") != (normalized_rule is not None):
-            fail(str(path), f"{manual_id} 的预期所有权字段矛盾", "重新运行 finalize")
-        ownership[manual_id] = (cast(str, owner), normalized_rule)
-    projected_ownership = {
-        manual_id: (
-            cast(str, item["owner"]),
-            cast(int, item["rule_number"]) if item.get("owner") == "rules" else None,
-        )
-        for manual_id, item in projection.items()
-    }
-    if ownership != projected_ownership:
-        fail(str(path), "expected_ownership 与 unit_projection 不一致", "重新运行 finalize")
-    if projection != expected_projection:
-        differing = sorted(set(projection).symmetric_difference(expected_projection))
-        if not differing:
-            differing = sorted(
-                manual_id
-                for manual_id in projection
-                if projection[manual_id] != expected_projection[manual_id]
-            )
-        detail = differing[0] if differing else "未知 Unit"
-        fail(
-            str(path),
-            f"unit_projection 的 {detail} 不能由 Survey 与 Rules manifest 重建",
-            "使用同一次 scan/finalize 的 coverage.json 与 rules-manifest.json",
-        )
-
-    generic_candidates: set[str] = set()
-    dispositions = coverage.get("dispositions")
-    if not isinstance(dispositions, list):
-        fail(str(path), "coverage 缺少 dispositions", "重新运行 finalize")
-    group_members: dict[str, list[str]] = {}
-    for item in locations:
-        group_id = item.get("review_group_id")
-        candidate_id = item.get("candidate_id")
-        if isinstance(group_id, str) and isinstance(candidate_id, str):
-            group_members.setdefault(group_id, []).append(candidate_id)
-    resolved_review_candidates: list[str] = []
-    rules_dispositions: dict[str, list[str]] = {}
-    for number, raw in enumerate(dispositions, start=1):
-        if not isinstance(raw, dict):
-            fail(str(path), f"dispositions 第 {number} 项不是 object", "重新运行 finalize")
-        owner = raw.get("owner")
-        allowed_fields = {
-            "rules": {"target", "owner", "candidate_ids"},
-            "generic": {"target", "owner", "candidate_ids", "evidence"},
-            "exclude": {"target", "owner", "candidate_ids", "reason", "evidence"},
-        }.get(owner if isinstance(owner, str) else "")
-        if allowed_fields is None:
-            fail(
-                str(path),
-                f"dispositions 第 {number} 项 owner 不属于 producer 闭集",
-                "重新运行 finalize；这里只接受 rules、generic 或 exclude",
-            )
-        validate_object_keys(raw, f"{path} dispositions 第 {number} 项", allowed_fields)
-        target = raw.get("target")
-        candidates = raw.get("candidate_ids")
-        if (
-            not isinstance(target, str)
-            or not isinstance(candidates, list)
-            or not candidates
-            or any(not isinstance(value, str) or value not in locations_by_id for value in candidates)
-            or len(candidates) != len(set(cast(list[str], candidates)))
-        ):
-            fail(str(path), f"dispositions 第 {number} 项身份或候选无效", "重新运行 finalize")
-        typed_candidates = cast(list[str], candidates)
-        if target.startswith("candidate:"):
-            expected_candidates = [target.removeprefix("candidate:")]
-        elif target.startswith("group:"):
-            expected_candidates = group_members.get(target.removeprefix("group:"))
-        else:
-            expected_candidates = None
-        if expected_candidates is None or typed_candidates != expected_candidates:
-            fail(str(path), f"dispositions 第 {number} 项 target 与候选不一致", "重新运行 finalize")
-        if owner == "generic":
-            evidence = raw.get("evidence")
-            if not isinstance(evidence, dict):
-                fail(str(path), f"dispositions 第 {number} 项缺少 Generic 证据", "重新运行 finalize")
-            validate_object_keys(
-                evidence,
-                f"{path} dispositions 第 {number} 项 evidence",
-                set(GENERIC_EVIDENCE_FIELDS),
-            )
-            if any(
-                not isinstance(evidence.get(field), str) or not cast(str, evidence[field]).strip()
-                for field in GENERIC_EVIDENCE_FIELDS
-            ):
-                fail(str(path), f"dispositions 第 {number} 项 Generic 证据无效", "重新运行 finalize")
-            overlap = generic_candidates.intersection(typed_candidates)
-            if overlap:
-                fail(str(path), f"Generic 候选 {min(overlap)} 被重复归属", "重新运行 finalize")
-            generic_candidates.update(typed_candidates)
-        elif owner == "rules":
-            if target in rules_dispositions:
-                fail(str(path), f"Rules target {target} 被重复决定", "重新运行 survey finalize")
-            rules_dispositions[target] = typed_candidates
-        elif owner == "exclude":
-            if any(
-                not isinstance(raw.get(field), str) or not cast(str, raw[field]).strip()
-                for field in ("reason", "evidence")
-            ):
-                fail(str(path), f"dispositions 第 {number} 项排除证据无效", "重新运行 finalize")
-        resolved_review_candidates.extend(typed_candidates)
-    manifest_targets: set[str] = set()
-    covered_by_target: dict[str, set[str]] = {target: set() for target in rules_dispositions}
-    for item in rules_manifest:
-        rule_number = cast(int, item["rule_number"])
-        targets = cast(list[str], item["targets"])
-        candidate_ids = cast(list[str], item["candidate_ids"])
-        allowed_candidates: set[str] = set()
-        for target in targets:
-            manifest_targets.add(target)
-            disposition_candidates = rules_dispositions.get(target)
-            if disposition_candidates is None:
-                fail(
-                    "rules-manifest.json",
-                    f"第 {rule_number} 条引用了非 Rules disposition {target}",
-                    "使用同一次 finalize 的 coverage 与 Rules manifest",
-                )
-            allowed_candidates.update(disposition_candidates)
-            covered_by_target[target].update(set(candidate_ids).intersection(disposition_candidates))
-        if not set(candidate_ids) <= allowed_candidates:
-            fail(
-                "rules-manifest.json",
-                f"第 {rule_number} 条候选与 Rules dispositions 不一致",
-                "重新运行 survey finalize",
-            )
-    incomplete_targets = sorted(
-        target
-        for target, candidates in rules_dispositions.items()
-        if covered_by_target.get(target) != set(candidates)
-    )
-    if manifest_targets != set(rules_dispositions) or incomplete_targets:
-        missing = sorted(set(rules_dispositions) - manifest_targets)
-        fail(
-            "rules-manifest.json",
-            f"Rules disposition {(missing or incomplete_targets or ['未知 target'])[0]} 没有完整真实 Rule recipe",
-            "重新运行 survey finalize",
-        )
-    unresolved = coverage.get("unresolved")
-    missing_targets = coverage.get("missing_targets")
-    if not isinstance(unresolved, list) or not isinstance(missing_targets, list):
-        fail(str(path), "coverage 缺少 unresolved 或 missing_targets", "重新运行 finalize")
-    if counts.get("unresolved") != len(unresolved):
-        fail(str(path), "coverage unresolved 计数不一致", "重新运行 finalize")
-    for number, raw in enumerate(unresolved, start=1):
-        if not isinstance(raw, dict):
-            fail(str(path), f"unresolved 第 {number} 项不是 object", "重新运行 finalize")
-        candidates = raw.get("candidate_ids")
-        if isinstance(candidates, list):
-            if any(not isinstance(value, str) or value not in locations_by_id for value in candidates):
-                fail(str(path), f"unresolved 第 {number} 项候选无效", "重新运行 finalize")
-            resolved_review_candidates.extend(cast(list[str], candidates))
-            continue
-        target = raw.get("target")
-        if not isinstance(target, str):
-            fail(str(path), f"unresolved 第 {number} 项缺少自然 target", "重新运行 finalize")
-        if target.startswith("candidate:"):
-            candidate_id = target.removeprefix("candidate:")
-            if candidate_id not in locations_by_id:
-                fail(str(path), f"unresolved 第 {number} 项引用未知候选", "重新运行 finalize")
-            resolved_review_candidates.append(candidate_id)
-        elif target.startswith("group:"):
-            group_id = target.removeprefix("group:")
-            if group_id not in group_members:
-                fail(str(path), f"unresolved 第 {number} 项引用未知关系组", "重新运行 finalize")
-            resolved_review_candidates.extend(group_members[group_id])
-        else:
-            fail(str(path), f"unresolved 第 {number} 项 target 无效", "重新运行 finalize")
-    review_candidates = {
-        cast(str, item["candidate_id"])
-        for item in locations
-        if item.get("classification") == "review" and isinstance(item.get("candidate_id"), str)
-    }
-    if (
-        len(resolved_review_candidates) != len(set(resolved_review_candidates))
-        or set(resolved_review_candidates) != review_candidates
-    ):
-        fail(
-            str(path),
-            "coverage 没有逐项覆盖 survey 的全部 Review 候选",
-            "使用同一次 survey finalize 生成的 coverage.json",
-        )
-    if any(not isinstance(value, str) for value in missing_targets):
-        fail(str(path), "missing_targets 结构无效", "重新运行 finalize")
-    complete_value = coverage.get("complete")
-    expected_complete = not unresolved and not missing_targets
-    if not isinstance(complete_value, bool) or complete_value != expected_complete:
-        fail(str(path), "coverage complete 与未解决事实矛盾", "重新运行 finalize")
-    return projection, generic_candidates, complete_value
 
 
 def _bind_rpg_export_to_coverage(
@@ -744,40 +501,6 @@ def _bind_rpg_export_to_coverage(
             )
 
 
-def _bind_generic_manifest(
-    manifest: Mapping[str, Mapping[str, JsonValue]],
-    generic_candidates: set[str],
-    locations: Sequence[Mapping[str, JsonValue]],
-) -> None:
-    locations_by_id = {
-        cast(str, item["candidate_id"]): item
-        for item in locations
-        if isinstance(item.get("candidate_id"), str)
-    }
-    manifest_candidates = {
-        cast(str, recipe["candidate_id"])
-        for recipe in manifest.values()
-        if isinstance(recipe.get("candidate_id"), str)
-    }
-    if manifest_candidates != generic_candidates:
-        fail(
-            "Generic manifest",
-            "manifest 候选集合与 coverage 的 Generic 归属不一致",
-            "使用同一次 finalize 生成的 coverage.json 和 generic/manifest.json",
-        )
-    for manual_id, recipe in manifest.items():
-        candidate_id = cast(str, recipe["candidate_id"])
-        location = locations_by_id[candidate_id]
-        if recipe.get("source") != location.get("source_text") or recipe.get("physical_file") != location.get(
-            "physical_file"
-        ):
-            fail(
-                "Generic manifest",
-                f"{manual_id} 与 survey 候选内容或物理来源不一致",
-                "使用同一次 survey finalize 生成的 Generic manifest",
-            )
-
-
 def _bind_generic_export_to_manifest(
     rows: Sequence[Mapping[str, JsonValue]],
     manifest: Mapping[str, Mapping[str, JsonValue]],
@@ -790,8 +513,10 @@ def _bind_generic_export_to_manifest(
             "使用该 manifest 输入建立的 ATT Generic 项目完整导出",
         )
     for manual_id, row in exported.items():
+        recipe_source = manifest[manual_id].get("source")
         if (
-            row.get("source") != [manifest[manual_id].get("source")]
+            not isinstance(recipe_source, str)
+            or row.get("source") != recipe_source.split("\n")
             or row.get("type") != "free"
             or row.get("owner") is not None
         ):
@@ -802,7 +527,7 @@ def _bind_generic_export_to_manifest(
             )
 
 
-def _terminology(path: Path | None) -> list[tuple[str, str]]:
+def _terminology(path: Path | None) -> list[_TerminologyEntry]:
     if path is None:
         return []
     source = require_file(path, "ATT terminology.toml")
@@ -811,9 +536,11 @@ def _terminology(path: Path | None) -> list[tuple[str, str]]:
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         fail(str(source), f"术语 TOML 无法读取：{error}", "使用 ATT 当前 terminology 语法修正文件")
     raw_terms = root.get("term")
-    if not isinstance(raw_terms, list):
-        fail(str(source), "term 必须是 array", "使用 ATT 当前 terminology 语法修正文件")
-    output: list[tuple[str, str]] = []
+    if set(root) != {"term"} or not isinstance(raw_terms, list):
+        fail(str(source), "根结构必须只包含 term array", "使用 ATT 当前 terminology 语法修正文件")
+    output: list[_TerminologyEntry] = []
+    seen_terms: set[str] = set()
+    seen_triggers: set[str] = set()
     for number, raw_value in enumerate(cast(list[object], raw_terms), start=1):
         if not isinstance(raw_value, dict):
             fail(str(source), f"第 {number} 项 term 不是 object", "使用 ATT 当前 terminology 语法修正文件")
@@ -821,18 +548,39 @@ def _terminology(path: Path | None) -> list[tuple[str, str]]:
         term = raw.get("term")
         translation = raw.get("translation")
         triggers = raw.get("triggers", [term])
-        if not isinstance(term, str) or not isinstance(translation, str) or not isinstance(triggers, list):
+        if (
+            set(raw) not in ({"term", "translation"}, {"term", "translation", "triggers"})
+            or not isinstance(term, str)
+            or not term.strip()
+            or not isinstance(translation, str)
+            or not translation.strip()
+            or not isinstance(triggers, list)
+            or not triggers
+        ):
             fail(str(source), f"第 {number} 项术语字段无效", "先让 ATT 解析并确认当前术语文件")
         raw_triggers = cast(list[object], triggers)
         typed_triggers = [trigger for trigger in raw_triggers if isinstance(trigger, str)]
-        if len(typed_triggers) != len(raw_triggers):
+        if (
+            len(typed_triggers) != len(raw_triggers)
+            or any(not trigger.strip() for trigger in typed_triggers)
+            or len(typed_triggers) != len(set(typed_triggers))
+            or any(
+                unicodedata.category(character) == "Cc"
+                for value in (term, translation, *typed_triggers)
+                for character in value
+            )
+            or term in seen_terms
+            or any(trigger in seen_triggers for trigger in typed_triggers)
+        ):
             fail(str(source), f"第 {number} 项术语字段无效", "先让 ATT 解析并确认当前术语文件")
-        output.extend((trigger, translation) for trigger in typed_triggers)
+        seen_terms.add(term)
+        seen_triggers.update(typed_triggers)
+        output.append(_TerminologyEntry(term, translation, tuple(typed_triggers)))
     return output
 
 
 def _display_width(value: str) -> int:
-    visible = _CONTROL_SHAPE.sub("", value)
+    visible = _visible_text(value)
     return sum(
         0
         if unicodedata.category(character).startswith("C")
@@ -877,8 +625,65 @@ def _source_script(character: str) -> str | None:
     return "other_letter"
 
 
-def _text_tokens(value: str) -> set[str]:
-    visible = _CONTROL_SHAPE.sub("", value)
+def _control_payload(match: re.Match[str]) -> str:
+    token = match.group(0)
+    if token.startswith("</"):
+        return ""
+    if token.startswith("<"):
+        angle_label = _ANGLE_LABEL.fullmatch(token)
+        return angle_label.group("body") if angle_label is not None else ""
+    if token[0] in {"\\", "\x1b"} and token.endswith(("]", ">")):
+        opener = "[" if token.endswith("]") else "<"
+        payload = token[token.find(opener) + 1 : -1]
+        return "" if payload.isascii() and payload.isdigit() else payload
+    return ""
+
+
+def _visible_text(value: str) -> str:
+    """保留启发式 wrapper 内可能属于正文的内容，只移除外壳。"""
+
+    return _CONTROL_SHAPE.sub(_control_payload, value)
+
+
+def _natural_text_segments(value: str) -> list[str]:
+    """按 Placeholder/OpaqueBoundary 分隔术语可见正文。"""
+
+    segments: list[str] = []
+    start = 0
+    for match in _CONTROL_SHAPE.finditer(value):
+        if match.start() > start:
+            segments.append(value[start : match.start()])
+        if payload := _control_payload(match):
+            segments.append(payload)
+        start = match.end()
+    if start < len(value):
+        segments.append(value[start:])
+    return segments
+
+
+def _control_token(match: re.Match[str]) -> str:
+    token = match.group(0)
+    payload = _control_payload(match)
+    if not payload:
+        return token
+    if token.startswith("<"):
+        angle_label = _ANGLE_LABEL.fullmatch(token)
+        if angle_label is not None:
+            return f"<{angle_label.group('name')}:>"
+    if token[0] in {"\\", "\x1b"} and token.endswith(("]", ">")):
+        opener = "[" if token.endswith("]") else "<"
+        return token[: token.find(opener) + 1] + token[-1]
+    return token
+
+
+def _control_tokens(value: str) -> list[str]:
+    """保留控制外壳身份；可翻译的启发式 payload 不参与外壳比较。"""
+
+    return [_control_token(match) for match in _CONTROL_SHAPE.finditer(value)]
+
+
+def _text_tokens(value: str, *, interpret_controls: bool = True) -> set[str]:
+    visible = _visible_text(value) if interpret_controls else value
     tokens: set[str] = set()
     current: list[str] = []
     current_script: str | None = None
@@ -934,7 +739,7 @@ def _finding(
 
 
 def _translation_findings(
-    row: Mapping[str, JsonValue], terms: Sequence[tuple[str, str]]
+    row: Mapping[str, JsonValue], terms: Sequence[_TerminologyEntry]
 ) -> list[dict[str, JsonValue]]:
     manual_id = cast(str, row["manual_id"])
     state = cast(str, row["state"])
@@ -945,7 +750,8 @@ def _translation_findings(
     source_lines = cast(list[str], row["source"])
     translation_lines = cast(list[str], row["translation"])
     findings: list[dict[str, JsonValue]] = []
-    if row["type"] == "fixed" and len(source_lines) != len(translation_lines):
+    unit_type = row["type"]
+    if unit_type == "fixed" and len(source_lines) != len(translation_lines):
         findings.append(
             _finding(
                 "current_fixed_shape_mismatch",
@@ -954,8 +760,14 @@ def _translation_findings(
                 details={"source_slots": len(source_lines), "translation_slots": len(translation_lines)},
             )
         )
-    for slot, (source, translation) in enumerate(zip(source_lines, translation_lines, strict=False), start=1):
-        if not is_structural_blank(source) and is_structural_blank(translation):
+    if unit_type == "fixed":
+        paired_lines = list(zip(source_lines, translation_lines, strict=False))
+    else:
+        paired_lines = [("\n".join(source_lines), "\n".join(translation_lines))]
+    for slot, (source, translation) in enumerate(paired_lines, start=1):
+        source_blank = is_structural_blank(source)
+        translation_blank = is_structural_blank(translation)
+        if not source_blank and translation_blank:
             findings.append(
                 _finding(
                     "blank_current_translation",
@@ -965,6 +777,15 @@ def _translation_findings(
                 )
             )
             continue
+        if unit_type == "fixed" and source_blank and not translation_blank:
+            findings.append(
+                _finding(
+                    "filled_structural_blank",
+                    manual_id=manual_id,
+                    status="confirmed_fact",
+                    details={"slot": slot},
+                )
+            )
         residual = _source_residual_tokens(source, translation)
         if residual:
             findings.append(
@@ -974,8 +795,16 @@ def _translation_findings(
                     details={"slot": slot, "words": residual[:10], "translation_preview": translation[:160]},
                 )
             )
-        source_controls = Counter(_CONTROL_SHAPE.findall(source))
-        translation_controls = Counter(_CONTROL_SHAPE.findall(translation))
+        if unit_type == "free":
+            source_controls = _control_tokens(source)
+            translation_controls = _control_tokens(translation)
+            source_control_fact: JsonValue = source_controls
+            translation_control_fact: JsonValue = translation_controls
+        else:
+            source_controls = Counter(_control_tokens(source))
+            translation_controls = Counter(_control_tokens(translation))
+            source_control_fact = dict(source_controls)
+            translation_control_fact = dict(translation_controls)
         if source_controls != translation_controls:
             findings.append(
                 _finding(
@@ -983,14 +812,27 @@ def _translation_findings(
                     manual_id=manual_id,
                     details={
                         "slot": slot,
-                        "source": dict(source_controls),
-                        "translation": dict(translation_controls),
+                        "source": source_control_fact,
+                        "translation": translation_control_fact,
                     },
                 )
             )
+    limit = _layout_limit(manual_id)
+    source_explanation_cues = {
+        cue for source in source_lines if (cue := _model_explanation_cue(source)) is not None
+    }
+    for slot, translation in enumerate(translation_lines, start=1):
+        explanation_cue = _model_explanation_cue(translation)
+        if explanation_cue is not None and explanation_cue not in source_explanation_cues:
+            findings.append(
+                _finding(
+                    "model_explanation_review",
+                    manual_id=manual_id,
+                    details={"slot": slot, "translation_preview": translation[:160]},
+                )
+            )
         width = _display_width(translation)
-        limit = _layout_limit(manual_id)
-        if "\n" not in translation and width > limit:
+        if width > limit:
             findings.append(
                 _finding(
                     "layout_risk",
@@ -1000,8 +842,9 @@ def _translation_findings(
             )
     source_text = "\n".join(source_lines)
     translation_text = "\n".join(translation_lines)
-    for trigger, expected in terms:
-        if trigger in source_text and expected not in translation_text:
+    target_segments = _natural_text_segments(translation_text)
+    for trigger, expected in _selected_terms(source_text, terms):
+        if not any(expected in segment for segment in target_segments):
             findings.append(
                 _finding(
                     "terminology_mismatch",
@@ -1010,6 +853,31 @@ def _translation_findings(
                 )
             )
     return findings
+
+
+def _selected_terms(source: str, terms: Sequence[_TerminologyEntry]) -> list[tuple[str, str]]:
+    """按 ATT 的最早起点、同起点最长规则选择互不重叠的术语。"""
+
+    selected_entries: dict[int, str] = {}
+    for segment in _natural_text_segments(source):
+        matches: list[tuple[int, int, int, int, str]] = []
+        for entry_number, entry in enumerate(terms):
+            for trigger_number, trigger in enumerate(entry.triggers):
+                start = segment.find(trigger)
+                while start >= 0:
+                    matches.append((start, -len(trigger), entry_number, trigger_number, trigger))
+                    start = segment.find(trigger, start + 1)
+        occupied_until = 0
+        for start, negative_length, entry_number, _trigger_number, trigger in sorted(matches):
+            if start < occupied_until:
+                continue
+            selected_entries.setdefault(entry_number, trigger)
+            occupied_until = start - negative_length
+    return [
+        (selected_entries[number], entry.translation)
+        for number, entry in enumerate(terms)
+        if number in selected_entries
+    ]
 
 
 def _survey_findings(
@@ -1062,24 +930,32 @@ def _directory_fact(root: Path) -> dict[str, JsonValue]:
 
 def _semantic_characters(value: str) -> str:
     return "".join(
-        character.casefold()
-        for character in _CONTROL_SHAPE.sub("", value)
-        if unicodedata.category(character).startswith(("L", "N"))
+        character.casefold() for character in value if unicodedata.category(character).startswith(("L", "N"))
     )
+
+
+def _normalize_write_back_punctuation(value: str) -> str:
+    normalized_value: list[str] = []
+    for character in value:
+        normalized = unicodedata.normalize("NFKC", character)
+        if len(normalized) == 1 and normalized in string.punctuation:
+            character = normalized
+        normalized_value.append(character)
+    return "".join(normalized_value)
 
 
 def _write_back_stable_characters(value: str) -> str:
-    return "".join(
-        character
-        for character in _CONTROL_SHAPE.sub("", value)
-        if unicodedata.category(character).startswith(("L", "M", "N", "S"))
-    )
+    stable: list[str] = []
+    for character in _normalize_write_back_punctuation(value):
+        if unicodedata.category(character).startswith(("L", "M", "N", "S")):
+            stable.append(character)
+    return "".join(stable)
 
 
 def _write_back_residual(source: str, expected_text: str, output_text: str) -> tuple[list[str], list[str]]:
-    source_tokens = _text_tokens(source)
-    actual = source_tokens.intersection(_text_tokens(output_text))
-    expected = source_tokens.intersection(_text_tokens(expected_text))
+    source_tokens = _text_tokens(source, interpret_controls=False)
+    actual = source_tokens.intersection(_text_tokens(output_text, interpret_controls=False))
+    expected = source_tokens.intersection(_text_tokens(expected_text, interpret_controls=False))
     return sorted(actual), sorted(actual - expected)
 
 
@@ -1089,7 +965,6 @@ def _generic_write_back_findings(
     manifest: Mapping[str, Mapping[str, JsonValue]],
     *,
     expected_files: set[str] | None,
-    strict_export_text: bool,
 ) -> tuple[list[dict[str, JsonValue]], bool, dict[str, JsonValue]]:
     tree = _read_generic_tree(root, "Generic write_back 目录", only_jsonl=True)
     required_files = (
@@ -1119,7 +994,7 @@ def _generic_write_back_findings(
         if (
             actual.relative_path != _generic_recipe_relative_path(recipe, "Generic recipe")
             or actual.group_id != recipe.get("group_id")
-            or actual.kind != recipe.get("kind")
+            or actual.kind != recipe.get("group_kind")
             or actual.unit_id != recipe.get("unit_id")
         ):
             fail(
@@ -1131,11 +1006,13 @@ def _generic_write_back_findings(
         source = "\n".join(cast(list[str], row["source"]))
         if row.get("state") == "current":
             expected_text = "\n".join(cast(list[str], row["translation"]))
-            if strict_export_text and output_text != expected_text:
+            if output_text != expected_text:
                 same_semantic_text = _write_back_stable_characters(
                     output_text
                 ) == _write_back_stable_characters(expected_text)
-                same_controls = _CONTROL_SHAPE.findall(output_text) == _CONTROL_SHAPE.findall(expected_text)
+                same_controls = _control_tokens(
+                    _normalize_write_back_punctuation(output_text)
+                ) == _control_tokens(_normalize_write_back_punctuation(expected_text))
                 if not same_semantic_text or not same_controls:
                     fail(
                         str(root),
@@ -1146,19 +1023,10 @@ def _generic_write_back_findings(
         else:
             expected_text = source
             if output_text != source:
-                if strict_export_text:
-                    fail(
-                        str(root),
-                        f"{manual_id} 的未接受正文没有保留当前原文",
-                        "用当前 translation export 重新执行 Generic WriteBack",
-                    )
-                findings.append(
-                    _finding(
-                        "write_back_unaccepted_text_changed",
-                        manual_id=manual_id,
-                        status="confirmed_fact",
-                        details={"candidate_id": recipe.get("candidate_id")},
-                    )
+                fail(
+                    str(root),
+                    f"{manual_id} 的未接受正文没有保留当前原文",
+                    "用当前 translation export 重新执行 Generic WriteBack",
                 )
         retained_source = (
             row.get("state") == "current"
@@ -1306,7 +1174,6 @@ def _write_back_findings(
     generic_project: bool,
     engine: str | None,
     generic_expected_files: set[str] | None = None,
-    strict_generic_text: bool = False,
 ) -> tuple[list[dict[str, JsonValue]], list[str], Path | None, dict[str, JsonValue] | None]:
     if path is None:
         return [], ["write_back_output_missing"], None, None
@@ -1319,11 +1186,10 @@ def _write_back_findings(
             rows,
             manifest,
             expected_files=generic_expected_files,
-            strict_export_text=strict_generic_text,
         )
         unverified = ["generic_write_back_text_transform_unverified"] if transformed_current else []
         return findings, unverified, root, write_back_fact
-    if engine not in {"mv", "mz"}:
+    if not isinstance(engine, str) or engine not in {"mv", "mz"}:
         fail("Survey", "RPG Maker QA 缺少有效引擎", "重新运行 survey scan/finalize")
     findings, unverified = _rpg_write_back_findings(root, rows, engine)
     return findings, unverified, root, _directory_fact(root)
@@ -1331,7 +1197,7 @@ def _write_back_findings(
 
 def _jsonl_objects(path: Path, description: str) -> list[dict[str, JsonValue]]:
     output: list[dict[str, JsonValue]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+    for line_number, line in physical_jsonl_lines(read_physical_text(path), str(path)):
         if not line.strip():
             fail(str(path), f"{description} 第 {line_number} 行为空", "重新运行 inspect_nwjs_runtime.py")
         value = parse_json_text(line, f"{path} 第 {line_number} 行")
@@ -1420,12 +1286,13 @@ def _runtime_scope(value: Mapping[str, JsonValue], description: str) -> tuple[st
     phase = scope.get("phase")
     scenario = scope.get("scenario")
     if (
-        phase not in {"startup", "transition", "scenario", "observe", "trailing"}
+        not isinstance(phase, str)
+        or phase not in {"startup", "transition", "scenario", "observe", "trailing"}
         or (scenario is not None and not isinstance(scenario, str))
         or (phase == "scenario" and not isinstance(scenario, str))
     ):
         fail(description, "运行时事件观察范围无效", "重新运行 inspect_nwjs_runtime.py")
-    return cast(str, phase), scenario
+    return phase, scenario
 
 
 def _runtime_draw_is_english(value: Mapping[str, JsonValue]) -> bool:
@@ -1509,7 +1376,8 @@ def _runtime_findings(
     mode = report.get("mode")
     engine = report.get("engine")
     if (
-        mode not in {"smoke", "observe"}
+        not isinstance(mode, str)
+        or mode not in {"smoke", "observe"}
         or engine != survey.get("engine")
         or report.get("input_confirmed_isolated_copy") is not True
         or report.get("keyboard_injection_used") is not False
@@ -1661,6 +1529,7 @@ def _runtime_findings(
     unverified_scenarios = report.get("unverified_scenario_count")
     if (
         not isinstance(startup, dict)
+        or not isinstance(startup.get("status"), str)
         or startup.get("status") not in {"ready", "runtime_error", "timed_out", "process_exited"}
         or not isinstance(startup.get("wait_seconds"), (int, float))
         or isinstance(startup.get("wait_seconds"), bool)
@@ -1693,6 +1562,7 @@ def _runtime_findings(
         observed_events = scenario.get("observed_events")
         if (
             not isinstance(scenario.get("name"), str)
+            or not isinstance(scenario.get("status"), str)
             or scenario.get("status") not in {"verified", "unverified"}
             or not isinstance(scenario.get("evidence"), str)
             or not cast(str, scenario.get("evidence")).strip()
@@ -1904,6 +1774,14 @@ def _scan(args: argparse.Namespace) -> int:
 
     inputs = [translations_path]
     survey_root = require_directory(survey_path, "survey 作业目录") if survey_path is not None else None
+    protected_game_root = None
+    if survey_root is not None:
+        survey_header = read_json_object(
+            survey_root / "survey.json",
+            "survey.json",
+            allowed_root=survey_root,
+        )
+        protected_game_root = survey_game_root(survey_header)
     generic_input_root = (
         require_directory(generic_input_path, "Generic JSONL 输入根")
         if generic_input_path is not None
@@ -1925,12 +1803,19 @@ def _scan(args: argparse.Namespace) -> int:
         for path in (survey_root, generic_input_root, coverage_path, rules_manifest_path)
         if path is not None
     )
+    if protected_game_root is not None:
+        inputs.append(protected_game_root)
     inputs.extend(
         path
         for path in (generic_manifest_path, terminology_path, write_back_path, runtime_path)
         if path is not None
     )
-    protect_outputs([args.output], inputs=inputs, replace=args.replace)
+    protect_outputs(
+        [args.output],
+        inputs=inputs,
+        forbidden_roots=[protected_game_root] if protected_game_root is not None else [],
+        replace=args.replace,
+    )
     rows = _read_translation_export(translations_path)
 
     survey: dict[str, JsonValue] | None
@@ -1954,10 +1839,12 @@ def _scan(args: argparse.Namespace) -> int:
         assert coverage_path is not None
         assert rules_manifest_path is not None
         survey, locations, groups, baseline = load_survey(survey_root)
+        if survey_game_root(survey) != protected_game_root:
+            fail(str(survey_root), "survey 游戏根在 QA 启动期间发生变化", "等待输入稳定后重新执行 QA")
         if write_back_path is not None or runtime_path is not None:
             verify_source_baseline(survey, baseline)
         rules_manifest = read_rules_manifest(rules_manifest_path)
-        coverage_projection, generic_candidates, coverage_complete = _coverage_projection(
+        rpg_projection, _generic_candidates, coverage_complete, generic_plans = coverage_projection(
             coverage_path,
             survey,
             locations,
@@ -1966,7 +1853,12 @@ def _scan(args: argparse.Namespace) -> int:
         )
         generic_tree = None
         generic_expected_files = None
-        generic_recipes = _generic_manifest(generic_manifest_path)
+        expected_generic_files, expected_generic_manifest = generic_materials(generic_plans)
+        generic_recipes = _generic_manifest(
+            generic_manifest_path,
+            expected_files=expected_generic_files,
+            expected_manifest=expected_generic_manifest,
+        )
         owner_values: set[str | None] = set()
         for row in rows:
             owner = row.get("owner")
@@ -1986,7 +1878,6 @@ def _scan(args: argparse.Namespace) -> int:
             )
         if generic_project:
             if generic_recipes is not None:
-                _bind_generic_manifest(generic_recipes, generic_candidates, locations)
                 _bind_generic_export_to_manifest(rows, generic_recipes)
         else:
             if generic_recipes is not None:
@@ -1995,7 +1886,7 @@ def _scan(args: argparse.Namespace) -> int:
                     "RPG Maker Translation export 不应附带 Generic manifest",
                     "只为对应 Generic 项目单独执行 QA",
                 )
-            _bind_rpg_export_to_coverage(rows, coverage_projection)
+            _bind_rpg_export_to_coverage(rows, rpg_projection)
 
     if standalone_generic and any(row.get("owner") is not None for row in rows):
         fail(
@@ -2035,7 +1926,6 @@ def _scan(args: argparse.Namespace) -> int:
         generic_project=generic_project,
         engine=cast(str, survey["engine"]) if survey is not None else None,
         generic_expected_files=generic_expected_files,
-        strict_generic_text=standalone_generic,
     )
     if standalone_generic:
         runtime_findings: list[dict[str, JsonValue]] = []
@@ -2153,6 +2043,18 @@ def _manual(args: argparse.Namespace) -> int:
     if current["bytes"] != bytes_value or current["sha256"] != digest_value:
         fail(path_value, "Translation export 在 QA 后发生变化", "重新运行 translation_qa.py scan")
     protected_inputs = [scan_root, Path(path_value)]
+    forbidden_roots: list[Path] = []
+    survey_game_value = summary.get("survey_game_root")
+    if "coverage" in summary:
+        if not isinstance(survey_game_value, str) or not survey_game_value:
+            fail(str(scan_root), "QA 摘要缺少 Survey 游戏根", "重新运行 translation_qa.py scan")
+        game_root = require_directory(Path(survey_game_value), "QA 使用的 Survey 游戏根")
+        protected_inputs.append(game_root)
+        forbidden_roots.append(game_root)
+    elif survey_game_value is not None:
+        fail(
+            str(scan_root), "standalone Generic QA 不应包含 Survey 游戏根", "重新运行 translation_qa.py scan"
+        )
     generic_input_fact = summary.get("generic_input")
     if generic_input_fact is not None:
         if not isinstance(generic_input_fact, dict):
@@ -2177,7 +2079,12 @@ def _manual(args: argparse.Namespace) -> int:
         if _directory_fact(write_back_root) != write_back_fact:
             fail(write_back_path, "WriteBack 输出在 QA 后发生变化", "重新运行 translation_qa.py scan")
         protected_inputs.append(write_back_root)
-    protect_outputs([args.output], inputs=protected_inputs, replace=args.replace)
+    protect_outputs(
+        [args.output],
+        inputs=protected_inputs,
+        forbidden_roots=forbidden_roots,
+        replace=args.replace,
+    )
     selected_groups = cast(list[str], args.review_group)
     if len(selected_groups) != len(set(selected_groups)) or any(not value for value in selected_groups):
         fail("--review-group", "Review 组为空或重复", "每个 review_group_id 只传一次")

@@ -11,6 +11,8 @@ from att_skill_tools import (
     JsonValue,
     fail,
     parse_json_text,
+    physical_jsonl_lines,
+    read_physical_text,
     require_file,
     validate_object_keys,
 )
@@ -34,7 +36,7 @@ def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
     source = require_file(path, "ATT Translation export JSONL")
     rows: list[dict[str, JsonValue]] = []
     seen: set[str] = set()
-    for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
+    for line_number, line in physical_jsonl_lines(read_physical_text(source), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", "重新执行 ATT translation export")
         raw = parse_json_text(line, f"{source} 第 {line_number} 行")
@@ -62,13 +64,18 @@ def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
             fail(str(source), f"第 {line_number} 行 manual_id 无效或重复", "重新执行 ATT translation export")
         if not isinstance(source_lines, list) or any(not isinstance(value, str) for value in source_lines):
             fail(str(source), f"{manual_id} 的 source 不是 string array", "重新执行 ATT translation export")
-        if state not in {"current", "pending", "rejected"} or unit_type not in {"fixed", "free"}:
+        if (
+            not isinstance(state, str)
+            or state not in {"current", "pending", "rejected"}
+            or not isinstance(unit_type, str)
+            or unit_type not in {"fixed", "free"}
+        ):
             fail(str(source), f"{manual_id} 的 state 或 type 无效", "重新执行 ATT translation export")
-        if origin not in {"none", "automatic", "manual"}:
+        if not isinstance(origin, str) or origin not in {"none", "automatic", "manual"}:
             fail(str(source), f"{manual_id} 的 origin 无效", "重新执行 ATT translation export")
         owner = row.get("owner")
         rule_number = row.get("rule_number")
-        if owner is not None and owner not in {"builtin", "rules"}:
+        if owner is not None and (not isinstance(owner, str) or owner not in {"builtin", "rules"}):
             fail(str(source), f"{manual_id} 的 owner 无效", "重新执行 ATT translation export")
         if owner == "rules":
             if not isinstance(rule_number, int) or isinstance(rule_number, bool) or rule_number <= 0:

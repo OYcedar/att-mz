@@ -25,15 +25,18 @@ from att_skill_tools import (
     display_path,
     fail,
     parse_json_text,
+    physical_jsonl_lines,
     protect_outputs,
     read_json_object,
     read_manual,
+    read_physical_text,
     require_directory,
     require_file,
     run_cli,
     toml_string,
     validate_object_keys,
 )
+from att_toolbox.coverage import coverage_projection
 from att_toolbox.rpg_control_codes import (
     ConsumerProfile,
     ControlContract,
@@ -41,9 +44,24 @@ from att_toolbox.rpg_control_codes import (
     is_structural_blank,
     unprotected_format_arguments,
 )
-from att_toolbox.survey import read_jsonl
+from att_toolbox.survey import load_survey, read_jsonl, survey_game_root, verify_source_baseline
+from att_toolbox.survey_projection import read_rules_manifest
 
 _CUSTOM_FORMS: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        "paired_angle_tag",
+        re.compile(
+            r"(?P<opening><(?P<name>[A-Za-z][A-Za-z0-9_-]*)(?:[^\S\r\n][^>\r\n]*)?>)"
+            r"(?P<body>.*?)</(?P=name)>",
+            re.DOTALL,
+        ),
+        "",
+    ),
+    (
+        "angle_label",
+        re.compile(r"<(?P<name>[A-Za-z][A-Za-z0-9_-]*):(?P<body>[^>\r\n]+)>", re.ASCII),
+        "",
+    ),
     (
         "backslash_bracket",
         re.compile(r"\\(?P<name>[A-Za-z][A-Za-z0-9]*)\[[^\]\r\n]*\]"),
@@ -108,13 +126,20 @@ def _file_baseline(path: Path) -> dict[str, JsonValue]:
     return {"path": str(source.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def _input_baseline(manual: Path, survey_root: Path, coverage: Path) -> dict[str, JsonValue]:
+def _input_baseline(
+    manual: Path,
+    survey_root: Path,
+    coverage: Path,
+    rules_manifest: Path,
+) -> dict[str, JsonValue]:
     return {
         "manual": _file_baseline(manual),
         "survey": _file_baseline(survey_root / "survey.json"),
         "locations": _file_baseline(survey_root / "locations.jsonl"),
+        "review_groups": _file_baseline(survey_root / "review-groups.jsonl"),
         "source_baseline": _file_baseline(survey_root / "source-baseline.json"),
         "coverage": _file_baseline(coverage),
+        "rules_manifest": _file_baseline(rules_manifest),
     }
 
 
@@ -164,7 +189,7 @@ def _load_previous_scan(
 def _read_decisions(path: Path) -> dict[str, dict[str, JsonValue]]:
     source = require_file(path, "preflight 审核 JSONL")
     output: dict[str, dict[str, JsonValue]] = {}
-    for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
+    for line_number, line in physical_jsonl_lines(read_physical_text(source), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", "删除空行")
         value = parse_json_text(line, f"{source} 第 {line_number} 行")
@@ -201,6 +226,13 @@ def _candidate_patterns(
     name = match.groupdict().get("name")
     if name is not None:
         whole = whole.format(name=re.escape(name))
+    if kind == "paired_angle_tag":
+        opening = cast(str, match.groupdict()["opening"])
+        closing = f"</{cast(str, name)}>"
+        return re.escape(match.group(0)), rf"{re.escape(opening)}(?P<text>(?s:.*?)){re.escape(closing)}"
+    if kind == "angle_label":
+        prefix = f"<{cast(str, name)}:"
+        return re.escape(match.group(0)), rf"{re.escape(prefix)}(?P<text>[^>\r\n]+)>"
     if kind == "backslash_bracket":
         return whole, rf"\\{re.escape(cast(str, name))}\[(?P<text>[^\]\r\n]*)\]"
     if kind == "escape_bracket":
@@ -234,7 +266,7 @@ def _control_contract(context: Mapping[str, JsonValue]) -> ControlContract:
     if not isinstance(raw, dict):
         fail("survey locations", "control_contract 不是 object", "对当前游戏重新运行 survey scan")
     consumer = raw.get("consumer")
-    if consumer not in {"plain_text", "extended_text", "message_text"}:
+    if not isinstance(consumer, str) or consumer not in {"plain_text", "extended_text", "message_text"}:
         fail("survey locations", "control_contract.consumer 无效", "对当前游戏重新运行 survey scan")
     raw_arity = raw.get("format_arity")
     if raw_arity is not None and (
@@ -263,89 +295,81 @@ def _cross_line_findings(entry: ManualEntry) -> list[tuple[str, str, int, int]]:
     return output
 
 
+def _physical_separator_offsets(lines: Sequence[str]) -> tuple[int, ...]:
+    """返回把 Lines 内容槽用 LF 拼接后，各槽间分隔符的字符位置。"""
+
+    offsets: list[int] = []
+    position = 0
+    for line in lines[:-1]:
+        position += len(line)
+        offsets.append(position)
+        position += 1
+    return tuple(offsets)
+
+
+def _crosses_physical_slot(start: int, end: int, separators: Sequence[int]) -> bool:
+    return any(start <= separator < end for separator in separators)
+
+
 def _coverage_context(
     manual_entries: Sequence[ManualEntry],
     survey: Mapping[str, JsonValue],
-    coverage: Mapping[str, JsonValue],
+    projection: Mapping[str, Mapping[str, JsonValue]],
 ) -> tuple[str, dict[str, str], list[dict[str, JsonValue]]]:
     engine = survey.get("engine")
-    if engine not in {"mv", "mz"} or coverage.get("engine") != engine:
-        fail("survey/coverage", "引擎不一致或无效", "使用同一次 scan/finalize 的当前文件")
-    expected_value = coverage.get("expected_ownership")
-    if not isinstance(expected_value, list):
-        fail("coverage.json", "缺少 expected_ownership", "重新运行 rpg_maker_survey finalize")
-    owners: dict[str, str] = {}
-    for number, raw_item in enumerate(cast(list[object], expected_value), start=1):
-        if not isinstance(raw_item, dict):
-            fail("coverage.json", f"expected_ownership 第 {number} 项不是 object", "重新运行 finalize")
-        item = cast(dict[str, object], raw_item)
-        manual_id = item.get("manual_id")
-        owner = item.get("owner")
-        if not isinstance(manual_id, str) or owner not in {"builtin", "rules"} or manual_id in owners:
-            fail("coverage.json", f"expected_ownership 第 {number} 项无效或冲突", "重新运行 finalize")
-        owners[manual_id] = cast(str, owner)
+    if not isinstance(engine, str) or engine not in {"mv", "mz"}:
+        fail("survey.json", "引擎无效", "使用当前 survey scan 重新生成调查")
 
-    projection_value = coverage.get("unit_projection")
-    if not isinstance(projection_value, list):
-        fail("coverage.json", "缺少 unit_projection", "重新运行 rpg_maker_survey finalize")
-    unit_projection: dict[str, Mapping[str, JsonValue]] = {}
-    for number, raw_item in enumerate(cast(list[object], projection_value), start=1):
-        if not isinstance(raw_item, dict):
-            fail("coverage.json", f"unit_projection 第 {number} 项不是 object", "重新运行 finalize")
-        item = cast(dict[str, JsonValue], raw_item)
-        manual_id = item.get("manual_id")
-        owner = item.get("owner")
-        if (
-            not isinstance(manual_id, str)
-            or manual_id in unit_projection
-            or owner not in {"builtin", "rules"}
-            or not isinstance(item.get("source_text"), str)
-            or not isinstance(item.get("control_contract"), dict)
-        ):
-            fail("coverage.json", f"unit_projection 第 {number} 项无效或冲突", "重新运行 finalize")
-        if owners.get(manual_id) != owner:
-            fail("coverage.json", f"unit_projection 第 {number} 项 owner 不一致", "重新运行 finalize")
-        unit_projection[manual_id] = item
-    if set(unit_projection) != set(owners):
-        fail("coverage.json", "unit_projection 与 expected_ownership 不一致", "重新运行 finalize")
     entries_by_id = {entry.readable_id: entry for entry in manual_entries}
-    if set(entries_by_id) != set(owners):
-        missing = sorted(set(owners) - set(entries_by_id))
-        unexpected = sorted(set(entries_by_id) - set(owners))
-        detail = f"缺少 {len(missing)} 项，意外 {len(unexpected)} 项"
+    if len(entries_by_id) != len(manual_entries) or set(entries_by_id) != set(projection):
+        missing = sorted(set(projection) - set(entries_by_id))
+        unexpected = sorted(set(entries_by_id) - set(projection))
         fail(
             "Manual/coverage",
-            f"当前 Extract 所有权集合不一致：{detail}",
-            "重新导出当前 Manual 和所有权并先完成 audit",
+            f"当前 Extract 所有权集合不一致：缺少 {len(missing)} 项，意外 {len(unexpected)} 项",
+            "重新导出当前 Manual 和所有权并完成 audit",
         )
 
+    owners: dict[str, str] = {}
     contexts: list[dict[str, JsonValue]] = []
     for entry in manual_entries:
-        location = unit_projection[entry.readable_id]
+        location = projection[entry.readable_id]
+        owner = location.get("owner")
+        if not isinstance(owner, str) or owner not in {"builtin", "rules"}:
+            fail(entry.readable_id, "coverage 投影 owner 无效", "重新运行 survey finalize")
         if location.get("source_text") != "\n".join(entry.source):
             fail(
                 entry.readable_id,
                 "Manual 原文不能映射回 finalize 的 Unit 投影",
-                "停止使用旧调查；对当前游戏重新 scan、finalize、Extract 和 audit",
+                "对当前游戏重新 scan、finalize、Extract 和 audit",
             )
         control_contract = location.get("control_contract")
+        content_kind = location.get("content_kind")
         if not isinstance(control_contract, dict):
             fail(
                 entry.readable_id,
                 "当前 Unit 投影缺少消费者契约",
                 "对当前游戏重新运行 survey scan、finalize、Extract 和 audit",
             )
+        if content_kind not in {"value", "lines"}:
+            fail(
+                entry.readable_id,
+                "当前 Unit 投影缺少 Value/Lines 内容结构",
+                "对当前游戏重新运行 survey scan、finalize、Extract 和 audit",
+            )
+        owners[entry.readable_id] = owner
         contexts.append(
             {
                 "manual_id": entry.readable_id,
-                "owner": owners[entry.readable_id],
+                "owner": owner,
                 "candidate_id": cast(str, location.get("candidate_id", "")),
                 "source": cast(str, location.get("source", "")),
                 "review_group_id": cast(str, location.get("review_group_id", "")),
                 "control_contract": control_contract,
+                "content_kind": cast(str, content_kind),
             }
         )
-    return cast(str, engine), owners, contexts
+    return engine, owners, contexts
 
 
 def _scan(
@@ -445,8 +469,13 @@ def _scan(
     for entry in entries:
         context = contexts[entry.readable_id]
         contract = _control_contract(context)
-        scan_texts = entry.source if entry.translation_type == "fixed" else ("\n".join(entry.source),)
-        for text in scan_texts:
+        scan_texts = (
+            (
+                "\n".join(entry.source),
+                (_physical_separator_offsets(entry.source) if context.get("content_kind") == "lines" else ()),
+            ),
+        )
+        for text, separators in scan_texts:
             builtin_spans = builtin_control_spans(engine, text, contract)
             claimed_review_spans: list[tuple[int, int, str]] = []
             for position, character in enumerate(text):
@@ -480,21 +509,32 @@ def _scan(
                     ):
                         continue
                     whole_pattern, shell_pattern = _candidate_patterns(kind, match, template)
+                    if kind == "paired_angle_tag" and _crosses_physical_slot(
+                        match.start(), match.end(), separators
+                    ):
+                        whole_pattern = None
                     if shell_pattern is not None:
-                        delimiter_lengths = {
-                            "backslash_bracket": (match.group(0).find("[") + 1, 1),
-                            "escape_bracket": (match.group(0).find("[") + 1, 1),
-                            "backslash_angle": (match.group(0).find("<") + 1, 1),
-                            "escape_angle": (match.group(0).find("<") + 1, 1),
-                            "mustache": (2, 2),
-                            "template": (2, 1),
-                            "percent": (1, 1),
-                        }
-                        prefix_length, suffix_length = delimiter_lengths[kind]
-                        protected_spans = [
-                            (match.start(), match.start() + prefix_length, kind),
-                            (match.end() - suffix_length, match.end(), kind),
-                        ]
+                        if kind in {"paired_angle_tag", "angle_label"}:
+                            body_start, body_end = match.span("body")
+                            protected_spans = [
+                                (match.start(), body_start, kind),
+                                (body_end, match.end(), kind),
+                            ]
+                        else:
+                            delimiter_lengths = {
+                                "backslash_bracket": (match.group(0).find("[") + 1, 1),
+                                "escape_bracket": (match.group(0).find("[") + 1, 1),
+                                "backslash_angle": (match.group(0).find("<") + 1, 1),
+                                "escape_angle": (match.group(0).find("<") + 1, 1),
+                                "mustache": (2, 2),
+                                "template": (2, 1),
+                                "percent": (1, 1),
+                            }
+                            prefix_length, suffix_length = delimiter_lengths[kind]
+                            protected_spans = [
+                                (match.start(), match.start() + prefix_length, kind),
+                                (match.end() - suffix_length, match.end(), kind),
+                            ]
                     else:
                         protected_spans = [(match.start(), match.end(), kind)]
                     if any(
@@ -650,8 +690,13 @@ def _apply_decisions(
 def _verify_generated_rules(
     rules: Sequence[Mapping[str, JsonValue]],
     entries: Sequence[ManualEntry],
+    content_kinds: Mapping[str, str],
 ) -> None:
     entries_by_id = {entry.readable_id: entry for entry in entries}
+    if set(content_kinds) != set(entries_by_id) or any(
+        kind not in {"value", "lines"} for kind in content_kinds.values()
+    ):
+        fail("Placeholder Rules", "Unit 内容结构与 Manual 不一致", "重新运行当前 preflight")
     compiled: list[tuple[int, frozenset[str], re.Pattern[str]]] = []
     for number, rule in enumerate(rules, start=1):
         pattern = rule.get("pattern")
@@ -662,6 +707,7 @@ def _verify_generated_rules(
             or not isinstance(raw_ids, list)
             or not raw_ids
             or not all(isinstance(value, str) for value in raw_ids)
+            or not isinstance(order, str)
             or order not in {"preserve", "reorder_within_slot"}
         ):
             fail("Placeholder Rules", f"第 {number} 条缺少有效 ids/order/pattern", "重新运行 preflight")
@@ -677,6 +723,9 @@ def _verify_generated_rules(
             fail("Placeholder Rules", f"第 {number} 条生成规则无法编译：{error}", "报告工具生成规则问题")
     for entry in entries:
         text = "\n".join(entry.source)
+        separators = (
+            _physical_separator_offsets(entry.source) if content_kinds[entry.readable_id] == "lines" else ()
+        )
         occupied: list[tuple[int, int, str]] = []
         for number, ids, pattern in compiled:
             if entry.readable_id not in ids:
@@ -705,6 +754,12 @@ def _verify_generated_rules(
                 for protected_start, protected_end in protected_spans:
                     if protected_start == protected_end:
                         continue
+                    if _crosses_physical_slot(protected_start, protected_end, separators):
+                        fail(
+                            "Placeholder Rules",
+                            f"第 {number} 条在 {entry.readable_id} 的实际保护范围跨越物理 source 槽",
+                            "选择只保护单个 source 槽的 whole 规则，或使用前后壳均位于单槽的 text 捕获",
+                        )
                     conflict = next(
                         (
                             label
@@ -740,10 +795,23 @@ def _run(args: argparse.Namespace) -> int:
     manual_path = require_file(args.manual, "Manual TOML")
     survey_root = require_directory(args.survey, "survey 作业目录")
     coverage_path = require_file(args.coverage, "coverage.json")
+    rules_manifest_path = require_file(
+        coverage_path.with_name("rules-manifest.json"),
+        "同一次 finalize 生成的 rules-manifest.json",
+    )
     decisions_path = cast(Path | None, args.decisions)
-    survey = read_json_object(survey_root / "survey.json", "survey.json", allowed_root=survey_root)
-    coverage = read_json_object(coverage_path, "coverage.json", allowed_root=coverage_path.parent)
-    baseline = _input_baseline(manual_path, survey_root, coverage_path)
+    survey, locations, groups, source_baseline = load_survey(survey_root)
+    game_root = survey_game_root(survey)
+    verify_source_baseline(survey, source_baseline)
+    rules_manifest = read_rules_manifest(rules_manifest_path)
+    rpg_projection, _generic_candidates, coverage_complete, _generic_plans = coverage_projection(
+        coverage_path,
+        survey,
+        locations,
+        groups,
+        rules_manifest,
+    )
+    baseline = _input_baseline(manual_path, survey_root, coverage_path, rules_manifest_path)
     previous_scan = None
     if decisions_path is not None:
         previous_scan = _load_previous_scan(args.output, baseline)
@@ -753,14 +821,17 @@ def _run(args: argparse.Namespace) -> int:
             manual_path,
             survey_root,
             coverage_path,
+            rules_manifest_path,
+            game_root,
             *([decisions_path] if decisions_path is not None else []),
         ],
+        forbidden_roots=[game_root],
         replace=args.replace,
     )
     entries = read_manual(manual_path)
-    engine, owners, contexts = _coverage_context(entries, survey, coverage)
+    engine, owners, contexts = _coverage_context(entries, survey, rpg_projection)
+    contexts_by_id = {cast(str, context["manual_id"]): context for context in contexts}
     if previous_scan is None:
-        contexts_by_id = {cast(str, context["manual_id"]): context for context in contexts}
         candidates, fixed_structure, facts = _scan(engine, entries, owners, contexts_by_id)
     else:
         candidates, fixed_structure, facts = previous_scan
@@ -773,8 +844,11 @@ def _run(args: argparse.Namespace) -> int:
     decisions = _read_decisions(decisions_path) if decisions_path is not None else {}
     reviewed_rules, resolutions, unresolved = _apply_decisions(candidates, decisions)
     rules = reviewed_rules
-    _verify_generated_rules(rules, entries)
-    coverage_complete = coverage.get("complete") is True
+    _verify_generated_rules(
+        rules,
+        entries,
+        {manual_id: cast(str, context["content_kind"]) for manual_id, context in contexts_by_id.items()},
+    )
     complete = coverage_complete and not unresolved
     candidates_text = _json_lines(candidates)
     fixed_structure_text = _json_lines(fixed_structure)

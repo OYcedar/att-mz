@@ -49,6 +49,7 @@ def _projection_row(
     manual_id: str,
     source_text: str,
     control_contract: Mapping[str, JsonValue],
+    content_kind: str,
     location: Mapping[str, JsonValue],
     *,
     owner: str,
@@ -58,6 +59,7 @@ def _projection_row(
         "manual_id": manual_id,
         "source_text": source_text,
         "control_contract": dict(control_contract),
+        "content_kind": content_kind,
         "source": cast(str, location["source"]),
         "candidate_id": cast(str, location["candidate_id"]),
         "owner": owner,
@@ -84,11 +86,13 @@ def project_builtin_units(
         control_contract = item.get("control_contract")
         source = item.get("source")
         candidate_id = item.get("candidate_id")
+        content_kind = item.get("content_kind")
         if (
             not isinstance(source_text, str)
             or not isinstance(control_contract, dict)
             or not isinstance(source, str)
             or not isinstance(candidate_id, str)
+            or content_kind not in {"value", "lines"}
         ):
             fail("locations.jsonl", f"{manual_id} 缺少 Builtin 投影事实", "使用当前工具重新执行 scan")
         projection.append(
@@ -96,6 +100,7 @@ def project_builtin_units(
                 manual_id,
                 source_text,
                 control_contract,
+                cast(str, content_kind),
                 item,
                 owner="builtin",
             )
@@ -186,6 +191,7 @@ def project_rule_units(
                         projected_id,
                         projected_text,
                         contract,
+                        "value",
                         location,
                         owner="rules",
                         rule_number=rule_number,

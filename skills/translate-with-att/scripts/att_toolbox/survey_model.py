@@ -33,6 +33,7 @@ class LocationFact:
     rule: dict[str, JsonValue] | None = None
     expected_manual_id: str | None = None
     control_contract: dict[str, JsonValue] | None = None
+    content_kind: str = "value"
     roles: set[str] = field(default_factory=set)
     evidence: list[dict[str, JsonValue]] = field(default_factory=list)
     resource: dict[str, JsonValue] | None = None
@@ -53,6 +54,7 @@ class LocationFact:
             "physical_file": self.physical_file,
             "json_path": list(self.json_path),
             "decode_positions": list(self.decode_positions),
+            "content_kind": self.content_kind,
             "roles": sorted(self.roles),
             "consumer_evidence": self.evidence,
         }

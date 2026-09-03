@@ -286,6 +286,7 @@ def builtin_event_locations(
                                 role=None,
                             ),
                             control_contract=event_control_contract("event_dialogue").json(),
+                            content_kind="lines",
                             roles={"display"},
                             dialogue_first_line=lines[0] if engine == "mv" else None,
                         )
@@ -312,6 +313,7 @@ def builtin_event_locations(
                                 role=None,
                             ),
                             control_contract=event_control_contract("event_choices").json(),
+                            content_kind="lines",
                             roles={"display"},
                         )
                     )
@@ -341,6 +343,7 @@ def builtin_event_locations(
                                 role=None,
                             ),
                             control_contract=event_control_contract("event_scrolling_text").json(),
+                            content_kind="lines",
                             roles={"display"},
                         )
                     )

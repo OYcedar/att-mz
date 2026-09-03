@@ -113,6 +113,7 @@ def coverage_projection(
             or owner not in {"builtin", "rules"}
             or not isinstance(item.get("source_text"), str)
             or not isinstance(item.get("source"), str)
+            or item.get("content_kind") not in {"value", "lines"}
         ):
             fail(str(path), f"unit_projection 第 {number} 项身份或字段无效", "重新运行 finalize")
         if owner == "rules":
@@ -121,8 +122,10 @@ def coverage_projection(
         elif rule_number is not None:
             fail(str(path), f"{manual_id} 不应包含 rule_number", "重新运行 finalize")
         location = locations_by_id[candidate_id]
-        if location.get("source") != item["source"] or (
-            owner == "builtin" and location.get("source_text") != item["source_text"]
+        if (
+            location.get("source") != item["source"]
+            or (owner == "builtin" and location.get("source_text") != item["source_text"])
+            or (owner == "builtin" and location.get("content_kind") != item["content_kind"])
         ):
             fail(str(path), f"{manual_id} 与 survey 候选内容不一致", "使用同一次 survey 生成的 finalize 计划")
         projection[manual_id] = item

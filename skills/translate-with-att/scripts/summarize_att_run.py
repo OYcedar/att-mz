@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -21,7 +23,9 @@ from att_skill_tools import (
     display_path,
     fail,
     parse_json_text,
+    physical_jsonl_lines,
     protect_outputs,
+    read_physical_text,
     require_directory,
     require_file,
     run_cli,
@@ -73,6 +77,7 @@ _TASK_COUNTER_FIELDS = {
 _GENERIC_SUMMARY_FIELDS = {
     "planned_units",
     "remaining_units",
+    "rejected_units",
     "cleared_units",
     "reused_units",
     "accepted_units",
@@ -87,6 +92,7 @@ _RPG_MAKER_SUMMARY_FIELDS = {
     "written_locations",
     "remaining_decisions",
     "remaining_locations",
+    "rejected_locations",
     "protocol_diagnostics",
     "recoverable_request_exhaustions",
     "request_admission_stopped",
@@ -133,6 +139,27 @@ _RPG_MAKER_PUBLICATION_FIELDS = {
     "translated_units",
     "original_units",
 }
+_NATURAL_SEQUENCE = r"(?:[0-9]{6}|[1-9][0-9]{6,})"
+_RUN_DIRECTORY = re.compile(rf"run-(?P<number>{_NATURAL_SEQUENCE})", re.ASCII)
+_TASK_RECORD = re.compile(rf"task-(?P<number>{_NATURAL_SEQUENCE})\.md", re.ASCII)
+_PROJECT_LOG_LOCALES = {"ar", "zh-Hans", "zh-Hant", "en", "fr", "ru", "es", "ja", "ko", "vi"}
+_PROJECT_LOG_ENGINES = {"generic", "rpg_maker_mv", "rpg_maker_mz"}
+_PROJECT_LOG_COMMANDS = {"init", "extract", "builtin", "rules", "translate", "write_back", "lua"}
+_BIDI_CONTROLS = {
+    "\u061c",
+    "\u200e",
+    "\u200f",
+    "\u202a",
+    "\u202b",
+    "\u202c",
+    "\u202d",
+    "\u202e",
+    "\u2066",
+    "\u2067",
+    "\u2068",
+    "\u2069",
+}
+_MAX_PROVIDER_NAME_BYTES = 128
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -144,11 +171,41 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_public_text(value: JsonValue, object_name: str, *, require_non_blank: bool = True) -> str:
+    if not isinstance(value, str) or (require_non_blank and not value.strip()):
+        fail(object_name, "值不是有效安全 string", "恢复 ATT 原始项目日志")
+    previous_was_space = False
+    for character in value:
+        if (
+            character in _BIDI_CONTROLS
+            or character in {"\u2028", "\u2029"}
+            or unicodedata.category(character) == "Cc"
+        ):
+            fail(object_name, "值包含项目日志不会保存的控制字符", "恢复 ATT 原始项目日志")
+        if character.isspace() and previous_was_space:
+            fail(object_name, "值包含项目日志会合并的连续空白", "恢复 ATT 原始项目日志")
+        previous_was_space = character.isspace()
+    return value
+
+
+def _project_log_context(value: JsonValue, object_name: str) -> dict[str, JsonValue]:
+    context = _exact_object(value, object_name, {"locale", "engine", "project", "command"})
+    if context["locale"] not in _PROJECT_LOG_LOCALES:
+        fail(object_name, "locale 不是当前项目日志枚举", "恢复 ATT 原始项目日志")
+    if context["engine"] not in _PROJECT_LOG_ENGINES:
+        fail(object_name, "engine 不是当前项目日志枚举", "恢复 ATT 原始项目日志")
+    if context["command"] not in _PROJECT_LOG_COMMANDS:
+        fail(object_name, "command 不是当前项目日志枚举", "恢复 ATT 原始项目日志")
+    _safe_public_text(context["project"], f"{object_name}.project")
+    return context
+
+
 def _read_records(path: Path) -> list[dict[str, JsonValue]]:
     source = require_file(path, "ATT 项目 JSONL")
     result: list[dict[str, JsonValue]] = []
     expected_sequence = 1
     expected_run_id: str | None = None
+    expected_context: dict[str, JsonValue] | None = None
     expected_fields = {
         "timestamp",
         "sequence",
@@ -159,7 +216,7 @@ def _read_records(path: Path) -> list[dict[str, JsonValue]]:
         "payload",
         "message",
     }
-    for line_number, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines(), start=1):
+    for line_number, line in physical_jsonl_lines(read_physical_text(source), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", "使用 ATT 完整写入的 JSONL 日志")
         raw = parse_json_text(line, f"{source}:第 {line_number} 行")
@@ -181,28 +238,41 @@ def _read_records(path: Path) -> list[dict[str, JsonValue]]:
             )
         expected_sequence += 1
         run_id = record.get("run_id")
-        if not isinstance(run_id, str) or not run_id.strip():
+        if (
+            not isinstance(run_id, str)
+            or (run_match := _RUN_DIRECTORY.fullmatch(run_id)) is None
+            or not 0 < int(run_match["number"]) <= _MAX_U64
+        ):
             fail(str(source), f"第 {line_number} 行缺少有效 run_id", "使用 ATT 完整写入的项目日志")
         if expected_run_id is None:
             expected_run_id = run_id
         elif run_id != expected_run_id:
             fail(str(source), f"第 {line_number} 行 run_id 与本文件前文不一致", "每份日志只保留同一次运行")
-        for field in ("timestamp", "level", "event", "message"):
+        for field in ("timestamp", "level", "event"):
             value = record.get(field)
             if not isinstance(value, str) or not value.strip():
                 fail(str(source), f"第 {line_number} 行缺少有效 {field}", "使用 ATT 完整写入的项目日志")
+        _safe_public_text(record.get("message"), f"{source}:第 {line_number} 行 message")
         event = cast(str, record["event"])
         level = cast(str, record["level"])
         if event not in _EVENTS:
             fail(str(source), f"第 {line_number} 行 event 不是当前项目日志事件", "恢复 ATT 当前版本日志")
         if level not in {"error", "warn", "info", "debug"}:
             fail(str(source), f"第 {line_number} 行 level 不是当前项目日志级别", "恢复 ATT 当前版本日志")
-        if not isinstance(record.get("context"), dict) or not isinstance(record.get("payload"), dict):
-            fail(str(source), f"第 {line_number} 行缺少有效 context/payload", "使用 ATT 项目日志")
+        context = _project_log_context(record.get("context"), f"{source}:第 {line_number} 行 context")
+        if expected_context is None:
+            expected_context = context
+        elif context != expected_context:
+            fail(str(source), f"第 {line_number} 行 context 与本文件前文不一致", "每份日志只保留同一次运行")
+        if not isinstance(record.get("payload"), dict):
+            fail(str(source), f"第 {line_number} 行缺少有效 payload", "使用 ATT 项目日志")
         _timestamp(record["timestamp"], str(source), line_number)
         result.append(record)
     if not result:
         fail(str(source), "项目日志为空", "提供 ATT 完整写入的非空项目日志")
+    started = [index for index, record in enumerate(result) if record.get("event") == "run.started"]
+    if started != [0]:
+        fail(str(source), "run.started 不是唯一且第一条记录", "保留 ATT 从启动开始的完整项目日志")
     finished = [index for index, record in enumerate(result) if record.get("event") == "run.finished"]
     if finished != [len(result) - 1]:
         fail(str(source), "run.finished 不是唯一且最后一条记录", "保留 ATT 完整关闭后的项目日志")
@@ -294,7 +364,7 @@ def _task_counters(value: JsonValue, object_name: str) -> dict[str, int]:
     return result
 
 
-def _translation_summary(value: JsonValue, object_name: str) -> None:
+def _translation_summary(value: JsonValue, object_name: str) -> dict[str, int]:
     wire = _exact_object(value, object_name, {"engine", "summary"})
     engine = wire["engine"]
     if engine == "generic":
@@ -305,14 +375,34 @@ def _translation_summary(value: JsonValue, object_name: str) -> None:
         fail(object_name, "engine 不是 generic 或 rpg_maker", "恢复 ATT 当前版本的项目日志")
     summary = _exact_object(wire["summary"], f"{object_name}.summary", fields)
     numeric_fields = fields - {"request_admission_stopped"}
-    for field in numeric_fields:
-        _u64(summary[field], f"{object_name}.summary.{field}")
+    numeric = {field: _u64(summary[field], f"{object_name}.summary.{field}") for field in numeric_fields}
     if not isinstance(summary["request_admission_stopped"], bool):
         fail(
             f"{object_name}.summary.request_admission_stopped",
             "值不是 boolean",
             "恢复 ATT 原始项目日志",
         )
+    if engine == "generic":
+        planned = numeric["planned_units"]
+        remaining = numeric["remaining_units"]
+        if remaining > planned:
+            fail(object_name, "remaining_units 大于 planned_units", "恢复 ATT 原始项目日志")
+        resolved = planned - remaining
+        if (
+            resolved > numeric["accepted_units"] + numeric["reused_units"]
+            or numeric["accepted_units"] > planned
+            or resolved > numeric["written_units"]
+            or numeric["written_units"] > resolved + numeric["reused_units"]
+            or numeric["rejected_units"] > remaining
+        ):
+            fail(object_name, "Generic summary 计数关系不一致", "恢复 ATT 原始项目日志")
+    elif (
+        numeric["accepted_decisions"] > numeric["written_locations"]
+        or numeric["remaining_decisions"] > numeric["remaining_locations"]
+        or numeric["rejected_locations"] > numeric["remaining_locations"]
+    ):
+        fail(object_name, "RPG Maker summary 计数关系不一致", "恢复 ATT 原始项目日志")
+    return numeric
 
 
 def _translation_result(value: JsonValue, object_name: str) -> dict[str, JsonValue]:
@@ -336,7 +426,17 @@ def _translation_result(value: JsonValue, object_name: str) -> dict[str, JsonVal
     summary = result["summary"]
     if kind in {"failed", "cancelled"} and summary is None:
         return result
-    _translation_summary(summary, f"{object_name}.summary")
+    numeric_summary = _translation_summary(summary, f"{object_name}.summary")
+    if kind in {"no_work", "complete"}:
+        remaining = (
+            numeric_summary["remaining_units"] + numeric_summary["rejected_units"]
+            if "remaining_units" in numeric_summary
+            else numeric_summary["remaining_decisions"]
+            + numeric_summary["remaining_locations"]
+            + numeric_summary["rejected_locations"]
+        )
+        if remaining != 0:
+            fail(object_name, f"{kind} 仍包含未完成工作", "恢复 ATT 原始项目日志")
     return result
 
 
@@ -359,20 +459,19 @@ def _require_level(level: JsonValue, expected: str, object_name: str) -> None:
 
 
 def _text(value: JsonValue, object_name: str, *, allow_empty: bool = False) -> str:
-    if not isinstance(value, str) or (not allow_empty and not value.strip()):
-        fail(object_name, "值不是有效 string", "恢复 ATT 原始项目日志")
-    return value
+    return _safe_public_text(value, object_name, require_non_blank=not allow_empty)
 
 
-def _task_position(value: JsonValue, object_name: str) -> None:
+def _task_position(value: JsonValue, object_name: str) -> tuple[int, int]:
     task = _exact_object(value, object_name, {"ordinal", "total"})
     ordinal = _u64(task["ordinal"], f"{object_name}.ordinal")
     total = _u64(task["total"], f"{object_name}.total")
     if ordinal == 0 or ordinal > total:
         fail(object_name, "任务序号不在 1..=total", "恢复 ATT 原始项目日志")
+    return ordinal, total
 
 
-def _run_plan(value: JsonValue, object_name: str) -> None:
+def _run_plan(value: JsonValue, object_name: str) -> str:
     if not isinstance(value, dict):
         fail(object_name, "plan 不是 object", "恢复 ATT 原始项目日志")
     kind = value.get("kind")
@@ -414,6 +513,7 @@ def _run_plan(value: JsonValue, object_name: str) -> None:
         "product_default",
     }:
         fail(f"{object_name}.source", "来源不是当前 RunPlan 枚举", "恢复 ATT 当前版本的项目日志")
+    return cast(str, kind)
 
 
 def _run_plan_finalization(value: JsonValue, object_name: str) -> str:
@@ -501,21 +601,57 @@ def _performance_snapshot(value: JsonValue, object_name: str) -> None:
 def _summarize_one(path: Path) -> dict[str, JsonValue]:
     records = _read_records(path)
     phases: list[JsonValue] = []
-    starts: dict[str, list[tuple[datetime, int]]] = defaultdict(list)
+    seen_phases: set[str] = set()
+    active_phase_starts: dict[str, tuple[datetime, int]] = {}
+    terminal_phases: set[str] = set()
     task_outcomes: Counter[str] = Counter()
     diagnostics: list[JsonValue] = []
     translation: JsonValue = None
     final: JsonValue = None
-    context: JsonValue = records[0].get("context") if records else None
+    context = cast(dict[str, JsonValue], records[0]["context"])
+    expected_summary_engine = "generic" if context["engine"] == "generic" else "rpg_maker"
     run_id: JsonValue = records[0].get("run_id") if records else None
     translation_finished_count = 0
     run_finished_count = 0
+    task_total: int | None = None
+    started_tasks: set[int] = set()
+    finished_tasks: dict[int, str] = {}
+    finished_attempts: dict[int, int] = {}
+    retry_attempted_values: list[int] = []
+    terminal_task_counters: dict[str, int] | None = None
+    cancellation_requested = False
+    run_plan_kind: str | None = None
+    run_plan_finalized = False
+    publication_state: str | None = None
+
+    def validate_task_counters(counters: Mapping[str, int], object_name: str) -> None:
+        expected_outcomes = Counter(
+            "failed" if kind == "not_committed_after_earlier_failure" else kind
+            for kind in finished_tasks.values()
+        )
+        if (
+            counters["started"] != len(finished_tasks)
+            or any(
+                counters[field] != expected_outcomes[field]
+                for field in ("complete", "partial", "unavailable", "failed", "cancelled")
+            )
+            or (task_total is not None and counters["planned"] != task_total)
+            or not started_tasks.issubset(finished_tasks)
+        ):
+            fail(
+                object_name,
+                "translation.finished 任务计数与实际生命周期不一致",
+                "恢复 ATT 原始项目日志",
+            )
+
     for record in records:
         event = cast(str, record["event"])
         payload = cast(dict[str, JsonValue], record["payload"])
         level = cast(str, record["level"])
         sequence = cast(int, record["sequence"])
         event_object = f"{path}:第 {sequence} 条 {event}"
+        if translation_finished_count > 0 and event in {"task.started", "task.finished"}:
+            fail(event_object, "翻译终态之后又出现模型任务事件", "恢复 ATT 原始项目日志")
         if event == "run.started":
             _exact_object(payload, event_object, set())
             _require_level(level, "info", event_object)
@@ -527,15 +663,19 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
                 total = _u64(total_value, f"{event_object}.total")
                 if confirmed > total:
                     fail(event_object, "confirmed 大于 total", "恢复 ATT 原始项目日志")
+            if cancellation_requested:
+                fail(event_object, "取消请求重复出现", "恢复 ATT 原始项目日志")
+            cancellation_requested = True
             _require_level(level, "warn", event_object)
         elif event == "phase.started":
             phase, _ = _phase_payload(event, payload, event_object)
             _require_level(level, "info", event_object)
-            starts[phase].append(
-                (
-                    _timestamp(record.get("timestamp"), str(path), sequence),
-                    sequence,
-                )
+            if phase in seen_phases:
+                fail(event_object, f"阶段 {phase} 重复开始或已经结束", "恢复 ATT 原始项目日志")
+            seen_phases.add(phase)
+            active_phase_starts[phase] = (
+                _timestamp(record.get("timestamp"), str(path), sequence),
+                sequence,
             )
         elif event in {"phase.completed", "phase.stopped"}:
             phase, stop_outcome = _phase_payload(event, payload, event_object)
@@ -544,9 +684,13 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
             else:
                 outcome_kind = cast(dict[str, JsonValue], stop_outcome)["kind"]
                 _require_level(level, "error" if outcome_kind == "failed" else "warn", event_object)
-            if not starts[phase]:
-                fail(str(path), f"阶段 {phase} 结束前没有 phase.started", "保留完整、自然顺序的项目日志")
-            start = starts[phase].pop()
+            if phase in terminal_phases:
+                fail(event_object, f"阶段 {phase} 出现多个结束事件", "恢复 ATT 原始项目日志")
+            terminal_phases.add(phase)
+            if phase not in seen_phases:
+                seen_phases.add(phase)
+                continue
+            start = active_phase_starts.pop(phase)
             end_time = _timestamp(record.get("timestamp"), str(path), sequence)
             duration = (end_time - start[0]).total_seconds()
             if duration < 0:
@@ -563,22 +707,57 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
             )
         elif event == "run_plan.resolved":
             wire = _exact_object(payload, event_object, {"plan"})
-            _run_plan(wire["plan"], f"{event_object}.plan")
+            plan_kind = _run_plan(wire["plan"], f"{event_object}.plan")
+            if run_plan_kind is not None:
+                fail(event_object, "run_plan.resolved 重复出现", "恢复 ATT 原始项目日志")
+            if plan_kind != context["command"]:
+                fail(event_object, "RunPlan 类型与 context.command 不一致", "恢复 ATT 原始项目日志")
+            run_plan_kind = plan_kind
             _require_level(level, "info", event_object)
         elif event == "run_plan.finalized":
             wire = _exact_object(payload, event_object, {"database", "result"})
             _text(wire["database"], f"{event_object}.database")
             result_kind = _run_plan_finalization(wire["result"], f"{event_object}.result")
+            if run_plan_kind is None or run_plan_finalized:
+                fail(event_object, "run_plan.finalized 没有唯一的 resolved 前序", "恢复 ATT 原始项目日志")
+            run_plan_finalized = True
             _require_level(level, "info" if result_kind == "saved" else "error", event_object)
         elif event == "task.started":
             wire = _exact_object(payload, event_object, {"task"})
-            _task_position(wire["task"], f"{event_object}.task")
+            ordinal, total = _task_position(wire["task"], f"{event_object}.task")
+            if (
+                (task_total is not None and total != task_total)
+                or ordinal in started_tasks
+                or ordinal in finished_tasks
+            ):
+                fail(event_object, "任务 total 不一致或同一任务重复开始", "恢复 ATT 原始项目日志")
+            task_total = total
+            started_tasks.add(ordinal)
             _require_level(level, "info", event_object)
         elif event == "task.finished":
-            wire = _exact_object(payload, event_object, {"task", "attempts", "outcome"})
-            _task_position(wire["task"], f"{event_object}.task")
-            _u64(wire["attempts"], f"{event_object}.attempts")
+            wire = _exact_object(payload, event_object, {"task", "attempts", "provider", "outcome"})
+            ordinal, total = _task_position(wire["task"], f"{event_object}.task")
+            attempts = _u64(wire["attempts"], f"{event_object}.attempts")
+            if attempts == 0:
+                fail(event_object, "已结束任务的 attempts 必须大于 0", "恢复 ATT 原始项目日志")
+            if (task_total is not None and task_total != total) or ordinal in finished_tasks:
+                fail(event_object, "任务 total 不一致或同一任务重复结束", "恢复 ATT 原始项目日志")
+            task_total = total
+            provider = wire["provider"]
+            if provider is not None:
+                provider_text = _safe_public_text(provider, f"{event_object}.provider")
+                if (
+                    provider_text != provider_text.strip()
+                    or len(provider_text.encode("utf-8")) > _MAX_PROVIDER_NAME_BYTES
+                ):
+                    fail(
+                        f"{event_object}.provider",
+                        f"provider 必须是去除首尾空白且不超过 {_MAX_PROVIDER_NAME_BYTES} UTF-8 字节的安全单行文本",
+                        "恢复 ATT 原始项目日志",
+                    )
             outcome_kind = _task_outcome(wire["outcome"], f"{event_object}.outcome")
+            finished_tasks[ordinal] = outcome_kind
+            finished_attempts[ordinal] = attempts
             expected_level = (
                 "info"
                 if outcome_kind == "complete"
@@ -606,16 +785,10 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
             diagnostic: dict[str, JsonValue] = {"event": event, "sequence": record.get("sequence")}
             for field in ("relation", "object", "reason", "impact", "help"):
                 value = payload.get(field)
-                if (
-                    not isinstance(value, str)
-                    or not value.strip()
-                    or any(
-                        unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"} or character == "\u0085"
-                        for character in value
-                    )
-                ):
-                    fail(str(path), f"{event} 的 {field} 不是非空安全单行文本", "恢复 ATT 原始项目日志")
-                diagnostic[field] = value
+                diagnostic[field] = _safe_public_text(
+                    value,
+                    f"{event_object}.{field}",
+                )
             diagnostics.append(diagnostic)
             _require_level(
                 level,
@@ -629,6 +802,16 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
             wire = _exact_object(payload, event_object, {"result"})
             translation = _translation_result(wire["result"], f"{event_object}.result")
             translation_kind = translation["kind"]
+            summary_value = translation.get("summary")
+            if isinstance(summary_value, dict) and summary_value.get("engine") != expected_summary_engine:
+                fail(event_object, "translation summary 与 context.engine 不一致", "恢复 ATT 原始项目日志")
+            tasks_value = translation.get("tasks")
+            if tasks_value is not None:
+                counters = _task_counters(tasks_value, f"{event_object}.result.tasks")
+                terminal_task_counters = counters
+                validate_task_counters(counters, event_object)
+            elif started_tasks or finished_tasks:
+                fail(event_object, "not_started 终态之前已经出现模型任务", "恢复 ATT 原始项目日志")
             expected_level = (
                 "info"
                 if translation_kind in {"no_work", "complete"}
@@ -639,16 +822,35 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
             _require_level(level, expected_level, event_object)
         elif event == "retry.summary":
             wire = _exact_object(payload, event_object, {"attempted", "recovered", "exhausted"})
-            for field in ("attempted", "recovered", "exhausted"):
-                _u64(wire[field], f"{event_object}.{field}")
+            retry = {
+                field: _u64(wire[field], f"{event_object}.{field}")
+                for field in ("attempted", "recovered", "exhausted")
+            }
+            if retry["attempted"] != retry["recovered"] + retry["exhausted"]:
+                fail(event_object, "retry.summary 计数关系不一致", "恢复 ATT 原始项目日志")
+            retry_attempted_values.append(retry["attempted"])
             _require_level(level, "info", event_object)
         elif event == "publication.started":
             wire = _exact_object(payload, event_object, {"output_root"})
             _text(wire["output_root"], f"{event_object}.output_root")
+            if publication_state is not None:
+                fail(event_object, "publication.started 重复或已经结束", "恢复 ATT 原始项目日志")
+            publication_state = "started"
             _require_level(level, "info", event_object)
         elif event == "publication.finished":
             wire = _exact_object(payload, event_object, {"result"})
             publication_kind = _publication_result(wire["result"], f"{event_object}.result")
+            if publication_state != "started":
+                fail(event_object, "publication.finished 缺少唯一的 started 前序", "恢复 ATT 原始项目日志")
+            publication_state = "finished"
+            publication_result = wire["result"]
+            if publication_kind == "published" and (
+                not isinstance(publication_result, dict)
+                or not isinstance(publication_result.get("summary"), dict)
+                or cast(dict[str, JsonValue], publication_result["summary"]).get("engine")
+                != expected_summary_engine
+            ):
+                fail(event_object, "publication summary 与 context.engine 不一致", "恢复 ATT 原始项目日志")
             _require_level(level, "info" if publication_kind == "published" else "error", event_object)
         elif event == "lua.print":
             wire = _exact_object(payload, event_object, {"message"})
@@ -670,18 +872,34 @@ def _summarize_one(path: Path) -> dict[str, JsonValue]:
             )
     if translation_finished_count > 1:
         fail(str(path), "translation.finished 出现多次", "每次 Translate 运行只保留一条翻译终态")
+    command = context.get("command")
+    expected_translation_finished = 1 if command == "translate" else 0
+    if translation_finished_count != expected_translation_finished:
+        fail(
+            str(path),
+            "translation.finished 数量与 context.command 不一致",
+            "恢复 ATT 当前命令完整关闭后的项目日志",
+        )
     if run_finished_count != 1:
         fail(str(path), "run.finished 数量不是一条", "使用 ATT 完整关闭后的项目日志")
-    dangling = [phase for phase, stack in starts.items() if stack]
-    if dangling:
-        fail(str(path), f"阶段没有完成或停止：{', '.join(sorted(dangling))}", "恢复 ATT 完整关闭后的项目日志")
+    if publication_state == "started":
+        fail(str(path), "publication.started 缺少 finished 终态", "恢复 ATT 原始项目日志")
+    final_kind = cast(dict[str, JsonValue], final)["kind"]
+    if run_plan_kind is not None and not run_plan_finalized and final_kind == "succeeded":
+        fail(str(path), "成功运行的 RunPlan 没有 finalized 终态", "恢复 ATT 原始项目日志")
+    if terminal_task_counters is not None:
+        validate_task_counters(terminal_task_counters, str(path))
+    if not started_tasks.issubset(finished_tasks):
+        fail(str(path), "存在已开始但未结束的模型任务", "恢复 ATT 完整关闭后的项目日志")
+    extra_attempts = sum(attempts - 1 for attempts in finished_attempts.values())
+    if any(attempted != extra_attempts for attempted in retry_attempted_values):
+        fail(str(path), "retry.summary 与任务实际额外 attempt 数不一致", "恢复 ATT 原始项目日志")
     return {
         "log": str(path.resolve()),
         "run_id": run_id,
         "context": context,
         "records": len(records),
         "phases": phases,
-        "open_phases": sorted(dangling),
         "task_outcomes": dict(sorted(task_outcomes.items())),
         "translation_finished": translation,
         "diagnostics": diagnostics,
@@ -696,22 +914,26 @@ def _task_records(path: Path | None) -> JsonValue:
     if path is None:
         return None
     root = require_directory(path, "ATT task-records 目录")
-    runs: dict[str, list[JsonValue]] = defaultdict(list)
-    for record in sorted(safe_walk_files(root), key=lambda item: item.as_posix()):
-        if (
-            record.parent.parent != root
-            or not record.parent.name.startswith("run-")
-            or not record.name.startswith("task-")
-            or record.suffix.lower() != ".md"
-        ):
+    inventory: list[tuple[int, int, str, str]] = []
+    for record in safe_walk_files(root):
+        run_match = _RUN_DIRECTORY.fullmatch(record.parent.name)
+        task_match = _TASK_RECORD.fullmatch(record.name)
+        if record.parent.parent != root or run_match is None or task_match is None:
             continue
-        runs[record.parent.name].append(record.name)
+        run_number = int(run_match["number"])
+        task_number = int(task_match["number"])
+        if not 0 < run_number <= _MAX_U64 or not 0 < task_number <= _MAX_U64:
+            continue
+        inventory.append((run_number, task_number, record.parent.name, record.name))
+    runs: dict[str, list[JsonValue]] = {}
+    for _run_number, _task_number, run_name, task_name in sorted(inventory):
+        runs.setdefault(run_name, []).append(task_name)
     return {
         "root": str(root),
-        "count": sum(len(files) for files in runs.values()),
-        "runs": {name: files for name, files in sorted(runs.items())},
+        "count": len(inventory),
+        "runs": runs,
         "coverage_inference": "forbidden",
-        "note": "任务记录数量只证明实际发出过的模型任务，不是 Planner 覆盖率。",
+        "note": "这里列出符合当前自然文件名格式的任务记录；项目日志负责证明实际任务终态。",
     }
 
 
@@ -736,7 +958,12 @@ def _summarize(args: argparse.Namespace) -> int:
         if summary.get("planning_failed") is True:
             failed_plans += 1
         translation = summary.get("translation_finished")
-        if isinstance(translation, dict) and translation.get("kind") in {"incomplete", "failed", "cancelled"}:
+        if isinstance(translation, dict) and translation.get("kind") in {
+            "not_started",
+            "incomplete",
+            "failed",
+            "cancelled",
+        }:
             incomplete += 1
     print(
         f"已汇总 {len(summaries)} 次 ATT 运行；规划失败 {failed_plans} 次，"
