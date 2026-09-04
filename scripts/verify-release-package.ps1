@@ -1,8 +1,11 @@
-﻿<#
+﻿#requires -Version 7.4
+
+<#
 .SYNOPSIS
 验证当前 dist 是否可以作为公开 Windows x64 发行物。
 
 .DESCRIPTION
+使用 PowerShell 7.4 或更新版本提供的 Markdown 解析器。
 检查发行资源、目录边界、空项目目录、Markdown 相对链接、PE 动态依赖，以及从仓库外
 运行 ATT、Formic 和最小翻译路径的真实结果。
 
@@ -174,20 +177,13 @@ function Get-MarkdownRelativeTargets {
         [string]$Content
     )
 
-    $targets = [System.Collections.Generic.List[string]]::new()
+    $html = (ConvertFrom-Markdown -InputObject $Content).Html
     foreach ($match in [regex]::Matches(
-            $Content,
-            '(?m)!?\[[^\]\r\n]*\]\((?<target><[^>\r\n]+>|[^)\r\n]+)\)'
+            $html,
+            '(?i)<(?:a|img)\b[^>]*?\b(?:href|src)="(?<target>[^"]+)"'
         )) {
-        $targets.Add($match.Groups['target'].Value)
+        [System.Net.WebUtility]::HtmlDecode($match.Groups['target'].Value)
     }
-    foreach ($match in [regex]::Matches(
-            $Content,
-            '(?m)^\s*\[[^\]\r\n]+\]:\s*(?<target><[^>\r\n]+>|\S+)'
-        )) {
-        $targets.Add($match.Groups['target'].Value)
-    }
-    $targets
 }
 
 function Assert-MarkdownLinks {
@@ -206,12 +202,6 @@ function Assert-MarkdownLinks {
         $content = Get-Content -Raw -LiteralPath $file.FullName
         foreach ($rawTarget in Get-MarkdownRelativeTargets -Content $content) {
             $target = $rawTarget.Trim()
-            if ($target.StartsWith('<') -and $target.EndsWith('>')) {
-                $target = $target.Substring(1, $target.Length - 2)
-            }
-            elseif ($target -match '^\S+\s+["'']') {
-                $target = ($target -split '\s+', 2)[0]
-            }
             if ([string]::IsNullOrWhiteSpace($target) -or $target.StartsWith('#')) {
                 continue
             }
