@@ -511,7 +511,7 @@ fn build_write_back_file(
                     line: group_ordinal + 1,
                     unit: unit_ordinal + 1,
                 };
-                let validated = validate_translation_candidate(
+                let mut validated = validate_translation_candidate(
                     &context,
                     unit.text(),
                     translation.text(),
@@ -551,20 +551,22 @@ fn build_write_back_file(
                         ensure_write_back_running(cancellation)
                     })?;
                 if max_width.is_some() || text_options.complete_continuation_whitespace {
-                    let layout_view = validate_translation_candidate(
-                        &context,
-                        unit.text(),
-                        punctuated.as_ref(),
-                        placeholder_rules,
-                        cancellation,
-                    )?;
+                    if matches!(punctuated, Cow::Owned(_)) {
+                        validated.translation = validate_replacement_candidate(
+                            &context,
+                            &validated.source,
+                            punctuated.as_ref(),
+                            placeholder_rules,
+                            cancellation,
+                        )?;
+                    }
                     if let Some(layout) = layout_text(
-                        layout_view.translation.text(),
+                        validated.translation.text(),
                         max_width,
                         text_options.complete_continuation_whitespace,
                     ) {
                         let protected = layout.joined_text();
-                        let restored = match layout_view
+                        let restored = match validated
                             .translation
                             .restore_with_cancellation(&protected, || {
                                 ensure_write_back_running(cancellation)
@@ -577,13 +579,19 @@ fn build_write_back_file(
                                 });
                             }
                         };
-                        validate_translation_candidate(
-                            &context,
-                            unit.text(),
+                        if !text_equal_with_cancellation(
                             &restored,
-                            placeholder_rules,
+                            punctuated.as_ref(),
                             cancellation,
-                        )?;
+                        )? {
+                            validate_replacement_candidate(
+                                &context,
+                                &validated.source,
+                                &restored,
+                                placeholder_rules,
+                                cancellation,
+                            )?;
+                        }
                         Cow::Owned(restored)
                     } else {
                         punctuated
@@ -674,39 +682,80 @@ fn validate_translation_candidate(
             });
         }
     };
-    let translation_view = match service.bind_target_candidate_with_cancellation(
+    let translation_view = bind_translation_candidate(
+        context,
         &source_view,
-        &target_id,
+        translation,
+        placeholder_rules,
+        cancellation,
+    )?;
+    Ok(ValidatedGenericTranslation {
+        source: source_view,
+        translation: translation_view,
+    })
+}
+
+fn validate_replacement_candidate(
+    context: &GenericWriteBackUnitContext<'_>,
+    source: &super::placeholder::GenericProtectedText,
+    translation: &str,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
+    cancellation: &CooperativeCancellation,
+) -> Result<super::placeholder::GenericProtectedText, GenericWriteBackError> {
+    if let Err(problem) = validate_reflowed_candidate_text_with_cancellation(translation, || {
+        ensure_write_back_running(cancellation)
+    })? {
+        return Err(GenericWriteBackError::CandidateViolation {
+            unit: context.diagnostic_locator(),
+            problem,
+        });
+    }
+    bind_translation_candidate(
+        context,
+        source,
+        translation,
+        placeholder_rules,
+        cancellation,
+    )
+}
+
+fn bind_translation_candidate(
+    context: &GenericWriteBackUnitContext<'_>,
+    source: &super::placeholder::GenericProtectedText,
+    translation: &str,
+    placeholder_rules: &GenericCompiledPlaceholderRules,
+    cancellation: &CooperativeCancellation,
+) -> Result<super::placeholder::GenericProtectedText, GenericWriteBackError> {
+    let unit_locator = || context.diagnostic_locator();
+    match GenericPlaceholderService::default().bind_target_candidate_with_cancellation(
+        source,
+        &context.readable_id(),
         context.kind,
         translation,
         placeholder_rules,
         || ensure_write_back_running(cancellation),
     )? {
-        Ok(translation) => translation,
+        Ok(translation) => Ok(translation),
         Err(GenericSourceBoundPlaceholderError::Protection(source)) => {
-            return Err(GenericWriteBackError::PlaceholderProtection {
+            Err(GenericWriteBackError::PlaceholderProtection {
                 unit: unit_locator(),
                 side: GenericWriteBackTextSide::Translation,
                 source,
-            });
+            })
         }
         Err(GenericSourceBoundPlaceholderError::Projection(source)) => {
-            return Err(GenericWriteBackError::LanguageProjection {
+            Err(GenericWriteBackError::LanguageProjection {
                 unit: unit_locator(),
                 side: GenericWriteBackTextSide::Translation,
                 source,
-            });
+            })
         }
         Err(GenericSourceBoundPlaceholderError::Mismatch) => {
-            return Err(GenericWriteBackError::PlaceholderBindingMismatch {
+            Err(GenericWriteBackError::PlaceholderBindingMismatch {
                 unit: unit_locator(),
-            });
+            })
         }
-    };
-    Ok(ValidatedGenericTranslation {
-        source: source_view,
-        translation: translation_view,
-    })
+    }
 }
 
 fn validate_group_shape(
