@@ -17,9 +17,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 
 from att_skill_tools import (
-    DirectoryPublishedError,
-    FilePublishedError,
     JsonValue,
+    OutputPublishedError,
     ToolArgumentParser,
     ToolCancelledError,
     ToolError,
@@ -622,8 +621,8 @@ def _run_apply(arguments: argparse.Namespace) -> int:
             return 0
         try:
             atomic_write_directory(state, font_state_files(plan), replace=False)
-        except DirectoryPublishedError as error:
-            raise DirectoryPublishedError(
+        except OutputPublishedError as error:
+            raise OutputPublishedError(
                 object_name=str(state.resolve(strict=False)),
                 reason=error.reason,
                 impact=(f"恢复 state 已经完整建立在 {state.resolve(strict=False)}；目标游戏尚未开始字体替换"),
@@ -656,7 +655,7 @@ def _run_apply(arguments: argparse.Namespace) -> int:
                 output=output,
                 output_published=output_published,
             )
-        except FilePublishedError as error:
+        except OutputPublishedError as error:
             if marker_body is not None:
                 try:
                     verify_applied_font_plan(
@@ -672,7 +671,7 @@ def _run_apply(arguments: argparse.Namespace) -> int:
                         output=output,
                         output_published=True,
                     )
-            raise FilePublishedError(
+            raise OutputPublishedError(
                 object_name=error.object_name,
                 reason=error.reason,
                 impact=(
@@ -784,8 +783,8 @@ def _run_restore(arguments: argparse.Namespace) -> int:
                 replace=False,
             )
             write_json(output, report, replace=replace)
-        except FilePublishedError as error:
-            raise FilePublishedError(
+        except OutputPublishedError as error:
+            raise OutputPublishedError(
                 object_name=error.object_name,
                 reason=error.reason,
                 impact=f"目标游戏已经逐字节恢复；{error.impact}",

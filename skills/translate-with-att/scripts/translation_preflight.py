@@ -902,8 +902,6 @@ def _run(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"preflight 作业目录 {output_display}",
-        impact="preflight 作业目录已经完整发布并可直接使用；最终完成提示未能显示",
-        help_text="直接查看该 preflight 作业目录并按检查结果继续，无需重新运行 preflight",
     )
     return 0
 

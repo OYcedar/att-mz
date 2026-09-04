@@ -1,11 +1,10 @@
 """ATT 随包 Skill 共用的安全文件与文本边界。"""
 
 from .core import (
-    DirectoryPublishedError,
-    FilePublishedError,
     JsonScalar,
     JsonValue,
     ManualEntry,
+    OutputPublishedError,
     TermOccurrence,
     ToolArgumentParser,
     ToolCancelledError,
@@ -45,11 +44,10 @@ from .core import (
 )
 
 __all__ = [
-    "DirectoryPublishedError",
-    "FilePublishedError",
     "JsonScalar",
     "JsonValue",
     "ManualEntry",
+    "OutputPublishedError",
     "TermOccurrence",
     "ToolArgumentParser",
     "ToolCancelledError",

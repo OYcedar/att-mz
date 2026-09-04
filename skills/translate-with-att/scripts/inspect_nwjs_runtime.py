@@ -22,7 +22,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 
 from att_skill_tools import (
-    DirectoryPublishedError,
+    OutputPublishedError,
     ToolArgumentParser,
     ToolCancelledError,
     ToolError,
@@ -862,7 +862,7 @@ def _cleanup_cancellation(error: BaseException | None) -> KeyboardInterrupt | No
         return error
     if isinstance(error, ToolCancelledError):
         return error.cause
-    if isinstance(error, DirectoryPublishedError) and isinstance(error.cause, KeyboardInterrupt):
+    if isinstance(error, OutputPublishedError) and isinstance(error.cause, KeyboardInterrupt):
         return error.cause
     if isinstance(error, _WorkCleanupFailure) and isinstance(error.cause, KeyboardInterrupt):
         return error.cause
@@ -903,7 +903,7 @@ def _complete_published_observation(
     cleanup_error = _cleanup_work_directory(work, work_identity)
     if cleanup_error is not None:
         retained = _cleanup_has_retained_sites(cleanup_error)
-        raise DirectoryPublishedError(
+        raise OutputPublishedError(
             object_name=str(work),
             reason=(
                 "观察报告已经发布，但固定运行现场"
@@ -924,7 +924,7 @@ def _complete_published_observation(
     try:
         return _published_completion(output)
     except BaseException as error:  # noqa: BLE001 - 报告已经发布，最终呈现也必须保留发布终态。
-        raise DirectoryPublishedError(
+        raise OutputPublishedError(
             object_name=str(output.resolve(strict=False)),
             reason=f"观察报告已经发布，但最终结果呈现失败（{type(error).__name__}）",
             impact=f"完整报告位于 {output.resolve(strict=False)}；报告内容已经生效",
@@ -1545,7 +1545,7 @@ def main() -> int:
             raise ToolError(**details)
     try:
         atomic_write_directory(output, files, replace=False)
-    except DirectoryPublishedError as error:
+    except OutputPublishedError as error:
         cleanup_error = _cleanup_work_directory(work, work_identity)
         cleanup_retained = _cleanup_has_retained_sites(cleanup_error)
         cleanup_fact = (
@@ -1555,7 +1555,7 @@ def main() -> int:
             if cleanup_error is not None
             else "；固定运行现场已经清理"
         )
-        raise DirectoryPublishedError(
+        raise OutputPublishedError(
             object_name=str(output.resolve(strict=False)),
             reason=f"{error.reason}{cleanup_fact}",
             impact=(

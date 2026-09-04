@@ -33,6 +33,23 @@
 
 暂时缺少消费者证据的位置记录为 `unresolved`，并把对应场景加入人工实机调查清单。
 
+使用 Survey 时，保留 `ownership-decisions.jsonl` 中的 `game_root` 与 `members` 来源绑定，
+填写 owner 和相应证据。关系组中存在不同所有者时，用 `rpg_maker_survey.py members` 导出
+逐候选决定，以这些行替换原 `group:*` 决定。
+
+Generic 决定的 `extract_group_unit_write_back_mapping.groups` 指定本行候选所属的语义组。
+每个候选按本行自然顺序恰好出现一次；不同决定中相关的正文填写相同 id、kind，并由 finalize
+合并。例如任务标题与说明分别归 Generic，内部编号归 exclude，两个 Generic 决定分别填写：
+
+```json
+{"groups":[{"id":"quest-entry-1","kind":"quest_entry","candidate_ids":["location-000101"]}]}
+{"groups":[{"id":"quest-entry-1","kind":"quest_entry","candidate_ids":["location-000102"]}]}
+```
+
+同一决定也可列出多个独立组。其余 Generic 证据说明实际消费者、可见正文及往返位置。
+组名表达[完整语境](../generic/jsonl.md#3-从源格式建立-group-与文件范围)，不由调查分组或 owner 决定。
+Preflight 使用同一次 finalize 的 `coverage.json` 与 `rules-manifest.json`；输入变化后从对应阶段重建产物。
+
 ## 3. 建立项目所有权
 
 ### 3.1 MV/MZ 按原生能力顺序判断

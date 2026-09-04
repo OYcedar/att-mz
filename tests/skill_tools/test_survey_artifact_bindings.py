@@ -96,7 +96,7 @@ class SurveyArtifactBindingTests(unittest.TestCase):
         self.assertEqual(recipe["path"] if recipe is not None else None, ["window", "title"])
         self.assertIsNone(generic_recipe({**base, "generic_kind": [], "source_text": "x"}))
 
-    def test_generic_group_placement_is_global_and_single_file(self) -> None:
+    def test_shared_generic_group_keeps_its_source_and_kind(self) -> None:
         candidate_ids = ["location-000001", "location-000002"]
         evidence = validate_generic_evidence(
             {
@@ -114,10 +114,13 @@ class SurveyArtifactBindingTests(unittest.TestCase):
             "test evidence",
         )
         same_file = {candidate_id: {"physical_file": "extras/data.json"} for candidate_id in candidate_ids}
-        seen: set[str] = set()
-        validate_generic_group_placement(evidence, same_file, seen, "test evidence")
+        placements: dict[str, tuple[str, str]] = {}
+        validate_generic_group_placement(evidence, same_file, placements, "test evidence")
+        validate_generic_group_placement(evidence, same_file, placements, "another ownership decision")
+        changed_kind = json.loads(json.dumps(evidence))
+        changed_kind["extract_group_unit_write_back_mapping"]["groups"][0]["kind"] = "different"
         with self.assertRaises(ToolError):
-            validate_generic_group_placement(evidence, same_file, seen, "test evidence")
+            validate_generic_group_placement(changed_kind, same_file, placements, "test evidence")
         with self.assertRaises(ToolError):
             validate_generic_group_placement(
                 evidence,
@@ -125,7 +128,7 @@ class SurveyArtifactBindingTests(unittest.TestCase):
                     "location-000001": {"physical_file": "extras/a.json"},
                     "location-000002": {"physical_file": "extras/b.json"},
                 },
-                set(),
+                {},
                 "test evidence",
             )
 

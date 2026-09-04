@@ -8,6 +8,7 @@ import tomllib
 from bisect import bisect_right
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from html import unescape as unescape_html
 from html.entities import html5 as HTML5_ENTITIES
@@ -59,46 +60,8 @@ _HTML_SCRIPT_SRC = re.compile(
 _CSS_FORMAT = re.compile(
     r"(?is)(?:\s|/\*.*?\*/)*format\(\s*(?P<quote>['\"]?)(?P<value>[^'\"()\r\n]+)(?P=quote)\s*\)"
 )
-_CSS_FORMAT_FUNCTION = re.compile(r"(?is)(?:\s|/\*.*?\*/)*(?P<function>format\([^)]*\))")
 _CSS_URL_START = re.compile(r"(?is)\burl\s*\(")
-_CSS_LOCAL_START = re.compile(r"(?is)\blocal\s*\(")
-_CSS_IDENTIFIER = (
-    rf"(?:--|-?(?:[A-Za-z_]|[^\x00-\x7f]|{_CSS_ESCAPE}))(?:[A-Za-z0-9_-]|[^\x00-\x7f]|{_CSS_ESCAPE})*"
-)
-_CSS_LOCAL_UNQUOTED_NAME = re.compile(rf"(?is)^{_CSS_IDENTIFIER}(?:\s+{_CSS_IDENTIFIER})*$")
-_CSS_TECH = re.compile(rf"(?is)\s*tech\(\s*(?P<value>{_CSS_IDENTIFIER}(?:\s*,\s*{_CSS_IDENTIFIER})*)\s*\)")
-_FONT_FORMAT_VALUES = frozenset(
-    {"collection", "embedded-opentype", "opentype", "svg", "truetype", "woff", "woff2"}
-)
-_SUPPORTED_FONT_FORMATS = frozenset({"opentype", "truetype", "woff", "woff2"})
-_COMPATIBLE_FONT_FORMATS = {
-    "collection": ("collection", ()),
-    "opentype": ("opentype", ()),
-    "opentype-variations": ("opentype", ("variations",)),
-    "truetype": ("truetype", ()),
-    "truetype-variations": ("truetype", ("variations",)),
-    "woff": ("woff", ()),
-    "woff-variations": ("woff", ("variations",)),
-    "woff2": ("woff2", ()),
-    "woff2-variations": ("woff2", ("variations",)),
-}
-_FONT_TECH_VALUES = frozenset(
-    {
-        "color-cbdt",
-        "color-colrv0",
-        "color-colrv1",
-        "color-sbix",
-        "color-svg",
-        "features-aat",
-        "features-graphite",
-        "features-opentype",
-        "incremental",
-        "palettes",
-        "variations",
-    }
-)
-# 当前工具不校验替换字体的可选技术表，因此不能承诺任何 tech() 要求。
-_SUPPORTED_FONT_TECHS: frozenset[str] = frozenset()
+_STATIC_FONT_FORMATS = frozenset({"opentype", "truetype", "woff", "woff2"})
 _HTML_TAG = re.compile(
     r"(?is)<\s*(?P<closing>/)?\s*(?P<name>[A-Za-z][A-Za-z0-9:-]*)"
     r"(?P<body>(?:\"[^\"]*\"|'[^']*'|[^'\">])*)>"
@@ -363,24 +326,6 @@ class _CssLexical:
     code_positions: bytearray
     comment_ranges: tuple[tuple[int, int], ...]
     comment_starts: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _CssFontFace:
-    body_start: int
-    body_end: int
-    family_declarations: tuple[tuple[int, int], ...]
-    family_declaration: tuple[int, int] | None
-    family: str | None
-    src_declarations: tuple[tuple[int, int], ...]
-    effective_src: tuple[int, int] | None
-    supported_url_starts: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _CssSrcSupport:
-    available: bool
-    url_starts: tuple[int, ...]
 
 
 def _asset_inventory(game_root: Path, files: Sequence[Path]) -> tuple[FontAsset, ...]:
@@ -1018,180 +963,6 @@ def _css_family_from_declaration(
     return (value, value_start, value_end) if value else None
 
 
-def _css_src_support(
-    lexical: _CssLexical,
-    declaration: tuple[int, int],
-    *,
-    url_matches: Sequence[re.Match[str]],
-    url_starts: Sequence[int],
-) -> _CssSrcSupport:
-    start, end = declaration
-    end = _css_value_end_before_important(lexical, start, end)
-    if not _css_without_comments(lexical, start, end).strip():
-        return _CssSrcSupport(False, ())
-    available = False
-    supported_urls: list[int] = []
-    component_start = start
-    while True:
-        component_end = _css_component_end(lexical, component_start, end)
-        if _css_local_component_is_valid(lexical, component_start, component_end):
-            available = True
-        elif (
-            supported_url := _css_supported_url_component(
-                lexical,
-                component_start,
-                component_end,
-                url_matches=url_matches,
-                url_starts=url_starts,
-            )
-        ) is not None:
-            available = True
-            supported_urls.append(supported_url.start())
-        if component_end == end:
-            break
-        component_start = component_end + 1
-    return _CssSrcSupport(available, tuple(supported_urls))
-
-
-def _css_supported_url_component(
-    lexical: _CssLexical,
-    start: int,
-    end: int,
-    *,
-    url_matches: Sequence[re.Match[str]],
-    url_starts: Sequence[int],
-) -> re.Match[str] | None:
-    matches = _matches_in_range(url_matches, url_starts, start, end)
-    if len(matches) != 1:
-        return None
-    match = matches[0]
-    if lexical.searchable[start : match.start()].strip():
-        return None
-    tail = lexical.searchable[match.end() : end]
-    required_techs: tuple[str, ...] = ()
-    format_match = _CSS_FORMAT.match(tail)
-    if format_match is not None:
-        try:
-            format_value = _decode_css_value(format_match.group("value").strip()).casefold()
-        except ValueError:
-            return None
-        if format_match.group("quote"):
-            compatible = _COMPATIBLE_FONT_FORMATS.get(format_value)
-            if compatible is None:
-                return None
-            format_value, required_techs = compatible
-        elif format_value not in _FONT_FORMAT_VALUES:
-            return None
-        if format_value not in _SUPPORTED_FONT_FORMATS:
-            return None
-        tail = tail[format_match.end() :]
-    tech_match = _CSS_TECH.match(tail)
-    if tech_match is not None:
-        try:
-            explicit_techs = tuple(
-                _decode_css_value(value.strip()).casefold() for value in tech_match.group("value").split(",")
-            )
-        except ValueError:
-            return None
-        if any(value not in _FONT_TECH_VALUES for value in explicit_techs):
-            return None
-        required_techs = (*required_techs, *explicit_techs)
-        tail = tail[tech_match.end() :]
-    if tail.strip() or any(value not in _SUPPORTED_FONT_TECHS for value in required_techs):
-        return None
-    return match
-
-
-def _css_local_component_is_valid(lexical: _CssLexical, start: int, end: int) -> bool:
-    searchable = lexical.searchable
-    while start < end and searchable[start].isspace():
-        start += 1
-    while end > start and searchable[end - 1].isspace():
-        end -= 1
-    match = _CSS_LOCAL_START.match(searchable, start, end)
-    if match is None or not lexical.code_positions[match.start()]:
-        return False
-    close = match.end()
-    while close < end:
-        if lexical.code_positions[close]:
-            if lexical.text[close] == "(":
-                return False
-            if lexical.text[close] == ")":
-                break
-        close += 1
-    if close >= end or lexical.text[close] != ")" or searchable[close + 1 : end].strip():
-        return False
-    raw_name = _css_without_comments(lexical, match.end(), close).strip()
-    if not raw_name:
-        return False
-    try:
-        items = _css_family_items(raw_name, 0, len(raw_name))
-    except ValueError:
-        return False
-    if len(items) != 1:
-        return False
-    quote, value_start, value_end = items[0]
-    value = raw_name[value_start:value_end]
-    if quote is not None:
-        try:
-            return bool(_decode_css_value(value))
-        except ValueError:
-            return False
-    return _CSS_LOCAL_UNQUOTED_NAME.fullmatch(value) is not None
-
-
-def _css_font_faces(
-    lexical: _CssLexical,
-    url_matches: Sequence[re.Match[str]],
-) -> tuple[_CssFontFace, ...]:
-    """按源码顺序解析每个 @font-face 的最后一个有效重复 descriptor。"""
-
-    url_starts = tuple(match.start() for match in url_matches)
-    faces: list[_CssFontFace] = []
-    for body_start, body_end in _css_font_face_ranges(lexical):
-        family_declarations = _css_font_family_declarations(
-            lexical,
-            start=body_start,
-            end=body_end,
-        )
-        selected_family_declaration: tuple[int, int] | None = None
-        selected_family: str | None = None
-        for declaration in reversed(family_declarations):
-            parsed = _css_family_from_declaration(lexical, declaration)
-            if parsed is None:
-                continue
-            selected_family_declaration = declaration
-            selected_family = parsed[0]
-            break
-        src_declarations = _css_src_declarations(lexical, start=body_start, end=body_end)
-        effective_src: tuple[int, int] | None = None
-        supported_url_starts: tuple[int, ...] = ()
-        for declaration in reversed(src_declarations):
-            support = _css_src_support(
-                lexical,
-                declaration,
-                url_matches=url_matches,
-                url_starts=url_starts,
-            )
-            if support.available:
-                effective_src = declaration
-                supported_url_starts = support.url_starts
-                break
-        faces.append(
-            _CssFontFace(
-                body_start,
-                body_end,
-                family_declarations,
-                selected_family_declaration,
-                selected_family,
-                src_declarations,
-                effective_src,
-                supported_url_starts,
-            )
-        )
-    return tuple(faces)
-
-
 def _css_url_src_ownership(
     url_matches: Sequence[re.Match[str]],
     src_ranges: Sequence[tuple[int, int]],
@@ -1281,37 +1052,27 @@ def _discover_aliases(
             lexical = _css_lexical_views(fragment)
             url_matches, _unparsed_urls = _css_url_matches(lexical)
             url_starts = tuple(match.start() for match in url_matches)
-            for face in _css_font_faces(lexical, url_matches):
-                if face.family is None:
-                    if face.family_declarations:
-                        family_start, family_end = face.family_declarations[-1]
+            src_ranges = _css_src_declarations(lexical)
+            url_owners = _css_url_src_ownership(url_matches, src_ranges)
+            for body_start, body_end in _css_font_face_ranges(lexical):
+                families: list[str] = []
+                for declaration in _css_font_family_declarations(lexical, start=body_start, end=body_end):
+                    parsed = _css_family_from_declaration(lexical, declaration)
+                    if parsed is None:
                         reviews.append(
                             ReviewItem(
                                 relative,
-                                line_index.line(offset + family_start),
+                                line_index.line(offset + declaration[0]),
                                 "unparsed_css_font_face_family",
-                                fragment[family_start:family_end].strip(),
+                                fragment[slice(*declaration)].strip(),
                             )
                         )
-                    continue
-                family = face.family
-                registered_families.add(family.casefold())
-                resolved_assets: dict[str, FontAsset] = {}
-                face_url_matches = (
-                    tuple(
-                        match
-                        for match in _matches_in_range(
-                            url_matches,
-                            url_starts,
-                            face.effective_src[0],
-                            face.effective_src[1],
-                        )
-                        if match.start() in face.supported_url_starts
-                    )
-                    if face.effective_src is not None
-                    else ()
-                )
-                for url_match in face_url_matches:
+                    else:
+                        families.append(parsed[0])
+                        registered_families.add(parsed[0].casefold())
+                for url_match in _matches_in_range(url_matches, url_starts, body_start, body_end):
+                    if url_match.start() not in url_owners:
+                        continue
                     raw_url, _quote, _start, _end = _css_url_parts(url_match)
                     url = _decode_css_value(raw_url)
                     asset = _resolve_reference(
@@ -1322,40 +1083,29 @@ def _discover_aliases(
                         assets=assets,
                         asset_index=indexed_assets,
                     )
-                    if asset is not None:
-                        resolved_assets.setdefault(asset.relative_path.casefold(), asset)
-                        continue
-                    reviews.append(
-                        ReviewItem(
-                            relative,
-                            line_index.line(offset + url_match.start()),
-                            "unresolved_font_face_asset",
-                            url,
-                        )
-                    )
-                if len(resolved_assets) == 1:
-                    asset = next(iter(resolved_assets.values()))
-                    facts.append(
-                        (
-                            FontAlias(
-                                family,
-                                asset.relative_path,
-                                "css_font_face",
+                    if asset is None:
+                        reviews.append(
+                            ReviewItem(
                                 relative,
-                                line_index.line(offset + face.body_start - 1),
-                            ),
-                            asset,
+                                line_index.line(offset + url_match.start()),
+                                "unresolved_font_face_asset",
+                                url,
+                            )
                         )
-                    )
-                elif len(resolved_assets) > 1:
-                    reviews.append(
-                        ReviewItem(
-                            relative,
-                            line_index.line(offset + face.body_start - 1),
-                            "css_font_face_maps_to_multiple_assets",
-                            family,
+                        continue
+                    for family in families:
+                        facts.append(
+                            (
+                                FontAlias(
+                                    family,
+                                    asset.relative_path,
+                                    "css_font_face",
+                                    relative,
+                                    line_index.line(offset + body_start - 1),
+                                ),
+                                asset,
+                            )
                         )
-                    )
         for fragment, offset in javascript_fragments:
             literals = tuple(
                 literal
@@ -1479,6 +1229,9 @@ def _discover_aliases(
     for normalized, candidates in sorted(by_value.items()):
         distinct = {candidate[1].relative_path.casefold() for candidate in candidates}
         if len(distinct) != 1:
+            if normalized in registered_families:
+                accepted.extend(candidate[0] for candidate in candidates)
+                continue
             reviews.append(
                 ReviewItem(
                     candidates[0][0].source,
@@ -2351,33 +2104,33 @@ def _scan_css(
     lexical = _css_lexical_views(text)
     url_matches, unparsed_url_starts = _css_url_matches(lexical)
     selected_format = "opentype" if Path(selected_name).suffix.casefold() == ".otf" else "truetype"
-    faces = _css_font_faces(lexical, url_matches)
     src_ranges = _css_src_declarations(lexical)
     src_starts = tuple(start for start, _end in src_ranges)
-    face_src_ranges = {item for face in faces for item in face.src_declarations}
-    effective_src_ranges = {item for item in src_ranges if item not in face_src_ranges}
-    url_starts = tuple(match.start() for match in url_matches)
-    supported_url_starts: set[int] = set()
-    for src_range in effective_src_ranges:
-        support = _css_src_support(
-            lexical,
-            src_range,
-            url_matches=url_matches,
-            url_starts=url_starts,
-        )
-        supported_url_starts.update(support.url_starts)
-    for face in faces:
-        active_src = face.effective_src or (face.src_declarations[-1] if face.src_declarations else None)
-        if active_src is not None:
-            effective_src_ranges.add(active_src)
-        supported_url_starts.update(face.supported_url_starts)
     url_ownership = _css_url_src_ownership(url_matches, src_ranges)
     for match in url_matches:
         owner = url_ownership.get(match.start())
-        if owner is not None and owner not in effective_src_ranges:
-            continue
-        if owner is not None and match.start() not in supported_url_starts:
-            continue
+        format_match: re.Match[str] | None = None
+        if owner is not None:
+            bound_end = _css_component_end(lexical, match.end(), owner[1])
+            tail = lexical.searchable[match.end() : bound_end]
+            format_match = _CSS_FORMAT.fullmatch(tail.rstrip())
+            format_value = None
+            if format_match is not None:
+                raw_format = format_match.group("value")
+                if not format_match.group("quote"):
+                    raw_format = raw_format.strip()
+                with suppress(ValueError):
+                    format_value = _decode_css_value(raw_format).casefold()
+            if tail.strip() and format_value not in _STATIC_FONT_FORMATS:
+                reviews.append(
+                    ReviewItem(
+                        relative,
+                        line_index.line(match.start()),
+                        "unverified_css_font_source",
+                        text[match.start() : bound_end],
+                    )
+                )
+                continue
         raw_value, css_quote, value_start, value_end = _css_url_parts(match)
         value = _decode_css_value(raw_value)
         resolved = _resolve_token(
@@ -2420,52 +2173,16 @@ def _scan_css(
             new_value=replacement,
         )
         patches.append(_TextPatch(start, end, text[start:end], encoded_replacement, (reference,)))
-        if owner is not None:
-            _src_start, src_end = owner
-            bound_end = _css_component_end(lexical, match.end(), src_end)
-            tail = lexical.searchable[match.end() : bound_end]
-            format_match = _CSS_FORMAT.match(tail)
-            if format_match is not None:
-                format_start = match.end() + format_match.start("value")
-                format_end = match.end() + format_match.end("value")
-                if text[format_start:format_end].casefold() != selected_format:
-                    patches.append(
-                        _TextPatch(
-                            format_start,
-                            format_end,
-                            text[format_start:format_end],
-                            selected_format,
-                            (),
-                        )
-                    )
-                continue
-            broad_format = _CSS_FORMAT_FUNCTION.match(tail)
-            if broad_format is not None:
-                format_start = match.end() + broad_format.start("function")
-                format_end = match.end() + broad_format.end("function")
+        if format_match is not None:
+            format_start = match.end() + format_match.start("value")
+            format_end = match.end() + format_match.end("value")
+            replacement_hint = selected_format if format_match.group("quote") else f'"{selected_format}"'
+            if text[format_start:format_end] != replacement_hint:
                 patches.append(
-                    _TextPatch(
-                        format_start,
-                        format_end,
-                        text[format_start:format_end],
-                        f'format("{selected_format}")',
-                        (),
-                    )
-                )
-                continue
-            if re.match(r"(?is)(?:\s|/\*.*?\*/)*format\s*\(", tail) is not None:
-                reviews.append(
-                    ReviewItem(
-                        relative,
-                        line_index.line(match.end()),
-                        "unparsed_css_font_format",
-                        tail.strip(),
-                    )
+                    _TextPatch(format_start, format_end, text[format_start:format_end], replacement_hint, ())
                 )
     for start in unparsed_url_starts:
         owner = _containing_range(start, src_ranges, src_starts)
-        if owner is not None and owner not in effective_src_ranges:
-            continue
         declaration_end = owner[1] if owner is not None else _css_declaration_end(lexical, start, len(text))
         closing = text.find(")", start, declaration_end)
         end = declaration_end if closing < 0 else closing + 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -14,7 +15,8 @@ from att_skill_tools import ToolError
 from att_toolbox.coverage import coverage_projection
 from att_toolbox.js import scan_javascript, static_code_targets
 from att_toolbox.rpg import discover_game, parse_plugins
-from att_toolbox.survey_io import verify_source_baseline
+from att_toolbox.survey_io import load_survey, verify_source_baseline
+from att_toolbox.survey_projection import read_rules_manifest
 from att_toolbox.survey_sources import scan_game
 
 
@@ -242,6 +244,108 @@ class SurveySourceSelectionTests(unittest.TestCase):
 
 
 class CoverageProjectionTests(unittest.TestCase):
+    def test_mixed_ownership_keeps_quest_title_and_description_in_one_generic_group(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = root / "game"
+            _write_mz_game(game, with_bootstrap=True)
+            (game / "js/main.js").write_text(
+                'const quest = { id: "quest_key", title: "Her Last Wish", description: "Bring it back to her." };\n'
+                "window.currentQuest = quest;\n",
+                encoding="utf-8",
+            )
+            survey_root = root / "survey"
+            plan = root / "plan"
+            script = ROOT / "skills/translate-with-att/scripts/rpg_maker_survey.py"
+
+            def run(*arguments: str | Path) -> None:
+                result = subprocess.run(
+                    [sys.executable, "-B", str(script), *map(str, arguments)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            run("scan", "--game", game, "--output", survey_root)
+            survey, locations, groups, _baseline = load_survey(survey_root)
+            quest = [item for item in locations if item.get("physical_file") == "js/main.js"]
+            self.assertEqual(len({item["review_group_id"] for item in quest}), 1)
+            members_path = root / "members.jsonl"
+            run(
+                "members",
+                "--survey",
+                survey_root,
+                "--group-id",
+                quest[0]["review_group_id"],
+                "--output",
+                members_path,
+            )
+            rows = [json.loads(line) for line in members_path.read_text(encoding="utf-8").splitlines()]
+            expected_candidates = []
+            for row in rows:
+                member = row["members"][0]
+                if member["source_text"] == "quest_key":
+                    row.update(owner="exclude", reason="内部任务键", evidence="界面读取 title 与 description")
+                    continue
+                candidate = member["candidate_id"]
+                expected_candidates.append(candidate)
+                row.update(
+                    owner="generic",
+                    generic_evidence={
+                        "exact_location": member["location"],
+                        "active_runtime_consumer": "currentQuest 的任务界面",
+                        "player_visible_non_image_text": "任务标题与说明",
+                        "builtin_not_owner": "活动脚本中的字符串",
+                        "rules_cannot_map_reversibly": "源码字符串使用 Generic 写回位置",
+                        "unique_owner": "仅此 Generic 项目",
+                        "extract_group_unit_write_back_mapping": {
+                            "groups": [{"id": "quest-entry", "kind": "quest", "candidate_ids": [candidate]}]
+                        },
+                    },
+                )
+            for row in (
+                json.loads(line)
+                for line in (survey_root / "ownership-decisions.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ):
+                if row["target"] != "group:" + quest[0]["review_group_id"]:
+                    row.update(owner="exclude", reason="样本启动信息", evidence="任务界面只读取 quest")
+                    rows.append(row)
+            members_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in reversed(rows)), encoding="utf-8"
+            )
+            run("finalize", "--survey", survey_root, "--decisions", members_path, "--output", plan)
+
+            generated = [
+                json.loads(line)
+                for line in (plan / "generic/input/js/main.js.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                generated,
+                [
+                    {
+                        "id": "quest-entry",
+                        "kind": "quest",
+                        "units": [
+                            {"id": expected_candidates[0], "text": "Her Last Wish"},
+                            {"id": expected_candidates[1], "text": "Bring it back to her."},
+                        ],
+                    }
+                ],
+            )
+            _projection, candidates, complete, _plans = coverage_projection(
+                plan / "coverage.json",
+                survey,
+                locations,
+                groups,
+                read_rules_manifest(plan / "rules-manifest.json"),
+            )
+            self.assertTrue(complete)
+            self.assertEqual(candidates, set(expected_candidates))
+
     def test_unresolved_target_covers_all_members_when_detail_names_only_unsupported_subset(self) -> None:
         locations = [
             {

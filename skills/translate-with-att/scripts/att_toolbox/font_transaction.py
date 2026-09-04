@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import NoReturn, Protocol, cast
 
 from att_skill_tools import (
-    FilePublishedError,
+    OutputPublishedError,
     ToolCancelledError,
     ToolError,
     atomic_write_bytes,
@@ -968,7 +968,7 @@ def write_font_apply_marker(
                 raise published_error from None
             marker_impact = "字体替换已生效；已绑定 state 仍完整，applied 标记尚未建立"
         else:
-            if isinstance(error, FilePublishedError):
+            if isinstance(error, OutputPublishedError):
                 raise error from None
             marker_impact = "字体替换与 applied 标记均已生效；标记临时文件的清理终态无法确认"
         cancellation = _first_cancellation(error)

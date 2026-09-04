@@ -978,8 +978,6 @@ def _summarize(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"ATT 运行汇总 {output_display}",
-        impact="ATT 运行汇总已经完整发布并可直接查看；最终完成提示未能显示",
-        help_text="直接查看该汇总文件，无需重新运行汇总命令",
     )
     return 0
 

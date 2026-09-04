@@ -926,7 +926,7 @@ class NwjsLifecycleTests(unittest.TestCase):
         work = Path("D:/review/.report.runtime")
         with (
             patch.object(runtime, "_cleanup_work_directory", return_value=PermissionError("blocked")),
-            self.assertRaises(runtime.DirectoryPublishedError) as raised,
+            self.assertRaises(runtime.OutputPublishedError) as raised,
         ):
             runtime._complete_published_observation(  # pyright: ignore[reportPrivateUsage]
                 output,

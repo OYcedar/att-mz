@@ -44,6 +44,10 @@ RPG Maker 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、�
 译文字段；Manual ID、scan/finalize 产物以及 audit/preflight 结果使用相应工具重新生成，以生成结果
 完成对账。
 
+按[项目调查指南](../../docs/guides/translation-project.md#2-调查可见文本)填写决定并保留来源绑定。
+所有权与翻译语境分别判断：排除内部键后，相关标题、说明或对白仍可通过同一组名一起翻译；
+独立记录使用不同组名。用同一次 finalize 产物继续 Extract、audit 与 preflight。
+
 暂时缺少消费者证据的位置标记为 `unresolved`，并列入人工实机检查清单。用户提供的截图、场景和
 触发步骤可以用于补充消费者证据和定位遗漏来源。
 

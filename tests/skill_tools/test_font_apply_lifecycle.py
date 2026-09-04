@@ -26,9 +26,8 @@ sys.path.insert(0, str(ROOT / "skills" / "translate-with-att" / "scripts"))
 import att_toolbox.font_transaction as transaction
 import manage_rpg_maker_fonts as fonts
 from att_skill_tools import (
-    DirectoryPublishedError,
-    FilePublishedError,
     JsonValue,
+    OutputPublishedError,
     ToolCancelledError,
     ToolError,
     atomic_write_directory,
@@ -119,7 +118,7 @@ class FontApplyLifecycleTests(unittest.TestCase):
                 mutations=(object(),),
             )
             coverage = SimpleNamespace(additional_paths=(), translation_path=None)
-            published = DirectoryPublishedError(
+            published = OutputPublishedError(
                 object_name=str(state),
                 reason="目录已经发布，但发布调用返回前发生：使用者取消了命令",
                 impact=f"新目录 {state} 已经生效",
@@ -313,7 +312,7 @@ class FontApplyLifecycleTests(unittest.TestCase):
 
     def test_published_apply_marker_cleanup_failure_keeps_exact_facts_through_cli(self) -> None:
         failures: tuple[tuple[BaseException, type[ToolError], int], ...] = (
-            (PermissionError("marker temporary cleanup blocked"), FilePublishedError, 1),
+            (PermissionError("marker temporary cleanup blocked"), OutputPublishedError, 1),
             (KeyboardInterrupt("marker temporary cleanup cancelled"), ToolCancelledError, 130),
         )
         for cleanup_failure, expected_type, expected_code in failures:

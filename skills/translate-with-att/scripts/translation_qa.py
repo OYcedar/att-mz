@@ -1854,7 +1854,7 @@ def _scan(args: argparse.Namespace) -> int:
         )
         generic_tree = None
         generic_expected_files = None
-        expected_generic_files, expected_generic_manifest = generic_materials(generic_plans)
+        expected_generic_files, expected_generic_manifest = generic_materials(generic_plans, locations)
         generic_recipes = _generic_manifest(
             generic_manifest_path,
             expected_files=expected_generic_files,
@@ -2027,8 +2027,6 @@ def _scan(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"QA 作业目录 {output_display}",
-        impact="QA 作业目录已经完整发布并可直接审核；最终完成提示未能显示",
-        help_text="直接打开该 QA 作业目录继续审核，无需重新运行 QA scan",
     )
     return 0
 
@@ -2132,8 +2130,6 @@ def _manual(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"QA Manual candidate 文件 {output_display}",
-        impact="QA Manual candidate 文件已经完整发布并可直接导出 Manual；最终完成提示未能显示",
-        help_text="直接把该 candidate 文件交给 ATT manual export，无需重新运行 QA manual",
     )
     return 0
 

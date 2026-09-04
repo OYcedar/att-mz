@@ -178,8 +178,6 @@ def _scan(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"Survey 调查目录 {output_display}",
-        impact="Survey 调查目录已经完整发布并可直接审核；最终完成提示未能显示",
-        help_text="直接打开该 Survey 调查目录继续审核，无需重新运行 scan",
     )
     return 0
 
@@ -354,8 +352,6 @@ def _members(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"candidate 决定文件 {output_display}",
-        impact="candidate 决定文件已经完整发布并可直接填写；最终完成提示未能显示",
-        help_text="直接填写该 candidate 决定文件，无需重新运行 members",
     )
     return 0
 
@@ -651,9 +647,12 @@ def _finalize(args: argparse.Namespace) -> int:
             "review_groups": len(groups),
             "decisions": len(decisions),
             "rules": len(rules),
-            "generic_groups": sum(
-                len(generic_mapping_groups(cast(dict[str, JsonValue], plan["evidence"])))
-                for plan in generic_plan
+            "generic_groups": len(
+                {
+                    cast(str, group["id"])
+                    for plan in generic_plan
+                    for group in generic_mapping_groups(cast(dict[str, JsonValue], plan["evidence"]))
+                }
             ),
             "unresolved": len(unresolved),
         },
@@ -667,7 +666,7 @@ def _finalize(args: argparse.Namespace) -> int:
         "local_commands_completed": 2,
         "external_request_wait_ms": 0,
     }
-    generic_files, generic_manifest = generic_materials(generic_plan)
+    generic_files, generic_manifest = generic_materials(generic_plan, locations)
     output_display = display_path(args.output)
     atomic_write_directory(
         args.output,
@@ -691,8 +690,6 @@ def _finalize(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"Survey 计划目录 {output_display}",
-        impact="Survey 计划目录已经完整发布并可直接使用；最终完成提示未能显示",
-        help_text="直接使用该计划目录继续后续步骤，无需重新运行 finalize",
     )
     return 0
 
@@ -837,8 +834,6 @@ def _audit(args: argparse.Namespace) -> int:
             ]
         ),
         object_name=f"Survey 所有权审计报告 {output_display}",
-        impact="Survey 所有权审计报告已经完整发布并可直接查看；最终完成提示未能显示",
-        help_text="直接查看该审计报告并按结果继续，无需重新运行 audit",
     )
     return 0
 

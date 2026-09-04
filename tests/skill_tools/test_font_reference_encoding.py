@@ -379,12 +379,12 @@ class FontReferenceEncodingTests(unittest.TestCase):
                 runtime_javascript=frozenset(),
             )
 
-        self.assertEqual(
-            [review.reason for review in reviews],
-            ["css_font_face_maps_to_multiple_assets"],
-        )
+        self.assertEqual(reviews, [])
         self.assertNotIn("first", mapping)
-        self.assertNotIn("First", [alias.value for alias in aliases])
+        self.assertEqual(
+            {alias.asset for alias in aliases if alias.value == "First"},
+            {"fonts/First.ttf", "fonts/Second.ttf"},
+        )
         self.assertIn("second", mapping)
 
     def test_build_font_plan_keeps_registered_family_with_remote_first_fallback(self) -> None:
@@ -432,7 +432,7 @@ class FontReferenceEncodingTests(unittest.TestCase):
         self.assertIn('url("fonts/Replacement.ttf")', updated)
         self.assertIn("url(https://cdn.example/x.woff2)", updated)
 
-    def test_build_font_plan_uses_last_valid_font_face_descriptors(self) -> None:
+    def test_build_font_plan_updates_all_static_font_sources_and_preserves_families(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             game_root = root / "game"
@@ -466,66 +466,20 @@ class FontReferenceEncodingTests(unittest.TestCase):
                     selected_font=selected_font,
                 )
 
-        runtime_alias = next(alias for alias in plan.aliases if alias.value == "RuntimeFont")
-        self.assertEqual(runtime_alias.asset, "fonts/Old.ttf")
+        self.assertEqual(
+            {alias.asset for alias in plan.aliases if alias.value == "RuntimeFont"},
+            {"fonts/Old.ttf", "fonts/Obsolete.ttf"},
+        )
         stylesheet_mutation = next(
             mutation for mutation in plan.mutations if mutation.relative_path == "style.css"
         )
         updated = stylesheet_mutation.replacement.decode("utf-8")
-        self.assertIn("url(fonts/Obsolete.ttf)", updated)
+        self.assertNotIn("url(fonts/Obsolete.ttf)", updated)
         self.assertIn("url(data:font/woff2;base64,AAAA;BBBB)", updated)
-        self.assertIn('url("fonts/Replacement.ttf")', updated)
+        self.assertEqual(updated.count('url("fonts/Replacement.ttf")'), 2)
         self.assertIn("font-family:RuntimeFont", updated)
 
-    def test_build_font_plan_ignores_invalid_late_source_descriptors(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            game_root = root / "game"
-            fonts = game_root / "fonts"
-            plugins = game_root / "js" / "plugins.js"
-            fonts.mkdir(parents=True)
-            plugins.parent.mkdir(parents=True)
-            (fonts / "Old.ttf").write_bytes(b"old-font")
-            selected_font = root / "Replacement.ttf"
-            selected_font.write_bytes(b"replacement-font")
-            plugins.write_text("var $plugins = [];\n", encoding="utf-8")
-            stylesheet = game_root / "style.css"
-            stylesheet.write_text(
-                "@font-face{font-family:RuntimeFont;"
-                'src:local(Installed),bogus(),url(fonts/Old.ttf);src:"local(fake)";}\n'
-                "body{font-family:RuntimeFont;}",
-                encoding="utf-8",
-            )
-
-            matcher_builder = _AliasMatcher.for_aliases
-            with (
-                patch(
-                    "att_toolbox.font_references.check_font_coverage",
-                    return_value=FontCoverage("", "", 1),
-                ),
-                patch.object(
-                    _AliasMatcher,
-                    "for_aliases",
-                    wraps=matcher_builder,
-                ) as build_matcher,
-            ):
-                plan = build_font_plan(
-                    game_root=game_root,
-                    content_root=game_root,
-                    selected_font=selected_font,
-                )
-
-        self.assertEqual(build_matcher.call_count, 1)
-        runtime_alias = next(alias for alias in plan.aliases if alias.value == "RuntimeFont")
-        self.assertEqual(runtime_alias.asset, "fonts/Old.ttf")
-        stylesheet_mutation = next(
-            mutation for mutation in plan.mutations if mutation.relative_path == "style.css"
-        )
-        updated = stylesheet_mutation.replacement.decode("utf-8")
-        self.assertIn('url("fonts/Replacement.ttf")', updated)
-        self.assertEqual(updated.count("font-family:RuntimeFont"), 2)
-
-    def test_build_font_plan_skips_url_with_unsupported_tech_hint(self) -> None:
+    def test_build_font_plan_updates_fallback_sources_without_selecting_a_browser_winner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             game_root = root / "game"
@@ -541,7 +495,46 @@ class FontReferenceEncodingTests(unittest.TestCase):
             stylesheet = game_root / "style.css"
             stylesheet.write_text(
                 "@font-face{font-family:RuntimeFont;"
-                "src:url(fonts/Old.ttf);src:url(fonts/New.ttf) tech(bogus);}\n"
+                "src:url(fonts/Old.ttf);src:local(Installed),bogus(),url(fonts/New.ttf);}\n"
+                "body{font-family:RuntimeFont;}",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "att_toolbox.font_references.check_font_coverage",
+                return_value=FontCoverage("", "", 1),
+            ):
+                plan = build_font_plan(
+                    game_root=game_root,
+                    content_root=game_root,
+                    selected_font=selected_font,
+                )
+
+        stylesheet_mutation = next(
+            mutation for mutation in plan.mutations if mutation.relative_path == "style.css"
+        )
+        updated = stylesheet_mutation.replacement.decode("utf-8")
+        self.assertEqual(updated.count('url("fonts/Replacement.ttf")'), 2)
+        self.assertEqual(updated.count("font-family:RuntimeFont"), 2)
+
+    def test_build_font_plan_keeps_unverified_hints_and_updates_normal_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game_root = root / "game"
+            fonts = game_root / "fonts"
+            plugins = game_root / "js" / "plugins.js"
+            fonts.mkdir(parents=True)
+            plugins.parent.mkdir(parents=True)
+            (fonts / "Old.ttf").write_bytes(b"old-font")
+            (fonts / "New.ttf").write_bytes(b"new-font")
+            selected_font = root / "Replacement.ttf"
+            selected_font.write_bytes(b"replacement-font")
+            plugins.write_text("var $plugins = [];\n", encoding="utf-8")
+            stylesheet = game_root / "style.css"
+            stylesheet.write_text(
+                "@font-face{font-family:RuntimeFont;"
+                "src:url(fonts/Old.ttf);src:url(fonts/New.ttf) tech(bogus);"
+                'src:url(fonts/New.ttf) format("truetype\\ ");}\n'
                 "body{font-family:RuntimeFont;}",
                 encoding="utf-8",
             )
@@ -564,6 +557,11 @@ class FontReferenceEncodingTests(unittest.TestCase):
         updated = stylesheet_mutation.replacement.decode("utf-8")
         self.assertIn('url("fonts/Replacement.ttf")', updated)
         self.assertIn("url(fonts/New.ttf) tech(bogus)", updated)
+        self.assertIn('url(fonts/New.ttf) format("truetype\\ ")', updated)
+        self.assertEqual(
+            len([review for review in plan.reviews if review.reason == "unverified_css_font_source"]),
+            2,
+        )
 
     def test_alias_candidates_use_one_joint_scan_and_preserve_overlaps(self) -> None:
         aliases = {

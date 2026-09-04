@@ -9,7 +9,6 @@ from typing import cast
 from att_skill_tools import JsonValue, fail, read_json_object, validate_object_keys
 
 from .generic_mapping import (
-    generic_mapping_groups,
     validate_generic_evidence,
     validate_generic_group_placement,
 )
@@ -188,8 +187,7 @@ def coverage_projection(
             group_members.setdefault(group_id, []).append(candidate_id)
     resolved_review_candidates: list[str] = []
     rules_dispositions: dict[str, list[str]] = {}
-    generic_group_count = 0
-    seen_generic_group_ids: set[str] = set()
+    generic_placements: dict[str, tuple[str, str]] = {}
     generic_plans: list[dict[str, JsonValue]] = []
     for number, raw in enumerate(dispositions, start=1):
         if not isinstance(raw, dict):
@@ -238,10 +236,9 @@ def coverage_projection(
             validate_generic_group_placement(
                 normalized_evidence,
                 locations_by_id,
-                seen_generic_group_ids,
+                generic_placements,
                 f"{path} dispositions 第 {number} 项 evidence",
             )
-            generic_group_count += len(generic_mapping_groups(normalized_evidence))
             generic_plans.append(
                 {
                     "target": target,
@@ -265,7 +262,7 @@ def coverage_projection(
             ):
                 fail(str(path), f"dispositions 第 {number} 项排除证据无效", "重新运行 finalize")
         resolved_review_candidates.extend(typed_candidates)
-    if counts.get("generic_groups") != generic_group_count:
+    if counts.get("generic_groups") != len(generic_placements):
         fail(str(path), "coverage generic_groups 与结构化映射不一致", "重新运行 survey finalize")
     manifest_targets: set[str] = set()
     covered_by_target: dict[str, set[str]] = {target: set() for target in rules_dispositions}

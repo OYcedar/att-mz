@@ -17,8 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "skills" / "_shared"))
 
 from att_skill_tools import (
-    DirectoryPublishedError,
-    FilePublishedError,
+    OutputPublishedError,
     ToolCancelledError,
     ToolError,
     atomic_write_bytes,
@@ -121,7 +120,7 @@ class CoreBoundaryTests(unittest.TestCase):
 
             with (
                 patch.object(core.os, "link", side_effect=publish_then_interrupt),
-                self.assertRaises(FilePublishedError) as raised,
+                self.assertRaises(OutputPublishedError) as raised,
             ):
                 atomic_write_bytes(
                     target,
@@ -612,7 +611,7 @@ class CoreBoundaryTests(unittest.TestCase):
                         f"att_skill_tools.core.os.{'replace' if replace else 'rename'}",
                         side_effect=rename_then_interrupt,
                     ),
-                    self.assertRaises(DirectoryPublishedError) as raised,
+                    self.assertRaises(OutputPublishedError) as raised,
                 ):
                     atomic_write_directory(target, {"report.json": "new\n"}, replace=replace)
 
@@ -831,7 +830,7 @@ class CoreBoundaryTests(unittest.TestCase):
 
             with (
                 patch.object(core.os, "rename", side_effect=rename_then_reoccupy),
-                self.assertRaises(DirectoryPublishedError) as raised,
+                self.assertRaises(OutputPublishedError) as raised,
             ):
                 atomic_write_directory(target, {"report.json": "new\n"}, replace=False)
 
@@ -1095,7 +1094,7 @@ class CoreBoundaryTests(unittest.TestCase):
             with (
                 patch.object(core.shutil, "rmtree", side_effect=PermissionError("cleanup blocked")),
                 patch.object(core.os, "rename", side_effect=fail_cleanup_restore),
-                self.assertRaises(DirectoryPublishedError) as raised,
+                self.assertRaises(OutputPublishedError) as raised,
             ):
                 atomic_write_directory(target, {"report.json": "new\n"}, replace=True)
 
@@ -1300,7 +1299,7 @@ class CoreBoundaryTests(unittest.TestCase):
 
             with (
                 patch.object(core.shutil, "rmtree", side_effect=fail_previous_cleanup),
-                self.assertRaises(DirectoryPublishedError) as raised,
+                self.assertRaises(OutputPublishedError) as raised,
             ):
                 atomic_write_directory(target, {"report.json": "new\n"}, replace=True)
 

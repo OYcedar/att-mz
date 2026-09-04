@@ -149,15 +149,13 @@ def generic_mapping_groups(evidence: Mapping[str, JsonValue]) -> list[dict[str, 
 def validate_generic_group_placement(
     evidence: Mapping[str, JsonValue],
     locations_by_id: Mapping[str, Mapping[str, JsonValue]],
-    seen_group_ids: set[str],
+    placements: dict[str, tuple[str, str]],
     object_name: str,
 ) -> None:
-    """证明 Group ID 全局唯一，且每组只落入一个物理 Semantic Scope。"""
+    """同名 Group 汇合不同所有权决定的成员，并保持同一 kind 和来源文件。"""
 
     for group in generic_mapping_groups(evidence):
         group_id = cast(str, group["id"])
-        if group_id in seen_group_ids:
-            fail(object_name, f"Generic Group ID {group_id} 在项目中重复", "为每个语义组使用全局唯一自然 ID")
         candidate_ids = cast(list[str], group["candidate_ids"])
         physical_values = [
             locations_by_id[candidate_id].get("physical_file")
@@ -172,9 +170,14 @@ def validate_generic_group_placement(
             fail(
                 object_name,
                 f"Generic Group {group_id} 跨越多个物理输入文件或引用未知候选",
-                "按物理文件拆分 groups，同时用 kind 保留共同语境",
+                "在同一来源文件内组织语义组，并使用当前调查中的候选",
             )
-        seen_group_ids.add(group_id)
+        placement = (cast(str, physical_values[0]), cast(str, group["kind"]))
+        if group_id in placements and placements[group_id] != placement:
+            fail(
+                object_name, f"Generic Group {group_id} 的来源文件或 kind 不一致", "同名组使用相同来源和 kind"
+            )
+        placements[group_id] = placement
 
 
 def _json_lines(values: Sequence[Mapping[str, JsonValue]]) -> str:
@@ -183,9 +186,12 @@ def _json_lines(values: Sequence[Mapping[str, JsonValue]]) -> str:
 
 def generic_materials(
     plans: Sequence[Mapping[str, JsonValue]],
+    survey_locations: Sequence[Mapping[str, JsonValue]],
 ) -> tuple[dict[str, str], dict[str, JsonValue]]:
-    groups_by_source: dict[str, list[dict[str, object]]] = {}
-    seen_group_ids: set[str] = set()
+    """按确认的语义组汇合候选，按 Survey 自然顺序生成 JSONL 与写回映射。"""
+
+    groups_by_id: dict[str, dict[str, object]] = {}
+    placements: dict[str, tuple[str, str]] = {}
     decisions: list[dict[str, JsonValue]] = []
     target_by_candidate: dict[str, str] = {}
     for plan in plans:
@@ -208,31 +214,46 @@ def generic_materials(
         validate_generic_group_placement(
             cast(dict[str, JsonValue], plan["evidence"]),
             locations_by_candidate,
-            seen_group_ids,
+            placements,
             target,
         )
         raw_groups = generic_mapping_groups(cast(dict[str, JsonValue], plan["evidence"]))
         for raw_group in raw_groups:
             candidate_ids = cast(list[str], raw_group["candidate_ids"])
             source_recipes = [recipes_by_candidate[candidate_id] for candidate_id in candidate_ids]
-            physical_files = {cast(str, recipe["physical_file"]) for recipe in source_recipes}
-            if len(physical_files) != 1:
-                raise AssertionError("已验收的 Generic Group 物理范围发生分叉")
-            physical_file = physical_files.pop()
             group_id = cast(str, raw_group["id"])
-            groups_by_source.setdefault(physical_file, []).append(
+            group = groups_by_id.setdefault(
+                group_id,
                 {
                     "id": group_id,
                     "kind": cast(str, raw_group["kind"]),
-                    "recipes": source_recipes,
-                }
+                    "recipes": [],
+                },
             )
+            cast(list[dict[str, JsonValue]], group["recipes"]).extend(source_recipes)
         decisions.append(
             {
                 "target": target,
                 "candidate_ids": cast(list[JsonValue], plan["candidate_ids"]),
                 "evidence": cast(dict[str, JsonValue], plan["evidence"]),
             }
+        )
+    order = {
+        candidate_id: index
+        for index, location in enumerate(survey_locations)
+        if (candidate_id := cast(str, location["candidate_id"])) in target_by_candidate
+    }
+    groups_by_source: dict[str, list[dict[str, object]]] = {}
+    for group_id, group in groups_by_id.items():
+        group_recipes = cast(list[dict[str, JsonValue]], group["recipes"])
+        group_recipes.sort(key=lambda recipe: order[cast(str, recipe["candidate_id"])])
+        physical_file, _kind = placements[group_id]
+        groups_by_source.setdefault(physical_file, []).append(group)
+    for source_groups in groups_by_source.values():
+        source_groups.sort(
+            key=lambda group: order[
+                cast(str, cast(list[dict[str, JsonValue]], group["recipes"])[0]["candidate_id"])
+            ]
         )
     files: dict[str, str] = {}
     sources: list[dict[str, JsonValue]] = []

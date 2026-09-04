@@ -33,15 +33,8 @@ class ToolError(Exception):
 
 
 @dataclass(slots=True)
-class DirectoryPublishedError(ToolError):
-    """目录已经完整发布，但发布调用以错误或取消结束。"""
-
-    cause: BaseException
-
-
-@dataclass(slots=True)
-class FilePublishedError(ToolError):
-    """文件已经完整发布，但发布或后续清理调用以错误或取消结束。"""
+class OutputPublishedError(ToolError):
+    """输出已经完整发布，但发布或后续清理调用以错误或取消结束。"""
 
     cause: BaseException
 
@@ -142,7 +135,7 @@ def run_cli(main: Callable[[], int]) -> None:
     except ToolCancelledError as error:
         print_error(error)
         raise SystemExit(130) from None
-    except (DirectoryPublishedError, FilePublishedError) as error:
+    except OutputPublishedError as error:
         print_error(error)
         raise SystemExit(130 if isinstance(error.cause, KeyboardInterrupt) else 1) from None
     except ToolError as error:
@@ -189,8 +182,8 @@ def print_published_completion(
     message: str,
     *,
     object_name: str,
-    impact: str,
-    help_text: str,
+    impact: str | None = None,
+    help_text: str = "直接查看已发布结果并继续后续步骤，无需重新运行当前命令",
 ) -> None:
     """输出最终完成提示；输出失败时保留已经完成的业务事实。"""
 
@@ -200,7 +193,7 @@ def print_published_completion(
         details = {
             "object_name": object_name,
             "reason": f"结果已经完成，但最终完成提示输出失败：{_failure_text(error)}",
-            "impact": impact,
+            "impact": impact or f"{object_name} 已经完整发布；最终完成提示未能显示",
             "help_text": help_text,
         }
         if isinstance(error, KeyboardInterrupt):
@@ -682,7 +675,7 @@ def _raise_file_published(
     else:
         impact = f"目标 {target} 已经生效；固定临时文件已经清理"
         help_text = "保留已发布目标并继续后续流程"
-    raise FilePublishedError(
+    raise OutputPublishedError(
         object_name=str(target),
         reason="；".join(reason_parts),
         impact=impact,
@@ -1215,7 +1208,7 @@ def _raise_published_directory_error(
     cause: BaseException = (
         _cancellation_from(primary, cancellation, cleanup, previous_error, cleanup_error) or primary
     )
-    raise DirectoryPublishedError(
+    raise OutputPublishedError(
         object_name=str(target),
         reason=details,
         impact=impact,
