@@ -27,7 +27,9 @@ pub(crate) use crate::translation::placeholder::{
 const MV_EXTENDED_CONTROL_PATTERN: &str =
     r"(?:\\|\x1B)(?:(?:\\|\x1B)|[VvNnPp]\[[0-9]+\]|[CcIi](?:\[[0-9]+\]|(?![A-Za-z]))|[Gg{}])";
 const MZ_EXTENDED_CONTROL_PATTERN: &str = r"(?:\\|\x1B)(?:(?:\\|\x1B)|[VvNnPp]\[[0-9]+\]|(?:[CcIi]|[Pp][Xx]|[Pp][Yy]|[Ff][Ss])(?:\[[0-9]+\]|(?![A-Za-z]))|[Gg{}])";
-const MESSAGE_CONTROL_PATTERN: &str = r"(?:(?:\\|\x1B)[$.|!><^]|\x0C)";
+// convertEscapeCharacters 先折叠反斜杠/ESC 对；Message 扫描跳过这些已由 extended 保护的对，
+// 再识别奇数尾的控制符。SKIP/F 保留原始跨度，让公共层继续检查真实的规则重叠。
+const MESSAGE_CONTROL_PATTERN: &str = r"(?:\\|\x1B){2}(*SKIP)(*F)|(?:(?:\\|\x1B)[$.|!><^]|\x0C)";
 const FORMAT_ARGUMENT_PATTERN: &str = r"%[0-9]+";
 const EXTENDED_SEMANTIC_LABEL: &str = "RPG_MAKER_EXTENDED_CONTROL";
 const MESSAGE_SEMANTIC_LABEL: &str = "RPG_MAKER_MESSAGE_CONTROL";
@@ -820,10 +822,34 @@ mod tests {
             TextUnitRole::DialogueBody,
             "",
         );
-        assert_eq!(
-            protected_originals(&service, RpgMakerEngine::Mv, &dialogue, "\\C[2]\\!\u{000C}"),
-            [r"\C[2]", r"\!", "\u{000C}"]
-        );
+        for engine in [RpgMakerEngine::Mv, RpgMakerEngine::Mz] {
+            for (original, expected) in [
+                ("\\C[2]\\!\u{000C}", vec![r"\C[2]", r"\!", "\u{000C}"]),
+                (
+                    r"\. \| \! \$ \> \< \^",
+                    vec![r"\.", r"\|", r"\!", r"\$", r"\>", r"\<", r"\^"],
+                ),
+                (r"\\. \\| \\!", vec![r"\\", r"\\", r"\\"]),
+                (r"\\\.", vec![r"\\", r"\."]),
+                (r"\\\\.", vec![r"\\", r"\\"]),
+                ("\u{001B}\u{001B}.", vec!["\u{001B}\u{001B}"]),
+                (
+                    "\u{001B}\u{001B}\u{001B}.",
+                    vec!["\u{001B}\u{001B}", "\u{001B}."],
+                ),
+                (
+                    "\u{001B}\u{001B}\u{001B}\u{001B}.",
+                    vec!["\u{001B}\u{001B}", "\u{001B}\u{001B}"],
+                ),
+                ("\\\u{001B}\\!", vec!["\\\u{001B}", r"\!"]),
+            ] {
+                assert_eq!(
+                    protected_originals(&service, engine, &dialogue, original),
+                    expected,
+                    "{engine:?}：{original:?}"
+                );
+            }
+        }
 
         let description = identity(
             RpgMakerAssetOwner::Builtin,
