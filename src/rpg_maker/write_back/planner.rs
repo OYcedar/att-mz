@@ -180,7 +180,7 @@ impl RpgMakerWriteBackUnit {
 
 fn repair_unit_punctuation_with_cancellation(
     unit: &mut RpgMakerWriteBackUnit,
-    owner: RpgMakerAssetOwner,
+    profile: RpgMakerBuiltinPlaceholderProfile,
     kind: TextGroupKind,
     group_location: &RpgMakerLocation,
     context: &RpgMakerWriteBackCandidateValidationContext,
@@ -193,13 +193,6 @@ fn repair_unit_punctuation_with_cancellation(
         return Ok(OperationCompletion::Completed(()));
     }
     let target_id = crate::manual::readable_rpg_maker_id(group_location, kind, &unit.role);
-    let profile = RpgMakerBuiltinPlaceholderProfile::for_location(
-        context.engine,
-        owner,
-        kind,
-        group_location,
-        &unit.role,
-    );
     let translation = unit
         .translation_content
         .as_ref()
@@ -462,7 +455,7 @@ fn layout_restore_planning_failure(
 
 fn layout_unit_with_cancellation(
     unit: &mut RpgMakerWriteBackUnit,
-    owner: RpgMakerAssetOwner,
+    profile: RpgMakerBuiltinPlaceholderProfile,
     kind: TextGroupKind,
     group_location: &RpgMakerLocation,
     context: &RpgMakerWriteBackCandidateValidationContext,
@@ -479,13 +472,6 @@ fn layout_unit_with_cancellation(
         return Ok(OperationCompletion::Completed(()));
     }
     let target_id = crate::manual::readable_rpg_maker_id(group_location, kind, &unit.role);
-    let profile = RpgMakerBuiltinPlaceholderProfile::for_location(
-        context.engine,
-        owner,
-        kind,
-        group_location,
-        &unit.role,
-    );
     let is_value = matches!(translation, TextUnitContent::Value(_));
     let joined;
     let source_joined;
@@ -532,7 +518,7 @@ fn layout_unit_with_cancellation(
 
 fn validate_unit_translation_with_cancellation(
     unit: &RpgMakerWriteBackUnit,
-    owner: RpgMakerAssetOwner,
+    profile: RpgMakerBuiltinPlaceholderProfile,
     kind: TextGroupKind,
     group_location: &RpgMakerLocation,
     context: &RpgMakerWriteBackCandidateValidationContext,
@@ -545,13 +531,6 @@ fn validate_unit_translation_with_cancellation(
         return Ok(OperationCompletion::Completed(()));
     };
     let target_id = crate::manual::readable_rpg_maker_id(group_location, kind, &unit.role);
-    let profile = RpgMakerBuiltinPlaceholderProfile::for_location(
-        context.engine,
-        owner,
-        kind,
-        group_location,
-        &unit.role,
-    );
     match (&unit.source_content, translation) {
         (TextUnitContent::Value(source), TextUnitContent::Value(translation)) => {
             if matches!(
@@ -2761,9 +2740,17 @@ fn plan_rpg_maker_write_back_group(
         if let Some(candidate_validation) = candidate_validation {
             if repair_punctuation {
                 for unit in &mut units {
+                    let profile = RpgMakerBuiltinPlaceholderProfile::for_recipes(
+                        candidate_validation.engine,
+                        owner,
+                        kind,
+                        &group_location,
+                        &unit.role,
+                        &recipes,
+                    );
                     let repaired = repair_unit_punctuation_with_cancellation(
                         unit,
-                        owner,
+                        profile,
                         kind,
                         &group_location,
                         candidate_validation,
@@ -2786,9 +2773,17 @@ fn plan_rpg_maker_write_back_group(
                 }
             }
             for unit in &mut units {
+                let profile = RpgMakerBuiltinPlaceholderProfile::for_recipes(
+                    candidate_validation.engine,
+                    owner,
+                    kind,
+                    &group_location,
+                    &unit.role,
+                    &recipes,
+                );
                 let laid_out = layout_unit_with_cancellation(
                     unit,
-                    owner,
+                    profile,
                     kind,
                     &group_location,
                     candidate_validation,
@@ -2820,9 +2815,17 @@ fn plan_rpg_maker_write_back_group(
                 {
                     continue;
                 }
+                let profile = RpgMakerBuiltinPlaceholderProfile::for_recipes(
+                    candidate_validation.engine,
+                    owner,
+                    kind,
+                    &group_location,
+                    &unit.role,
+                    &recipes,
+                );
                 let validated = validate_unit_translation_with_cancellation(
                     unit,
-                    owner,
+                    profile,
                     kind,
                     &group_location,
                     candidate_validation,

@@ -1,6 +1,6 @@
 # ATT 游戏翻译项目指南
 
-这份指南组织一条完整交付主线：
+按以下主线完成翻译，并从最早受影响的阶段继续返修：
 
 `调查 → Extract → 术语 → Translate → QA → WriteBack → 字体/封包`
 
@@ -79,8 +79,9 @@ MV/MZ 来源按 [Extract](../rpg-maker/extraction.md)和 [Rules](../rpg-maker/ru
 按 [MV/MZ Init](../rpg-maker/init.md)或 [Generic Init](../generic/init.md)建立项目，再用本轮确定的
 Builtin、Rules 或 JSONL 执行 Extract。完成后：
 
-1. 导出 ownership，核对已纳入位置的唯一所有者；
-2. 处理 Rules 和 Extract 给出的具体位置问题；
+1. MV/MZ 导出 ownership，核对已纳入位置的唯一所有者；使用 Survey 时同步运行 audit。独立
+   Generic 核对外部来源到 JSONL 的逐项映射；
+2. 处理 Extract 给出的具体位置问题；MV/MZ 同时处理 Rules 诊断；
 3. 导出 `--selection all` 的完整 Manual；
 4. 把完整 Manual 固定为本轮术语与翻译语料。
 
@@ -100,9 +101,10 @@ Builtin、Rules 或 JSONL 执行 Extract。完成后：
 [Generic Translate](../generic/translation.md)运行当前项目。Translate 使用当前配置、术语、
 Placeholder 和项目语境生成并保存译文。
 
-命令结束后确认实际业务结果并导出当前译文。Partial、Unavailable 或中断任务按
-[诊断与恢复指南](diagnosis-and-recovery.md)沿当前状态继续；少量剩余和语境问题使用
-[Manual TOML](../manual/README.md)集中完成。
+命令结束后查看 NoWork、Complete 或 Incomplete 的汇总，并导出当前译文。Incomplete 中的
+Partial、Unavailable 和未开始 Task，以及失败或取消的运行，按
+[诊断与恢复指南](diagnosis-and-recovery.md#64-translate)处理。当前 Rejected 需要显式重试或
+人工修订；少量剩余和语境问题使用 [Manual TOML](../manual/README.md)集中完成。
 
 ## 7. QA
 
@@ -114,7 +116,9 @@ Placeholder 和项目语境生成并保存译文。
 - 源语言残留、异常转义和模型说明；
 - Generic 外部映射与组合项目的唯一所有权。
 
-使用 `translation_qa.py` 聚合 Review 组，Agent 审核后用 Manual 集中修订，并重新导出和复查。
+Agent 负责完整译文的语义审校。`translation_qa.py` 提供覆盖、结构、控制符、字面术语和残留等
+静态检查，将发现聚合为 Review 组。独立 Generic 通过 `--generic-input` 提供同源 JSONL；
+RPG Maker 使用对应的调查与所有权证据。审核发现后用 Manual 集中修订，再重新导出和复查。
 
 ## 8. WriteBack
 
@@ -127,8 +131,9 @@ RPG Maker 输出部署到隔离副本；Generic 输出经过本任务确定的�
 
 ## 9. 字体、封包与人工实机验证
 
-按[字体工具指南](nwjs-font-tools.md#2-递归字体调查替换与恢复)检查实际字体引用，在隔离副本中应用中文字体并验证
-完整译文字符集。把 WriteBack、外部转换、字体和原有资源组合为独立交付目录。
+RPG Maker 游戏按[字体工具指南](nwjs-font-tools.md#2-递归字体调查替换与恢复)检查实际字体引用，
+在隔离副本中应用中文字体并验证完整译文字符集。其他引擎按其实际字体加载方式处理。
+把 WriteBack、外部转换、字体和原有资源组合为独立交付目录。
 
 静态检查完成后，把标题、菜单、主要对话、插件界面、换行、裁切、字体回退和存档列入实机检查
 清单。任务发起者指定的人工运行译本并反馈具体场景；返修从最早受影响阶段继续，随后重新 QA、

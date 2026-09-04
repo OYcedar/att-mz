@@ -1493,7 +1493,8 @@ fn is_japanese_kana_letter(character: char) -> bool {
             | 0x30A1..=0x30FA
             | 0x30FF
             | 0x31F0..=0x31FF
-            | 0xFF66..=0xFF9D
+            | 0xFF66..=0xFF6F
+            | 0xFF71..=0xFF9D
     )
 }
 
@@ -2056,9 +2057,14 @@ mod tests {
                 .needs_translation()
         );
         let analysis = module.analyze_source(&LanguageText::natural("勇者"));
+        assert!(
+            !module
+                .analyze_source(&LanguageText::natural("ｰ"))
+                .needs_translation()
+        );
         assert_eq!(
             module
-                .find_source_residual(&analysis, &LanguageText::natural("・・ーー"))
+                .find_source_residual(&analysis, &LanguageText::natural("・・ーーｰ"))
                 .expect("分析类型一致"),
             None
         );
@@ -2069,6 +2075,14 @@ mod tests {
                 .expect("长音符不计数但应留在真实假名片段中")
                 .fragment(),
             "ゲーム"
+        );
+        assert_eq!(
+            module
+                .find_source_residual(&analysis, &LanguageText::natural("ｹﾞｰﾑ"))
+                .expect("分析类型一致")
+                .expect("半角长音符应留在真实假名片段中")
+                .fragment(),
+            "ｹﾞｰﾑ"
         );
     }
 

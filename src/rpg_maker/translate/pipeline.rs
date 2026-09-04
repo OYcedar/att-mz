@@ -150,6 +150,7 @@ struct TranslationUnitIdentityInner {
     logical_location: LogicalTextLocation,
     source_content: TextUnitContent,
     source_context_json: String,
+    physical_control_target: Option<(RpgMakerLocation, Option<i64>)>,
 }
 
 impl TranslationUnitIdentity {
@@ -167,7 +168,22 @@ impl TranslationUnitIdentity {
             logical_location: LogicalTextLocation::new(group_location, role),
             source_content,
             source_context_json: source_context_json.into(),
+            physical_control_target: None,
         }))
+    }
+
+    pub(crate) fn with_physical_control_target(
+        mut self,
+        target: Option<(RpgMakerLocation, Option<i64>)>,
+    ) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("物理消费者事实应在身份共享前建立")
+            .physical_control_target = target;
+        self
+    }
+
+    pub(crate) fn physical_control_target(&self) -> Option<&(RpgMakerLocation, Option<i64>)> {
+        self.0.physical_control_target.as_ref()
     }
 
     pub(crate) fn owner(&self) -> RpgMakerAssetOwner {

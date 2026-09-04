@@ -1,84 +1,36 @@
 # Formic
 
-Formic 是面向大量独立语义任务的 Rust CLI。调用方提供输入目录、JSONL 分片计划和共同任务说明；Formic 为每个单元运行一个独立的多轮 `LLM ↔ 工具` worker，并负责并发、限流、缓存、取消、上下文压缩、续跑、原子发布和运行档案。
+Formic 按计划批量执行需要模型判断和工具查证的独立任务。调用方提供输入目录、JSONL 分片计划和共同任务说明；每个单元由一个 worker 完成多轮 `LLM ↔ 工具` 会话并独立发布结果。
 
-它适合“同一套判断规则执行很多次”的工作，例如逐文件抽取、逐对象核验、结构化元数据补全、分类审阅和证据查证。
+它适合逐文件抽取、逐对象核验、分类审阅和元数据补全。需要全局视图的去重、统一命名、排名与汇总，由调用方在结果齐备后完成。分片和任务说明的写法见[任务设计](docs/task-design.md)。
 
-## 什么时候适合使用
+## 1. 使用随包程序
 
-一个 Formic 作业应满足：
+本目录已包含 Windows x64 的 `formic.exe`。以下 PowerShell 命令均在本目录执行：
 
-- 每个单元有明确且有限的主动处理范围；
-- 单元能够独立完成、独立重试和独立验收；
-- 调整并发或完成顺序不会改变结果含义；
-- worker 只需要共同任务、当前分片、只读证据和被允许的工具；
-- 部分单元失败时，其他已发布结果仍然有用。
-
-全局去重、统一命名、总排名、唯一编号分配和跨单元最终汇总，应由调用方在结果齐备后统一完成。详细判断方法见[任务设计](docs/task-design.md)。
-
-## 主要能力
-
-- 每个计划单元一个独立微型 agent，多轮调用模型与工具；
-- Chat Completions、Responses、Anthropic Messages 三种协议；
-- 文本与 JPEG、PNG、GIF、WebP 图片输入；
-- 内置 `search`、`read`、`read_image`，以及任意 stdio 或 Streamable HTTP MCP；
-- 显式 worker 输出权限：完全隔离或只读已发布结果；
-- 文本结果或受 JSON Schema 校验的结构化结果；
-- 供应商专有请求 JSON 透传；
-- 工具缓存、共享请求门控、上下文预算与历史压缩；
-- 中断后按不可变作业身份续跑，已发布结果不覆盖；
-- 每个 worker 的模型输入、工具往返、状态与失败原因可审计。
-
-Formic 不限制计划单元总量、对话总回合数或普通工具调用总数。配置中的并发值只限制当前活动工作。
-
-## 快速开始
-
-### 1. 构建
-
-需要 Rust 1.88 或更高版本：
-
-```bash
-cargo build --release
+```powershell
+.\formic.exe --help
 ```
 
-### 2. 配置模型
+需要从其他目录调用时，使用 `formic.exe` 的完整路径，并显式传入 `--config`。本包提供程序与用户资料；源码位置、提交和构建说明见[来源记录](FORMIC-SOURCE.md)。
 
-复制 `config.example.toml` 为自己的 `config.toml`，填写服务地址、密钥、模型和真实上下文大小：
+## 2. 配置模型
 
-```toml
-protocol = "completions"
-url = "https://api.example.com/v1"
-api_key = ""
-model = "model-name"
-context_window_tokens = 131072
+编辑本目录已有的 `config.toml`，填写模型服务地址、密钥、模型名和上下文大小。若该文件缺失，先复制 `config.example.toml` 创建；已有配置保留原值，按需修改。
 
-model_input_modalities = ["text"]
-metrics = false
+Formic 支持 Chat Completions、Responses 和 Anthropic Messages 三种协议。模型支持图片时，可声明 `["text", "image"]`，接收 JPEG、PNG、GIF 和 WebP。协议要求、输入模态、超时、重试和 MCP 配置见[详细使用说明](docs/usage.md#2-最小配置)。
+
+配置完成后执行连接自检。它会发送一次最小 LLM 请求，并依次初始化已启用的 MCP server、发现工具目录，在终端报告结果：
+
+```powershell
+.\formic.exe test --config .\config.toml
 ```
 
-可选值为 `completions`、`responses`、`anthropic`。只有确认模型支持图片时，才把输入模态改为：
+自检只输出终端报告，不创建作业目录和 worker 档案。真实密钥只保存在自己的活动配置中，勿提交或公开分享。
 
-```toml
-model_input_modalities = ["text", "image"]
-```
+## 3. 准备作业
 
-供应商专有参数可以原样加入每次请求：
-
-```toml
-extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
-```
-
-Formic 只从这个 TOML 读取部署与服务配置，不接受环境变量覆盖。不要把真实密钥提交到 Git。
-
-配置完成后，可以先验证实际连接：
-
-```bash
-formic test --config config.toml
-```
-
-`test` 首先验证配置，然后发送一次最小 LLM 请求，再按名称逐个初始化已启用的 MCP server 并发现完整工具目录。这条路径在终端输出每项结果及汇总，并在工具发现后结束；作业目录和运行档案保持原状。
-
-### 3. 准备作业
+在自己的任务目录中准备以下文件，运行命令中的 `job` 替换为实际路径：
 
 ```text
 job/
@@ -89,113 +41,51 @@ job/
 └─ task.md
 ```
 
-`plan.jsonl` 一行一个单元：
+`plan.jsonl` 每行定义一个单元；`files` 使用相对于 `data/` 的路径：
 
 ```jsonl
 {"unit":1,"files":["item-001.txt"]}
 {"unit":2,"files":["item-002.txt"]}
 ```
 
-`task.md` 说明每个 worker 的单元目标、范围、证据规则、未知情况、输出含义和完成条件。例如：
+`task.md` 写清当前单元的目标、证据规则、未知情况、输出含义和完成条件，例如：
 
 ```markdown
 只处理“你的分片”中的对象，抽取名称、日期和直接证据。
-证据不足时明确写 unknown，不要猜测。
-当前对象所有字段都有值或未知状态后立即提交。
+证据不足时写 unknown，并说明缺少哪项证据。
+当前对象的所有字段都有值或明确未知状态后提交结果。
 ```
 
-### 4. 运行
+## 4. 运行与续跑
 
-```bash
-formic run \
-  --data job/data \
-  --plan job/plan.jsonl \
-  --task job/task.md \
-  --out job/out \
-  --worker-output-access none \
-  --config config.toml
+```powershell
+.\formic.exe run --data job/data --plan job/plan.jsonl --task job/task.md --out job/out --worker-output-access none --config .\config.toml
 ```
 
-`--worker-output-access` 首次运行和续跑都必填：
+每个单元独立发布到 `job/out/results/`；运行档案位于 `job/out/runs/run-N/workers/`。并发窗口控制同时活动的工作，计划单元总量、普通工具调用总数和对话回合总数没有额外上限。
 
-- `none`：worker 只能读取冻结 input，彼此隔离；
-- `published`：还可读取当时已经发布的数字编号结果。
+首次运行和续跑都必须传 `--worker-output-access`。独立任务通常使用 `none`，worker 可读取冻结的 input；`published` 额外允许辅助查阅已经发布的单元结果。结果出现的顺序取决于完成时间，因此单元正确性必须独立于其他 worker 的结果。
 
-独立任务优先使用 `none`。`published` 不能用于等待、认领、去重或推断全局完成状态，因为可见结果受并发完成顺序影响。
+作业中断或部分失败后，保留相同输入、输出目录和权限，在原命令末尾增加 `--resume`：
 
-### 5. 可选结构化输出
-
-```bash
-formic run \
-  --data job/data \
-  --plan job/plan.jsonl \
-  --task job/task.md \
-  --out job/out \
-  --worker-output-access none \
-  --config config.toml \
-  --output-schema result.schema.json
+```powershell
+.\formic.exe run --data job/data --plan job/plan.jsonl --task job/task.md --out job/out --worker-output-access none --config .\config.toml --resume
 ```
 
-Formic 会让模型通过内部提交工具交付 object，并在本地通过 schema 校验后发布 JSON。校验失败时，模型会一次收到本次提交的全部格式问题并修正；最终结果要么符合 schema，要么本单元失败且不发布 JSON。结构化模式支持 nullable、固定值以及常用的字符串、数组和数值范围约束，具体子集和可复制示例见[结构化输出](docs/usage.md#9-结构化输出)。
+Formic 核对作业身份和已发布结果，只继续失败、停止和未开始单元。需要改变数据、计划、任务、schema、权限或模型输入模态时，使用新的输出目录。MCP 初始化失败后也应保留已经建立的作业状态，修复连接后按[启动排错](docs/observability.md#71-作业启动失败)续跑。
 
-### 6. 续跑
+## 5. 结构化结果与验收
 
-中断或部分失败后，使用完全相同的作业输入和权限增加 `--resume`：
+默认结果为 Markdown；需要 JSON 时，在运行命令中增加 `--output-schema result.schema.json`。只有通过本地 schema 校验的 object 才会发布。无效提交次数达到 `execution.llm_attempts` 时，当前 worker 失败；计数包含首次无效提交。schema 子集和完整示例见[结构化输出](docs/usage.md#9-结构化输出)。
 
-```bash
-formic run \
-  --data job/data \
-  --plan job/plan.jsonl \
-  --task job/task.md \
-  --out job/out \
-  --worker-output-access none \
-  --config config.toml \
-  --resume
-```
+退出码 `0` 表示作业完整或自检全部通过，`1` 表示作业未完成或自检失败，`2` 表示启动失败，`3` 表示收到终止信号。完整状态与恢复方法见[可观测性与排错](docs/observability.md)。
 
-续跑只处理 failed、stopped 和未开始单元。plan、task、schema、完整 input、输出权限或模型输入模态变化时，会在任何 MCP/LLM 请求前拒绝续跑。
-
-## 图片和工具
-
-声明 `image` 后，`files` 分片可以混合文字和支持图片，worker 也会获得只读取冻结 input 的 `read_image`。行区间只支持 UTF-8 文本。
-
-图片保持原始字节，不下载 URL，不自动缩放、转码或截断。实际请求中的 data URL/base64 不进入日志和公开档案。MCP 返回的图片会原样保存到当前 run 的 `media/`。
-
-内置文字工具可以检索完整 input；启用 `published` 后才可读取已发布结果。远端搜索、浏览器或其他能力由操作者通过 MCP 配置，Formic 不硬编码具体产品。
-
-## 输出
-
-```text
-out/
-├─ results/
-│  ├─ 1.md 或 1.json
-│  └─ output-schema.json           # 仅结构化模式
-└─ runs/
-   └─ run-000001/
-      ├─ workers/1.md              # 完整 worker 运行档案
-      ├─ media/1/1.png             # 仅 MCP 图片
-      ├─ stats.jsonl
-      └─ summary.json
-```
-
-每次运行创建新的 `run-N`。结果先写临时文件，再原子发布；已存在的完成记录不会覆盖。
-
-退出码：
-
-| 代码 | 含义 |
-| --- | --- |
-| `0` | 作业完整，或自检全部通过 |
-| `1` | 作业存在未完成单元，或自检项失败 |
-| `2` | 启动配置、输入或续跑现场无效 |
-| `3` | 收到终止信号 |
-
-## 文档
+## 文档与许可
 
 - [文档索引](docs/README.md)
 - [详细使用说明](docs/usage.md)
-- [任务设计与提示词](docs/task-design.md)
-- [可观测性与排错](docs/observability.md)
+- [任务设计](docs/task-design.md)
+- [运行档案与排错](docs/observability.md)
+- [程序和源码来源](FORMIC-SOURCE.md)
 
-## 开源协议
-
-[GNU Affero General Public License v3.0](LICENSE)。Copyright (C) 2026 yexi。
+Formic 使用 [GNU Affero General Public License v3.0](LICENSE)。Copyright (C) 2026 yexi。

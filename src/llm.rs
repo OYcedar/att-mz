@@ -445,31 +445,6 @@ impl ApiKeyRedactor {
         self.redact_json_string_tokens(value, false)
     }
 
-    /// 替换 RPG Maker User message 中 API key 的原文和 Markdown 转义表示。
-    ///
-    /// RPG Maker Prompt 会在每个 ASCII 标点前插入反斜杠。任务记录接收的是已经渲染
-    /// 的消息，因此必须同时识别原文和该确定性表示，且不能把普通反斜杠当作通用转义
-    /// 再解释。
-    pub(crate) fn redact_text_with_markdown_ascii_punctuation_escaped(
-        &self,
-        value: &str,
-    ) -> String {
-        let api_key = self.api_key.expose_secret();
-        if api_key.is_empty() {
-            return value.to_owned();
-        }
-        let mut escaped_api_key = String::with_capacity(api_key.len().saturating_mul(2));
-        for character in api_key.chars() {
-            if character.is_ascii_punctuation() {
-                escaped_api_key.push('\\');
-            }
-            escaped_api_key.push(character);
-        }
-        let mut replacements = Self::literal_source_ranges(value, api_key);
-        replacements.extend(Self::literal_source_ranges(value, &escaped_api_key));
-        Self::replace_source_ranges(value, Self::merge_source_ranges(replacements))
-    }
-
     /// 替换整个 endpoint 中出现的 API key 实际值，逐字保留其余内容。
     ///
     /// 全串字面匹配覆盖跨 URL 分隔符的实际值；同时按 URL component 解码后匹配
@@ -1436,37 +1411,6 @@ mod tests {
         assert_eq!(
             redactor.redact_text_with_json_strings(raw),
             format!("prefix {} trailing {{", ApiKeyRedactor::REPLACEMENT)
-        );
-    }
-
-    #[test]
-    fn markdown_ascii_punctuation_redaction_covers_raw_and_rendered_keys() {
-        const API_KEY: &str = "quote\"slash\\[value]?";
-        let redactor = ApiKeyRedactor::new(SecretString::from(API_KEY));
-        let escaped = API_KEY
-            .chars()
-            .fold(String::new(), |mut output, character| {
-                if character.is_ascii_punctuation() {
-                    output.push('\\');
-                }
-                output.push(character);
-                output
-            });
-        let raw = format!(
-            "raw={API_KEY}; rendered={escaped}; marker={}",
-            ApiKeyRedactor::REPLACEMENT
-        );
-        let expected = format!(
-            "raw={0}; rendered={0}; marker={0}",
-            ApiKeyRedactor::REPLACEMENT
-        );
-
-        let redacted = redactor.redact_text_with_markdown_ascii_punctuation_escaped(&raw);
-        assert_eq!(redacted, expected);
-        assert_eq!(
-            redactor.redact_text_with_markdown_ascii_punctuation_escaped(&redacted),
-            expected,
-            "重复替换不得改写替换标记"
         );
     }
 

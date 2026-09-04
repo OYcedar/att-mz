@@ -3,9 +3,9 @@
 MV、MZ 和 Generic 各自拥有项目状态与流程，同时复用语义相同的翻译能力。资源仍由每个
 项目分别保存；公共配置中的 Profile 定义可以复用，但每个项目独立记录实际选择。
 
-完整游戏翻译按“调查 → Extract → 术语 → Translate → QA → WriteBack → 字体/封包”推进，
-执行入口是[使用 ATT 完成游戏翻译](../../skills/translate-with-att/SKILL.md)。本页用于进入术语、
-Placeholder、任务规划、模型协议、Manual 和 WriteBack 排版等公共能力。
+完整游戏翻译从调查与提取开始，随后制作术语、翻译并审校，最后生成写回输出并验证实际
+加载。执行流程见[使用 ATT 完成游戏翻译](../../skills/translate-with-att/SKILL.md)；本页按问题
+引导到各项公共能力的权威规格。
 
 按当前问题读取：
 

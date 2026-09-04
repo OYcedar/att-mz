@@ -269,6 +269,7 @@ pub(super) struct MatchedRuleTarget {
     source_order: usize,
     physical_order: Vec<usize>,
     plugin_parameter_order: Option<usize>,
+    event_command_code: Option<i64>,
 }
 
 impl MatchedRuleTarget {
@@ -341,7 +342,11 @@ impl MatchedRuleTarget {
             })
             .collect::<Result<Vec<_>, RulesMatchError>>()?;
         DirectTextRecipe::new(self.physical_location()?, self.expected_text.clone(), parts)
-            .map(TextProjectionRecipe::Direct)
+            .map(|recipe| {
+                TextProjectionRecipe::Direct(
+                    recipe.with_event_command_code(self.event_command_code),
+                )
+            })
             .map_err(|source| RulesMatchError::InvalidMaterialization {
                 rule_number: self.rule_number,
                 reason: RulesMaterializationReason::Projection {
@@ -792,12 +797,17 @@ fn match_file_rules_on_source(
                     .map(|local| {
                         local
                             .into_iter()
-                            .map(|terminal| MatchedRuleTarget {
-                                kind,
-                                source: source.clone(),
-                                source_order,
-                                physical_order: terminal.physical_order,
-                                ..terminal.target
+                            .map(|terminal| {
+                                let mut target = MatchedRuleTarget {
+                                    kind,
+                                    source: source.clone(),
+                                    source_order,
+                                    physical_order: terminal.physical_order,
+                                    ..terminal.target
+                                };
+                                target.event_command_code =
+                                    source_event_command_code(&target, root);
+                                target
                             })
                             .collect()
                     }),
@@ -1365,6 +1375,9 @@ fn match_file_rule_on_source_reference(
         },
         &mut targets,
     )?;
+    for target in &mut targets {
+        target.event_command_code = source_event_command_code(target, root);
+    }
     Ok(targets)
 }
 
@@ -1649,7 +1662,33 @@ fn match_command_rule_at(
             ..terminal.target
         }));
     }
+    let RuleSource::Command { code, .. } = rule.source() else {
+        unreachable!("事件匹配必须使用 command 规则");
+    };
+    for target in &mut targets {
+        if target
+            .physical_location()?
+            .standard_event_parameter()
+            .is_some()
+        {
+            target.event_command_code = Some(*code);
+        }
+    }
     Ok(CommandRuleMatchOutcome::Matched(targets))
+}
+
+fn source_event_command_code(target: &MatchedRuleTarget, root: &Value) -> Option<i64> {
+    let location = target.physical_location().ok()?;
+    let (command_steps, _, _) = location.standard_event_parameter()?;
+    let mut command = root;
+    for step in command_steps {
+        command = match step {
+            RpgMakerLocationStep::ObjectKey(key) => command.get(key)?,
+            RpgMakerLocationStep::ArrayIndex(index) => command.get(*index)?,
+            RpgMakerLocationStep::DecodeJsonString => return None,
+        };
+    }
+    command.get("code")?.as_i64()
 }
 
 struct RulePathTarget {
@@ -2112,6 +2151,7 @@ fn materialize_target(
         source_order: 0,
         physical_order: Vec::new(),
         plugin_parameter_order: None,
+        event_command_code: None,
     }))
 }
 

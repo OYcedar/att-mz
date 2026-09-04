@@ -22,14 +22,14 @@ mod runtime_issue;
 mod safe_value;
 
 pub(crate) use generic_issue::{
-    GenericDiagnosticStage, GenericIssue, GenericJsonErrorCategory, GenericJsonlLocation,
-    GenericLanguageProjectionProblem, GenericLanguageViolation, GenericPlaceholderMultisetProblem,
-    GenericProblem, GenericProjectDatabaseProblem, GenericProjectTranslationProblem,
-    GenericResourceKind, GenericResponseDestinationProblem, GenericResponseReviewFinding,
-    GenericResponseTextProblem, GenericResponseValueProblem, GenericTaskResponseJsonCategory,
-    GenericTaskResponseProblem, GenericTaskUnavailableReason, GenericTextViolation,
-    GenericTranslationPreparationProblem, GenericWriteBackSnapshotProblem,
-    GenericWriteBackTextSide, GenericWriteBackUnitProblem,
+    GenericDiagnosticStage, GenericIssue, GenericJsonErrorCategory, GenericJsonlFieldProblem,
+    GenericJsonlLocation, GenericJsonlValueKind, GenericLanguageProjectionProblem,
+    GenericLanguageViolation, GenericPlaceholderMultisetProblem, GenericProblem,
+    GenericProjectDatabaseProblem, GenericProjectTranslationProblem, GenericResourceKind,
+    GenericResponseDestinationProblem, GenericResponseReviewFinding, GenericResponseTextProblem,
+    GenericResponseValueProblem, GenericTaskResponseJsonCategory, GenericTaskResponseProblem,
+    GenericTaskUnavailableReason, GenericTextViolation, GenericTranslationPreparationProblem,
+    GenericWriteBackSnapshotProblem, GenericWriteBackTextSide, GenericWriteBackUnitProblem,
 };
 pub(crate) use issue::{
     ConfigurationIssue, DiagnosticIssue, GenericUnitLocator, IoFailure, Pcre2Failure,

@@ -35,6 +35,10 @@ use crate::runtime::sqlite::{
     apply_att_sqlite_cancellable_read_write_policy, apply_att_sqlite_new_database_page_policy,
     begin_cancellable_transaction, execute_transaction_control, suspend_att_sqlite_cancellation,
 };
+use crate::runtime::windows::{
+    FileIdentity, WindowsFsError, create_new_pinned_database_file, delete_regular_file_if_identity,
+    pin_directory_without_reparse, pin_path_without_reparse, rename_without_replace_if_identity,
+};
 use crate::translation::TranslationOrigin;
 use crate::translation::candidate_validation::ProvenInvariantViolation;
 use crate::translation::layout_rules::{LayoutRuleSet, LayoutRulesError};
@@ -895,23 +899,38 @@ impl GenericProjectStore {
             "首次 Init 的发布目标旁存在不属于当前项目的 SQLite sidecar",
             &self.cancellation,
         )?;
-        let candidate_path = self
-            .workspace_root
+        let parent = pin_directory_without_reparse(&self.workspace_root).map_err(|source| {
+            initial_database_file_system_error(FileSystemOperation::Open, source)
+        })?;
+        let candidate_path = parent
+            .resolved_path()
             .join(format!(".{DATABASE_FILE_NAME}.init.tmp"));
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate_path)
-            .map_err(|source| GenericProjectError::Io {
-                operation: FileSystemOperation::Create,
-                path: candidate_path.clone(),
-                source,
-            })?;
+        ensure_initial_database_path_has_no_sidecars(
+            &candidate_path,
+            FileSystemOperation::Metadata,
+            "首次 Init 的候选路径旁存在需要保留的 SQLite sidecar",
+            &self.cancellation,
+        )?;
+        let file = create_new_pinned_database_file(&candidate_path).map_err(|source| {
+            initial_database_file_system_error(FileSystemOperation::Create, source)
+        })?;
+        let identity = FileIdentity::of(&file, &candidate_path).map_err(|source| {
+            GenericProjectError::InitialDatabaseOutcomeUnknown(Box::new(
+                initial_database_file_system_error(FileSystemOperation::Metadata, source),
+            ))
+        })?;
+        let mut cleanup_targets = vec![(candidate_path.clone(), identity)];
 
         let build_result = (|| {
-            let mut connection =
-                open_sqlite_connection(&candidate_path, true, self.cancellation.clone())?;
-            create_initial_schema(
+            let opened = open_sqlite_connection(&candidate_path, true, self.cancellation.clone());
+            let mut connection = match opened {
+                Ok(connection) => connection,
+                Err(source) => {
+                    observe_initial_database_sidecars(&candidate_path, &mut cleanup_targets)?;
+                    return Err(source);
+                }
+            };
+            let initialized = create_initial_schema(
                 &mut connection,
                 project_name,
                 source_root,
@@ -919,19 +938,24 @@ impl GenericProjectStore {
                 target_language,
                 &self.cancellation,
                 self.performance.as_ref(),
-            )?;
-            validate_schema_with_cancellation(&connection, &self.cancellation)?;
+            )
+            .and_then(|()| validate_schema_with_cancellation(&connection, &self.cancellation));
+            // 连接仍持有本次 SQLite sidecar 时记录身份；失败清理不会按名称接管后来出现的文件。
+            observe_initial_database_sidecars(&candidate_path, &mut cleanup_targets)?;
+            initialized?;
             publish_initial_database_candidate(
                 connection,
+                file,
+                identity,
                 &candidate_path,
                 &self.database_path,
                 &self.cancellation,
             )
         })();
-
         match build_result {
             Ok(()) => Ok(()),
-            Err(original) => match cleanup_initial_database_candidate(&candidate_path) {
+            Err(original @ GenericProjectError::InitialDatabaseOutcomeUnknown(_)) => Err(original),
+            Err(original) => match cleanup_initial_database_candidate(&cleanup_targets) {
                 Ok(()) => Err(original),
                 Err(cleanup) => Err(GenericProjectError::InitialCandidateCleanup {
                     original: Box::new(original),
@@ -2284,6 +2308,11 @@ pub(crate) enum GenericProjectError {
         path: PathBuf,
         source: io::Error,
     },
+    InitialDatabaseFileSystem {
+        operation: FileSystemOperation,
+        source: WindowsFsError,
+    },
+    InitialDatabaseOutcomeUnknown(Box<GenericProjectError>),
     Sqlite {
         operation: &'static str,
         source: rusqlite::Error,
@@ -2299,7 +2328,7 @@ pub(crate) enum GenericProjectError {
     },
     InitialCandidateCleanup {
         original: Box<GenericProjectError>,
-        cleanup: Vec<(PathBuf, io::Error)>,
+        cleanup: Vec<GenericProjectError>,
     },
     InvalidDatabase {
         problem: GenericProjectDatabaseProblem,
@@ -2376,6 +2405,10 @@ impl fmt::Display for GenericProjectError {
                 path.display()
             ),
             Self::Sqlite { operation, source } => write!(formatter, "{operation}失败：{source}"),
+            Self::InitialDatabaseFileSystem { source, .. } => source.fmt(formatter),
+            Self::InitialDatabaseOutcomeUnknown(source) => {
+                write!(formatter, "初始数据库结果未知：{source}")
+            }
             Self::TransactionNotCommitted { operation, source } => write!(
                 formatter,
                 "{operation}失败，事务已确认回滚且未提交：{source}"
@@ -2393,12 +2426,8 @@ impl fmt::Display for GenericProjectError {
             }
             Self::InitialCandidateCleanup { original, cleanup } => {
                 write!(formatter, "{original}")?;
-                for (path, source) in cleanup {
-                    write!(
-                        formatter,
-                        "；清理初始数据库候选失败：{}（{source}）",
-                        path.display()
-                    )?;
+                for source in cleanup {
+                    write!(formatter, "；清理初始数据库候选失败：{source}")?;
                 }
                 Ok(())
             }
@@ -2449,6 +2478,8 @@ impl Error for GenericProjectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::InitialDatabaseFileSystem { source, .. } => Some(source),
+            Self::InitialDatabaseOutcomeUnknown(source) => Some(source.as_ref()),
             Self::Sqlite { source, .. } | Self::TransactionNotCommitted { source, .. } => {
                 Some(source)
             }
@@ -2576,6 +2607,16 @@ impl GenericProjectError {
                 SqliteTransactionState::RolledBack,
                 StateEffect::Unchanged,
             ),
+            Self::InitialDatabaseFileSystem { operation, source } => DiagnosticReport::new(
+                effect,
+                source.diagnostic(FileSystemDiagnosticContext::new(
+                    file_system_project_stage(stage),
+                    *operation,
+                )),
+            ),
+            Self::InitialDatabaseOutcomeUnknown(source) => {
+                source.diagnostic_report(stage, database, StateEffect::OutcomeUnknown)
+            }
             Self::TransactionOutcomeUnknown {
                 operation: _,
                 primary,
@@ -2617,18 +2658,10 @@ impl GenericProjectError {
             }
             Self::InitialCandidateCleanup { original, cleanup } => {
                 let mut report = original.diagnostic_report(stage, database, effect);
-                for (path, source) in cleanup {
+                for source in cleanup {
                     report = report.with_related(
                         RelatedFailureRelation::Cleanup,
-                        file_system_project_report(
-                            stage,
-                            FileSystemOperation::Remove,
-                            FileSystemProblem::Io {
-                                path: SafePath::new(path),
-                                failure: IoFailure::from_error(source),
-                            },
-                            StateEffect::RecoveryRequired,
-                        ),
+                        source.diagnostic_report(stage, database, StateEffect::RecoveryRequired),
                     );
                 }
                 report
@@ -2888,6 +2921,8 @@ impl GenericProjectError {
             | Self::ProjectNotFound { .. }
             | Self::ProjectIdentityMismatch { .. }
             | Self::Io { .. }
+            | Self::InitialDatabaseFileSystem { .. }
+            | Self::InitialDatabaseOutcomeUnknown(_)
             | Self::TransactionNotCommitted { .. }
             | Self::TransactionOutcomeUnknown { .. }
             | Self::InvalidDatabase { .. }
@@ -4702,6 +4737,8 @@ fn resolve_planned_path(path: &Path) -> Result<PathBuf, GenericProjectError> {
 
 fn publish_initial_database_candidate(
     connection: AttSqliteCancellableConnection,
+    candidate_file: fs::File,
+    identity: FileIdentity,
     candidate_path: &Path,
     database_path: &Path,
     cancellation: &CooperativeCancellation,
@@ -4779,10 +4816,32 @@ fn publish_initial_database_candidate(
         "首次 Init 的发布目标旁存在不属于当前项目的 SQLite sidecar",
         cancellation,
     )?;
-    fs::rename(candidate_path, database_path).map_err(|source| GenericProjectError::Io {
-        operation: FileSystemOperation::Rename,
-        path: database_path.to_path_buf(),
-        source,
+    let verify_identity = (|| {
+        let current = pin_path_without_reparse(candidate_path)?;
+        if FileIdentity::of(&candidate_file, candidate_path)? == identity
+            && FileIdentity::of(current.file(), candidate_path)? == identity
+        {
+            Ok(())
+        } else {
+            Err(WindowsFsError::FileIdentityChanged {
+                path: candidate_path.to_path_buf(),
+            })
+        }
+    })();
+    verify_identity.map_err(|source| {
+        GenericProjectError::InitialDatabaseOutcomeUnknown(Box::new(
+            initial_database_file_system_error(FileSystemOperation::Metadata, source),
+        ))
+    })?;
+    drop(candidate_file);
+    rename_without_replace_if_identity(candidate_path, database_path, identity).map_err(|source| {
+        let unknown = matches!(source, WindowsFsError::RenameTargetUnconfirmed { .. });
+        let source = initial_database_file_system_error(FileSystemOperation::Rename, source);
+        if unknown {
+            GenericProjectError::InitialDatabaseOutcomeUnknown(Box::new(source))
+        } else {
+            source
+        }
     })
 }
 
@@ -4822,20 +4881,49 @@ fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
-fn cleanup_initial_database_candidate(
-    candidate_path: &Path,
-) -> Result<(), Vec<(PathBuf, io::Error)>> {
-    let mut paths = vec![candidate_path.to_path_buf()];
-    for suffix in SQLITE_SIDECAR_SUFFIXES {
-        paths.push(sqlite_sidecar_path(candidate_path, suffix));
-    }
+fn initial_database_file_system_error(
+    operation: FileSystemOperation,
+    source: WindowsFsError,
+) -> GenericProjectError {
+    GenericProjectError::InitialDatabaseFileSystem { operation, source }
+}
 
+fn observe_initial_database_sidecars(
+    candidate_path: &Path,
+    targets: &mut Vec<(PathBuf, FileIdentity)>,
+) -> Result<(), GenericProjectError> {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let path = sqlite_sidecar_path(candidate_path, suffix);
+        let observed =
+            pin_path_without_reparse(&path).and_then(|file| FileIdentity::of(file.file(), &path));
+        match observed {
+            Ok(identity) => targets.push((path, identity)),
+            Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(GenericProjectError::InitialDatabaseOutcomeUnknown(
+                    Box::new(initial_database_file_system_error(
+                        FileSystemOperation::Metadata,
+                        source,
+                    )),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_initial_database_candidate(
+    targets: &[(PathBuf, FileIdentity)],
+) -> Result<(), Vec<GenericProjectError>> {
     let mut failures = Vec::new();
-    for path in paths {
-        match fs::remove_file(&path) {
+    for (path, identity) in targets {
+        match delete_regular_file_if_identity(path, *identity) {
             Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => failures.push((path, source)),
+            Err(WindowsFsError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => failures.push(initial_database_file_system_error(
+                FileSystemOperation::Remove,
+                source,
+            )),
         }
     }
     if failures.is_empty() {
@@ -5257,14 +5345,25 @@ mod tests {
         let directory = tempdir().unwrap();
         let candidate = directory.path().join(".project.db.init.tmp");
         let sidecar = sqlite_sidecar_path(&candidate, SQLITE_SIDECAR_SUFFIXES[0]);
-        fs::create_dir(&candidate).unwrap();
-        fs::create_dir(&sidecar).unwrap();
+        fs::write(&candidate, "candidate").unwrap();
+        fs::write(&sidecar, "sidecar").unwrap();
+        let targets = [&candidate, &sidecar]
+            .into_iter()
+            .map(|path| {
+                let file = pin_path_without_reparse(path).unwrap();
+                (path.clone(), FileIdentity::of(file.file(), path).unwrap())
+            })
+            .collect::<Vec<_>>();
+        fs::rename(&candidate, directory.path().join("original.db")).unwrap();
+        fs::rename(&sidecar, directory.path().join("original-journal")).unwrap();
+        fs::write(&candidate, "foreign database").unwrap();
+        fs::write(&sidecar, "foreign sidecar").unwrap();
 
-        let cleanup = cleanup_initial_database_candidate(&candidate)
-            .expect_err("目录不能当作候选数据库文件删除");
+        let cleanup = cleanup_initial_database_candidate(&targets)
+            .expect_err("清理必须保留被替换后的外来文件");
         assert_eq!(cleanup.len(), 2);
-        assert_eq!(cleanup[0].0, candidate);
-        assert_eq!(cleanup[1].0, sidecar);
+        assert_eq!(fs::read_to_string(&candidate).unwrap(), "foreign database");
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "foreign sidecar");
 
         let error = GenericProjectError::InitialCandidateCleanup {
             original: Box::new(GenericProjectError::Io {
@@ -5934,6 +6033,8 @@ mod tests {
             let published = temp.path().join(DATABASE_FILE_NAME);
             let stale_sidecar = sqlite_sidecar_path(&published, suffix);
             let cancellation = CooperativeCancellation::default();
+            let candidate_file = create_new_pinned_database_file(&candidate).unwrap();
+            let identity = FileIdentity::of(&candidate_file, &candidate).unwrap();
             let mut connection = open_sqlite_connection(&candidate, true, cancellation.clone())
                 .expect("应打开候选库");
             create_initial_schema(
@@ -5951,6 +6052,8 @@ mod tests {
 
             let error = publish_initial_database_candidate(
                 connection,
+                candidate_file,
+                identity,
                 &candidate,
                 &published,
                 &cancellation,
@@ -5970,7 +6073,7 @@ mod tests {
                 fs::read(&stale_sidecar).expect("竞争产生的 sidecar 必须保留"),
                 b"appeared-during-init"
             );
-            cleanup_initial_database_candidate(&candidate).expect("应清理未发布候选");
+            cleanup_initial_database_candidate(&[(candidate, identity)]).expect("应清理未发布候选");
         }
     }
 
@@ -5982,6 +6085,8 @@ mod tests {
         let candidate = temp.path().join("candidate.db");
         let published = temp.path().join(DATABASE_FILE_NAME);
         let cancellation = CooperativeCancellation::default();
+        let candidate_file = create_new_pinned_database_file(&candidate).unwrap();
+        let identity = FileIdentity::of(&candidate_file, &candidate).unwrap();
         let mut writer =
             open_sqlite_connection(&candidate, true, cancellation.clone()).expect("应打开候选库");
         create_initial_schema(
@@ -6025,9 +6130,15 @@ mod tests {
         publisher
             .progress_handler(0, None::<fn() -> bool>)
             .expect("测试只应由 busy handler 停止 checkpoint");
-        let error =
-            publish_initial_database_candidate(publisher, &candidate, &published, &cancellation)
-                .expect_err("checkpoint 被读取快照占用时不得发布主数据库");
+        let error = publish_initial_database_candidate(
+            publisher,
+            candidate_file,
+            identity,
+            &candidate,
+            &published,
+            &cancellation,
+        )
+        .expect_err("checkpoint 被读取快照占用时不得发布主数据库");
         assert!(matches!(
             error,
             GenericProjectError::Sqlite {
@@ -6039,7 +6150,9 @@ mod tests {
 
         blocker.execute_batch("ROLLBACK").expect("应释放读取快照");
         drop(blocker);
-        cleanup_initial_database_candidate(&candidate).expect("应清理测试候选及 sidecar");
+        let mut cleanup_targets = vec![(candidate.clone(), identity)];
+        observe_initial_database_sidecars(&candidate, &mut cleanup_targets).unwrap();
+        cleanup_initial_database_candidate(&cleanup_targets).expect("应清理测试候选及 sidecar");
     }
 
     #[test]

@@ -13,7 +13,7 @@
 | 从完整游戏原文制作术语表 | [游戏术语表制作 Skill](../skills/extract-game-terminology/SKILL.md) → [术语规格](translation/terminology.md) |
 | 继续旧任务且当前状态明确 | 当前 ATT 项目状态 → [翻译项目指南](guides/translation-project.md)的当前阶段 → 对应规格 |
 | 确认旧任务的续跑位置 | 当前 ATT 项目状态与日志 → [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 权威状态所属规格 |
-| 命令出现失败、Partial、Unavailable、取消、警告或结果未知 | [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 当前阶段规格 → 相关公共或运行时规格 |
+| 命令失败、Translate 未完整、取消、警告或结果未知 | [诊断与恢复指南](guides/diagnosis-and-recovery.md) → 当前阶段规格 → 相关公共或运行时规格 |
 | 调查遗漏、审校质量、人工或 agent 补译、定点修订 | [翻译验收指南](guides/acceptance.md) → [Manual](manual/README.md)；需要批量上下文或复杂数据库操作时再读 [Lua](lua/README.md) |
 | WriteBack、外部转换、部署或最终交付 | [翻译验收指南](guides/acceptance.md) → 对应 WriteBack 规格 → [目录发布](runtime/directory-publishing.md) |
 | 发行包缺文件、配置或 Prompt 来源不明 | [发行物规格](runtime/distribution.md)与[配置规格](runtime/configuration.md)；解决前不执行项目命令 |
@@ -37,7 +37,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 
 ### 组合项目
 
-按[翻译项目指南的项目分配方法](guides/translation-project.md#3-逐类选择唯一项目所有者)
+按[翻译项目指南的项目分配方法](guides/translation-project.md#3-建立项目所有权)
 记录每类来源、项目、写回方式和消费者。最终按
 [组合项目验收](guides/acceptance.md)统一检查遗漏、重叠和加载结果。
 
@@ -62,10 +62,10 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | --- | --- |
 | `succeeded` | [诊断与恢复指南](guides/diagnosis-and-recovery.md#4-按进程终态判断)，再确认本阶段具体业务结果 |
 | `failed` | 同上，并读取产生失败的阶段规格 |
-| `cancelled` | [诊断与恢复指南的取消分支](guides/diagnosis-and-recovery.md#43-cancelled) |
-| `recovery_required` | [诊断与恢复指南](guides/diagnosis-and-recovery.md#44-recovery_required) → 按诊断 operation 与恢复路径读取所属阶段规格；只有目录发布受管路径再读目录发布，SQLite 再读 SQLite |
-| `outcome_unknown` | [诊断与恢复指南](guides/diagnosis-and-recovery.md#45-outcome_unknown)；停止新的写入和重跑 |
-| Translate Complete、Partial 或 Unavailable | [诊断与恢复指南的 Translate 分支](guides/diagnosis-and-recovery.md#64-translate)与对应引擎 Translate 规格 |
+| `cancelled` | [诊断与恢复指南的取消分支](guides/diagnosis-and-recovery.md#43-取消) |
+| `recovery_required` | [诊断与恢复指南](guides/diagnosis-and-recovery.md#44-需要恢复)，按诊断对象与恢复路径读取目录发布、SQLite 或对应阶段规格 |
+| `outcome_unknown` | [诊断与恢复指南](guides/diagnosis-and-recovery.md#45-结果未知)；停止新的写入和重跑 |
+| Translate NoWork、Complete 或 Incomplete | [诊断与恢复指南的 Translate 分支](guides/diagnosis-and-recovery.md#64-translate)与对应引擎 Translate 规格 |
 | Rules 跳过警告或 owner 部分提交 | [诊断与恢复指南的 Extract 分支](guides/diagnosis-and-recovery.md#63-extract)与 [Rules](rpg-maker/rules.md) |
 | 译后 QA、WriteBack 候选或发布问题 | [诊断与恢复指南的 WriteBack 分支](guides/diagnosis-and-recovery.md#66-writeback-与目录发布) |
 | 日志、任务记录或终端呈现失败 | [项目日志](runtime/project-log.md)与[诊断与恢复指南](guides/diagnosis-and-recovery.md#67-sqlite-与可观测性) |

@@ -32,10 +32,12 @@ Agent 负责游戏调查、静态 QA、写回和封包，并根据非标准插�
 ### 1. 下载并配置 ATT
 
 从 [GitHub Releases](https://github.com/yexi-by/att/releases/latest) 下载 Windows x64
-发行包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压到新的可写目录。运行时让 `att.exe` 与同版
-配置、文档、Prompt、Skill 和工具保持在同一发行根。更新已有安装时，以当前
-`config.example.toml` 为字段权威，把旧配置中的实际服务取值逐项填入新活动配置；项目数据需要
-转换时使用该版本明确提供的一次性转换步骤。
+发行包和 `SHA256SUMS.txt`，核对 SHA-256 后完整解压。选择本地固定磁盘上可写的 NTFS 目录，
+并保持目录大小写不敏感；完整条件见[目录发布规格](docs/runtime/directory-publishing.md#3-候选目录)。
+让 `att.exe`、配置、文档、Prompt、Skill 和工具保持在同一发行根。
+
+更新已有安装时，保留 ATT 和 Formic 的活动配置，以当前 `config.example.toml` 为字段说明，
+逐项核对已经填写的服务取值。普通资源同步会保留这两份活动配置。
 
 打开 `config.toml`，填写模型服务：
 
@@ -49,14 +51,12 @@ stream = false
 ```
 
 `stream` 是必填项。`protocol` 省略时使用 `chat_completions`；需要 Responses 时改为
-`responses`。`url` 可以
-填写基础地址或完整端点，ATT 会按协议补全路径。`stream = true` 时以流式 HTTP 响应接收
+`responses`。`url` 可以填写基础地址或完整端点，ATT 会按协议补全路径。
+`stream = true` 时以流式 HTTP 响应接收
 模型结果，`false` 时等待完整 JSON；两种方式都会在响应完整结束后再验收和保存译文。
 
-`config.example.toml` 保存当前不含真实凭据的完整字段和发行默认。旧活动配置提供实际服务取值
-参考，当前模板定义字段集合。服务明确限制上下文、输出、并发或请求频率时，再按实际限制降低
-相应配置。
-填写完成后执行：
+`config.example.toml` 保存完整字段和发行默认，不含真实凭据。根据模型服务实际规定的上下文、
+输出、并发和请求频率填写限制；字段含义见[配置规格](docs/runtime/configuration.md)。完成后执行：
 
 ```powershell
 .\att.exe test

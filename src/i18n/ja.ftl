@@ -28,6 +28,11 @@ cli-placeholders-help = プロジェクトの Placeholder リソースを置換�
 cli-project-lua-script-help = プロジェクトデータベースに対して実行する Lua スクリプト
 cli-project-lua-arguments-help = -- の後で Lua arg[1..] に渡す UTF-8 引数
 cli-manual-file-help = 手動翻訳 TOML ファイル
+cli-jsonl-file-help = JSONL のエクスポート先ファイル
+cli-retry-rejected-help = 保存済みの Rejected 候補を再処理
+cli-manual-selection-help = エクスポート対象：pending（既定）、rejected、all
+cli-manual-ids-help = この JSONL ファイルの自然 ID に一致する項目をエクスポート
+cli-layout-rules-help = TOML ファイルから WriteBack のレイアウト規則を読み込み、保存
 cli-usage-heading = 使用法:
 cli-commands-heading = コマンド:
 cli-options-heading = オプション:
@@ -184,6 +189,29 @@ log-publication-finished = { $result ->
     [recovery_required] 公開が停止し、復旧が必要です。
     [outcome_unknown] 公開の最終状態は不明です。
    *[other] 公開が不明な結果で停止しました。
+}
+log-phase-name = { $phase ->
+    [check_project] プロジェクト確認
+    [scan_source] ソースファイル走査
+    [prepare_candidate] 候補の準備
+    [update_database] データベース更新
+    [publish] 公開
+    [builtin] Builtin 抽出
+    [builtin_documents] Builtin 文書走査
+    [builtin_work_units] Builtin テキスト単位の抽出
+    [builtin_commit] Builtin コミット
+    [rules] Rules 抽出
+    [rules_documents] Rules 文書走査
+    [rules_matches] Rules 照合
+    [rules_commit] Rules コミット
+    [lua] Lua 実行
+    [planning] 翻訳タスクの計画
+    [confirmed_tasks] 翻訳タスクの確定
+    [read_assets] プロジェクト内容の読み込み
+    [plan_rpg_maker_write_back] WriteBack の計画
+    [rewrite_documents] 文書の書き換え
+    [validate_candidate] 候補の検証
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] 完了
@@ -403,6 +431,29 @@ diagnostic-provider-code = プロバイダー code：{ $code }
 diagnostic-provider-type = プロバイダー type：{ $kind }
 diagnostic-provider-message = プロバイダーのメッセージ：{ $message }
 diagnostic-json-position = { $line } 行、{ $column } 列
+diagnostic-input-field = フィールド：{ $field }
+diagnostic-input-failure = { $code ->
+    [syntax] TOML の構文が無効です
+    [missing_field] 必須フィールドがありません
+    [unknown_field] 現在の形式ではこのフィールドを使用できません
+    [duplicate_field] フィールドが重複しています
+    [type_mismatch] フィールドの型が正しくありません
+    [invalid_value] フィールドの値が無効です
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = 必要な型：{ $expected ->
+    [string] 文字列
+    [integer] 整数
+    [boolean] 真偽値
+    [string_or_boolean] 文字列または真偽値
+    [string_array] 文字列の配列
+    [integer_array] 整数の配列
+    [table] テーブル
+    [table_array] テーブルの配列
+    [array] 配列
+    [object] オブジェクト
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = 応答項目 { $item }
 diagnostic-array-item = 配列項目 { $item }
 diagnostic-token-position = 制御 token の位置 { $position }
@@ -415,6 +466,9 @@ manual-exported = { $entries } 件を { $path } にエクスポートしまし�
 manual-checked = 有効 { $valid }、未入力 { $unfilled }、エラー { $errors }
 manual-applied = 適用 { $applied }、未入力 { $unfilled }、エラー { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] translation の { $line } 番目の要素に BOM（U+FEFF）が含まれています
+    [remove_byte_order_mark] 訳文から BOM（U+FEFF）文字を削除してください
+    [keep_placeholders] 訳文に原文の Placeholder を復元し、個数、必要な順序、所属するテキストスロットを維持してください
     [invalid_source_line] source の { $line } 番目に改行または NUL が含まれています
     [invalid_translation_line] translation の { $line } 番目に改行または NUL が含まれています
     [fixed_length] fixed 訳には { $expected } 項必要ですが、{ $actual } 項あります
@@ -432,6 +486,7 @@ task-record-final-result-heading = 最終結果
 task-record-final-status = 状態：{ $state ->
     [complete] 完了、コミット確認済み
     [partial] 一部完了、コミット確認済み
+    [unavailable_rejected_committed] 利用不可。拒否された候補を保存済み
     [unavailable] 利用不可、プロジェクト変更なし
     [execution_failed] 実行失敗、未コミット
     [commit_preparation_failed] コミット準備失敗、未適用を確認

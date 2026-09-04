@@ -28,6 +28,11 @@ cli-placeholders-help = 替换项目 Placeholder 资源
 cli-project-lua-script-help = 要对项目数据库运行的 Lua 脚本
 cli-project-lua-arguments-help = 在 -- 后传给 Lua arg[1..] 的 UTF-8 参数
 cli-manual-file-help = 人工译文 TOML 文件
+cli-jsonl-file-help = JSONL 导出文件
+cli-retry-rejected-help = 重新处理已保存的 Rejected 候选
+cli-manual-selection-help = 导出范围：pending（默认）、rejected 或 all
+cli-manual-ids-help = 按 JSONL 文件中的自然 ID 导出条目
+cli-layout-rules-help = 加载并保存 WriteBack 排版规则 TOML
 cli-usage-heading = 用法：
 cli-commands-heading = 命令：
 cli-options-heading = 选项：
@@ -184,6 +189,29 @@ log-publication-finished = { $result ->
     [recovery_required] 发布已停止，需要恢复。
     [outcome_unknown] 发布的最终状态未知。
    *[other] 发布已停止，结果无法识别。
+}
+log-phase-name = { $phase ->
+    [check_project] 项目检查
+    [scan_source] 源文件扫描
+    [prepare_candidate] 候选构建
+    [update_database] 数据库更新
+    [publish] 发布
+    [builtin] Builtin 提取
+    [builtin_documents] Builtin 文档扫描
+    [builtin_work_units] Builtin 文本单元提取
+    [builtin_commit] Builtin 提交
+    [rules] Rules 提取
+    [rules_documents] Rules 文档扫描
+    [rules_matches] Rules 匹配
+    [rules_commit] Rules 提交
+    [lua] Lua 执行
+    [planning] 翻译任务规划
+    [confirmed_tasks] 翻译任务确认
+    [read_assets] 项目内容读取
+    [plan_rpg_maker_write_back] 写回规划
+    [rewrite_documents] 文档改写
+    [validate_candidate] 候选验证
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] 完成
@@ -403,6 +431,29 @@ diagnostic-provider-code = 服务方 code：{ $code }
 diagnostic-provider-type = 服务方 type：{ $kind }
 diagnostic-provider-message = 服务方消息：{ $message }
 diagnostic-json-position = 第 { $line } 行，第 { $column } 列
+diagnostic-input-field = 字段：{ $field }
+diagnostic-input-failure = { $code ->
+    [syntax] TOML 语法无效
+    [missing_field] 缺少必填字段
+    [unknown_field] 当前格式不接受该字段
+    [duplicate_field] 字段重复
+    [type_mismatch] 字段类型不符合要求
+    [invalid_value] 字段值不符合要求
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = 要求的类型：{ $expected ->
+    [string] 字符串
+    [integer] 整数
+    [boolean] 布尔值
+    [string_or_boolean] 字符串或布尔值
+    [string_array] 字符串数组
+    [integer_array] 整数数组
+    [table] 表
+    [table_array] 表数组
+    [array] 数组
+    [object] 对象
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = 响应第 { $item } 项
 diagnostic-array-item = 数组第 { $item } 项
 diagnostic-token-position = 控制 token 第 { $position } 个位置
@@ -415,6 +466,9 @@ manual-exported = 已导出 { $entries } 条：{ $path }
 manual-checked = 有效 { $valid }，未填写 { $unfilled }，错误 { $errors }
 manual-applied = 已应用 { $applied }，未填写 { $unfilled }，错误 { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] translation 第 { $line } 项包含 BOM（U+FEFF）
+    [remove_byte_order_mark] 删除译文中的 BOM（U+FEFF）字符
+    [keep_placeholders] 在译文中恢复原文的 Placeholder，保留其数量、要求的顺序和所属文本槽
     [invalid_source_line] source 第 { $line } 项包含换行或 NUL
     [invalid_translation_line] translation 第 { $line } 项包含换行或 NUL
     [fixed_length] fixed 译文需要 { $expected } 项，当前为 { $actual } 项
@@ -432,6 +486,7 @@ task-record-final-result-heading = 最终结果
 task-record-final-status = 状态：{ $state ->
     [complete] 完成，已确认提交
     [partial] 部分完成，已确认提交
+    [unavailable_rejected_committed] 不可用，已保存拒绝候选
     [unavailable] 不可用，项目未改变
     [execution_failed] 执行失败，未提交
     [commit_preparation_failed] 提交准备失败，确定未应用

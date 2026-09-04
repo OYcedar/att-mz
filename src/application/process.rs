@@ -3713,7 +3713,10 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("诊断应为 UTF-8");
         let plain = stderr.replace(['\u{2068}', '\u{2069}'], "");
         assert!(plain.contains("对象：settings.toml"));
-        assert!(plain.contains("原因：值的语法无效"));
+        assert!(plain.contains("原因：字段类型不符合要求"));
+        assert!(plain.contains("字段：llm.clients.primary"));
+        assert!(plain.contains("要求的类型：表"));
+        assert!(plain.contains("第 3 行，第 7 列"));
         assert!(plain.contains("影响：业务状态没有修改"));
         assert!(plain.contains("处理办法：修正指出的配置字段后重试"));
         for forbidden in [

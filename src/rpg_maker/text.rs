@@ -306,6 +306,54 @@ impl RpgMakerLocation {
         &self.steps
     }
 
+    /// 返回标准事件参数的命令位置、参数槽和可选数组项；JSON 解码内层不属于原生参数。
+    pub(crate) fn standard_event_parameter(
+        &self,
+    ) -> Option<(&[RpgMakerLocationStep], usize, Option<usize>)> {
+        use RpgMakerLocationStep::{ArrayIndex, ObjectKey};
+        let (command, parameter, item) = match self.steps.as_slice() {
+            [command @ .., ObjectKey(key), ArrayIndex(parameter)] if key == "parameters" => {
+                (command, *parameter, None)
+            }
+            [
+                command @ ..,
+                ObjectKey(key),
+                ArrayIndex(parameter),
+                ArrayIndex(item),
+            ] if key == "parameters" => (command, *parameter, Some(*item)),
+            _ => return None,
+        };
+        let standard = match (&self.source, command) {
+            (
+                RpgMakerSource::Map(_),
+                [
+                    ObjectKey(events),
+                    ArrayIndex(_),
+                    ObjectKey(pages),
+                    ArrayIndex(_),
+                    ObjectKey(list),
+                    ArrayIndex(_),
+                ],
+            ) => events == "events" && pages == "pages" && list == "list",
+            (
+                RpgMakerSource::Data(StandardDataFile::Troops),
+                [
+                    ArrayIndex(_),
+                    ObjectKey(pages),
+                    ArrayIndex(_),
+                    ObjectKey(list),
+                    ArrayIndex(_),
+                ],
+            ) => pages == "pages" && list == "list",
+            (
+                RpgMakerSource::Data(StandardDataFile::CommonEvents),
+                [ArrayIndex(_), ObjectKey(list), ArrayIndex(_)],
+            ) => list == "list",
+            _ => false,
+        };
+        standard.then_some((command, parameter, item))
+    }
+
     /// 将已经校验的领域位置投影为结构化公开位置。
     pub(crate) fn diagnostic_location(&self) -> RpgMakerDiagnosticLocation {
         let source = match &self.source {

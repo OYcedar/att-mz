@@ -28,6 +28,11 @@ cli-placeholders-help = 프로젝트 Placeholder 리소스 교체
 cli-project-lua-script-help = 프로젝트 데이터베이스에서 실행할 Lua 스크립트
 cli-project-lua-arguments-help = -- 뒤에서 Lua arg[1..]에 전달할 UTF-8 인수
 cli-manual-file-help = 수동 번역 TOML 파일
+cli-jsonl-file-help = JSONL 내보내기 파일
+cli-retry-rejected-help = 저장된 Rejected 후보 다시 처리
+cli-manual-selection-help = 내보낼 범위: pending(기본값), rejected 또는 all
+cli-manual-ids-help = 이 JSONL 파일의 자연 ID와 일치하는 항목 내보내기
+cli-layout-rules-help = TOML 파일에서 WriteBack 레이아웃 규칙을 불러와 저장
 cli-usage-heading = 사용법:
 cli-commands-heading = 명령:
 cli-options-heading = 옵션:
@@ -184,6 +189,29 @@ log-publication-finished = { $result ->
     [recovery_required] 게시가 중지되었으며 복구가 필요합니다.
     [outcome_unknown] 게시의 최종 상태를 알 수 없습니다.
    *[other] 게시가 알 수 없는 결과로 중지되었습니다.
+}
+log-phase-name = { $phase ->
+    [check_project] 프로젝트 확인
+    [scan_source] 원본 파일 스캔
+    [prepare_candidate] 후보 준비
+    [update_database] 데이터베이스 업데이트
+    [publish] 게시
+    [builtin] Builtin 추출
+    [builtin_documents] Builtin 문서 스캔
+    [builtin_work_units] Builtin 텍스트 단위 추출
+    [builtin_commit] Builtin 커밋
+    [rules] Rules 추출
+    [rules_documents] Rules 문서 스캔
+    [rules_matches] Rules 일치 항목 검색
+    [rules_commit] Rules 커밋
+    [lua] Lua 실행
+    [planning] 번역 작업 계획
+    [confirmed_tasks] 번역 작업 확인
+    [read_assets] 프로젝트 내용 읽기
+    [plan_rpg_maker_write_back] WriteBack 계획
+    [rewrite_documents] 문서 다시 쓰기
+    [validate_candidate] 후보 검증
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] 완료
@@ -403,6 +431,29 @@ diagnostic-provider-code = 공급자 code: { $code }
 diagnostic-provider-type = 공급자 type: { $kind }
 diagnostic-provider-message = 공급자 메시지: { $message }
 diagnostic-json-position = { $line }행 { $column }열
+diagnostic-input-field = 필드: { $field }
+diagnostic-input-failure = { $code ->
+    [syntax] TOML 구문이 잘못되었습니다
+    [missing_field] 필수 필드가 없습니다
+    [unknown_field] 현재 형식에서는 이 필드를 허용하지 않습니다
+    [duplicate_field] 필드가 중복되었습니다
+    [type_mismatch] 필드 형식이 잘못되었습니다
+    [invalid_value] 필드 값이 잘못되었습니다
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = 필요한 형식: { $expected ->
+    [string] 문자열
+    [integer] 정수
+    [boolean] 불리언
+    [string_or_boolean] 문자열 또는 불리언
+    [string_array] 문자열 배열
+    [integer_array] 정수 배열
+    [table] 테이블
+    [table_array] 테이블 배열
+    [array] 배열
+    [object] 객체
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = 응답 항목 { $item }
 diagnostic-array-item = 배열 항목 { $item }
 diagnostic-token-position = 제어 token 위치 { $position }
@@ -415,6 +466,9 @@ manual-exported = { $entries }개 항목을 { $path }에 내보냈습니다
 manual-checked = 유효 { $valid }, 미입력 { $unfilled }, 오류 { $errors }
 manual-applied = 적용 { $applied }, 미입력 { $unfilled }, 오류 { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] translation의 { $line }번째 항목에 BOM(U+FEFF)이 있습니다
+    [remove_byte_order_mark] 번역문에서 BOM(U+FEFF) 문자를 삭제하세요
+    [keep_placeholders] 번역문에 원문의 Placeholder를 복원하고 개수, 필요한 순서 및 해당 텍스트 슬롯을 유지하세요
     [invalid_source_line] source의 { $line }번째 항목에 줄바꿈 또는 NUL이 있습니다
     [invalid_translation_line] translation의 { $line }번째 항목에 줄바꿈 또는 NUL이 있습니다
     [fixed_length] fixed 번역은 { $expected }개 항목이 필요하지만 { $actual }개입니다
@@ -432,6 +486,7 @@ task-record-final-result-heading = 최종 결과
 task-record-final-status = 상태: { $state ->
     [complete] 완료, 커밋 확인됨
     [partial] 부분 완료, 커밋 확인됨
+    [unavailable_rejected_committed] 사용 불가; 거부된 후보 저장됨
     [unavailable] 사용 불가, 프로젝트 변경 없음
     [execution_failed] 실행 실패, 미커밋
     [commit_preparation_failed] 커밋 준비 실패, 미적용 확인

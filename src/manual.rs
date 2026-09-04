@@ -334,6 +334,7 @@ enum ManualCheckProblem {
     SourceChanged,
     TypeMismatch,
     InvalidTranslationLine { line: usize },
+    TranslationByteOrderMark { line: usize },
     FixedLength { expected: usize, actual: usize },
     FixedBlankSlot { slot: usize },
     PlaceholderMismatch,
@@ -922,9 +923,13 @@ fn manual_text_violation_problem(violation: ProvenInvariantViolation) -> ManualC
         ProvenInvariantViolation::LineCountMismatch { expected, actual } => {
             ManualCheckProblem::FixedLength { expected, actual }
         }
-        ProvenInvariantViolation::InvalidLineText { line_index }
-        | ProvenInvariantViolation::ContainsByteOrderMark { line_index } => {
+        ProvenInvariantViolation::InvalidLineText { line_index } => {
             ManualCheckProblem::InvalidTranslationLine {
+                line: line_index + 1,
+            }
+        }
+        ProvenInvariantViolation::ContainsByteOrderMark { line_index } => {
+            ManualCheckProblem::TranslationByteOrderMark {
                 line: line_index + 1,
             }
         }
@@ -2182,6 +2187,13 @@ fn render_manual_check_problem(
             0,
             0,
         ),
+        ManualCheckProblem::TranslationByteOrderMark { line } => (
+            "translation_byte_order_mark",
+            "remove_byte_order_mark",
+            manual_count(*line),
+            0,
+            0,
+        ),
         ManualCheckProblem::FixedLength { expected, actual } => (
             "fixed_length",
             "keep_array_length",
@@ -2224,6 +2236,9 @@ fn render_manual_value(
     match code {
         "invalid_source_line"
         | "invalid_translation_line"
+        | "translation_byte_order_mark"
+        | "remove_byte_order_mark"
+        | "keep_placeholders"
         | "fixed_length"
         | "fixed_blank_slot"
         | "rerun_export"
@@ -2250,7 +2265,6 @@ fn render_manual_value(
         "document_invalid_utf8" => failure("invalid_encoding"),
         "document_invalid_toml" => failure("invalid_syntax"),
         "document_encode" => failure("internal_invariant"),
-        "keep_placeholders" => resolution("fix_placeholder_rules"),
         "check_read_access" | "check_write_access" | "check_database_access" => {
             resolution("check_path_and_permissions")
         }
@@ -2808,7 +2822,7 @@ fn load_rpg_maker_manual_unit_profiles(
     engine: RpgMakerEngine,
 ) -> Result<HashMap<String, RpgMakerBuiltinPlaceholderProfile>, ManualDatabaseError> {
     let mut statement = connection.prepare(
-        "SELECT g.owner, g.group_location, g.group_kind, u.unit_role
+        "SELECT g.owner, g.group_location, g.group_kind, u.unit_role, g.projection_recipe_json
          FROM rpg_maker_text_group AS g
          JOIN rpg_maker_text_unit AS u
            ON u.owner = g.owner AND u.group_id = g.group_id
@@ -2821,6 +2835,7 @@ fn load_rpg_maker_manual_unit_profiles(
         let location_raw: String = row.get(1)?;
         let kind_raw: String = row.get(2)?;
         let role_raw: String = row.get(3)?;
+        let recipes_raw: String = row.get(4)?;
         let owner = RpgMakerAssetOwner::from_storage_name(&owner_raw).ok_or_else(|| {
             ManualDatabaseError::InvalidProject("RPG Maker Unit owner 无效".to_owned())
         })?;
@@ -2834,8 +2849,12 @@ fn load_rpg_maker_manual_unit_profiles(
             ManualDatabaseError::InvalidProject("RPG Maker Unit role 无效".to_owned())
         })?;
         let id = readable_rpg_maker_id(&location, kind, &role);
-        let profile =
-            RpgMakerBuiltinPlaceholderProfile::for_location(engine, owner, kind, &location, &role);
+        let recipes = RpgMakerProjectionCodec::decode_recipes(&recipes_raw).map_err(|_| {
+            ManualDatabaseError::InvalidProject("RPG Maker Unit 写回配方无效".to_owned())
+        })?;
+        let profile = RpgMakerBuiltinPlaceholderProfile::for_recipes(
+            engine, owner, kind, &location, &role, &recipes,
+        );
         if profiles.insert(id, profile).is_some() {
             return Err(ManualDatabaseError::InvalidProject(
                 "RPG Maker Extract 产生了重复自然 ID".to_owned(),
@@ -3183,6 +3202,15 @@ fn load_rpg_maker_entries(
         }
         let content = serde_json::from_str::<TextUnitContent>(&source_json)
             .map_err(|_| ManualDatabaseError::InvalidProject("人工译文原文无效".to_owned()))?;
+        let physical_control_target = if owner == RpgMakerAssetOwner::Rules {
+            let recipes = RpgMakerProjectionCodec::decode_recipes(&recipe_json).map_err(|_| {
+                ManualDatabaseError::InvalidProject("RPG Maker Unit 写回配方无效".to_owned())
+            })?;
+            crate::rpg_maker::translate::placeholder::physical_control_target(&role, &recipes)
+                .map(|(target, code)| (target.clone(), code))
+        } else {
+            None
+        };
         let identity = TranslationUnitIdentity::new(
             owner,
             kind,
@@ -3190,7 +3218,8 @@ fn load_rpg_maker_entries(
             role.clone(),
             content.clone(),
             context_json,
-        );
+        )
+        .with_physical_control_target(physical_control_target);
         let manual_type = rpg_maker_manual_type(&identity);
         let source = rpg_maker_manual_source_lines(&content);
         let id = readable_rpg_maker_id(&group_location, kind, &role);
@@ -5499,6 +5528,41 @@ mod tests {
         assert_eq!(stderr.lines().count(), 6);
         assert!(!stderr.contains('\u{202e}'));
         assert!(!stderr.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn manual_candidate_errors_explain_bom_and_placeholder_repairs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manual.toml");
+        let index = ManualTranslationIndex::new(vec![indexed_entry(
+            ManualTranslationType::Fixed,
+            &["source"],
+        )])
+        .unwrap();
+        write_document(
+            &path,
+            "[[translation]]\nid = \"Skills.json:798:name\"\ntype = \"fixed\"\nsource = [\"source\"]\ntranslation = [\"译文\\uFEFF\"]\n",
+        );
+        let report = check_manual_document(&path, &index, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            report.errors[0].problem,
+            ManualCheckProblem::TranslationByteOrderMark { line: 1 }
+        );
+        for locale in crate::i18n::UiLocale::ALL {
+            let localizer = UiLocalizer::new(locale);
+            let (reason, help) = render_manual_check_problem(&report.errors[0].problem, &localizer);
+            assert!(reason.contains("U+FEFF"), "{reason}");
+            assert!(help.contains("U+FEFF"), "{help}");
+            let (_, help) =
+                render_manual_check_problem(&ManualCheckProblem::PlaceholderMismatch, &localizer);
+            assert_ne!(
+                help,
+                localizer.format(UiMessage::DiagnosticResolutionValue {
+                    code: "fix_placeholder_rules"
+                })
+            );
+            assert!(!help.contains("__ATT_FALLBACK__"), "{help}");
+        }
     }
 
     #[test]

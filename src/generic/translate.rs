@@ -1144,13 +1144,16 @@ pub(crate) fn prepare_generic_translation(
                     .err();
                     let current_protected = if text_violation.is_none() {
                         generic_current_translation_protection_result(
-                            service.protect_target_with_cancellation(
-                                &locator.readable_id(),
-                                group.kind(),
-                                current_translation,
-                                placeholder_rules,
-                                || ensure_generic_cpu_running(cancellation),
-                            )?,
+                            service
+                                .bind_target_candidate_with_cancellation(
+                                    &protected,
+                                    &locator.readable_id(),
+                                    group.kind(),
+                                    current_translation,
+                                    placeholder_rules,
+                                    || ensure_generic_cpu_running(cancellation),
+                                )?
+                                .map_err(Into::into),
                             placeholder_rule_source,
                             &locator,
                         )?
@@ -4008,6 +4011,57 @@ mod tests {
                 ordinal: 0,
                 groups,
             }],
+        }
+    }
+
+    #[test]
+    fn current_translation_keeps_source_bound_placeholders_after_context_translation() {
+        let rules = GenericPlaceholderService::default()
+            .compile(vec![GenericPlaceholderRuleDefinition::new(
+                None,
+                r"(?<=名前: )[A-Za-z0-9-]+",
+            )])
+            .unwrap();
+        for origin in [TranslationOrigin::Manual, TranslationOrigin::Automatic] {
+            let mut snapshot = cross_kind_snapshot(None);
+            snapshot.files[0].groups.truncate(1);
+            let group = &mut snapshot.files[0].groups[0];
+            group.units[0].source_text = "名前: abc-123".to_owned();
+            group.units[0].translation = Some(GenericStoredTranslation {
+                translation: "名称：abc-123".to_owned(),
+                origin,
+                state_fingerprint: automatic_translation_state_fingerprint(
+                    snapshot.project.language_pair(),
+                    &GenericUnitKey::new(group.id.clone(), group.units[0].id.clone()),
+                    &group.units[0].source_text,
+                    group.context_fingerprint,
+                ),
+            });
+            group.units.push(GenericStoredUnit {
+                id: "pending".to_owned(),
+                ordinal: 1,
+                source_text: "こんにちは".to_owned(),
+                translation: None,
+                rejected: None,
+            });
+            let prepared = prepare_generic_translation(
+                &snapshot,
+                Arc::new(CompiledTerminology::empty()),
+                &rules,
+                &GenericPlaceholderRuleSource::ProjectSnapshot,
+                Arc::new(japanese_language_module()),
+                NonZeroUsize::new(10_000).unwrap(),
+                false,
+                &CooperativeCancellation::default(),
+            )
+            .unwrap();
+            assert!(prepared.plan().invalidations().is_empty());
+            let task = &prepared.plan().tasks()[0];
+            assert_eq!(task.unit_count(), 1);
+            let current_context = &task.groups()[0].units()[0];
+            assert_eq!(current_context.output_id(), None);
+            assert!(current_context.text().starts_with("名称："));
+            assert!(!current_context.text().contains("abc-123"));
         }
     }
 

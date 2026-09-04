@@ -243,6 +243,33 @@ fn database(path: &std::path::Path) -> Connection {
 }
 
 #[test]
+fn print_arguments_stay_separated_in_safe_log_text() {
+    #[derive(Default)]
+    struct PrintSink(Mutex<Vec<String>>);
+
+    impl super::ProjectLuaPrintSink for PrintSink {
+        fn print(&self, bytes: &[u8]) -> Result<(), ProjectLuaCallError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(crate::user_text::sanitize_user_text(
+                    &String::from_utf8_lossy(bytes),
+                ));
+            Ok(())
+        }
+    }
+
+    let sink = Arc::new(PrintSink::default());
+    let request = request(
+        r#"print("count", 12, "status", "ok")"#,
+        Arc::new(TestAdapter::default()),
+    )
+    .with_print_sink(sink.clone());
+    run_project_lua(Connection::open_in_memory().unwrap(), request).unwrap();
+    assert_eq!(*sink.0.lock().unwrap(), ["count 12 status ok"]);
+}
+
+#[test]
 fn readable_translation_api_uses_arrays_and_batch_context() {
     let adapter = Arc::new(TestAdapter::default());
     let source = r#"

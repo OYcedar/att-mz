@@ -1343,6 +1343,7 @@ struct DecodedUnit {
     semantic_order_key: RpgMakerSemanticOrderKey,
     source_content: TextUnitContent,
     source_context_json: String,
+    physical_control_target: Option<(RpgMakerLocation, Option<i64>)>,
     recipe_shape: String,
     translation: Option<TextUnitContent>,
     translation_state: Option<Sha256Fingerprint>,
@@ -1418,6 +1419,14 @@ fn decode_unit_for_language(
     let projection_recipe_json = row
         .required_text("projection_recipe_json")
         .map_err(map_storage_row_error)?;
+    let physical_control_target = if owner == RpgMakerAssetOwner::Rules {
+        let recipes = RpgMakerProjectionCodec::decode_recipes(&projection_recipe_json)
+            .map_err(InvalidRpgMakerTranslationAssetSnapshot::InvalidRole)?;
+        super::placeholder::physical_control_target(&storage.role, &recipes)
+            .map(|(target, code)| (target.clone(), code))
+    } else {
+        None
+    };
     let manual_translation_json = row
         .optional_text("manual.translation_json")
         .map_err(map_storage_row_error)?;
@@ -1577,6 +1586,7 @@ fn decode_unit_for_language(
         semantic_order_key,
         source_content,
         source_context_json,
+        physical_control_target,
         recipe_shape,
         translation,
         translation_state,
@@ -1839,7 +1849,8 @@ fn assemble_corpus(
             unit.role,
             unit.source_content,
             unit.source_context_json,
-        );
+        )
+        .with_physical_control_target(unit.physical_control_target);
         let asset = if unit.manual {
             RpgMakerTranslationAsset::with_manual_semantic_order_key(
                 identity,
@@ -2223,6 +2234,7 @@ mod tests {
                     ),
                     source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
                     source_context_json: "{}".to_owned(),
+                    physical_control_target: None,
                     recipe_shape: "[]".to_owned(),
                     translation: None,
                     translation_state: None,
@@ -2334,6 +2346,7 @@ mod tests {
             semantic_order_key,
             source_content: TextUnitContent::Value(owner.storage_name().to_owned()),
             source_context_json: "{}".to_owned(),
+            physical_control_target: None,
             recipe_shape: "[]".to_owned(),
             translation: None,
             translation_state: None,

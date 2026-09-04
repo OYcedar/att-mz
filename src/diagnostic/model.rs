@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::i18n::{UiLocalizer, UiMessage};
 
 use super::{
-    ConfigurationIssue, DiagnosticIssue, DiagnosticStage, HttpIssue, HttpRoute, PlaceholderIssue,
+    ConfigurationIssue, ConfigurationTomlFailureKind, DiagnosticIssue, DiagnosticStage,
+    GenericJsonlFieldProblem, GenericProblem, HttpIssue, HttpRoute, PlaceholderIssue,
     PlaceholderRuleSource, TranslationIssue,
 };
 
@@ -471,8 +472,65 @@ fn render_diagnostic_reason(
         return rule.render_localized(localizer);
     }
 
+    let mut summary = summary;
+
     let mut details = Vec::new();
     match issue {
+        DiagnosticIssue::Configuration(ConfigurationIssue::InvalidToml {
+            resource,
+            failure,
+            line,
+            column,
+            ..
+        }) => {
+            summary = localizer.format(UiMessage::DiagnosticInputFailure {
+                code: failure.as_str(),
+            });
+            if !resource.as_str().is_empty() {
+                details.push(localizer.format(UiMessage::DiagnosticInputField {
+                    field: resource.as_str(),
+                }));
+            }
+            if let ConfigurationTomlFailureKind::TypeMismatch { expected } = failure {
+                details.push(localizer.format(UiMessage::DiagnosticExpectedType {
+                    expected: expected.as_str(),
+                }));
+            }
+            if let (Some(line), Some(column)) = (line, column) {
+                details.push(localizer.format(UiMessage::DiagnosticJsonPosition {
+                    line: *line as u64,
+                    column: *column as u64,
+                }));
+            }
+        }
+        DiagnosticIssue::Generic(generic) => {
+            if let GenericProblem::InvalidJson {
+                location,
+                json_column,
+                field_problem,
+                ..
+            } = generic.problem()
+            {
+                if let Some(problem) = field_problem {
+                    summary = localizer.format(UiMessage::DiagnosticInputFailure {
+                        code: problem.as_str(),
+                    });
+                    details.push(localizer.format(UiMessage::DiagnosticInputField {
+                        field: problem.field().as_str(),
+                    }));
+                    if let GenericJsonlFieldProblem::TypeMismatch { expected, .. } = problem {
+                        details.push(localizer.format(UiMessage::DiagnosticExpectedType {
+                            expected: expected.as_str(),
+                        }));
+                    }
+                } else {
+                    details.push(localizer.format(UiMessage::DiagnosticJsonPosition {
+                        line: location.line.get() as u64,
+                        column: *json_column as u64,
+                    }));
+                }
+            }
+        }
         DiagnosticIssue::Translation(TranslationIssue::Placeholder {
             rule_source,
             problem,
@@ -701,6 +759,50 @@ mod tests {
                 match_range: ByteRange::new(4, 12).expect("有效范围"),
             },
         })
+    }
+
+    #[test]
+    fn configuration_toml_reason_shows_field_position_and_expected_type() {
+        use crate::diagnostic::{ConfigurationTomlValueKind, SafePath};
+        for (failure, reason) in [
+            (ConfigurationTomlFailureKind::UnknownField, "not allowed"),
+            (ConfigurationTomlFailureKind::MissingField, "missing"),
+            (ConfigurationTomlFailureKind::DuplicateField, "duplicated"),
+            (ConfigurationTomlFailureKind::Syntax, "TOML syntax"),
+            (
+                ConfigurationTomlFailureKind::TypeMismatch {
+                    expected: ConfigurationTomlValueKind::Boolean,
+                },
+                "boolean",
+            ),
+        ] {
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                Diagnostic::configuration(ConfigurationIssue::InvalidToml {
+                    path: SafePath::new("config.toml"),
+                    line: Some(3),
+                    column: Some(7),
+                    resource: SafeText::new("prompts.thinking_output"),
+                    failure,
+                }),
+            );
+            let rendered = render_diagnostic_fields(
+                &report,
+                &UiLocalizer::new(crate::i18n::UiLocale::English),
+            );
+            assert_eq!(rendered.object, "config.toml");
+            assert!(
+                rendered.reason.contains("prompts.thinking_output"),
+                "{}",
+                rendered.reason
+            );
+            assert!(rendered.reason.contains(reason), "{}", rendered.reason);
+            assert!(
+                rendered.reason.contains('3') && rendered.reason.contains('7'),
+                "{}",
+                rendered.reason
+            );
+        }
     }
 
     #[test]

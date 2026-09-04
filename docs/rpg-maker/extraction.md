@@ -1,5 +1,8 @@
 # RPG Maker Extract 现行规格
 
+Extract 从 Init 冻结的来源中提取文本，保存语义层次、原文和可逆写回关系。Builtin 处理本页
+列出的标准字段，Rules 处理使用者明确选择的来源和路径；整个命令不发出模型请求。
+
 ```text
 att mv extract --name NAME [--builtin] \
   [--dialogue-rules FILE] [--rules FILE]
@@ -7,15 +10,13 @@ att mv extract --name NAME [--builtin] \
 att mz extract --name NAME [--builtin] [--rules FILE]
 ```
 
-Extract 的执行者是 Builtin 与 Rules 两类能力，Lua 不在其中。
-
 ## 1. 运行方案
 
 首次 Extract 必须显式选择 `--builtin`、`--rules FILE` 中至少一项。MV 的
 `--dialogue-rules FILE` 只修饰 Builtin，不构成独立 owner。
 
 项目保存最近一次成功采用的 Builtin/Rules 集合。之后省略全部提取选项时复用该集合；
-显式提供任一 owner 时，本次集合精确替换旧方案，未列出的 owner 跳过执行，既有资产
+显式提供任一 owner（资产所有者）时，本次集合精确替换旧方案，未列出的 owner 跳过执行，既有资产
 原样保留。
 
 - `rule = []` 的 Extract Rules 文件停用 Rules 并删除其资产；
@@ -46,7 +47,9 @@ Extract 先按引擎结构建立明确的 `Semantic Scope → Group → Unit`。
 
 内部身份由来源位置和 Unit 角色确定，排序字段不参与身份。Builtin 与 Rules 都保存可从
 冻结来源重新验证的写回 recipe。Rules Unit 还保存产生它的 TOML 自然规则序号，从 1 开始；
-Builtin Unit 没有规则序号。内部位置和顺序键不会进入 CLI、Manual、日志或高级 Lua。
+Builtin Unit 没有规则序号。Rules 命中标准事件参数时，Extract 还冻结实际命令编号，后续
+按物理参数位置和命令编号继承内建控制规则。内部位置和顺序键不会进入 CLI、Manual、日志
+或高级 Lua。
 
 对人使用的 ID 由当前项目索引生成，例如：
 
@@ -88,8 +91,7 @@ Builtin 只读取下表中的标准字段。数据库数组里的 `null` 条目�
 
 非空 `System.json.gameTitle` 只建立这一项 Builtin Unit。标准 NW.js `package.json` 的
 `window.title` 与 `package.main` 活动 HTML 中实际且唯一的小写无属性 `<title>` 元素是该
-Unit 的派生启动显示位置，
-不建立重复 Unit，也不进入 Rules 或 Generic ownership。
+Unit 的派生启动显示位置，不建立重复 Unit，也不进入 Rules 或 Generic ownership。
 
 上述数组中的 `null` 槽跳过，其他槽必须是字符串。Map 与事件列表只读取：
 
@@ -116,12 +118,11 @@ MZ 的 `101.parameters[4]` 可以缺少；JSON 中可达的 JavaScript falsy 值
 选项仍作为位置槽保留。每条事件指令本身仍必须是对象，并具有整数 `code` 和数组
 `parameters`；“不提取某个 code”不表示接受损坏的事件列表结构。
 
-Builtin 明确不读取插件参数、插件命令 `356/357`、`note`/`meta`、`MapInfos.json`、任意
-自定义 `data/*.json`、事件脚本 `355/655`、普通事件注释 `108/408`、普通 JavaScript 或其他
-未列出的字段与事件 code。已知结构中的这些内容应先按 [Extract Rules](rules.md)判断；
-只有 Rules 也无法形成确定、完整、可逆读写时，才把独立材料整理为 JSONL 并建立
-[Generic 项目](../generic/README.md)。Builtin 没有覆盖、内容复杂、数量多或位于插件相关
-位置，都不能单独作为选择 Generic 的依据；ATT 也不会仅凭内容可见性猜测字段语义。
+插件参数、插件命令 `356/357`、`note`/`meta`、`MapInfos.json`、自定义 `data/*.json`、事件
+脚本 `355/655`、普通事件注释 `108/408`、JavaScript 以及其他未列出的字段和事件 code，均
+不在 Builtin 覆盖范围内。这些来源先按 [Extract Rules](rules.md)核对；Rules 也无法形成
+确定、完整、可逆的读写时，再转换为 JSONL 并建立 [Generic 项目](../generic/README.md)。
+可见性、复杂度、数量和插件位置只是调查线索，来源选择仍取决于实际字段语义与读写关系。
 
 Rules 的字段、来源、路径、捕获、顺序和错误范围由[规则规格](rules.md)定义。
 
@@ -144,8 +145,8 @@ owner 成功提交时：
 
 Extract 不删除 `rpg_maker_manual_translation`。位置不存在，或 Group kind、Unit 角色、写回
 recipe、正文形状、原文或项目语言对改变时，人工记录成为过期，但旧原文和译文继续保留。
-完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工失效。条件重新
-匹配时，记录可以再次成为当前。
+完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工
+适用性。绑定条件重新匹配、且通过当前强契约复验时，记录可以再次成为当前。
 
 Extract 替换 owner 快照时，同一自然位置和角色上的 Rejected 候选及其状态随 Unit 原样保留。
 只有与新事实精确匹配的当前适用性指纹才是 Current；绑定事实恢复后，原状态可以重新匹配。位置或角色已经

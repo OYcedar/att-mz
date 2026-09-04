@@ -6,13 +6,13 @@
 请求，拥有共享 HTTP 连接池、Client 活动请求许可、可选 RPM limiter、连接/读取/完整请求
 超时和实际 HTTP 协议。MV、MZ 与 Generic Translate 共享同一 Client 约束。
 
-运行根专注做好一件事：执行请求，并把结构化传输事实交还调用方。TaskBlock、引擎
-value 形状、逐 ID 验收、数据库提交状态和任务记录各有负责的翻译域；独立 Lua 走
-自己的通道，不经过运行根。
-所选 Client 及其 Endpoint、Model、协议、流式选择和参数只描述本次及后续请求，不参与数据库中
-既有译文正文的 Current 判断。
+运行根执行请求，并把结构化传输事实交给调用方。翻译域负责 TaskBlock、引擎 value 形状、
+逐 ID 验收、数据库提交和任务记录；独立 Lua 使用自己的执行通道。
 
-外部请求准入只受两样东西控制：Client 的 `max_concurrent_requests` 和可选 `rate_limit`。
+Client、Endpoint、Model、协议、流式选择和参数决定本次及后续请求，不参与已有译文的
+Current 判断。
+
+外部请求准入由 Client 的 `max_concurrent_requests` 和可选 `rate_limit` 控制。
 ATT 不叠加第二层用户队列、总容量或本地准入截止时间；等待活动许可或 RPM 时只响应
 取消/shutdown，这种等待既不是模型失败，也不消耗重试。完整 JSON 或 SSE 流形成明确终态后
 立即归还 Client 的 HTTP 许可；Translate 自己的确定性顺序提交窗口是独立的内部背压边界，不计作

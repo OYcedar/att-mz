@@ -11,7 +11,7 @@ Generic 项目处理。
 
 建立项目之前，从游戏运行时实际消费的位置确认：
 
-- `www/data` 或 `data` 哪一个是当前游戏根；
+- 游戏根位置，以及根下正在使用的 MV `www/data/`、`www/js/` 或 MZ `data/`、`js/`；
 - MV/MZ 版本、补丁和 MOD 实际覆盖顺序；
 - 数据库、Map、CommonEvents、Troops、插件参数和自定义文件中的玩家可见文本；
 - 每段文本的完整值、语境、自然顺序和写回位置；
@@ -21,8 +21,9 @@ Generic 项目处理。
 
 ## 选择提取能力
 
-必须先读 [Extract 精确覆盖](extraction.md)与 [Rules 完整规格](rules.md)，再为每类来源做
-选择。不能把“Builtin 未覆盖”“位于插件”“内容复杂”或“数量多”当成 Generic 的依据。
+先用 [Extract 精确覆盖](extraction.md)与 [Rules 完整规格](rules.md)核对每类来源，按下表选择
+能够完整提取并可逆写回的能力。Builtin 未覆盖的内容继续检查 Rules；插件位置、复杂度和数量
+本身不决定是否使用 Generic。
 
 | 内容 | 能力 |
 |---|---|
@@ -44,9 +45,8 @@ Builtin 和 Rules 可以在同一项目中搭配使用，只要两者声明的�
 - [Manual](../manual/README.md)：导出、检查并应用仍需人工处理的 TOML 条目；
 - [WriteBack](write-back.md)：从冻结来源构建并发布候选。
 
-独立 [Lua](../lua/README.md) 只操作项目数据库：它不进入上述阶段，也不接触游戏文件。
-普通人工补译使用 Manual TOML；Lua 用于一次批量读取上下文、复杂筛选、批量变换、诊断
-或特殊数据库修改。
+普通人工补译使用 Manual TOML。[Lua](../lua/README.md) 是独立的项目数据库入口，用于批量
+读取上下文、复杂筛选、批量变换、诊断或特殊数据库修改；它不接触游戏文件。
 
 完整任务顺序见[翻译项目指南](../guides/translation-project.md)，失败或不完整结果见
 [诊断与恢复指南](../guides/diagnosis-and-recovery.md)，遗漏、补译、输出和实际加载见

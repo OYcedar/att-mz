@@ -10,8 +10,8 @@ RPG Maker MV/MZ 的三类声明式规则，其引擎专用事实由本规格统�
 MV 姓名投影与 Extract Rules 的字段、默认值、互斥关系、解析失败和执行失败，均以本
 规格为唯一权威。Placeholder 的公共 TOML、捕获、token、恢复与资源生命周期以
 [公共 Placeholder 规格](../translation/placeholders.md)为准；本规格只补充 MV/MZ
-作用域、控制符和形状规则。提取、翻译阶段文档只说明状态交接，字段定义全部回到这里。外部
-作者读完本规格即可写对规则，真实行为不需要从源码反推。
+作用域、控制符和形状规则。提取、翻译阶段的状态交接分别见
+[Extract](extraction.md)与[Translate](translation.md)。
 
 WriteBack 的排版规则是另一份跨引擎文件，不属于本规格的三类提取/翻译规则；其严格 TOML、
 选择器、项目持久化和 401/405/LF 物化只由
@@ -32,7 +32,7 @@ WriteBack 的排版规则是另一份跨引擎文件，不属于本规格的三�
 ## 2. 共同根结构、严格解析与生命周期
 
 三类文件都是严格 UTF-8 TOML，根恰好包含 `rule` 数组。非空定义使用一个或多个
-`[[rule]]`；权威空定义统一写作：
+`[[rule]]`；清空定义写作：
 
 ```toml
 rule = []
@@ -53,9 +53,9 @@ rule = []
 | 提供 `rule = []` | 清空姓名定义 | 停用并删除 Rules owner 快照 | 清空自定义规则；Builtin 保护仍在 |
 | 省略参数 | 复用项目当前定义，不重新解析文件 | 所有 owner 参数均省略时按上次成功方案复用；显式选择其他 owner 时不执行且既有资产不变 | 复用项目当前资源 |
 
-`--dialogue-rules` 必须与 MV `--builtin` 结伴出现。三个文件中任一候选失败，旧状态都
-原样保留，半成品永远不会盖上去。阶段级的先后提交语义见[提取规格](extraction.md)和
-[翻译规格](translation.md)。
+`--dialogue-rules` 必须与 MV `--builtin` 同时提供。候选失败时，对应的旧定义或快照保持
+不变；其他 owner 已经成功提交的结果继续保留。阶段之间的提交顺序见
+[提取规格](extraction.md)和[翻译规格](translation.md)。
 
 Extract Rules 的 `rule = []` 成功生效后，CLI 与项目日志使用同一份四字段诊断说明停用、
 资产删除和运行方案影响；它是退出码仍为 `0` 的成功警告，不是无效规则错误。
@@ -74,14 +74,13 @@ Extract Rules 的 `rule = []` 成功生效后，CLI 与项目日志使用同一�
 槽边界依然有效：匹配可以跨过 `Value` 内部的 LF，但实际 opaque 保护跨度不得吞入两个
 `Lines` 元素之间的拼接 LF。
 
-写 pattern 时推荐用 TOML 单引号字面字符串，反斜杠可以原样直达 PCRE2：
-
-下面两个标为 `valid` 的完整 `[[rule]]` 采用 Placeholder Rules 的字段形状，由 Placeholder
-生产解析与编译边界验收；MV 姓名规则和 Extract Rules 遵循同一套 TOML/PCRE2 转义原则，
-只是还要分别补齐 `speaker` 捕获，或 Extract 来源与 `text` 捕获。
+写 pattern 时推荐用 TOML 单引号字面字符串，让反斜杠原样传给 PCRE2。下面两个完整例子
+使用 Placeholder Rules 格式，因此都提供必填的 `order`。MV 姓名规则与 Extract Rules
+遵循相同的转义原则，各自还需满足 `speaker` 捕获或 Extract 来源、`text` 捕获要求。
 
 ```toml
 [[rule]]
+order = 'preserve'
 pattern = '\A(?<text>正文)\z'
 ```
 
@@ -102,6 +101,7 @@ path = '["a\"b"]'
 
 ```toml
 [[rule]]
+order = 'preserve'
 pattern = '\\SE\[[^]]+\]'
 ```
 
@@ -120,8 +120,7 @@ pattern = '\\SE\[[^]]+\]'
 pattern = '\A\\N<(?<speaker>[^>]*)>\z'
 ```
 
-未命名捕获随意使用，命名捕获则只有 `speaker` 一个位置。`pattern = ''` 会在编译边界
-作为空模式错误被拒绝——它不会变成一条到处零宽命中的规则。
+可以使用未命名捕获；命名捕获只允许一个 `speaker`。下面的空模式会在编译时被拒绝：
 
 ```toml
 [[rule]]
@@ -189,8 +188,7 @@ Body    ：不由这一行建立
 - 某条规则在全部当前对话中从未建立任何非空白 Speaker；
 - 投影与 Builtin/Rules 的物理修改声明冲突。
 
-写规则要对准当前游戏消费协议的 marker 和锚点，并用反例验证；“看起来像姓名”的整行
-猜测迟早会误伤。
+按当前游戏的姓名显示协议确定 marker 和锚点，并用形似但不应提取的文本验证边界。
 
 ### 3.6 提供文件、略去参数与显式空数组的生命周期
 
@@ -243,10 +241,10 @@ path = 'name'
 ### 4.2 类型、默认值与互斥
 
 三项来源的互斥选择见 4.1。`file/plugin` 必须提供 `path`；command 可省略 `path`，
-此时直接读取原始参数：string 进入后续 `decode_json` 和 `pattern`，而 null、boolean、
-number、array、object 按类型聚合为警告并跳过。这个跳过只属于“command 且省略
-`path`”的直接参数，不放宽任何路径、解码或来源结构错误。`decode_json` 仅接受 boolean，
-默认 `false`；`pattern` 省略时使用整个最终 string，提供时必须是非空 string。
+此时直接读取原始参数：string 进入后续 `decode_json` 和 `pattern`，其余 JSON 类型按类型
+聚合为警告并跳过。这个跳过只适用于未提供 `path` 的 command 直接参数；路径、解码和来源
+结构仍按各自规则检查。`decode_json` 仅接受 boolean，默认 `false`；`pattern` 省略时使用
+整个最终 string，提供时必须是非空 string。
 `code`、`parameter` 与固定数组下标都是非负整数，浮点数、数字字符串和负数都不接受。
 
 来源选择是互斥关系而非优先级：字段的排列顺序无法让一个来源盖过另一个。
@@ -271,18 +269,12 @@ number、array、object 按类型聚合为警告并跳过。这个跳过只属�
 
 ### 4.4 针对来源执行失败
 
-解析成功后，ATT 才对冻结来源执行。扫描 command 来源时，事件列表中的非 object 项或
-`code` 非整数项不构成事件命令，按项跳过；这种来源结构异常本身不使候选失败。已经建立
-整数 `code` 且命中规则后，`parameters` 非数组或缺少规则声明的 `parameter` 才表示该规则
-依赖的事件协议不成立。command 省略 `path` 时，存在的直接参数若不是 string，则按
-`rule_number + source_file + command_code + parameter + actual_type` 聚合跳过数量；string
-没有命中 `pattern` 只是普通未命中，不产生警告。精确文件/插件/事件来源不存在，实际
-大小写不符，插件未启用，上述已命中 command 协议失败，显式 `path` 的结构或终值类型
-不符，逐层或 `decode_json` 解码失败，解码后终值不是 string，捕获非法，或规则最终未
-产出任何非空单元，都会使候选失败。路径缺 key 或固定数组越界只让当前展开分支不产出；
-它不是候选失败，除非最终导致该规则零产出。
+解析成功后，ATT 才对冻结来源执行。执行依次确认来源、参数、路径类型、JSON 解码、最终
+字符串和捕获；其中任一必需条件不成立，整个 Rules 候选失败。
 
-完整来源行为见[第 4.11 节](#411-来源执行与原子失败范围)。
+路径缺 key 或固定数组越界只让当前展开分支不产出，但每条规则最终都必须至少产出一个
+非空单元。command 的扫描跳过、非字符串警告与失败条件见
+[第 4.11 节](#411-来源执行与原子失败范围)。
 
 ### 4.5 原子失败范围
 
@@ -303,9 +295,8 @@ owner 候选提交。任一规则失败、recipe 无法重建或 Mutation Claim 
 - 提供内容为 `rule = []` 的文件：明确停用并删除 Rules owner 快照，同时把 Rules 移出
   后续自动方案。
 
-可见，“整组 owner 参数省略”“显式选择其他 owner 时未列出 Rules”和“传空定义”是三个
-不同意图，请按需选用。保存方案持有 canonical 语义而不是文件路径，原 TOML 移动或删除
-都不影响自动复用。
+省略全部 owner 参数用于复用方案，显式选择其他 owner 用于更换本次方案，空定义用于删除
+Rules 资产。项目保存解析后的规范规则内容；原 TOML 移动或删除不影响自动复用。
 
 ### 4.7 可复制正例、反例和物化结果
 
@@ -350,7 +341,7 @@ path = 'title'
 
 ### 4.9 路径 EBNF 与 quoted key
 
-路径不是 JSONPath。完整语法为：
+路径使用下面的确定性语法：
 
 ```ebnf
 path          = segment, { (".", bare-key) | bracket-step } ;
@@ -377,8 +368,8 @@ file = 'QuestEntries.json'
 path = ''
 ```
 
-语法到此为止：`$`、递归下降、过滤器、对象键通配、负数下标和方括号外的任意 Unicode
-key 都不在其中。
+这套语法不支持 JSONPath 的 `$`、递归下降、过滤器、对象键通配或负数下标。包含 Unicode
+或标点的对象键使用 `["..."]`，其中的键按 JSON string 转义。
 
 路径继续而当前值为 JSON string 时，ATT 会把该 string 解码成 JSON 后继续；若下一步仍
 需要继续且又遇到 string，就再次解码。每一层都记录进 recipe，写回按相反顺序编码。
@@ -419,8 +410,8 @@ path = 'payload.entry.title'
 `rules_no_non_blank_match` 失败；诊断附带各实际类型及数量，便于区分“规则没有目标”和
 “来源存在但直接参数类型混合”。候选失败时不提交快照，也不把成功警告交给 CLI。
 
-同一最终 string 内由同一规则的多次捕获自动形成一个组，字段按捕获字节位置排列；同一
-个 string 交给一条规则就好，别让多条规则瓜分。组的自然顺序使用
+同一最终 string 内由同一规则的多次捕获自动形成一个组，字段按捕获字节位置排列。需要
+提取同一 string 的多个片段时，使用一条规则完成这些捕获。组的自然顺序使用
 [第 5 节](#5-语义范围自然顺序与-mutation-claim)定义的 canonical 来源顺序，再按结构路径和捕获
 字节位置排列；规则编号不参与排序。数组下标按数值顺序（`2` 在 `10` 前），而不是按
 位置字符串排序。
@@ -449,14 +440,19 @@ recipe：Literal("A<t>") + Slot(0) + Literal("</t>B<t>") + Slot(1) + Literal("</
   模式，则 Unit 仍是完整 `<Help:炎之剑的说明>`；Placeholder 只在该 Unit 内保护前后壳，
   不改变 Unit 身份或 recipe。
 
-选择哪一种，取决于规则作者想表达的翻译边界；ATT 只认写明的规则，不根据 `<name:value>`
-外观猜测标签。
+按需要的翻译边界选择：Extract 捕获让协议壳进入 recipe，Placeholder wrapper 让完整值
+保留为 Unit 并在翻译时保护协议壳。`<name:value>` 的外观本身不赋予任何提取语义。
 
 ### 4.11 来源执行与原子失败范围
 
 插件来源只读取 `js/plugins.js` 中名称精确匹配且 `status = true` 的参数。插件文件存在、
 但插件禁用或名称大小写不同，均不建立该来源。事件来源扫描规范 Map、CommonEvents 和
 Troops 中的事件列表；`code` 本身没有 ATT 预设语义。
+
+扫描 command 来源时，非 object 项或 `code` 非整数项按项跳过。整数 `code` 命中规则后，
+`parameters` 必须是数组并包含声明的下标，否则整个候选失败。省略 `path` 且直接参数为
+非字符串时，ATT 按自然规则号、来源文件、command code、参数下标和实际类型聚合跳过
+数量。字符串没有命中 `pattern` 只是普通未命中，不产生警告。
 
 每个命中的事件 command 独立选择自己的一个 `parameters[parameter]`，可选路径和
 `pattern` 只作用于这个参数最终得到的单个 string。Rules 不会把相邻 `355/655`、多条
@@ -518,8 +514,8 @@ owner 内、跨 owner Store 和 WriteBack 发布前使用同一规则。
 | Dialogue/Choices/ScrollingText 事件块与其覆盖字段或 decoded descendant | 冲突 |
 | 两个互不覆盖的事件块或普通值 | 允许 |
 
-所以，“最终字符串文字刚好相等”和 Value 是否包含 `<`、`>` 都不构成冲突判断；真正的
-问题是两个 recipe 是否竞争同一物理资源。
+冲突取决于两个 recipe 是否竞争同一物理资源，与最终字符串是否相等或是否包含 `<`、`>`
+无关。
 
 ## 6. RPG Maker Placeholder Rules
 
@@ -542,28 +538,19 @@ order = 'preserve'
 pattern = '<name>(?<text>.*?)</name>'
 ```
 
-| 字段 | 类型 | 必填/默认 | 约束 |
-|---|---|---|---|
-| `pattern` | string | 必填 | 非空 PCRE2；无命名捕获，或恰好一个 `text` |
-| `scopes` | string array | 可选；省略表示全部 scope | 显式数组必须非空、无重复、只含下表值 |
-| `ids` | string array | 可选；省略表示全部自然 ID | 显式数组必须非空、无重复且全部属于当前项目 |
-| `order` | string | 必填 | `preserve` 或 `reorder_within_slot`；wrapper 只能用 `preserve` |
-
 合法 scope 共八个：`database_entry`、`system`、`map`、`event_dialogue`、`event_choices`、
 `event_scrolling_text`、`event_command`、`plugin_parameter`；`all`、别名和父 scope 都不
 存在。
 
 无 `text` 捕获时，完整匹配整段都是不透明保护区；有 `text` 时，捕获前后的 wrapper 是
-不透明边界，捕获本身仍是可以翻译的 NaturalText。注意 `text` 的含义恰恰不是“要保护
-的内容”。
+不透明边界，`text` 捕获本身是继续交给模型翻译的 NaturalText。
 
 ### 6.2 类型、默认值与互斥
 
-`pattern` 和 `order` 必填。`scopes` 省略表示全部八个精确 scope；`ids` 省略表示全部
-当前自然 ID；两者同时出现时取交集。显式数组必须非空且不能重复，scope 也不能写 `all`。
-模式要么没有命名捕获，要么恰好
-只有一个 `text`；其他命名捕获不允许。无 `text` 与有 `text` 是两种互斥投影形态，不会
-按匹配结果自动切换。
+字段类型、必填项和捕获约束见[公共 Placeholder 规格](../translation/placeholders.md#文件字段与匹配)。
+RPG Maker 的 `scopes` 省略时适用于全部八个 kind；提供时只接受本节列出的值。`ids` 选择
+当前项目的完整自然 ID，与 `scopes` 取交集。规则是否声明 `text` 决定投影方式，所有实际
+匹配都必须遵守该方式。
 
 ### 6.3 解析失败
 
@@ -574,20 +561,20 @@ wrapper 使用 `reorder_within_slot`，都会在读取
 
 ### 6.4 针对来源执行失败
 
-定义成功后，规则只对 kind、scope 与自然 ID 都相符的 Unit 执行。这个 kind 来自 Builtin 或
-Rules；owner、文件路径和 Rule 序号都不参与 scope 选择。单条自定义规则零命中是正常结果；一旦命中，完整匹配必须
-非零宽并位于 UTF-8 边界，`text` 必须参与、位于完整匹配内并落在 UTF-8 字符边界。
-实际保护跨度冲突、跨越 `Lines` 元素的语义槽边界、原文占用保留前缀 `⟦ATT_`，或最终
-token 无法安全投影时，错误仍定位到当前 Unit。Planner 不会删掉该 Unit 后发送残缺语境；
-包含它的完整 TaskBlock 本次不发送。其他完整 TaskBlock 是否继续，沿用 Translate 的阶段
-结果规则。
+定义成功后，规则只对 kind 与 `scopes`、自然 ID 与 `ids` 都相符的 Unit 执行。kind 来自
+Builtin 或 Rules；owner、文件路径和自然规则号不参与 scope 选择。单条自定义规则零命中
+是正常结果；实际匹配、捕获与保护跨度的要求见第 6.9 节。
+
+保护跨度冲突、跨越 `Lines` 元素槽边界、原文占用保留前缀 `⟦ATT_`，或 token 无法安全投影
+时，诊断定位到当前 Unit，整次 Translate 规划失败。ATT 不删去失败 Unit，也不发送任何
+其他模型任务；数据库保持不变。
 
 ### 6.5 原子失败范围
 
-文件解析/编译失败时不替换项目自定义 Placeholder 资源。翻译执行期的匹配或保护冲突以
-Unit 为最小诊断和状态单位，以完整 TaskBlock 为最小发送单位：失败 Unit 所在块不发送，
-不受影响的完整块仍可规划。阶段如何记录部分结果由[翻译规格](translation.md)规定，规则
-文件本身没有“忽略冲突”或优先级开关。
+文件解析或编译失败时，项目原有自定义 Placeholder 资源保持不变。针对来源的准备错误同样
+终止整次规划，结果为 Failed，并在任何模型请求之前报告规则文件、自然规则号、Unit 位置、
+原因和修改方法。规划失败保留数据库原状。规划完成后的逐 ID 候选拒绝属于另一阶段，按
+[翻译规格](translation.md)保留合法响应；规则文件没有忽略冲突或优先级开关。
 
 ### 6.6 提供文件、略去参数与显式空数组的生命周期
 
@@ -599,8 +586,8 @@ Unit 为最小诊断和状态单位，以完整 TaskBlock 为最小发送单位�
 
 ### 6.7 可复制正例、反例和物化结果
 
-本节 6.1 的 TOML 是可复制正例；最小反例是 `pattern = ''`，它与 3.1 的空模式反例具有
-相同编译失败语义。完整多 scope 文件见
+本节 6.1 的 TOML 是可复制正例；将其中的 `pattern` 改成 `''` 可以验证空模式的编译失败。
+完整多 scope 文件见
 [`examples/placeholders.toml`](examples/placeholders.toml)。第 6.9 节给出 wrapper、
 NaturalText 与 Builtin 控制符共同物化的结果；测试时应同时覆盖命中 scope、不命中 scope、
 opaque 壳和壳内正文。
@@ -610,8 +597,10 @@ opaque 壳和壳内正文。
 MV/MZ 的标准控制语法和标准字段消费者是 ATT 的默认领域事实。开发时用于确认这些事实的
 官方 core、历史实现和真实样本不进入生产流程；项目运行时不扫描 core、不计算函数摘要，
 也不因活动插件覆写重新决定内建规则。实现根据项目引擎与 Unit 的标准物理来源直接应用下表。
+Rules 命中标准事件参数时，Extract 同时冻结实际命令编号，后续按物理参数位置和命令编号
+继承内建控制规则；插件参数或嵌套解码后的字段不因外形相似而获得标准字段的消费者身份。
 
-这些语法不是脱离标准消费者的全局匹配表：
+下表的每种语法都依赖最后一列所列的标准字段消费者：
 
 | 语法族 | MV | MZ | 只有何种消费者成立时才保护 |
 |---|:---:|:---:|---|
@@ -660,39 +649,41 @@ NaturalText，`\C[2]` 是 NaturalText 内的 Builtin 保护段。三者可以自
 
 同理，Extract 省略 `pattern` 得到的完整 Unit `<Help:炎之剑的说明>`，可以在
 `database_entry` scope 使用 `\A<Help:(?<text>.*?)>\z`：前后壳成为 opaque，正文保持
-NaturalText，但 Unit 原文、Group、recipe、持久身份和去重输入都不改变。Placeholder
-只保护明确跨度，不承担 `<Help:...>` grammar 的候选验收。需要由 ATT 保证前后壳时，应把
-Extract Rule 改为用 `text` 捕获正文，让前后壳进入 recipe，再重新 Extract。只有实际来源
-或写回关系超出 Extract Rules 的表达能力时，才由外部转换和独立 Generic 项目负责。
+NaturalText。Unit 原文、Group、recipe 和持久身份保持不变；保护后的文本及实际 binding
+参与本次去重。候选验收会检查 wrapper 的原配对、捕获形状和拓扑，保证已确认的前后壳。
+
+如果目标是让 `<Help:` 与 `>` 从提取时就固定在写回结构中，则在 Extract Rule 中使用
+`text` 捕获正文，并重新 Extract，使前后壳进入 recipe。Placeholder 负责当前 Unit 内已确认
+片段的保护，完整来源 grammar 与写回关系仍由 Extract 表达；只有后者超出 Rules 能力时，
+才交由外部转换和独立 Generic 项目处理。
 
 例如源 `Lines` 为 `["<msg>第一行", "第二行</msg>"]` 时，若模式启用 DOTALL，元素边界
 位于 `text` 捕获中，因此合法；无 `text` 捕获并把两行整体保护的模式则使该单元规划失败。
 
-Custom/Custom 或 Custom/Builtin 的实际保护跨度一旦相交，本单元规划失败——这里没有
-规则优先级、最长匹配或静默覆盖。
+Custom/Custom 或 Custom/Builtin 的实际保护跨度相交时，诊断指出本 Unit 的冲突，整次规划
+失败。规则顺序不会赋予优先级，也不会让最长匹配覆盖另一条规则。
 
 ### 6.10 token、FullyProtected 与 Current
 
-原文中保留前缀 `⟦ATT_`，不能作为普通文本进入翻译，因为它属于 ATT token 命名空间。
-token 只由实际选中的保护类别、segment 和源位置顺序生成；自定义规则编号不进入 token、
-label 或 state。插入、删除、重排一条对该单元不命中的规则，不改变模型文本或 state。
+前缀 `⟦ATT_` 属于 ATT token 命名空间，原文占用它会使规划失败。token 根据实际保护类别、
+segment 和源位置顺序生成。自定义规则编号只用于诊断；插入、删除或重排一条未命中当前
+Unit 的规则，不改变它的保护后模型文本。
 
 若去掉全部 opaque 段后没有任何非空白 NaturalText，prepared 状态为
 `fully_protected`，不请求 LLM；只剩空格、制表符或换行也属于这种情况。
-模型响应必须精确保留 token 的数量和原有位置关系。候选缺少 token 时，只有对应原片段属于
-唯一槽且在候选中恰好回显一次，才可归一化回该 token；多个同字节槽或多次回显无法唯一
-对应时拒绝为 `placeholder_normalization_ambiguous`。token 已经在场时，额外出现的
-Builtin 原控制符仍按内建控制语义拒绝；Custom 原片段不会反向扫描候选正文，正文中的
-同字节内容保持 NaturalText。
+候选验收使用源文已建立的 binding。候选保留 token 时直接核对；回显原始片段时，按完整
+数量、自然顺序和允许槽位绑定到源 token。多个同字节片段只要仍能唯一归属就可以绑定；
+数量不符、重叠或无法唯一归属时拒绝。`fixed` 按槽分别绑定，允许换序也只限于同一槽。
 
-已存译文对当前源文、完整 Group 语境、项目语言对和强不变量仍适用时直接判定
-Current，不把恢复后的旧译文再次反向
-正规化。因此重复相同占位符的已验收译文在第二次运行不会再次请求 LLM；严格歧义检查
-只用于验收新的模型候选。
+预期片段绑定后，ATT 扫描完整候选，拒绝源 binding 之外新增的 Custom 或内建控制身份。
+规则无需在译文的自然语言上下文再次命中既有片段；wrapper 仍须保持配对、捕获形状和拓扑。
+模型响应、Manual、受管 Lua、Current 复验和 WriteBack 共用
+[公共 Placeholder 验收](../translation/placeholders.md#候选验收)。
 
-实际命中的 Placeholder 绑定（而非整份文件）进入 state。以下变化会使受影响单元失效：
-保护跨度、类别、顺序或原始保护字节改变。未命中规则、规则诊断编号、并发和重试变化
-不会使它失效。
+Placeholder binding 不进入自动译文的适用性指纹。当前原文、完整 Group 语境、语言对、
+位置、角色与写回结构先决定正文是否适用，当前 Placeholder 强契约再独立复验。规则改变后，
+仍合法的正文继续为 Current；违反当前强不变量的正文保留并转入 Rejected。规则诊断编号、
+并发和重试变化不会使正文失效。
 
 ## 7. Terminology 与协议壳的边界
 
@@ -714,9 +705,9 @@ opaque 后壳：不扫描
 即使 trigger 的前半在一个 NaturalText 段、后半在另一个 NaturalText 段，它同样不命中。
 术语文件完整契约见[公共术语规格](../translation/terminology.md)。
 
-## 8. 一次写对的验证清单
+## 8. 用当前来源验证规则
 
-提交规则前，拿当前游戏的正向和反向样本逐项过一遍：
+加载到正式项目之前，使用当前游戏的命中样本和不应命中的样本验证：
 
 1. 来源是实际启用的消费者读取的精确物理身份，文件大小写与目录项一致；
 2. 正例能命中，形似的代码、资源名、禁用插件或不可达内容不命中；
@@ -727,5 +718,5 @@ opaque 后壳：不扫描
 7. 未翻译 round-trip 逐字保持，翻译 round-trip 只改变允许的槽；
 8. 重复 Extract/Translate 收敛，未命中资源变化不制造无关重译。
 
-完整阶段事务见[提取规格](extraction.md)，state 与验收见[翻译规格](translation.md)，
+完整阶段事务见[提取规格](extraction.md)，译文状态与验收见[翻译规格](translation.md)，
 物化 recipe 的写回见[写回规格](write-back.md)。

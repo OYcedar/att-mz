@@ -10,10 +10,10 @@
 
 ## 2. 检查文本覆盖
 
-对调查清单、ownership、完整 Manual 和当前 `translation export` 进行对应检查：
+对调查清单、完整 Manual 和当前 `translation export` 进行对应检查；MV/MZ 同时核对 ownership：
 
 - 每个已声明可见文本来源进入正确项目；
-- 每个位置只有一个 Builtin、Rules 或 Generic 所有者；
+- 每个位置只交给一个提取与写回流程；组合项目明确 Builtin、Rules 与 Generic 的边界；
 - 每个 Group 和 Unit 保留所需上下文、自然顺序和稳定来源映射；
 - 每个待译自然文本拥有当前译文或明确的原文保留理由；
 - 待确认来源和场景形成具体人工检查项。
@@ -30,9 +30,13 @@ Generic 项目同时核对外部来源、JSONL、WriteBack 和实际消费者之
 - 标点、换行、数组形状、UI 长度和可读性；
 - 源语言残留、模型说明、JSON 痕迹和异常转义。
 
-使用随 Skill 的 `translation_qa.py scan` 读取当前完整导出和对应来源证据。先查看
-`review-groups.jsonl`，再展开准备处理的 Review 组。确定问题通过自然 ID 导出 Manual，集中修订、
-apply、重新导出并复查。
+Agent 审校原意、上下文、语气和自然度；随 Skill 的 `translation_qa.py scan` 读取完整导出和
+同源证据，提供覆盖、结构、控制符、字面术语、残留和布局风险的静态检查。独立 Generic 使用
+`--generic-input` 指定 JSONL 输入。脚本没有报告问题，只能说明已执行的检查没有发现，不能代替
+完整语义审校。
+
+处理静态发现时，先查看 `review-groups.jsonl`，再展开相应 Review 组。将确认的问题按自然 ID
+导出到 Manual，集中修订、apply、重新导出并复查。
 
 ## 4. 检查 WriteBack
 
@@ -49,8 +53,9 @@ apply、重新导出并复查。
 
 ## 5. 检查字体与封包
 
-使用 `manage_rpg_maker_fonts.py inspect` 找到实际字体引用，再用 `apply` 把选定中文字体应用到隔离
-副本。根据完整当前译文字符集检查 glyph 覆盖，同时保留引擎和插件使用的字体名称与加载关系。
+RPG Maker 游戏用 `manage_rpg_maker_fonts.py apply` 扫描实际引用，并把选定中文字体应用到隔离副本；
+需要修改前比较或只读调查时使用 `inspect`。其他引擎采用其字体加载方式。根据完整译文检查 glyph 覆盖，
+同时保留引擎和插件使用的字体名称与加载关系。
 
 封包目录包含当前 WriteBack、Generic 外部结果、字体、原有运行文件和所需资源。完成文件解析、
 源语言残留、字体覆盖和启动文件检查后，记录交付目录与静态 QA 结果。

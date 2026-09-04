@@ -634,34 +634,19 @@ fn localize_command_tree(
         .disable_help_subcommand(true)
         .disable_version_flag(true);
 
-    const ARGUMENT_IDENTIFIERS: [&str; 15] = [
-        "ui_language",
-        "progress",
-        "name",
-        "path",
-        "source_language",
-        "target_language",
-        "builtin",
-        "rules",
-        "dialogue_rules",
-        "profile_id",
-        "terms",
-        "placeholders",
-        "script",
-        "arguments",
-        "file",
-    ];
-    for identifier in ARGUMENT_IDENTIFIERS {
-        let Some(takes_values) = command
-            .get_arguments()
-            .find(|argument| argument.get_id().as_str() == identifier)
-            .map(|argument| argument.get_action().takes_values())
-        else {
-            continue;
-        };
-        let message = argument_help(identifier).expect("已列出的参数必须拥有本地化帮助消息");
+    let arguments = command
+        .get_arguments()
+        .map(|argument| {
+            (
+                argument.get_id().to_string(),
+                argument.get_action().takes_values(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (identifier, takes_values) in arguments {
+        let message = argument_help(&identifier).expect("命令参数必须拥有本地化帮助消息");
         let help = localizer.format(message);
-        command = command.mut_arg(identifier, move |argument| {
+        command = command.mut_arg(&identifier, move |argument| {
             let localized = argument.help(help.clone()).long_help(help);
             if takes_values {
                 localized.hide_possible_values(true)
@@ -784,10 +769,14 @@ fn argument_help(identifier: &str) -> Option<UiMessage<'static>> {
         "profile_id" => Some(UiMessage::CliProfileHelp),
         "terms" => Some(UiMessage::CliTermsHelp),
         "placeholders" => Some(UiMessage::CliPlaceholdersHelp),
+        "retry_rejected" => Some(UiMessage::CliRetryRejectedHelp),
+        "selection" => Some(UiMessage::CliManualSelectionHelp),
+        "ids" => Some(UiMessage::CliManualIdsHelp),
+        "layout_rules" => Some(UiMessage::CliLayoutRulesHelp),
         "script" => Some(UiMessage::CliProjectLuaScriptHelp),
         "arguments" => Some(UiMessage::CliProjectLuaArgumentsHelp),
         "file" => Some(UiMessage::CliManualFileHelp),
-        "jsonl" => Some(UiMessage::CliManualFileHelp),
+        "jsonl" => Some(UiMessage::CliJsonlFileHelp),
         _ => None,
     }
 }
@@ -1323,6 +1312,35 @@ mod tests {
                     .output()
                     .contains(&localizer.format(UiMessage::CliTranslationExportAbout))
             );
+            assert!(
+                translation_export
+                    .output()
+                    .contains(&localizer.format(UiMessage::CliJsonlFileHelp))
+            );
+            for (command, messages) in [
+                (vec!["translate"], vec![UiMessage::CliRetryRejectedHelp]),
+                (
+                    vec!["manual", "export"],
+                    vec![
+                        UiMessage::CliManualSelectionHelp,
+                        UiMessage::CliManualIdsHelp,
+                    ],
+                ),
+                (vec!["write-back"], vec![UiMessage::CliLayoutRulesHelp]),
+            ] {
+                let mut args = vec!["att", "--ui-language", locale.as_str(), "generic"];
+                args.extend(command);
+                args.push("--help");
+                let help =
+                    AttArguments::try_parse_localized_from(args).expect_err("Help 应提前退出");
+                for message in messages {
+                    assert!(
+                        help.output().contains(&localizer.format(message)),
+                        "{}",
+                        help.output()
+                    );
+                }
+            }
         }
 
         let chinese =

@@ -26,13 +26,14 @@ Current。术语、Prompt、Profile、Client、模型参数和语言检查阈值
 既有正文的适用性。当前人工译文来自独立人工表，优先于自动译文；Translate 跳过它，
 模型提交也不能覆盖它。
 
-人工译文只在内部位置、Group kind、Unit 角色、写回 recipe、正文形状、原文或项目语言对
-变化时过期。完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 变化
-不影响已经应用的人工译文。
+人工译文的适用性只绑定内部位置、Group kind、Unit 角色、写回 recipe、正文形状、原文和
+项目语言对；这些事实变化时，旧人工记录过期。完整 Group 语境、相邻文本、术语、Prompt、
+Profile 和 Client 不参与人工适用性。Placeholder 配置也不改变适用性，但新强契约会独立
+复验仍适用的正文：合法则保留，违反强不变量则保留正文并转入 Rejected。
 
 不匹配当前语言对或 Group 来源语境的自动正文和状态保留但不再是 Current，不参与模型语境、去重复用或
 WriteBack。Translate 不在请求模型之前删除它；替代候选通过验收后，按当前来源、Unit、
-Group 语境和旧译文状态执行 CAS 原子覆盖。请求失败、取消、额度不足、Partial 或提交冲突
+Group 语境和旧译文状态执行 CAS（比较并交换）原子覆盖。请求失败、取消、额度不足、Partial 或提交冲突
 都保留读取时的正文；绑定事实恢复后，原状态可以重新匹配。
 
 Rejected 候选与自动正文共用同一当前适用性指纹。候选原文、来源上下文、项目
@@ -85,18 +86,23 @@ Partial 后重试重新判断 ID，但不重新装箱。原块中的已完成 Un
 
 ## 4. 验收、并发和结果
 
+### 4.1 候选验收与 Rejected
+
 每个 ID 按[译文候选验收规格](../translation/candidate-validation.md)独立检查。结构合法的
 候选立即保存；源语残留、术语、语义和布局只产生 Review，不拒绝候选。唯一绑定但违反强
 不变量的候选保存为 Rejected，默认后续 Translate 不重复请求；只有显式
-`--retry-rejected` 才重新请求。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
+`--retry-rejected` 才重新请求。也可以使用 `manual export --selection rejected` 导出并
+修订候选。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
 
 已有自动译文经当前强不变量复核不通过时，准备事务按读取快照把正文和违反原因原子转入
 Rejected。`--retry-rejected` 的合法响应以准备完成后的空 Current 为提交基线；代表和全部
 传播目标仍在该基线时才整项写入，任一位置发生并发变化就整体回滚。请求失败或取消时保留
 Rejected 中的原正文和原因，不把它误报为 Current，也不丢失恢复证据。
 
-任务之间可以并发执行，确认和提交仍按自然顺序进行。已确认的前序进度落库后，后续
-失败或取消都不会把它带走。提交时重新检查当前来源、Unit、译文和语义状态，发现并发变化
+### 4.2 提交顺序与请求失败
+
+任务之间可以并发执行，确认和提交仍按自然顺序进行。后续任务失败或取消时，已确认提交
+的前序进度继续保留。提交时重新检查当前来源、Unit、译文和语义状态，发现并发变化
 或当前人工译文时，不覆盖新状态。
 
 永久认证、授权、额度或账户错误一经类型化确认，就停止后续模型请求和 Task 准入，本次
@@ -106,21 +112,26 @@ Incomplete 并退出 `0`。普通网络、超时、HTTP 500、502–504 或 520�
 Task Unavailable，不会停止后续 Task。停止前已经准入且获得有效结果的 Task 仍按自然顺序验收，并在当前 CAS
 成立时提交；单个外部请求失败不能让其他已经付费取得且通过验收的结果失效。
 
+### 4.3 任务状态与命令状态
+
 每个已开始至少一次真实外部 HTTP attempt 的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
 NotCommittedAfterEarlierFailure 或 Cancelled；Partial、Unavailable 与 Failed 同时写可读任务
 诊断。NotCommittedAfterEarlierFailure 只用于更早的数据库提交、内部最终化或取消边界已经使
 后续副作用不再安全的情况；外部模型请求失败本身不能把后续合法响应改成这一状态，也不伪造
-当前 Task 的新错误。每次命令恰好写
-一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、Failed 或
-Cancelled。含 Partial 或 Unavailable 任务但业务结果明确时，Translate 结果是 Incomplete，
-退出码仍为 `0`；完整翻译目标尚未达成。CLI 明确显示 `状态：未完整`，并在 stderr 汇总
+当前 Task 的新错误。
+
+每次命令恰好写一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、
+Failed 或 Cancelled。任务级 Partial 或 Unavailable 表示某个请求的结果；命令级 Incomplete
+表示本次 Translate 仍有未完成内容，退出码为 `0`。CLI 显示 `状态：未完整`，并在 stderr 汇总
 Partial、Unavailable、协议问题、可恢复请求耗尽、剩余决策和剩余位置；逐任务详情保留在
 本次项目日志与任务记录。NoWork 和 Complete 分别显示 `无需处理` 与 `完整`。
 
+### 4.4 计数与规划失败
+
 `translation.finished` 固定保存完整 Task 计数，并保存 RPG Maker 专用的 accepted decisions、
 written/remaining locations、remaining decisions、运行结束时仍为 Rejected 的
-rejected_locations、protocol diagnostics、recoverable request
-exhaustions、request admission stopped 和 reconciliation 计数。Task 计数始终满足
+rejected_locations、protocol diagnostics、recoverable request exhaustions、request admission
+stopped 和 reconciliation 计数。Task 计数始终满足
 `planned = started + not_started`；remaining decisions 与 remaining locations 按实际提交
 递减，不把已准入、冲突或停发后的工作伪装成已完成。started 只在第一次真实 HTTP
 attempt 开始时计数；准入前失败、取消或停发仍计入 not_started。Failed 与 Cancelled 在已经形成计划和
@@ -133,10 +144,11 @@ rejected_locations 必须是 remaining_locations 的子集。准备阶段的失�
 以及每个已提交 Task 的首次拒绝、再次拒绝和修复都更新同一终态计数；提交失败或冲突不伪造
 状态变化。NoWork 与 Complete 要求 remaining 和 Rejected 同时为零。
 
-Partial 会保留合法 ID 和已确认前序进度；再次运行会重新判断剩余 ID 而不改变稳定装箱。
-是否继续同一 Translate、修正系统性资源问题，还是用 Manual 完成少量局部补译，要按
-[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断，
-不能把任一选择当成所有失败的固定做法。
+### 4.5 继续翻译与质量验收
+
+Partial 后再次运行会重新判断剩余 ID，保留已经接受的结果和稳定块边界。pending 可正常
+继续；Rejected 需要显式 `--retry-rejected` 或 Manual 修订。系统性资源问题先修正规则或
+Prompt，具体分流见[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)。
 
 Translate 的 Complete 只表示计划内 Unit 都有结构合法的当前译文；译后 QA 另行报告
 `clean`、`needs_review` 或 `unverified`，不把质量风险伪装成 Translate 失败。

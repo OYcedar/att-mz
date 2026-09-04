@@ -1,9 +1,9 @@
 # ATT 诊断与恢复指南
 
-本指南用于命令失败、Partial、Unavailable、取消、警告、需要恢复或结果未知时选择下一步。
-具体产品行为仍以对应现行规格为准。
+命令失败、Translate 未完整、取消或出现恢复提示时，先确定已经生效的结果，再选择继续方式。
+本指南组织排错步骤，具体状态与事务边界由对应现行规格定义。
 
-## 1. 不先重跑，先确定发生了什么
+## 1. 确认本次结果
 
 先收集当前命令直接产生的事实：
 
@@ -14,8 +14,7 @@
    `<project>/task-records/run-000001/task-000001.md`；
 5. 检查项目数据库和输出目录是否存在、是否仍能由对应普通命令读取。
 
-Manual export/check/apply 不建立项目日志；它们的 stdout/stderr 就是本次权威结果。不要因为
-没有新 RunId 把 Manual 误判为没有执行。
+Manual export/check/apply 的执行结果直接显示在 stdout/stderr，不建立 RunId 或项目日志。
 
 不要先删除数据库、任务记录、目录发布工作区或临时文件，也不要用重跑试探结果未知的
 提交。项目日志和任务记录只是证据，不是数据库或目录恢复权威。
@@ -46,8 +45,7 @@ Manual export/check/apply 不建立项目日志；它们的 stdout/stderr 就是
 - 留下需要恢复的数据库事务或目录；
 - 无法确认是否生效。
 
-公开诊断不再提供内部 effect 或事务字段袋。根据普通文字、当前数据库、输出目录和对应
-规格判断，不从错误 code 或实现阶段猜测。
+诊断的“影响”说明已经确认的状态变化；再结合当前数据库、输出目录和对应规格判断下一步。
 
 ## 3. 通用处理顺序
 
@@ -59,8 +57,8 @@ Manual export/check/apply 不建立项目日志；它们的 stdout/stderr 就是
 6. 只有状态明确允许时才重跑；
 7. 重跑后重新检查业务摘要和实际产物。
 
-错误只给自然对象时，不要回到 raw SQLite 猜内部位置。翻译条目使用 Manual 或高级 Lua 的
-可读 ID；数据库结构调查只有在任务明确需要低级操作时才使用 `ctx.db`。
+定位翻译条目时，使用 Manual 或高级 Lua 的可读 ID；只有任务需要调查数据库结构时，才使用
+`ctx.db` 低级接口。
 
 ## 4. 按进程终态判断
 
@@ -71,8 +69,8 @@ Manual export/check/apply 不建立项目日志；它们的 stdout/stderr 就是
 
 ### 4.2 失败
 
-按诊断修改输入、配置、规则、文件权限或项目状态。确认没有需要恢复或结果未知后，才重跑
-同一命令。不要为了一个局部译文问题修改全局规则并触发大规模 Translate。
+按诊断修正输入、配置、规则、权限或项目状态。确认结果明确且恢复现场已经处理后，重跑同一
+命令。局部译文问题用 Manual 修订；全局规则只在已确认存在系统性错误时调整。
 
 ### 4.3 取消
 
@@ -125,9 +123,9 @@ journal 损坏、目标与已知旧目录都缺失、必要 backup 缺失，或�
 
 ### 6.1 启动、配置与发行
 
-Help 和 Version 不需要配置。其他命令从 `att.exe` 同目录读取固定资源。缺少配置、Prompt、
-语言模块或发行文件时，先修复发行根，不建立项目状态。发行包完整性只通过
-`SHA256SUMS.txt` 校验，checksum 不作为对象名称或普通日志字段。
+Help 和 Version 不需要配置。其他命令从 `att.exe` 同目录读取本次需要的固定资源。配置、Prompt、
+语言模块或发行资源有误时，先按诊断修正。下载包用 `SHA256SUMS.txt` 核验，解压后的文件集合、
+资源一致性与独立运行按[发行物规格](../runtime/distribution.md)检查。
 
 ### 6.2 Init
 
@@ -135,45 +133,48 @@ Generic 首次 Init 使用 `<project>/.project.db.init.tmp`，失败时会尝试
 sidecar。清理失败时保留准确路径，先解除占用并确认内容，再按诊断处理。
 
 MV/MZ Init 使用目录发布器建立来源与数据库。交换前失败保持旧项目；已发布但清理失败或
-需要恢复时，按 4.4 节运行同目标 Init。项目数据库不符合当前 schema 时只按当前数据库损坏
-处理，不识别版本、不迁移、不兼容读取。
+需要恢复时，按 4.4 节运行同目标 Init。项目数据库不符合当前 schema 时，按数据库损坏处理。
 
 ### 6.3 Extract
 
 Generic Extract 整体原子提交；输入在读取期间改变时数据库不变，重新稳定输入后再运行。
 MV/MZ 每个 owner 独立提交，后续 owner 失败不撤销已经成功的前序 owner。
 
-Extract 不删除人工译文表。原文或实际结构变化会让对应人工记录过期，旧正文仍由高级 Lua
-可见；无关人工译文保持当前。不要用 raw SQL 删除过期记录来伪装成功 Extract。
+原文或实际结构变化会让对应人工记录过期，旧正文继续保留并由高级 Lua 查看；无关人工译文
+保持当前。Extract 的结果由当前内容视图与摘要确认。
 
 ### 6.4 Translate
 
-#### Complete
+#### NoWork 或 Complete
 
-确认任务汇总、当前数据库和需要时的任务记录，再进入 WriteBack。Complete 不替代最终输出
-验收。
+确认剩余与 Rejected 为零，再检查当前译文并进入 QA、WriteBack。NoWork 表示本轮没有需要
+执行的模型任务；Complete 表示本轮要求的翻译已经完成。两者都不代替完整游戏的质量与覆盖验收。
 
-#### Partial
+#### Incomplete
 
-先看哪些 Task 和条目仍未完成：
+Incomplete 是 Translate 的业务结果，进程仍可退出 `0`。Partial、Unavailable 和未开始描述
+其中各 Task 的情况；接下来还要按条目状态选择动作：
 
-- 外部服务短暂失败、响应截断或可重试请求耗尽：保留已确认前序进度，状态明确时重跑同一
-  Translate；
-- Placeholder、Prompt 或语言规则存在可复现的系统性错误：修正规则后重跑；
-- 只剩少量局部条目或同文异译：使用 Manual TOML；
-- 含义不明：把全部待查可读 ID 合并到一次 `ctx.translation.context(ids)`，同时读取
-  `ctx.terminology.list()`，不要逐条启动 Lua；
-- 无法确认正确译文：停止并报告缺少的上下文或领域事实。
+| 当前情况 | 下一步 |
+| --- | --- |
+| pending，服务短暂失败或请求耗尽 | 修复服务原因，确认状态明确后再次 Translate，保留前序进度 |
+| Rejected，候选违反控制符或结构契约 | 用 `manual export --selection rejected` 导出并修订；确需重新请求模型时显式使用 `--retry-rejected` |
+| Prompt、Placeholder 或语言规则有可复现的系统性错误 | 修正对应资源；再次 Translate 时显式选择是否重试 Rejected，普通重跑仍跳过它们 |
+| 少量剩余、同文异译或局部质量问题 | 用 Manual 集中补译或修订 |
+| 含义不明 | 把全部待查 ID 合并到一次 `ctx.translation.context(ids)`，同时读取 `ctx.terminology.list()` |
+| 仍缺上下文或领域事实 | 记录准确位置、缺失事实和人工调查场景，保留当前项目 |
 
 Manual 默认流程为 export、填写、apply。apply 已执行与 check 相同的结构和 Placeholder 检查；
 只在需要事先试检或单独诊断 TOML 时先运行 check。Manual 负责 TOML 结构与 Placeholder 验收；
 apply 后按[翻译验收指南](acceptance.md)继续检查残留英文、译文等于原文、术语偏好和翻译质量，
 需要复核数据库全部当前正文时重新执行 `translation export`。
 
-#### Unavailable
+#### 请求或模型结果不可用
 
-Unavailable 表示模型没有给出可接受结果，但命令终态明确。根据任务记录判断是否值得重跑；
-少量剩余项优先 Manual。不要只为绕过一个条目修改 ignored terms、Placeholder 或语言规则。
+Unavailable Task 没有产生可接受译文，可能仍保存了能够唯一定位的 Rejected 候选。结合本次日志、
+任务记录和 `translation export` 确认条目状态，再按上表处理。普通网络错误耗尽通常只影响当前
+Task；认证、权限、额度或普通 429 停发按 [HTTP 规格](../runtime/openai-compatible.md#4-失败与重试)
+区分。修正服务问题不会自动清除已经保存的 Rejected。
 
 #### 整体无效响应与逐 ID 失败
 
@@ -196,9 +197,10 @@ Raw `ctx.db` 从 autocommit 开始，可以执行 DML、DDL、PRAGMA 和显式�
 
 ### 6.6 WriteBack 与目录发布
 
-WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工译文优先于自动译文；当前
-人工译文和自动译文都必须满足当前 Placeholder 契约。正文先按配置中的独立标点与补空白
-开关处理，再只对项目保存的规则命中位置断行；完整行为见对应 WriteBack 与排版规则规格。
+WriteBack 可以在翻译未完整的项目上运行；pending 和 Rejected 条目使用原文。当前人工译文优先
+于自动译文，两者都必须满足当前 Placeholder 契约。显式排版规则先经验证并保存；正文随后依次
+执行自动译文标点修复、规则断行和续行空白补全。人工译文跳过标点修复，其他步骤按各自开关与
+规则执行；完整行为见对应 WriteBack 与[排版规则规格](../translation/write-back-layout-rules.md)。
 
 规则未覆盖、无法安全断行或仍需人工判断的布局问题由译后 QA 或实际界面观察报告。按可读 ID 导出修订 Manual，调整后再次运行 QA；
 需要 Group 语境时批量调用 Lua context。修订完成后重新 WriteBack，并在隔离副本中检查
@@ -209,7 +211,7 @@ WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工�
 
 ### 6.7 SQLite 与可观测性
 
-普通命令发现当前 schema 不完整时停止，不迁移或兼容。公开诊断不显示 SQLite 查询、code、
+普通命令发现当前 schema 不完整时停止并报告问题。公开诊断不显示 SQLite 查询、code、
 数据库行或内部指纹。Raw Lua 破坏数据库后，普通命令失败是预期结果；Generic Lua 仍可直接
 打开 `project.db` 继续调查。
 
@@ -226,5 +228,5 @@ WriteBack 可以在 Partial 项目上运行，未译条目保留原文。人工�
 - 输出结构或发布问题：WriteBack 与目录发布；
 - 实际游戏没有采用输出：外部部署与消费者检查。
 
-无法证明是系统性规则缺陷时，不通过修改全局规则触发大规模重译。完成局部 Manual 补译，
-或停止并报告无法确认的事实。
+用局部 Manual 修订处理单个译文问题；有可复现证据时再修正系统规则。无法确定的问题保留
+准确位置和缺失事实，供后续调查。

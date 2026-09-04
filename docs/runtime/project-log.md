@@ -22,7 +22,8 @@ timestamp, sequence, run_id, level, event, context, payload, message
 - `context` 包含 `locale`、`engine`、`project` 和 `command`；
 - `event` 是自然事件名，例如 `run.started`、`phase.completed` 或 `lua.print`；
 - `payload` 只保存该事件确实需要的结构化事实；
-- `message` 是按本次 UI 语言生成的可读单行说明；
+- `message` 是按本次 UI 语言生成的可读单行说明；方案来源和阶段名也使用本地化标签，
+  `payload` 保留对应的稳定字段值；
 - 未知字段和不一致的 event、level、payload 组合无效。
 
 日志不使用公开 `code` 或诊断引用字段。内部实现可用类型化错误和临时身份维持控制流，
@@ -135,8 +136,8 @@ Rejected 都必须为零。
 
 只要 Translate 已经形成计划事实，Complete、Incomplete、Failed 和 Cancelled 都保存当时
 的 Task 计数和引擎汇总。Failed 或 Cancelled 不得把已经开始、未开始、已写入和剩余工作
-清零；终端短汇总直接使用同一份事实。Generic 的 remaining_units 是计划交给模型的 Unit
-减去实际写入的 Unit，CAS 冲突不算写入；RPG Maker 的剩余决策和位置同样按实际提交递减。
+清零；终端短汇总直接使用同一份事实。Generic 的 remaining_units 按上述 planned_units 集合中
+尚未解决的 Unit 计算，CAS 冲突不算已解决；RPG Maker 的剩余决策和位置同样按实际提交递减。
 服务停发后没有开始的 Task 只计入 not_started。
 执行器结束准入并确认全部已开始 Task 后，`confirmed_tasks` 阶段按实际 started/total 完成；
 Incomplete 可以保留 `started < total`，未开始部分仍由任务汇总表达。

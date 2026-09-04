@@ -28,6 +28,11 @@ cli-placeholders-help = Заменить ресурс Placeholder проекта
 cli-project-lua-script-help = Lua-скрипт для выполнения над базой данных проекта
 cli-project-lua-arguments-help = Аргумент UTF-8 для Lua arg[1..] после --
 cli-manual-file-help = TOML-файл с ручными переводами
+cli-jsonl-file-help = Файл экспорта JSONL
+cli-retry-rejected-help = Повторно обработать сохранённые кандидаты Rejected
+cli-manual-selection-help = Выбор для экспорта: pending (по умолчанию), rejected или all
+cli-manual-ids-help = Экспортировать записи с естественными ID из этого файла JSONL
+cli-layout-rules-help = Загрузить и сохранить правила оформления WriteBack из файла TOML
 cli-usage-heading = Использование:
 cli-commands-heading = Команды:
 cli-options-heading = Параметры:
@@ -189,6 +194,29 @@ log-publication-finished = { $result ->
     [recovery_required] Публикация остановлена и требует восстановления.
     [outcome_unknown] Итоговое состояние публикации неизвестно.
    *[other] Публикация остановилась без распознанного результата.
+}
+log-phase-name = { $phase ->
+    [check_project] Проверка проекта
+    [scan_source] Сканирование исходных файлов
+    [prepare_candidate] Подготовка кандидата
+    [update_database] Обновление базы данных
+    [publish] Публикация
+    [builtin] Извлечение Builtin
+    [builtin_documents] Сканирование документов Builtin
+    [builtin_work_units] Извлечение текстовых единиц Builtin
+    [builtin_commit] Фиксация Builtin
+    [rules] Извлечение Rules
+    [rules_documents] Сканирование документов Rules
+    [rules_matches] Поиск совпадений Rules
+    [rules_commit] Фиксация Rules
+    [lua] Выполнение Lua
+    [planning] Планирование задач перевода
+    [confirmed_tasks] Подтверждение задач перевода
+    [read_assets] Чтение содержимого проекта
+    [plan_rpg_maker_write_back] Планирование WriteBack
+    [rewrite_documents] Перезапись документов
+    [validate_candidate] Проверка кандидата
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] завершена
@@ -408,6 +436,29 @@ diagnostic-provider-code = Код провайдера: { $code }
 diagnostic-provider-type = Тип провайдера: { $kind }
 diagnostic-provider-message = Сообщение провайдера: { $message }
 diagnostic-json-position = строка { $line }, столбец { $column }
+diagnostic-input-field = Поле: { $field }
+diagnostic-input-failure = { $code ->
+    [syntax] Неверный синтаксис TOML
+    [missing_field] Отсутствует обязательное поле
+    [unknown_field] Текущий формат не допускает это поле
+    [duplicate_field] Поле указано повторно
+    [type_mismatch] Неверный тип поля
+    [invalid_value] Недопустимое значение поля
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = Ожидаемый тип: { $expected ->
+    [string] строка
+    [integer] целое число
+    [boolean] логическое значение
+    [string_or_boolean] строка или логическое значение
+    [string_array] массив строк
+    [integer_array] массив целых чисел
+    [table] таблица
+    [table_array] массив таблиц
+    [array] массив
+    [object] объект
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = элемент ответа { $item }
 diagnostic-array-item = элемент массива { $item }
 diagnostic-token-position = позиция управляющего token { $position }
@@ -420,6 +471,9 @@ manual-exported = Экспортировано записей: { $entries }; ф�
 manual-checked = Допустимых: { $valid }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-applied = Применено: { $applied }, незаполненных: { $unfilled }, ошибок: { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] Элемент translation № { $line } содержит BOM (U+FEFF)
+    [remove_byte_order_mark] Удалите символ BOM (U+FEFF) из перевода
+    [keep_placeholders] Восстановите исходные Placeholder в переводе, сохранив их количество, требуемый порядок и текстовые слоты
     [invalid_source_line] элемент source { $line } содержит перевод строки или NUL
     [invalid_translation_line] элемент translation { $line } содержит перевод строки или NUL
     [fixed_length] для перевода fixed требуется элементов: { $expected }; получено: { $actual }
@@ -437,6 +491,7 @@ task-record-final-result-heading = Итоговый результат
 task-record-final-status = Состояние: { $state ->
     [complete] завершена, фиксация подтверждена
     [partial] частично завершена, фиксация подтверждена
+    [unavailable_rejected_committed] Недоступно; отклонённые кандидаты сохранены
     [unavailable] недоступна, проект не изменён
     [execution_failed] ошибка выполнения, без фиксации
     [commit_preparation_failed] ошибка подготовки фиксации, точно не применена

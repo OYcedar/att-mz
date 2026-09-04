@@ -628,6 +628,7 @@ enum StoredRecipe {
         StoredMutationClaim,
         String,
         Vec<StoredDirectTextPart>,
+        Option<i64>,
     ),
     #[serde(rename = "l")]
     Dialogue(
@@ -646,6 +647,7 @@ enum StoredRoleRecipeShape {
         StoredLocation,
         StoredMutationClaim,
         Vec<StoredDirectTextPart>,
+        Option<i64>,
     ),
     #[serde(rename = "l")]
     Dialogue(
@@ -668,6 +670,7 @@ impl StoredRoleRecipeShape {
                 StoredLocation::from(recipe.target()),
                 StoredMutationClaim::from(recipe.mutation_claim()),
                 recipe.parts().iter().map(Into::into).collect(),
+                recipe.event_command_code(),
             ),
             TextProjectionRecipe::Dialogue(recipe) => Self::Dialogue(
                 StoredLocation::from(recipe.group_location()),
@@ -705,6 +708,7 @@ impl From<&TextProjectionRecipe> for StoredRecipe {
                 StoredMutationClaim::from(recipe.mutation_claim()),
                 recipe.expected_raw().to_owned(),
                 recipe.parts().iter().map(Into::into).collect(),
+                recipe.event_command_code(),
             ),
             TextProjectionRecipe::Dialogue(recipe) => Self::Dialogue(
                 StoredLocation::from(recipe.group_location()),
@@ -721,21 +725,27 @@ impl TryFrom<StoredRecipe> for TextProjectionRecipe {
 
     fn try_from(recipe: StoredRecipe) -> Result<Self, Self::Error> {
         match recipe {
-            StoredRecipe::Direct(target, mutation_claim, expected_raw, parts) => {
-                DirectTextRecipe::new_with_claim(
-                    target
-                        .try_into()
-                        .map_err(RpgMakerProjectionCodecError::Location)?,
-                    mutation_claim.try_into()?,
-                    expected_raw,
-                    parts
-                        .into_iter()
-                        .map(TryInto::try_into)
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-                .map(TextProjectionRecipe::Direct)
-                .map_err(RpgMakerProjectionCodecError::Projection)
-            }
+            StoredRecipe::Direct(
+                target,
+                mutation_claim,
+                expected_raw,
+                parts,
+                event_command_code,
+            ) => DirectTextRecipe::new_with_claim(
+                target
+                    .try_into()
+                    .map_err(RpgMakerProjectionCodecError::Location)?,
+                mutation_claim.try_into()?,
+                expected_raw,
+                parts
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map(|recipe| {
+                TextProjectionRecipe::Direct(recipe.with_event_command_code(event_command_code))
+            })
+            .map_err(RpgMakerProjectionCodecError::Projection),
             StoredRecipe::Dialogue(group_location, direct_speaker, lines) => {
                 DialogueWriteRecipe::new(
                     group_location
@@ -1284,7 +1294,7 @@ mod tests {
 
         assert_eq!(
             encoded,
-            r#"[{"d":[["v",["m",1],[3]],{"v":["v",["m",1],[3]]},"第二项",[{"s":["c",1]}]]}]"#
+            r#"[{"d":[["v",["m",1],[3]],{"v":["v",["m",1],[3]]},"第二项",[{"s":["c",1]}],null]}]"#
         );
         assert_eq!(
             RpgMakerProjectionCodec::decode_recipes(&encoded).expect("配方应可解码"),

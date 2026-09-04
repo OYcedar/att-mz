@@ -27,7 +27,7 @@ use crate::diagnostic::{
     ObservabilityWriteFailure, RelatedFailureRelation, ReportedFailure, SafeIdentifier, SafeIoKind,
     SafePath, SafeText, StateEffect, render_diagnostic_fields,
 };
-use crate::i18n::{UiLocale, UiLocalizer, UiMessage};
+use crate::i18n::{UiLocale, UiLocalizer, UiMessage, project_log_value_source_label};
 use crate::llm::ApiKeyRedactionGate;
 use crate::observability::RunId;
 
@@ -332,6 +332,12 @@ pub(crate) enum ProjectLogPhase {
 }
 
 impl ProjectLogPhase {
+    fn message(self) -> UiMessage<'static> {
+        UiMessage::LogPhaseName {
+            phase: self.as_str(),
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::CheckProject => "check_project",
@@ -1390,13 +1396,16 @@ impl ProjectLogEvent {
             }),
             Self::RunPlanResolved { plan } => localizer.format(UiMessage::LogPlanResolved {
                 command: context.command().as_str(),
-                source: plan.source().as_str(),
+                source: &localizer.format(
+                    project_log_value_source_label(plan.source().as_str())
+                        .expect("运行计划来源必须有本地化标签"),
+                ),
             }),
             Self::PhaseStarted { phase, .. } => localizer.format(UiMessage::LogPhaseStarted {
-                phase: phase.as_str(),
+                phase: &localizer.format(phase.message()),
             }),
             Self::PhaseCompleted { phase, .. } => localizer.format(UiMessage::LogPhaseCompleted {
-                phase: phase.as_str(),
+                phase: &localizer.format(phase.message()),
             }),
             Self::PhaseStopped { phase, outcome } => {
                 let outcome = match outcome {
@@ -1404,7 +1413,7 @@ impl ProjectLogEvent {
                     PhaseStopOutcome::Cancelled => "cancelled",
                 };
                 localizer.format(UiMessage::LogPhaseStopped {
-                    phase: phase.as_str(),
+                    phase: &localizer.format(phase.message()),
                     outcome,
                 })
             }
@@ -4570,6 +4579,60 @@ mod tests {
             )
             .expect("测试 context 必须有效");
             let localizer = UiLocalizer::new(context.locale().ui_locale());
+            let plan = ProjectLogEvent::RunPlanResolved {
+                plan: ResolvedRunPlan::generic_extract(RunPlanValueSource::Explicit),
+            };
+            let message = plan.message(&context, &localizer);
+            assert!(message.contains(&localizer.format(UiMessage::PlanSourceExplicit)));
+            for phase in [
+                ProjectLogPhase::CheckProject,
+                ProjectLogPhase::ScanSource,
+                ProjectLogPhase::PrepareCandidate,
+                ProjectLogPhase::UpdateDatabase,
+                ProjectLogPhase::Publish,
+                ProjectLogPhase::Builtin,
+                ProjectLogPhase::BuiltinDocuments,
+                ProjectLogPhase::BuiltinWorkUnits,
+                ProjectLogPhase::BuiltinCommit,
+                ProjectLogPhase::Rules,
+                ProjectLogPhase::RulesDocuments,
+                ProjectLogPhase::RulesMatches,
+                ProjectLogPhase::RulesCommit,
+                ProjectLogPhase::Lua,
+                ProjectLogPhase::Planning,
+                ProjectLogPhase::ConfirmedTasks,
+                ProjectLogPhase::ReadAssets,
+                ProjectLogPhase::PlanRpgMakerWriteBack,
+                ProjectLogPhase::RewriteDocuments,
+                ProjectLogPhase::ValidateCandidate,
+            ] {
+                let name = localizer.format(phase.message());
+                assert!(!name.trim().is_empty());
+                assert!(!name.contains("__ATT_FALLBACK__"));
+                assert_ne!(name, "log-phase-name");
+                assert_ne!(name, phase.as_str());
+                for event in [
+                    ProjectLogEvent::PhaseStarted {
+                        phase,
+                        amount: ProjectLogAmount::Indeterminate,
+                    },
+                    ProjectLogEvent::PhaseCompleted {
+                        phase,
+                        amount: ProjectLogAmount::Indeterminate,
+                    },
+                    ProjectLogEvent::PhaseStopped {
+                        phase,
+                        outcome: PhaseStopOutcome::Cancelled,
+                    },
+                ] {
+                    let message = event.message(&context, &localizer);
+                    assert!(message.contains(&name), "{message}");
+                    assert!(!message.contains("__ATT_FALLBACK__"));
+                    if locale == UiLocale::SimplifiedChinese {
+                        assert!(!message.contains("正在"), "{message}");
+                    }
+                }
+            }
             let events = [
                 ProjectLogEvent::CancellationRequested {
                     confirmed: 2,

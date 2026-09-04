@@ -8,7 +8,7 @@ order = 'preserve'
 pattern = '\\SE\[[^]]+\]'
 
 [[rule]]
-scopes = ['dialogue', 'choice']
+scopes = ['event_dialogue', 'event_choices']
 ids = ['Map023.json:event17:page1:dialogue42']
 order = 'preserve'
 pattern = '<msg>(?<text>.*?)</msg>'
@@ -17,14 +17,16 @@ pattern = '<msg>(?<text>.*?)</msg>'
 仍交给语言判断、术语匹配和模型翻译的文本片段称为 NaturalText；被 Placeholder
 替换成 ATT token 的片段称为不透明保护段。
 
-每项只允许：
+## 文件字段与匹配
+
+上例使用 RPG Maker scope。每项只允许：
 
 | 字段 | 要求 |
 |---|---|
-| `pattern` | 非空、可编译的 PCRE2 表达式 |
+| `pattern` | 必填；非空、可编译的 PCRE2 表达式 |
 | `scopes` | 可省略的非空字符串数组；省略表示适用于全部 kind |
 | `ids` | 可省略的非空自然 Manual ID 数组；省略表示不按 ID 限定 |
-| `order` | `preserve` 或 `reorder_within_slot` |
+| `order` | 必填；`preserve` 或 `reorder_within_slot` |
 
 `scopes` 与 `ids` 同时出现时取交集。每个 `ids` 值必须是当前项目的完整自然 ID；未知、
 重复或空 ID 会在模型请求前使资源无效。`preserve` 要求命中片段保持相对顺序；
@@ -48,6 +50,8 @@ Generic 项目使用与 JSONL `kind` 原值精确对应的 `scopes`。从 MZ Pla
 逐项复核或改写 `scopes`，并作为独立 Generic 规则随 Translate 加载；两类文件共享 TOML 语法，
 scope 语义分别由各自引擎负责。
 
+## 候选验收
+
 ATT 把匹配片段替换成临时 ATT token，再把模型结果中的 token 恢复为原片段。token 的
 字符、大小写、编号、数量、顺序和允许位置必须保持；缺失、重复、改写或跨不允许边界移动
 都会拒绝该 ID。
@@ -64,19 +68,23 @@ ATT 把匹配片段替换成临时 ATT token，再把模型结果中的 token �
 拓扑变化都会拒绝候选。模型响应、传播目标、Manual、受管 Lua、Current 复验和 WriteBack
 使用同一套源文绑定验收。
 
+## 完整语境与规划失败
+
 Placeholder 准备作用于完整 TaskBlock 语境，不只作用于本轮带 ID 的 Unit。模型代表显示
 带 ID 的保护后原文；Current 或已确认复用的无编号 Unit 只有在目标文本能够按该 Unit 的
 Placeholder 绑定建立安全表示时才显示目标文本，否则显示保护后原文。只有带 ID 的 Unit
 建立响应恢复和验收契约。
 
-任一 Unit 的原文无法完成保护或语言投影时，ATT 不会删除它后发送残缺 Group。包含该
-Unit 的完整 TaskBlock 不发送，并按相应引擎的规划失败语义报告。
+任一 Unit 的原文无法完成保护或语言投影时，整次 Translate 规划失败，不发送任何模型任务，
+数据库保持不变。诊断定位到失败 Unit，完整 Group 与 TaskBlock 保留原有语境。
 
 Placeholder 问题会区分 worker 启动、PCRE2 匹配、空匹配、缺少 `text` 捕获、无效范围、
 重叠、跨文本单元边界和保留 token namespace。公开诊断只保留规则文件或当前项目规则、
 自然规则号、可读条目位置、直接原因和修改方法，不输出编码位置、数据库键、内部状态或
 游戏正文。规划因此失败时不发模型请求，数据库保持不变，`translation.finished` 明确记录
 本次 Translate 失败。
+
+## 保存规则与复验
 
 `translate --placeholders FILE` 在模型请求之前完整解析并原子替换当前项目规则。省略参数
 时复用当前规则；`rule = []` 显式清空。解析失败时项目保持不变，也不发出请求。

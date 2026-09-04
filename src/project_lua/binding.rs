@@ -522,7 +522,7 @@ return function(native)
     for index = 1, select("#", ...) do
       values[index] = tostring(select(index, ...))
     end
-    local ok, value = native(concat(values, "\t"))
+    local ok, value = native(concat(values, " "))
     if not ok then error(value, 0) end
     return value
   end

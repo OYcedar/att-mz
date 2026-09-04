@@ -28,6 +28,11 @@ cli-placeholders-help = Sustituye el recurso Placeholder del proyecto
 cli-project-lua-script-help = Script Lua que se ejecutará en la base de datos del proyecto
 cli-project-lua-arguments-help = Argumento UTF-8 pasado a Lua arg[1..] después de --
 cli-manual-file-help = Archivo TOML de traducciones manuales
+cli-jsonl-file-help = Archivo de exportación JSONL
+cli-retry-rejected-help = Reintentar los candidatos Rejected guardados
+cli-manual-selection-help = Selección para exportar: pending (predeterminada), rejected o all
+cli-manual-ids-help = Exportar las entradas con los ID naturales de este archivo JSONL
+cli-layout-rules-help = Cargar y guardar las reglas de formato WriteBack desde un archivo TOML
 cli-usage-heading = Uso:
 cli-commands-heading = Comandos:
 cli-options-heading = Opciones:
@@ -187,6 +192,29 @@ log-publication-finished = { $result ->
     [recovery_required] La publicación se detuvo y requiere recuperación.
     [outcome_unknown] Se desconoce el estado final de la publicación.
    *[other] La publicación se detuvo sin un resultado reconocido.
+}
+log-phase-name = { $phase ->
+    [check_project] Comprobación del proyecto
+    [scan_source] Análisis de los archivos fuente
+    [prepare_candidate] Preparación del candidato
+    [update_database] Actualización de la base de datos
+    [publish] Publicación
+    [builtin] Extracción Builtin
+    [builtin_documents] Análisis de documentos Builtin
+    [builtin_work_units] Extracción de unidades de texto Builtin
+    [builtin_commit] Confirmación en la base de datos de Builtin
+    [rules] Extracción Rules
+    [rules_documents] Análisis de documentos Rules
+    [rules_matches] Búsqueda de coincidencias Rules
+    [rules_commit] Confirmación en la base de datos de Rules
+    [lua] Ejecución de Lua
+    [planning] Planificación de tareas de traducción
+    [confirmed_tasks] Confirmación de tareas de traducción
+    [read_assets] Lectura del contenido del proyecto
+    [plan_rpg_maker_write_back] Planificación de WriteBack
+    [rewrite_documents] Reescritura de documentos
+    [validate_candidate] Validación del candidato
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] completada
@@ -406,6 +434,29 @@ diagnostic-provider-code = Código del proveedor: { $code }
 diagnostic-provider-type = Tipo del proveedor: { $kind }
 diagnostic-provider-message = Mensaje del proveedor: { $message }
 diagnostic-json-position = línea { $line }, columna { $column }
+diagnostic-input-field = Campo: { $field }
+diagnostic-input-failure = { $code ->
+    [syntax] Sintaxis TOML no válida
+    [missing_field] Falta un campo obligatorio
+    [unknown_field] El formato actual no admite este campo
+    [duplicate_field] El campo está duplicado
+    [type_mismatch] El campo tiene un tipo incorrecto
+    [invalid_value] El valor del campo no es válido
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = Tipo esperado: { $expected ->
+    [string] cadena
+    [integer] entero
+    [boolean] booleano
+    [string_or_boolean] cadena o booleano
+    [string_array] matriz de cadenas
+    [integer_array] matriz de enteros
+    [table] tabla
+    [table_array] matriz de tablas
+    [array] matriz
+    [object] objeto
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = elemento de respuesta { $item }
 diagnostic-array-item = elemento de matriz { $item }
 diagnostic-token-position = posición del token de control { $position }
@@ -418,6 +469,9 @@ manual-exported = Se exportaron { $entries } entradas a { $path }
 manual-checked = Válidas { $valid }, sin completar { $unfilled }, errores { $errors }
 manual-applied = Aplicadas { $applied }, sin completar { $unfilled }, errores { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] El elemento { $line } de translation contiene un BOM (U+FEFF)
+    [remove_byte_order_mark] Eliminar el carácter BOM (U+FEFF) de la traducción
+    [keep_placeholders] Restaurar los Placeholders del original en la traducción, conservando su cantidad, el orden requerido y sus segmentos de texto
     [invalid_source_line] el elemento source { $line } contiene un salto de línea o NUL
     [invalid_translation_line] el elemento translation { $line } contiene un salto de línea o NUL
     [fixed_length] la traducción fixed requiere { $expected } elementos; hay { $actual }
@@ -435,6 +489,7 @@ task-record-final-result-heading = Resultado final
 task-record-final-status = Estado: { $state ->
     [complete] completada y commit confirmado
     [partial] parcialmente completada y commit confirmado
+    [unavailable_rejected_committed] No disponible; candidatos rechazados guardados
     [unavailable] no disponible; proyecto sin cambios
     [execution_failed] error de ejecución; sin commit
     [commit_preparation_failed] error al preparar el commit; no aplicado con certeza

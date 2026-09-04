@@ -6092,7 +6092,7 @@ mod tests {
 
     #[cfg(feature = "release-stress")]
     fn large_data_root_recipe(location: &str) -> String {
-        format!(r#"[{{"d":[{location},{{"v":{location}}},"原文",[{{"t":{{"f":"name"}}}}]]}}]"#)
+        format!(r#"[{{"d":[{location},{{"v":{location}}},"原文",[{{"t":{{"f":"name"}}}}],null]}}]"#)
     }
 
     #[cfg(feature = "release-stress")]

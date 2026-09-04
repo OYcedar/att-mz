@@ -747,6 +747,7 @@ pub(crate) struct DirectTextRecipe {
     mutation_claim: MutationClaim,
     expected_raw: String,
     parts: Vec<DirectTextPart>,
+    event_command_code: Option<i64>,
 }
 
 impl DirectTextRecipe {
@@ -804,7 +805,17 @@ impl DirectTextRecipe {
             mutation_claim,
             expected_raw,
             parts,
+            event_command_code: None,
         })
+    }
+
+    pub(crate) fn with_event_command_code(mut self, code: Option<i64>) -> Self {
+        self.event_command_code = code;
+        self
+    }
+
+    pub(crate) fn event_command_code(&self) -> Option<i64> {
+        self.event_command_code
     }
 
     pub(crate) fn target(&self) -> &RpgMakerLocation {

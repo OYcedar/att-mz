@@ -28,6 +28,11 @@ cli-placeholders-help = Thay tài nguyên Placeholder của dự án
 cli-project-lua-script-help = Tập lệnh Lua sẽ chạy trên cơ sở dữ liệu dự án
 cli-project-lua-arguments-help = Đối số UTF-8 truyền cho Lua arg[1..] sau --
 cli-manual-file-help = Tệp TOML bản dịch thủ công
+cli-jsonl-file-help = Tệp xuất JSONL
+cli-retry-rejected-help = Xử lý lại các bản dịch Rejected đã lưu
+cli-manual-selection-help = Phạm vi xuất: pending (mặc định), rejected hoặc all
+cli-manual-ids-help = Xuất các mục khớp với ID tự nhiên trong tệp JSONL này
+cli-layout-rules-help = Nạp và lưu quy tắc bố cục WriteBack từ tệp TOML
 cli-usage-heading = Cách dùng:
 cli-commands-heading = Lệnh:
 cli-options-heading = Tùy chọn:
@@ -184,6 +189,29 @@ log-publication-finished = { $result ->
     [recovery_required] Xuất bản đã dừng và cần khôi phục.
     [outcome_unknown] Chưa biết trạng thái cuối của việc xuất bản.
    *[other] Xuất bản dừng với kết quả không xác định.
+}
+log-phase-name = { $phase ->
+    [check_project] Kiểm tra dự án
+    [scan_source] Quét tệp nguồn
+    [prepare_candidate] Chuẩn bị bản ứng viên
+    [update_database] Cập nhật cơ sở dữ liệu
+    [publish] Xuất bản
+    [builtin] Trích xuất Builtin
+    [builtin_documents] Quét tài liệu Builtin
+    [builtin_work_units] Trích xuất đơn vị văn bản Builtin
+    [builtin_commit] Ghi nhận Builtin vào cơ sở dữ liệu
+    [rules] Trích xuất Rules
+    [rules_documents] Quét tài liệu Rules
+    [rules_matches] Tìm mục khớp Rules
+    [rules_commit] Ghi nhận Rules vào cơ sở dữ liệu
+    [lua] Thực thi Lua
+    [planning] Lập kế hoạch tác vụ dịch
+    [confirmed_tasks] Xác nhận tác vụ dịch
+    [read_assets] Đọc nội dung dự án
+    [plan_rpg_maker_write_back] Lập kế hoạch WriteBack
+    [rewrite_documents] Ghi lại tài liệu
+    [validate_candidate] Kiểm tra bản ứng viên
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] hoàn tất
@@ -403,6 +431,29 @@ diagnostic-provider-code = Mã nhà cung cấp: { $code }
 diagnostic-provider-type = Loại nhà cung cấp: { $kind }
 diagnostic-provider-message = Thông báo nhà cung cấp: { $message }
 diagnostic-json-position = dòng { $line }, cột { $column }
+diagnostic-input-field = Trường: { $field }
+diagnostic-input-failure = { $code ->
+    [syntax] Cú pháp TOML không hợp lệ
+    [missing_field] Thiếu trường bắt buộc
+    [unknown_field] Định dạng hiện tại không cho phép trường này
+    [duplicate_field] Trường bị trùng lặp
+    [type_mismatch] Trường có kiểu dữ liệu không đúng
+    [invalid_value] Giá trị của trường không hợp lệ
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = Kiểu dữ liệu yêu cầu: { $expected ->
+    [string] chuỗi
+    [integer] số nguyên
+    [boolean] boolean
+    [string_or_boolean] chuỗi hoặc boolean
+    [string_array] mảng chuỗi
+    [integer_array] mảng số nguyên
+    [table] bảng
+    [table_array] mảng bảng
+    [array] mảng
+    [object] đối tượng
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = mục phản hồi { $item }
 diagnostic-array-item = mục trong mảng { $item }
 diagnostic-token-position = vị trí token điều khiển { $position }
@@ -415,6 +466,9 @@ manual-exported = Đã xuất { $entries } mục vào { $path }
 manual-checked = Hợp lệ { $valid }, chưa điền { $unfilled }, lỗi { $errors }
 manual-applied = Đã áp dụng { $applied }, chưa điền { $unfilled }, lỗi { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] Phần tử { $line } của translation chứa BOM (U+FEFF)
+    [remove_byte_order_mark] Xóa ký tự BOM (U+FEFF) khỏi bản dịch
+    [keep_placeholders] Khôi phục các Placeholder của nguồn trong bản dịch, giữ nguyên số lượng, thứ tự bắt buộc và vị trí văn bản tương ứng
     [invalid_source_line] mục source { $line } chứa ký tự xuống dòng hoặc NUL
     [invalid_translation_line] mục translation { $line } chứa ký tự xuống dòng hoặc NUL
     [fixed_length] bản dịch fixed cần { $expected } mục; hiện có { $actual }
@@ -432,6 +486,7 @@ task-record-final-result-heading = Kết quả cuối
 task-record-final-status = Trạng thái: { $state ->
     [complete] hoàn tất, đã xác nhận commit
     [partial] hoàn tất một phần, đã xác nhận commit
+    [unavailable_rejected_committed] Không khả dụng; đã lưu các bản dịch bị từ chối
     [unavailable] không khả dụng, dự án không thay đổi
     [execution_failed] thực thi thất bại, chưa commit
     [commit_preparation_failed] chuẩn bị commit thất bại, chắc chắn chưa áp dụng

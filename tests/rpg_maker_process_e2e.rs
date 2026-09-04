@@ -306,6 +306,336 @@ fn manual_export_check_and_apply_work_for_mv_and_mz() {
 }
 
 #[test]
+fn rules_standard_fields_keep_builtin_controls_across_manual_translate_and_write_back() {
+    for engine in ["mv", "mz"] {
+        let temporary = tempfile::tempdir().expect("应可建立 Rules 控制验收目录");
+        let root = temporary.path();
+        let game = root.join("game");
+        if engine == "mv" {
+            write_minimal_mv_game(&game);
+        } else {
+            write_minimal_mz_game(&game);
+        }
+        let data = game.join(if engine == "mv" { "www/data" } else { "data" });
+        fs::write(
+            data.join("Items.json"),
+            serde_json::to_vec(&json!([null, {
+                "id": 1, "name": "", "description": r"説明\C[2]",
+                "pluginDescription": r"独自\C[2]"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("System.json"),
+            serde_json::to_vec(&json!({
+                "terms": {"messages": {"partyName": "仲間%1"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("Map001.json"),
+            serde_json::to_vec(&json!({
+                "events": [null, {"pages": [{"list": [
+                    {"code": 401, "indent": 0, "parameters": [r"会話\!"]},
+                    {"code": 405, "indent": 0, "parameters": [r"巻物\C[2]"]}
+                ]}]}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("rules.toml"),
+            r#"
+[[rule]]
+file = "Items.json"
+path = '[1].description'
+[[rule]]
+file = "Items.json"
+path = '[1].pluginDescription'
+[[rule]]
+file = "System.json"
+path = 'terms.messages.partyName'
+[[rule]]
+file = "Map001.json"
+path = 'events[1].pages[0].list[0].parameters[0]'
+[[rule]]
+code = 405
+parameter = 0
+"#,
+        )
+        .unwrap();
+        write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+        write_rpg_maker_prompt(root);
+        assert_success("Rules Init", &run_att(root, init_arguments(engine, &game)));
+        assert_success(
+            "Rules Extract",
+            &run_att(
+                root,
+                arguments(&[
+                    engine,
+                    "extract",
+                    "--name",
+                    PROJECT,
+                    "--rules",
+                    "rules.toml",
+                ]),
+            ),
+        );
+        let manual = root.join("manual.toml");
+        assert_success(
+            "Rules Manual export",
+            &run_att(
+                root,
+                arguments(&[engine, "manual", "export", "--name", PROJECT, "manual.toml"]),
+            ),
+        );
+        let exported = read_manual_toml(&manual);
+        let entries = exported["translation"].as_array().unwrap();
+        assert_eq!(entries.len(), 5);
+        for index in 0..entries.len() {
+            let mut candidate = exported.clone();
+            let entry = &mut candidate["translation"].as_array_mut().unwrap()[index];
+            let custom = entry["source"][0].as_str().unwrap().starts_with("独自");
+            entry["translation"] = toml::Value::Array(vec![toml::Value::String("译文".to_owned())]);
+            fs::write(&manual, toml::to_string(&candidate).unwrap()).unwrap();
+            let output = run_att(
+                root,
+                arguments(&[engine, "manual", "check", "--name", PROJECT, "manual.toml"]),
+            );
+            assert_eq!(
+                output.status.success(),
+                custom,
+                "标准字段应拒绝漏控制符，插件字段保持普通文本：{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut translated = exported;
+        for entry in translated["translation"].as_array_mut().unwrap() {
+            let source = entry["source"][0].as_str().unwrap();
+            let text = source
+                .replace("説明", "说明")
+                .replace("独自", "自定义")
+                .replace("仲間", "伙伴")
+                .replace("会話", "对白")
+                .replace("巻物", "滚动");
+            entry["translation"] = toml::Value::Array(vec![toml::Value::String(text)]);
+        }
+        fs::write(&manual, toml::to_string(&translated).unwrap()).unwrap();
+        assert_success(
+            "Rules Manual apply",
+            &run_att(
+                root,
+                arguments(&[engine, "manual", "apply", "--name", PROJECT, "manual.toml"]),
+            ),
+        );
+        assert_success(
+            "Rules Current 复验",
+            &run_att(
+                root,
+                arguments(&[engine, "translate", "--name", PROJECT, "local"]),
+            ),
+        );
+        assert_success(
+            "Rules WriteBack",
+            &run_att(root, arguments(&[engine, "write-back", "--name", PROJECT])),
+        );
+        let workspace = distribution_root(root)
+            .join("projects")
+            .join(engine)
+            .join(PROJECT);
+        let output_data = workspace.join(if engine == "mv" {
+            "write_back/www/data"
+        } else {
+            "write_back/data"
+        });
+        let items = read_items(&output_data.join("Items.json"));
+        assert_eq!(items[1]["description"], r"说明\C[2]");
+        let map: Value =
+            serde_json::from_slice(&fs::read(output_data.join("Map001.json")).unwrap()).unwrap();
+        assert_eq!(
+            map["events"][1]["pages"][0]["list"][0]["parameters"][0],
+            r"对白\!"
+        );
+        assert_eq!(
+            map["events"][1]["pages"][0]["list"][1]["parameters"][0],
+            r"滚动\C[2]"
+        );
+        let connection = Connection::open(workspace.join("project.db")).unwrap();
+        let rejected: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rpg_maker_rejected_translation",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rejected, 0, "合法人工译文经过 Current 复验后应保留");
+    }
+}
+
+#[test]
+fn empty_model_candidate_is_rejected_and_task_record_redacts_json_escaped_key() {
+    const API_KEY: &str = "sk-a\"b";
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let game = root.join("game");
+    write_minimal_mz_game(&game);
+    fs::write(
+        game.join("data/Items.json"),
+        serde_json::to_vec(&json!([
+            null, {"id": 1, "name": format!("テスト {API_KEY}"), "description": ""}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    write_configuration(root, &endpoint);
+    let config_path = distribution_root(root).join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("e2e-secret", r#"sk-a\"b"#);
+    fs::write(config_path, config).unwrap();
+    write_rpg_maker_prompt(root);
+    assert_success("空候选 Init", &run_att(root, init_arguments("mz", &game)));
+    assert_success(
+        "空候选 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--builtin"]),
+        ),
+    );
+    let server = thread::spawn(move || serve_one_response(listener, json!({"0": []})));
+    let output = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+    );
+    assert_success("空数组候选保存为 Rejected", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout).replace(['\u{2068}', '\u{2069}'], "");
+    assert!(
+        stdout.lines().any(|line| line == "状态：未完整"),
+        "实际 stdout：{stdout}"
+    );
+    let request = server.join().unwrap().unwrap();
+    let user = parse_user_message(request["messages"][1]["content"].as_str().unwrap());
+    assert!(
+        user_message_texts(&user)
+            .iter()
+            .any(|text| text.contains(API_KEY))
+    );
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    let connection = Connection::open(workspace.join("project.db")).unwrap();
+    let (candidate, translation): (String, Option<String>) = connection
+        .query_row(
+            "SELECT candidate_json, translation_json FROM rpg_maker_rejected_translation",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(candidate, "[]");
+    assert_eq!(translation, None);
+    drop(connection);
+    let record = read_single_task_record_sharing_log_run_id(&workspace);
+    assert!(record.contains("不可用，已保存拒绝候选"), "{record}");
+    assert!(record.contains("[REDACTED API KEY]"));
+    assert!(!record.contains(API_KEY));
+    assert!(!record.contains(r#"sk-a\"b"#));
+    assert_success(
+        "Rejected 默认跳过",
+        &run_att(
+            root,
+            arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+        ),
+    );
+    assert_eq!(
+        read_task_records_sharing_log_run_ids(&workspace).len(),
+        1,
+        "默认重跑应保留 Rejected，并跳过模型请求"
+    );
+}
+
+#[test]
+fn rules_fully_protected_source_is_excluded_from_manual_lua_and_model_requests() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let game = root.join("game");
+    write_minimal_mz_game(&game);
+    fs::write(
+        game.join("data/Items.json"),
+        serde_json::to_vec(&json!([
+            null, {"id": 1, "name": "", "description": r"\PX[2]"}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("rules.toml"),
+        "[[rule]]\nfile = 'Items.json'\npath = '[1].description'\n",
+    )
+    .unwrap();
+    write_configuration(root, "http://127.0.0.1:9/v1/chat/completions");
+    write_rpg_maker_prompt(root);
+    let mut init = arguments(&["mz", "init", "--name", PROJECT, "--path"]);
+    init.push(game.as_os_str().to_owned());
+    init.extend(arguments(&[
+        "--source-language",
+        "en",
+        "--target-language",
+        "zh-Hans",
+    ]));
+    assert_success("全保护原文 Init", &run_att(root, init));
+    assert_success(
+        "全保护原文 Extract",
+        &run_att(
+            root,
+            arguments(&["mz", "extract", "--name", PROJECT, "--rules", "rules.toml"]),
+        ),
+    );
+    assert_success(
+        "全保护原文 Manual export",
+        &run_att(
+            root,
+            arguments(&["mz", "manual", "export", "--name", PROJECT, "manual.toml"]),
+        ),
+    );
+    assert!(
+        read_manual_toml(&root.join("manual.toml"))
+            .as_table()
+            .unwrap()
+            .is_empty()
+    );
+    fs::write(root.join("check-pending.lua"),
+        "local entries = ctx.translation.list()\nassert(#entries == 1 and entries[1].status == 'not_needed')\n"
+    ).unwrap();
+    assert_success(
+        "全保护原文 Lua list",
+        &run_att(
+            root,
+            arguments(&["mz", "lua", "--name", PROJECT, "check-pending.lua"]),
+        ),
+    );
+    let output = run_att(
+        root,
+        arguments(&["mz", "translate", "--name", PROJECT, "local"]),
+    );
+    assert_success("全保护原文 Translate", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout).replace(['\u{2068}', '\u{2069}'], "");
+    assert!(
+        stdout.lines().any(|line| line == "状态：无需处理"),
+        "{stdout}"
+    );
+    let workspace = distribution_root(root).join("projects/mz").join(PROJECT);
+    assert!(
+        !workspace.join("task-records").exists(),
+        "全保护原文不应请求模型"
+    );
+}
+
+#[test]
 fn mz_standard_bootstrap_titles_follow_the_single_game_title_unit() {
     let temporary = tempfile::tempdir().expect("应可建立启动标题纵向测试目录");
     let root = temporary.path();

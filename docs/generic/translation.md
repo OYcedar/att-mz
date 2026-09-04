@@ -1,5 +1,7 @@
 # Generic Translate 现行规格
 
+Translate 把最近成功 Extract 的 JSONL 内容交给模型翻译，逐项验收并保存有效结果。
+
 ```text
 att generic translate --name NAME [PROFILE_ID] \
   [--terms TERMINOLOGY_TOML] [--placeholders PLACEHOLDER_TOML] [--retry-rejected]
@@ -16,18 +18,19 @@ Translate 首先确认外部 JSONL 与最近成功 Extract 一致，然后按完
 每个 Unit 独立拥有译文和状态。空白、没有源语内容或完全受 Placeholder 保护的 text 直接
 保留，不请求模型；其 Group 被发送时，它们仍按原样参与语境。
 
-自动译文只在对当前源文、完整实际 Group 语境、项目语言对和当前 Placeholder 等强
-不变量仍适用时才是 Current。术语、Prompt、Profile、Client、模型参数和语言检查阈值只
-影响后续请求，不使既有正文失去 Current。当前人工译文来自独立人工表，优先于
-自动译文；Translate 跳过它，模型提交也不能覆盖它。
+自动译文先按当前源文、完整实际 Group 语境和项目语言对判断适用性，再独立复验当前
+Placeholder 与结构强契约；两项都成立才是 Current。术语、Prompt、Profile、Client、模型
+参数和语言检查阈值只影响后续请求，不使既有正文失去 Current。当前人工译文来自独立
+人工表，优先于自动译文；模型提交不能覆盖它。
 
-人工译文只在对应逻辑 Unit、所属文件、Group kind、正文形状、原文或项目语言对变化时
-过期。完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 变化不
-影响已经应用的人工译文。
+人工译文的适用性只绑定对应逻辑 Unit、所属文件、Group kind、正文形状、原文和项目语言
+对；这些事实变化时，旧人工记录过期。完整 Group 语境、相邻文本、术语、Prompt、Profile
+和 Client 不参与人工适用性。Placeholder 配置也不改变适用性，但新强契约会独立复验仍
+适用的正文：合法则保留，违反强不变量则保留正文并转入 Rejected。
 
 旧语言对或旧 Group 语境的自动正文保留但不再是 Current，不参与模型语境、去重复用或
 WriteBack。Translate 不在请求模型之前删除它；替代候选通过逐 ID 验收后，按读取到的
-源文、Group 语境和旧译文状态执行 CAS 原子覆盖。请求失败、取消、额度不足、Partial 或
+源文、Group 语境和旧译文状态执行 CAS（比较并交换）原子覆盖。请求失败、取消、额度不足、Partial 或
 提交冲突都保留读取时的旧正文。
 
 ## 2. 全局去重
@@ -62,9 +65,8 @@ Group 是不可拆分的最小语义整体；同一稳定 TaskBlock 内的相邻
 TaskBlock。完整公共规则见
 [TaskBlock 规划规格](../translation/task-planning.md)。
 
-因此，外部转换不得把大量相互独立的记录放进单个 Group。ATT 只会在 Group 之间分配
-TaskBlock，不会在一个 Group 内按容量切断语境。真正不可拆的长 Group 可以独占任务；由错误
-分组造成的超长任务必须回到 JSONL 转换步骤修正，不能靠重试、临时分片或放宽响应验收处理。
+外部转换时按真实语义边界建立 Group。不可拆的长 Group 可以独占任务；错误分组造成的
+超长任务应回到 JSONL 转换步骤修正。ATT 只在完整 Group 之间划分 TaskBlock。
 
 发送 TaskBlock 时：
 
@@ -86,6 +88,8 @@ Current、复用、去重、语言判断、Placeholder token、术语和 ID 都�
 
 ## 4. 响应与提交
 
+### 4.1 响应数组
+
 Generic 使用公共的四种 JSON 响应模式。关闭思考与原文回显时，每个 ID 的 value 是译文
 字符串数组：
 
@@ -98,12 +102,17 @@ Generic 使用公共的四种 JSON 响应模式。关闭思考与原文回显时
 规则见[Prompt 规格](../translation/prompts.md)；原文回显只检查字符串数组形状，不比较
 内容。
 
+### 4.2 候选验收与 Rejected
+
 每个 ID 按[译文候选验收规格](../translation/candidate-validation.md)独立检查。结构合法的
 候选立即保存；源语残留、术语、语义和布局只产生 Review，不拒绝候选。唯一绑定但违反强
 不变量的候选保存为 Rejected，默认后续 Translate 不重复请求；只有显式
-`--retry-rejected` 才重新请求。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
+`--retry-rejected` 才重新请求。也可以使用 `manual export --selection rejected` 导出并
+修订候选。响应无法建立唯一 ID 映射时，相应 Unit 保持 pending。
 保存 Rejected 时同样核对规划读取到的旧自动正文和状态；旧正文可以与当前 Rejected 同时
 保留，候选拒绝本身不得提前清除旧正文，正文或状态已变化时则报告提交冲突。
+### 4.3 提交顺序与请求失败
+
 任务并发执行，并始终按自然顺序确认和提交；取消或后续失败时，已经确认的前序进度原样
 保留。
 
@@ -115,38 +124,44 @@ Translate 为 Failed 并退出 `1`。普通 429 的共享 `Retry-After` 等待�
 停止前已经准入且获得有效结果的 Task 仍按自然顺序验收，并在当前 CAS 成立时提交；单个外部
 请求失败不能让其他已经付费取得且通过验收的结果失效。
 
+### 4.4 任务状态与命令状态
+
 每个已开始至少一次真实外部 HTTP attempt 的 Task 写 `task.finished`：Complete、Partial、Unavailable、Failed、
 NotCommittedAfterEarlierFailure 或 Cancelled。Partial、Unavailable 与 Failed 同时写可读任务
 诊断。NotCommittedAfterEarlierFailure 只用于更早的数据库提交、内部最终化或取消边界已经使
 后续副作用不再安全的情况；外部模型请求失败本身不能把后续合法响应改成这一状态。该终态不伪造
 当前 Task 的新错误。
-每次命令恰好写一条 `translation.finished`：
-NotStarted、NoWork、Complete、Incomplete、Failed 或 Cancelled。含 Partial 或 Unavailable
-任务但业务结果明确时，Translate 结果是 Incomplete，退出码仍为 `0`；项目是否全部译完以
-该事件和数据库当前状态为准。CLI 明确显示 `状态：未完整`，并在 stderr 汇总 Partial、
+
+每次命令恰好写一条 `translation.finished`：NotStarted、NoWork、Complete、Incomplete、
+Failed 或 Cancelled。任务级 Partial 或 Unavailable 表示某个请求的结果；命令级 Incomplete
+表示本次 Translate 仍有未完成内容，退出码为 `0`。项目是否全部译完以该事件和数据库当前
+状态为准。CLI 显示 `状态：未完整`，并在 stderr 汇总 Partial、
 Unavailable、写入冲突和响应问题；逐任务详情保留在本次项目日志与任务记录。NoWork 和
 Complete 分别显示 `无需处理` 与 `完整`。
+
+### 4.5 计数与规划失败
 
 `translation.finished` 固定保存 planned、started、complete、partial、unavailable、failed、
 cancelled 与 not_started Task 计数，并保存 Generic 专用的 cleared/reused/accepted/written/
 conflicted units、response problems、planned_units、remaining_units、运行结束时仍为 Rejected 的
-rejected_units、recoverable request
-exhaustions 与 request admission stopped。Task 计数始终满足
+rejected_units、recoverable request exhaustions 与 request admission stopped。Task 计数始终满足
 `planned = started + not_started`；planned_units 是模型责任 Unit 与未进入模型 Task 的当前
 Rejected Unit 的并集，只有模型结果或受信复用确认修复的位置才从 remaining_units 扣除。
 rejected_units 始终是 remaining_units 的子集；CAS 冲突不算写入或修复。
 Task 只在第一次真实 HTTP attempt 开始时计入 started，准入前失败或停发仍属于 not_started。
 Failed 与 Cancelled 在已经形成计划和引擎汇总时，也把同一份
 计数和汇总写入 JSONL，并在 stderr 打印一次短汇总；规划前失败或提前取消不伪造引擎
-工作量。停止路径不补写 100%。它取代按 Task 与 Unit 含义混合的通用 Partial 汇总。
+工作量。停止路径不补写 100%。Task 与 Unit 分别计数，避免混淆请求数和剩余条目数。
 Placeholder 等规划错误发生在任何 Task 或模型请求之前时，结果为 Failed；可读诊断保留
 规则文件、自然规则号、类似 `story.jsonl:line3:unit2:text` 的位置、原因和修改方法，数据库
 保持不变。
 
-Partial 会保留合法 ID 和已确认前序进度；再次运行只给仍需模型的 Unit 分配临时 ID，并
-继续提供稳定 TaskBlock 的完整语境。是否继续同一 Translate、修正系统性资源问题，还是用
-Manual 完成少量局部补译，要按
-[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)根据具体原因与实际进展判断。
+### 4.6 继续翻译与质量验收
+
+Partial 后再次运行只给仍需模型的 Unit 分配临时 ID，并继续提供原 TaskBlock 的完整语境。
+pending 可正常继续；Rejected 需要显式 `--retry-rejected` 或 Manual 修订。系统性资源问题
+先修正规则或 Prompt，具体分流见
+[诊断与恢复指南](../guides/diagnosis-and-recovery.md#64-translate)。
 
 Translate 的 Complete 只表示计划内 Unit 都有结构合法的当前译文；译后 QA 另行报告
 `clean`、`needs_review` 或 `unverified`，不把质量风险伪装成 Translate 失败。

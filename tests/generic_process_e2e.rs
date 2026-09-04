@@ -642,7 +642,7 @@ target_task_user_message_characters = 10000
     fs::write(
         nested.join("bad.jsonl"),
         format!(
-            "{{\"id\":\"bad\",\"kind\":\"dialogue\",\"units\":[{{\"id\":\"line\",\"text\":\"x\"}}],\"{SENTINEL}\":true}}"
+            "{{\"id\":\"bad\",\"kind\":\"dialogue\",\"units\":[{{\"id\":\"line\",\"text\":\"x\"}}],\"unexpected\":\"{SENTINEL}\"}}"
         ),
     )
     .expect("应可写入含未知字段的 JSONL");
@@ -658,6 +658,10 @@ target_task_user_message_characters = 10000
         "诊断必须指出损坏行号：{stderr}"
     );
     assert!(stderr.contains("Reason:") && stderr.contains("Action:"));
+    assert!(
+        stderr.contains("unexpected"),
+        "诊断必须指出未知字段：{stderr}"
+    );
     for internal in [
         "generic.jsonl",
         "operation=",
@@ -671,7 +675,7 @@ target_task_user_message_characters = 10000
     }
     assert!(
         !stderr.contains(SENTINEL),
-        "公开诊断不得包含原始 JSON 字段或 serde 自由文本：{stderr}"
+        "公开诊断不得包含原始 JSON 字段值：{stderr}"
     );
     assert!(
         !stderr.contains("RPG Maker"),

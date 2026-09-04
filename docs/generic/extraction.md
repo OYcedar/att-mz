@@ -40,9 +40,9 @@ Extract 同时建立供 Translate 使用的稳定文本层次：一个 JSONL 文
 | 新增 Group | 新 Group 未翻译 |
 | 新增 Unit | 新 Unit 未翻译；其余 Unit 正文保留但因 Group 语境改变而不再是 Current |
 
-Extract 不把“语境已改变”等同于“正文已删除”。保留但过期的自动正文不参与 WriteBack
-或后续模型语境；新候选通过验收后才以该旧正文为 CAS 预期值原子覆盖。其他文件或
-Group 的自动译文原样保留。
+语境改变后，仍能对应的旧正文继续保存，但不参与 WriteBack 或后续模型语境。新候选通过
+验收后，才以旧正文为预期值执行 CAS（比较并交换）原子覆盖。其他文件或 Group 的自动译文
+原样保留。
 
 ## 3. 人工译文状态
 
@@ -53,14 +53,15 @@ Extract 不删除 `generic_manual_translation`。人工记录按当前位置重�
   记录成为过期；
 - 删除当前位置时，旧原文和人工译文继续保存在人工表中；
 - 以后同一内部位置、文件、kind、正文形状和原文重新匹配时，记录可以再次成为当前；
-- 术语、Prompt、Profile、Client、语言判断和 Placeholder 配置不参与这个判断；
+- 术语、Prompt、Profile、Client、语言判断和 Placeholder 配置不参与适用性判断；当前
+  Placeholder 强契约的独立复验见[Translate](translation.md#1-unit-与当前译文)；
 - 人工译文另外绑定填写时的项目语言对，语言对不同时保留正文但不作为当前译文。
 
 过期人工记录不参与 WriteBack，也不阻止后续自动 Translate。高级 Lua 的
 `ctx.translation.list({ status = "outdated" })` 可以查看保存的旧快照。
 
-成功提交后，数据库保存的内容是当前文件位置、Group、Unit、译文状态和输入指纹；源文件
-副本、去重族、代表项、译文历史和 kind 注册表不在其中。
+成功提交后，数据库保存当前文件位置、Group、Unit、译文状态和输入指纹。源文件继续由外部
+输入根提供，去重族与代表项在 Translate 运行中计算；项目不另外维护译文历史或 kind 注册表。
 
 ## 4. 后续命令
 

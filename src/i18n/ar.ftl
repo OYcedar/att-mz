@@ -28,6 +28,11 @@ cli-placeholders-help = استبدال مورد Placeholder للمشروع
 cli-project-lua-script-help = برنامج Lua النصي المطلوب تشغيله على قاعدة بيانات المشروع
 cli-project-lua-arguments-help = وسيطة UTF-8 تمرر إلى Lua arg[1..] بعد --
 cli-manual-file-help = ملف TOML للترجمات اليدوية
+cli-jsonl-file-help = ملف تصدير JSONL
+cli-retry-rejected-help = إعادة معالجة المرشحات المحفوظة بحالة Rejected
+cli-manual-selection-help = نطاق التصدير: pending (الافتراضي) أو rejected أو all
+cli-manual-ids-help = تصدير العناصر المطابقة للمعرّفات الطبيعية في ملف JSONL هذا
+cli-layout-rules-help = تحميل قواعد تنسيق WriteBack من ملف TOML وحفظها
 cli-usage-heading = الاستخدام:
 cli-commands-heading = الأوامر:
 cli-options-heading = الخيارات:
@@ -191,6 +196,29 @@ log-publication-finished = { $result ->
     [recovery_required] توقف النشر ويتطلب الاسترداد.
     [outcome_unknown] الحالة النهائية للنشر غير معروفة.
    *[other] توقف النشر دون نتيجة معروفة.
+}
+log-phase-name = { $phase ->
+    [check_project] فحص المشروع
+    [scan_source] فحص ملفات المصدر
+    [prepare_candidate] إعداد النسخة المرشحة
+    [update_database] تحديث قاعدة البيانات
+    [publish] النشر
+    [builtin] استخراج Builtin
+    [builtin_documents] فحص مستندات Builtin
+    [builtin_work_units] استخراج وحدات النص Builtin
+    [builtin_commit] تثبيت نتائج Builtin
+    [rules] استخراج Rules
+    [rules_documents] فحص مستندات Rules
+    [rules_matches] مطابقة Rules
+    [rules_commit] تثبيت نتائج Rules
+    [lua] تنفيذ Lua
+    [planning] تخطيط مهام الترجمة
+    [confirmed_tasks] تأكيد مهام الترجمة
+    [read_assets] قراءة محتوى المشروع
+    [plan_rpg_maker_write_back] تخطيط WriteBack
+    [rewrite_documents] إعادة كتابة المستندات
+    [validate_candidate] التحقق من النسخة المرشحة
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] مكتملة
@@ -410,6 +438,29 @@ diagnostic-provider-code = رمز المزوّد: { $code }
 diagnostic-provider-type = نوع المزوّد: { $kind }
 diagnostic-provider-message = رسالة المزوّد: { $message }
 diagnostic-json-position = السطر { $line }، العمود { $column }
+diagnostic-input-field = الحقل: { $field }
+diagnostic-input-failure = { $code ->
+    [syntax] صياغة TOML غير صالحة
+    [missing_field] حقل مطلوب مفقود
+    [unknown_field] هذا الحقل غير مسموح به في التنسيق الحالي
+    [duplicate_field] الحقل مكرر
+    [type_mismatch] نوع الحقل غير صحيح
+    [invalid_value] قيمة الحقل غير صالحة
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = النوع المطلوب: { $expected ->
+    [string] سلسلة نصية
+    [integer] عدد صحيح
+    [boolean] قيمة منطقية
+    [string_or_boolean] سلسلة نصية أو قيمة منطقية
+    [string_array] مصفوفة سلاسل نصية
+    [integer_array] مصفوفة أعداد صحيحة
+    [table] جدول
+    [table_array] مصفوفة جداول
+    [array] مصفوفة
+    [object] كائن
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = عنصر الاستجابة { $item }
 diagnostic-array-item = عنصر المصفوفة { $item }
 diagnostic-token-position = موضع token التحكم { $position }
@@ -422,6 +473,9 @@ manual-exported = تم تصدير { $entries } إدخالات إلى { $path }
 manual-checked = صالح { $valid }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-applied = طُبّق { $applied }، غير مملوء { $unfilled }، أخطاء { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] يحتوي العنصر { $line } من translation على BOM ‏(U+FEFF)
+    [remove_byte_order_mark] أزل المحرف BOM ‏(U+FEFF) من الترجمة
+    [keep_placeholders] أعد Placeholder الأصلية إلى الترجمة مع الحفاظ على عددها وترتيبها المطلوب ومواضعها النصية
     [invalid_source_line] يحتوي عنصر source رقم { $line } على سطر جديد أو NUL
     [invalid_translation_line] يحتوي عنصر translation رقم { $line } على سطر جديد أو NUL
     [fixed_length] تتطلب ترجمة fixed عدد { $expected } من العناصر؛ الموجود { $actual }
@@ -439,6 +493,7 @@ task-record-final-result-heading = النتيجة النهائية
 task-record-final-status = الحالة: { $state ->
     [complete] مكتملة والتثبيت مؤكّد
     [partial] مكتملة جزئيًا والتثبيت مؤكّد
+    [unavailable_rejected_committed] غير متاح؛ تم حفظ المرشحات المرفوضة
     [unavailable] غير متاحة؛ المشروع لم يتغير
     [execution_failed] فشل التنفيذ؛ لم تُثبَّت
     [commit_preparation_failed] فشل إعداد التثبيت؛ لم يُطبَّق يقينًا

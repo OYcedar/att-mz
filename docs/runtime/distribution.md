@@ -24,7 +24,10 @@
 程序固定从该目录读取 `config.toml`，并使用同目录下的 `projects/` 和 `prompts/`；
 不接受外部配置或资源根，也不把源码目录或调用 cwd 当作备用位置。`projects/` 可以在首次
 Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、术语、Placeholder、Lua
-等 CLI 显式路径仍按[配置规格](configuration.md#5-路径与敏感信息)从调用 cwd 解析。
+等 CLI 显式路径仍按[配置规格](configuration.md#6-路径与敏感信息)从调用 cwd 解析。
+
+发行根中的项目和发布目标需要满足[目录发布的存储条件](directory-publishing.md#3-候选目录)：
+本地固定磁盘、NTFS、大小写不敏感的目录。安装时选择符合这些条件的可写目录。
 
 发行包中的 Skill 也以同一目录为产品与知识根，只使用包内的程序、配置、项目、Prompt
 和文档。缺少本次任务需要的包内资源时，应报告发行缺口，不能从源码仓库、其他安装或
@@ -71,12 +74,12 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 源码仓库读取资源，也不得把使用者游戏或项目内容写进发行包。测试代码、测试材料、Python
 开发配置和缓存放在 Skill 目录之外，不得随 `skills/` 同步。
 
-发行包只保留当前版本。仓库的 `docs/` 作为完整集合发布，其中包含产品规格和使用者或执行者
-完成发行内任务所需的指南。只供源码维护使用的资料放在该同步集合之外。`AGENTS.md`、
+仓库的 `docs/` 作为完整集合发布，保存当前产品规格和完成发行内任务所需的指南。
+只供源码维护使用的资料放在该同步集合之外。`AGENTS.md`、
 `maintenance/`、源码、测试、构建目录与缓存、历史版本文件都不进入发行包。根
 两个 `config.example.toml` 是允许且必须存在的托管模板。
 当前同步脚本会直接拒绝发行根下的 `AGENTS.md`、`maintenance/`、`src/`、`tests/` 和
-`target/`；其他禁止内容仍须在完整发行检查中确认，不能因为脚本未逐项列出而保留。
+`target/`；完整发行检查同时确认其余禁止内容。
 
 ## 4. 同步与验证责任
 
@@ -84,7 +87,7 @@ Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准
 
 - `README.md`、`LICENSE`、`config.example.toml` → `dist/` 下的同名文件；
 - `dist/config.toml` 不存在时，从根 `config.example.toml` 首次创建；已经存在时逐字节保留；
-- `licenses/`、`docs/`、`prompts/`、`skills/` → `dist/` 下的同名目录。
+- `licenses/`、`docs/`、`prompts/`、`skills/` → `dist/` 下的同名目录；
 - `tools/formic/` 中的程序、许可、来源说明、配置模板、README 和完整用户文档 → 发行包同名目录；活动
   `config.toml` 缺失时从模板创建，已经存在时逐字节保留。
 

@@ -9,7 +9,7 @@ use super::issue::{
     GenericUnitLocator, IoFailure, PlaceholderCompilationProblem, PlaceholderIssue,
 };
 use super::model::DiagnosticResolution;
-use super::safe_value::{SafeIdentifier, SafePath};
+use super::safe_value::{SafeIdentifier, SafePath, SafeText};
 use crate::json_diagnostic::JsonErrorCategory;
 use crate::translation::candidate_validation::ProvenInvariantViolation;
 
@@ -1596,6 +1596,57 @@ impl GenericJsonlLocation {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub(crate) enum GenericJsonlFieldProblem {
+    UnknownField {
+        field: SafeText,
+    },
+    MissingField {
+        field: SafeText,
+    },
+    TypeMismatch {
+        field: SafeText,
+        expected: GenericJsonlValueKind,
+    },
+}
+
+impl GenericJsonlFieldProblem {
+    pub(crate) fn field(&self) -> &SafeText {
+        match self {
+            Self::UnknownField { field }
+            | Self::MissingField { field }
+            | Self::TypeMismatch { field, .. } => field,
+        }
+    }
+
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownField { .. } => "unknown_field",
+            Self::MissingField { .. } => "missing_field",
+            Self::TypeMismatch { .. } => "type_mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GenericJsonlValueKind {
+    String,
+    Array,
+    Object,
+}
+
+impl GenericJsonlValueKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GenericProblem {
     Cancelled,
     ProjectCancelled,
@@ -1612,6 +1663,7 @@ pub(crate) enum GenericProblem {
         json_line: usize,
         json_column: usize,
         category: GenericJsonErrorCategory,
+        field_problem: Option<GenericJsonlFieldProblem>,
     },
     BlankField {
         location: Option<GenericJsonlLocation>,
@@ -2276,6 +2328,7 @@ impl GenericProblem {
                 json_line,
                 json_column,
                 category,
+                field_problem,
             } => {
                 let mut facts = location_facts(location);
                 facts.extend([
@@ -2283,6 +2336,13 @@ impl GenericProblem {
                     ("json_column", json_column.to_string()),
                     ("json_category", category.as_str().to_owned()),
                 ]);
+                if let Some(problem) = field_problem {
+                    facts.push(("field", problem.field().to_string()));
+                    facts.push(("field_failure", problem.as_str().to_owned()));
+                    if let GenericJsonlFieldProblem::TypeMismatch { expected, .. } = problem {
+                        facts.push(("expected", expected.as_str().to_owned()));
+                    }
+                }
                 facts
             }
             Self::BlankField { location, field } => {
@@ -2501,6 +2561,10 @@ pub(crate) struct GenericIssue {
 }
 
 impl GenericIssue {
+    pub(crate) const fn problem(&self) -> &GenericProblem {
+        &self.problem
+    }
+
     const fn new(
         stage: GenericDiagnosticStage,
         operation: GenericOperation,
@@ -2720,6 +2784,7 @@ mod tests {
                     json_line: 1,
                     json_column: 7,
                     category: GenericJsonErrorCategory::Syntax,
+                    field_problem: None,
                 },
             )),
         );

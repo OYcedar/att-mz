@@ -15,15 +15,14 @@
 - 当前术语、Placeholder 和最近成功 Profile；
 - MV/MZ 当前 Builtin/Rules 选择与写回所需资源。
 
-项目只接受当前代码声明的精确 schema。普通命令可以检查当前结构是否完整，但不识别业务
-schema 版本，不检测旧格式，不迁移，也不提供兼容 view、别名或双读双写。无效数据库只按
-当前项目损坏处理。
+项目只接受当前代码声明的精确 schema。普通命令检查当前结构是否完整，无效时报告项目数据库
+损坏。结构更新直接同步当前读写方；数据库不提供版本识别、迁移或兼容读取。
 
 Generic 不复制外部 JSONL。外部 JSONL、去重族、代表项和译文历史都不属于项目数据库。
 
 ## 2. 自动译文与人工译文
 
-自动译文继续保存在当前 Unit 表中，并与自动状态一起出现或一起为空。自动状态只绑定
+自动译文保存在当前 Unit 表中，并与自动状态一起出现或一起为空。自动状态只绑定
 正文针对的当前原文、完整实际 Group 来源语境、项目语言对、位置、角色和写回结构；不绑定
 Placeholder。只有与这些事实精确匹配的当前适用性指纹才进入候选，随后 Translate、
 Manual 和 WriteBack 各自在消费入口重新执行当前 Placeholder 与结构强验收。术语、Prompt、
@@ -38,10 +37,9 @@ Extract 删除或重建当前位置时，旧人工正文仍可保留并供高级
 - Generic：逻辑 Group/Unit、所属文件、Group kind、正文形状和原文；
 - RPG Maker：内部位置、Group kind、Unit 角色、写回 recipe、正文形状和原文。
 
-完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、Profile 和 Client 不参与人工
-译文失效。位置不存在，或上述实际结构、原文或语言对变化时，记录成为过期；
-正文不会被静默删除。
-以后条件重新匹配时，同一记录可以再次成为当前。
+位置不存在，或上述实际结构、原文或语言对变化时，人工记录过期，正文继续保留；条件重新匹配
+时，同一记录可以再次成为当前。完整 Group 语境、相邻文本、术语、Placeholder 配置、Prompt、
+Profile 和 Client 不参与人工适用性计算；Placeholder 的强契约验收在下文单独说明。
 
 当前人工译文优先于自动译文。Manual apply 或 `ctx.translation.set` 写入人工记录时，只清除
 同一 Unit 的自动译文和 Rejected 候选。Translate 跳过当前人工译文，模型结果提交也不能
@@ -67,9 +65,10 @@ RPG Maker Rejected 的 `planning_state` 与自动正文状态使用同一当前�
 - Generic Extract 整体原子替换当前内容视图；
 - MV/MZ Extract 的每个 owner 独立提交；
 - Translate 准备阶段原子处理资源与确定的强不变量失效，不在模型请求前删除待替换
-  正文；每个模型任务按自然顺序独立提交；
+  正文；每个模型任务按自然顺序独立提交，包括能够唯一绑定位置的 Rejected 候选；
 - Manual apply 在一个写事务中重新检查整份 TOML，任一错误使修改为零；
-- WriteBack 只读项目数据库，输出提交由目录发布器负责。
+- WriteBack 使用只读快照读取正文；显式 `--layout-rules` 经验证后，在独立写事务中保存规则，
+  再用于本次输出。输出提交由目录发布器负责。
 
 提交使用当前快照比较，避免并发命令静默覆盖新状态。SQLite busy 时等待并响应取消，不用
 固定本地容量拒绝合法工作。
@@ -94,7 +93,7 @@ Generic 主要表：
 | `generic_unit` | Unit、原文、自动译文和自动状态 |
 | `generic_manual_translation` | 独立人工译文快照与内部适用性 |
 | `generic_rejected_translation` | 当前 Rejected 候选、来源、确定原因和验收状态 |
-| `translation_resource` | 当前术语与 Placeholder |
+| `translation_resource` | 当前术语、Placeholder 与 WriteBack 排版规则 |
 
 `generic_unit` 的自动正文使用 `translation` 与 `translation_state`；人工正文只使用
 `generic_manual_translation`。Generic 人工条目始终是 `free`，人工表不重复保存
@@ -107,7 +106,7 @@ MV/MZ 主要表：
 | `metadata` | 项目、语言与来源快照 |
 | `rpg_maker_asset_owner_state` | Builtin/Rules 当前来源状态 |
 | `rpg_maker_project_definition` | 当前 MV/MZ 项目定义 |
-| `rpg_maker_translation_resource` | 当前术语与 Placeholder |
+| `rpg_maker_translation_resource` | 当前术语、Placeholder 与 WriteBack 排版规则 |
 | `rpg_maker_text_group` | 当前 Group、自然顺序、kind 与写回 recipe |
 | `rpg_maker_text_unit` | 当前 Unit、owner、Rules 自然规则序号、原文、上下文、自动译文和自动状态 |
 | `rpg_maker_manual_translation` | 独立人工译文快照与内部适用性 |
@@ -120,10 +119,8 @@ MV/MZ 主要表：
 版本或迁移文档。
 
 `rpg_maker_text_unit.rule_number` 保存 Extract Rules TOML 中从 1 开始的自然规则序号；
-Builtin Unit 必须为 `NULL`，Rules Unit 必须为正整数。这个事实供 MV/MZ Manual 所有权导出
-精确说明来源，不作为公开 ID，也不替代 Unit 的内部身份。新增该列后，旧结构的 MV/MZ
-项目不能在原工作区直接重跑 Init：先在 ATT 之外备份并移走或清理整个旧项目工作区，再用
-当前程序新建项目并执行 Init、Extract。ATT 不迁移或兼容旧项目数据库。
+Builtin Unit 必须为 `NULL`，Rules Unit 必须为正整数。`ownership export` 和 `translation export`
+使用这个自然序号说明 Rules 来源；它不作为 Unit 的公开 ID，也不替代内部身份。
 
 ## 5. Lua 数据库连接
 

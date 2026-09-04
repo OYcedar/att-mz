@@ -350,7 +350,7 @@ impl TranslationTaskRecordFinalState {
             Self::CompleteCommitted { .. } => "complete",
             Self::PartialCommitted { .. } => "partial",
             Self::UnavailableNoChanges { .. } => "unavailable",
-            Self::UnavailableRejectedCommitted { .. } => "unavailable",
+            Self::UnavailableRejectedCommitted { .. } => "unavailable_rejected_committed",
             Self::ExecutionFailedNoChanges { .. } => "execution_failed",
             Self::CommitNotApplied {
                 phase: TranslationTaskCommitPhase::Preparation,
@@ -517,8 +517,7 @@ fn render_translation_task_record(
     render_final_result(&mut output, &localizer, api_key_redactor, document);
 
     output.push_str("\n## User\n\n");
-    let user = api_key_redactor
-        .redact_text_with_markdown_ascii_punctuation_escaped(&document.user_message);
+    let user = api_key_redactor.redact_text_with_json_strings(&document.user_message);
     output.push_str(&user);
     if !user.ends_with('\n') {
         output.push('\n');

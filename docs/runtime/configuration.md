@@ -12,9 +12,9 @@ CLI 不接受自定义配置路径，也不搜索当前工作目录、环境变�
 - `[translation]` 与 `[[translation.profiles]]`
 - `[write_back]`
 
-未知字段、重复 key、错误类型、空白 ID 和规范化后的重复 ID 都会被严格拒绝——启动
-时说清楚，胜过带着歧义往下走。配置只解析当前命令实际使用的子树；`att test` 读取并完整
-校验全部 LLM Client。
+配置先检查 TOML 语法和完整字段集合，再解析当前命令实际使用的子树。未知字段、重复 key，
+以及所用配置中的错误类型、空白 ID 和规范化后重复的 ID 都会使命令失败。`att test` 完整
+校验全部 LLM Client。诊断说明出错位置与修改方法，原配置文件保持原样。
 
 ## 1. 固定发行目录
 
@@ -81,12 +81,12 @@ minimum_copied_letter_count = 4
 allowed_terms = ["Page Up", "Page Down"]
 ```
 
-每种语言类型只接受自己声明的字段。Translate 校验全部定义，再精确选择项目源语言
-模块。英语的 `ignored_terms`
-只改变译前准入；`allowed_terms` 只允许译文保留已经确认的英文项，不改变译前判断或临时
-ID 分配。这些语言检查阈值和允许项只用于后续准入与候选验收，不参与既有正文的
-Current 身份。WriteBack 不读取语言配置；它只按本规格的独立正文开关处理当前译文。完整语言
-语义见[语言规格](../translation/language.md)。
+每种语言类型只接受自己声明的字段。Translate 校验全部定义，再按项目源语言精确选择模块。
+英语的 `ignored_terms` 改变译前准入；`allowed_terms` 用于确认哪些英文可以保留在译文中，
+不改变译前判断或临时 ID 分配。完整语义见[语言规格](../translation/language.md)。
+
+这些阈值和允许项用于后续准入与候选验收，不参与既有正文的 Current 适用性计算。
+WriteBack 使用本规格的独立正文开关，不读取语言配置。
 
 ## 4. WriteBack 正文开关
 

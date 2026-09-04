@@ -5,7 +5,7 @@ description: 使用已打包 ATT 完成 RPG Maker MV、MZ、Generic 或组合项
 
 # 使用 ATT 完成游戏翻译
 
-目标是交付可供人工实机验证的译本。主线固定为：
+交付可供人工实机验证的译本，按以下主线推进：
 
 `调查 → Extract → 术语 → Translate → QA → WriteBack → 字体/封包`
 
@@ -19,6 +19,9 @@ ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agen
    `docs/guides/translation-project.md`，再读取当前引擎和阶段的规格。
 3. 继续已有项目时，以 ATT 数据库、当前输入、日志和已有译文为续跑依据。
 4. 原版游戏作为只读基线；Extract、字体应用、合并和封包使用 ATT 项目目录或隔离副本。
+
+随包 Python 工具在 Python 3.11 或更新环境中运行。没有 Python 时，按相应指南完成调查和对账，
+并在交付中说明实际采用的方法。
 
 当 RPG Maker MV 项目同时具有数万翻译单元、大量活动插件、嵌套插件参数和多种玩家界面时，
 读取[大型、高插件 MV 经验](references/game-type-large-plugin-heavy-mv.md)。
@@ -44,26 +47,31 @@ RPG Maker 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、�
 译文字段；Manual ID、scan/finalize 产物以及 audit/preflight 结果使用相应工具重新生成，以生成结果
 完成对账。
 
-按[项目调查指南](../../docs/guides/translation-project.md#2-调查可见文本)填写决定并保留来源绑定。
-所有权与翻译语境分别判断：排除内部键后，相关标题、说明或对白仍可通过同一组名一起翻译；
-独立记录使用不同组名。用同一次 finalize 产物继续 Extract、audit 与 preflight。
+使用 RPG Maker Survey 时，按[项目调查指南](../../docs/guides/translation-project.md#2-调查可见文本)
+填写决定并保留来源绑定，再用同一次 finalize 产物继续 Extract、audit 与 preflight。
+独立 Generic 项目按 JSONL 规格建立外部来源映射。两种路径都分别判断所有权与翻译语境：排除
+内部键后，相关标题、说明或对白仍可组成同一语义组；独立记录使用不同组。
 
 暂时缺少消费者证据的位置标记为 `unresolved`，并列入人工实机检查清单。用户提供的截图、场景和
 触发步骤可以用于补充消费者证据和定位遗漏来源。
 
 ## 2. Extract
 
-按引擎规格执行 Init，保存本轮实际采用的 dialogue rules、Extract Rules 和 Generic 输入，然后
-执行 Extract。导出 ownership 并运行 Survey audit，确认每个已纳入位置只有一个所有者。
+按引擎规格执行 Init 和 Extract：MV/MZ 使用本轮确定的 Builtin、Extract Rules 及适用的 MV
+对话姓名规则；Generic 读取项目绑定的 JSONL 输入。
 
-Survey 生成的 Manual ID、ownership 投影、audit 和 preflight 集合必须与同目录 `att.exe` 的实际
+MV/MZ 导出 ownership，使用 Survey 的项目继续运行 audit，核对每个位置的唯一所有者。
+独立 Generic 核对 JSONL 与外部来源、自然顺序和写回位置的映射，不执行 RPG Maker ownership
+或 Survey 命令。
+
+使用 Survey 时，生成的 Manual ID、ownership 投影、audit 和 preflight 集合必须与同目录 `att.exe` 的实际
 导出逐项一致。出现缺失、多出或不匹配时，以首个不一致的物理位置为反例，追溯分类和编号规则，
 并判断 Survey 或 `att.exe` 哪一侧偏离现行规格。`att.exe` 符合现行规格而 Survey 偏离时，维护者在
 仓库统一源 `skills/translate-with-att/scripts` 修复脚本、验证受影响来源并通过发行资源同步交付；
 普通任务继续使用完整发行文件，不建立游戏私有脚本分支。`att.exe` 与现行规格冲突时，暂停翻译
 流水线并在 ATT 语义所有者处修复根因，脚本随后对齐修复后的正确投影。
 
-辅助程序更新后，从最早受影响的 Survey 阶段重新生成 decisions、Rules、Placeholder Rules、Manual
+Survey 辅助程序更新后，从最早受影响阶段重新生成 decisions、Rules、Placeholder Rules、Manual
 ID、audit 和 preflight 结果，然后重新执行 Extract、ownership export、audit 和 preflight。
 
 Extract 完成后导出完整 Manual：
@@ -87,27 +95,29 @@ Agent 可以直接完成全部语料；大量独立语料分片也可以交给�
 ## 4. Translate
 
 使用当前 ATT 配置、术语和 Placeholder 运行对应引擎的 Translate。命令结束后按 Translate 规格
-确认 Complete、Partial 或 Unavailable 的实际含义，并导出当前译文：
+确认 NoWork、Complete 或 Incomplete 的汇总，以及失败或取消时已经保留的进度，再导出当前译文：
 
 ```powershell
 att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations.jsonl
 ```
 
-可恢复任务沿当前项目状态继续。少量剩余、语境歧义和已经定位的质量问题使用 Manual TOML
-集中补译或修订，使 Agent 能直接完成最后的自然单元。
+Incomplete 中的 Partial、Unavailable 和未开始 Task 按恢复指南处理。当前 Rejected 只有显式
+`--retry-rejected` 才重新请求；也可以用 `manual export --selection rejected` 导出修订。
+少量剩余、语境歧义和已经定位的质量问题使用 Manual TOML 集中补译或修订。
 
 ## 5. QA
 
-按 `docs/guides/acceptance.md` 检查完整译文。使用随包 `translation_qa.py` 汇总以下内容：
+按 `docs/guides/acceptance.md` 检查完整译文。Agent 负责原意、目标语自然度、上下文、人物语气、
+叙事和专名译法的全量审校。随包 `translation_qa.py` 提供以下静态检查：
 
 - 可见文本覆盖和所有权；
-- 目标语自然度、上下文、人物语气和叙事一致性；
-- 术语、专名和系统用语一致性；
+- 术语表的字面匹配；
 - Placeholder、控制符、空槽、结构和换行；
 - 源语言残留、模型说明、异常转义和布局风险。
 
-先按 Review 组审核问题，再导出对应自然 ID 的 Manual，集中修订、apply、重新导出并复查。QA
-结果清楚区分已经静态确认的范围和需要人工实机观察的场景。
+独立 Generic 使用 `--generic-input` 提供同源 JSONL；RPG Maker 使用相应调查与所有权证据。
+按 Review 组审核静态发现，并把语义审校确认的问题一起按自然 ID 导出到 Manual，集中修订、
+apply、重新导出并复查。报告分别说明静态检查、Agent 语义审校和仍需人工实机观察的场景。
 
 ## 6. WriteBack
 
@@ -119,9 +129,11 @@ JSONL Unit 与实际来源位置。组合项目按真实加载顺序合并，确
 
 ## 7. 字体与封包
 
-使用 `manage_rpg_maker_fonts.py inspect` 检查实际字体引用，再在隔离副本中执行 `apply`。根据当前
-完整译文字符集确认中文 glyph 覆盖，并保留游戏运行时使用的字体名称和加载关系。可选字体包括
-随 Skill 提供的 Noto Sans CJK SC、Noto Serif CJK SC 和霞鹜文楷 GB。
+RPG Maker 游戏按[字体工具指南](../../docs/guides/nwjs-font-tools.md#2-递归字体调查替换与恢复)
+在隔离副本中执行 `manage_rpg_maker_fonts.py apply`；需要修改前比较或只读调查时先用 `inspect`。
+可选字体包括随 Skill 提供的 Noto Sans CJK SC、Noto Serif CJK SC 和霞鹜文楷 GB。
+其他引擎按实际字体加载方式处理。根据完整译文字符集检查 glyph 覆盖，并保留游戏使用的字体
+名称与加载关系。
 
 封包时汇总 WriteBack、Generic 外部结果、字体和游戏原有资源，生成独立交付目录。交付目录完成
 结构解析、可见文本残留、字体覆盖和启动文件检查后，向任务发起者提供人工实机检查清单。实机
@@ -140,6 +152,6 @@ JSONL Unit 与实际来源位置。组合项目按真实加载顺序合并，确
 
 ## 状态恢复
 
-命令失败、Partial、Unavailable、取消或状态不明时，读取
+命令失败、Incomplete、取消或状态不明时，读取
 `docs/guides/diagnosis-and-recovery.md`，根据当前项目状态选择恢复动作。恢复沿用现有项目、输入、
 术语、Manual 和 WriteBack 结果，使已经确认的翻译继续成为后续工作的基础。

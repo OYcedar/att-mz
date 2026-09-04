@@ -76,7 +76,7 @@ impl GenericTaskRecordState {
         diagnostics: Vec<DiagnosticReport>,
     ) -> Self {
         Self {
-            code: "not_committed",
+            code: "not_committed_after_earlier_failure",
             accepted_ids,
             written: 0,
             diagnostics,
@@ -315,6 +315,24 @@ mod tests {
         );
 
         assert!(rendered.contains("上游服务方：未提供"));
+    }
+
+    #[test]
+    fn earlier_failure_explains_why_the_task_was_not_committed() {
+        let document = GenericTaskRecordDocument::new(
+            0,
+            1,
+            "{}".to_owned(),
+            None,
+            None,
+            GenericTaskRecordState::not_committed_due_to_prior_failure(vec![], vec![]),
+        );
+        let rendered = document.render(
+            &ApiKeyRedactor::new(SecretString::from("secret")),
+            UiLocale::SimplifiedChinese,
+        );
+        assert!(rendered.contains("因前序任务失败而未提交"), "{rendered}");
+        assert!(!rendered.contains("not_committed"));
     }
 
     #[test]

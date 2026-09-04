@@ -28,6 +28,11 @@ cli-placeholders-help = Replace the project's placeholder resource
 cli-project-lua-script-help = Lua script to run against the project database
 cli-project-lua-arguments-help = UTF-8 argument passed to Lua arg[1..] after --
 cli-manual-file-help = Manual translation TOML file
+cli-jsonl-file-help = JSONL export file
+cli-retry-rejected-help = Retry saved Rejected candidates
+cli-manual-selection-help = Export selection: pending (default), rejected, or all
+cli-manual-ids-help = Export entries matching the natural IDs in this JSONL file
+cli-layout-rules-help = Load and save WriteBack layout rules from a TOML file
 cli-usage-heading = Usage:
 cli-commands-heading = Commands:
 cli-options-heading = Options:
@@ -187,6 +192,29 @@ log-publication-finished = { $result ->
     [recovery_required] Publication stopped and requires recovery.
     [outcome_unknown] The final publication state is unknown.
    *[other] Publication stopped without a recognized result.
+}
+log-phase-name = { $phase ->
+    [check_project] Project check
+    [scan_source] Source scan
+    [prepare_candidate] Candidate preparation
+    [update_database] Database update
+    [publish] Publication
+    [builtin] Builtin extraction
+    [builtin_documents] Builtin document scan
+    [builtin_work_units] Builtin text unit extraction
+    [builtin_commit] Builtin commit
+    [rules] Rules extraction
+    [rules_documents] Rules document scan
+    [rules_matches] Rules matching
+    [rules_commit] Rules commit
+    [lua] Lua execution
+    [planning] Translation task planning
+    [confirmed_tasks] Translation task confirmation
+    [read_assets] Project content reading
+    [plan_rpg_maker_write_back] WriteBack planning
+    [rewrite_documents] Document rewriting
+    [validate_candidate] Candidate validation
+   *[other] __ATT_FALLBACK__
 }
 log-task-outcome-value = { $outcome ->
     [complete] completed
@@ -406,6 +434,29 @@ diagnostic-provider-code = Provider code: { $code }
 diagnostic-provider-type = Provider type: { $kind }
 diagnostic-provider-message = Provider message: { $message }
 diagnostic-json-position = line { $line }, column { $column }
+diagnostic-input-field = Field: { $field }
+diagnostic-input-failure = { $code ->
+    [syntax] Invalid TOML syntax
+    [missing_field] A required field is missing
+    [unknown_field] This field is not allowed by the current format
+    [duplicate_field] The field is duplicated
+    [type_mismatch] The field has the wrong type
+    [invalid_value] The field value is invalid
+   *[other] __ATT_FALLBACK__
+}
+diagnostic-expected-type = Expected type: { $expected ->
+    [string] string
+    [integer] integer
+    [boolean] boolean
+    [string_or_boolean] string or boolean
+    [string_array] array of strings
+    [integer_array] array of integers
+    [table] table
+    [table_array] array of tables
+    [array] array
+    [object] object
+   *[other] __ATT_FALLBACK__
+}
 diagnostic-response-item = response item { $item }
 diagnostic-array-item = array item { $item }
 diagnostic-token-position = control-token position { $position }
@@ -418,6 +469,9 @@ manual-exported = Exported { $entries } entries to { $path }
 manual-checked = Valid { $valid }, unfilled { $unfilled }, errors { $errors }
 manual-applied = Applied { $applied }, unfilled { $unfilled }, errors { $errors }
 manual-value = { $code ->
+    [translation_byte_order_mark] translation item { $line } contains a BOM (U+FEFF)
+    [remove_byte_order_mark] Remove the BOM (U+FEFF) character from the translation
+    [keep_placeholders] Restore the source Placeholders in the translation, preserving their counts, required order, and text slots
     [invalid_source_line] source item { $line } contains a line break or NUL
     [invalid_translation_line] translation item { $line } contains a line break or NUL
     [fixed_length] fixed translation requires { $expected } items; found { $actual }
@@ -435,6 +489,7 @@ task-record-final-result-heading = Final result
 task-record-final-status = Status: { $state ->
     [complete] complete and commit confirmed
     [partial] partially complete and commit confirmed
+    [unavailable_rejected_committed] Unavailable; rejected candidates saved
     [unavailable] unavailable; project unchanged
     [execution_failed] execution failed; not committed
     [commit_preparation_failed] commit preparation failed; definitely not applied

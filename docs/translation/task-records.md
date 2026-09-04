@@ -1,7 +1,8 @@
 # 模型任务记录现行规格
 
-`[translation].record_translation_tasks` 省略时默认 `true`。开启时，Translate 为每个至少
-已开始一次真实外部 HTTP attempt 的模型任务建立一份 Markdown：
+模型任务记录保存实际请求、原始响应和确认后的任务结果，便于调查模型行为或人工补译。
+`[translation].record_translation_tasks` 省略时默认 `true`。开启时，Translate 为每个已开始
+至少一次真实 HTTP 请求尝试（attempt）的模型任务建立一份 Markdown：
 
 ```text
 <project>/task-records/run-000001/task-000001.md
@@ -14,12 +15,14 @@
 
 ## 1. 最小内容
 
-每份记录只保存三类事实：
+每份记录按阅读顺序保存：
 
 - 位于文档顶部的最终状态、最终一次实际 HTTP attempt 的上游服务方、要求译文数量、已接受和
-  未接受的临时 ID、已确认写入数量，以及使用者需要处理的精确诊断；
+  未接受的临时 ID、已确认写入数量，以及需要处理的具体诊断；
 - 实际发给模型的 User message；
-- 协议完整结束后，模型返回的原始 Assistant 正文；
+- 协议完整结束后，模型返回的原始 Assistant 正文。
+
+### 最终结果与服务方
 
 最终结果中的“已接受”表示相应临时 ID 的译文已经通过逐项验收，“写入”单独表示已经确认
 提交的实际位置数量；提交冲突或终态未知时不能把验收伪装成写入。未接受 ID 的具体原因
@@ -32,7 +35,9 @@ attempt 不继承上一次名称。上游未提供元数据、元数据无效或
 显示名称中的 CommonMark ASCII 标点按行内纯文本转义，不形成链接、HTML 或其他 Markdown 结构。
 这个字段帮助使用者定位实际服务方，不参与验收、提交或恢复。
 
-User message 按实际请求保存，不另造简化版。Assistant 使用能够包住正文的动态 `json`
+### 请求与响应正文
+
+User message 按实际请求保存。Assistant 使用能够包住正文的动态 `json`
 fence；模型已经返回规范围栏时只移除这层围栏再建立同等的 `json` fence，使 Markdown
 能够高亮 JSON 而不出现嵌套围栏。记录只执行敏感信息替换，不解析后重新排版，也不另行
 展开 `think`、原文回显、逐 ID 译文或 JSON 修复过程。
@@ -40,6 +45,8 @@ fence；模型已经返回规范围栏时只移除这层围栏再建立同等的
 流式 HTTP 只改变响应接收方式。任务记录只保存协议完整终态后组装的 Assistant 正文，
 不保存 SSE envelope、增量片段、心跳或未完整结束的流；非流式与流式请求使用相同的记录结构
 和保存时机。
+
+### 记录范围
 
 任务记录不重复保存 System message、引擎名、RunId、时间、耗时、Endpoint、模型、请求参数、
 尝试过程、token 统计、供应商请求标识或 JSON 修复坐标。它只从路由元数据投影最终 attempt 的
@@ -62,7 +69,8 @@ fence；模型已经返回规范围栏时只移除这层围栏再建立同等的
 3. 结合任务记录中的实际请求和 Assistant、当前术语及 Lua 返回的 Group 上下文填写 TOML；
 4. 默认直接运行 `manual apply`；只在需要事先试检或单独诊断 TOML 时先运行 `manual check`。
 
-不要从重复原文、任务序号或任务记录文件名猜数据库位置。完整流程见
+使用 Manual 导出的可读 ID 定位项目条目；重复原文、任务序号和任务记录文件名都不能确定
+数据库位置。完整流程见
 [Manual](../manual/README.md)和[Lua](../lua/README.md)。
 
 ## 3. 敏感信息与权威性

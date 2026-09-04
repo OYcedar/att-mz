@@ -1,7 +1,8 @@
 # Manual TOML 人工补译规格
 
-Manual 是 MV、MZ 和 Generic 普通人工补译的统一入口。它只处理当前项目数据库和一份可直接
-编辑的 UTF-8 TOML，不请求模型，不修改 Prompt、术语、语言规则或 Placeholder 配置。
+Manual 通过一份可编辑的 UTF-8 TOML，为 MV、MZ 和 Generic 项目补译或修订正文。通常按
+“导出 → 填写译文 → 应用”执行；需要单独检查文件时使用 `check`。这些操作使用当前项目数据库，
+不请求模型，也不修改 Prompt、术语、语言规则或 Placeholder 配置。
 
 ```text
 att mv|mz|generic manual export --name NAME \
@@ -38,7 +39,7 @@ translation = ["译文可以按照中文需要重新分行。"]
 - `type` 只能是 `fixed` 或 `free`；
 - `source` 和 `translation` 只能是字符串数组；
 - `translation = []` 是唯一的未填写表示；
-- 数组元素不能包含 CR、LF 或 NUL，多行内容使用多个数组元素表达；
+- 数组元素不能包含 CR、LF 或 NUL；译文还不能包含 BOM/U+FEFF。多行内容使用多个数组元素表达；
 - 未知字段、标量正文、重复 ID 和其他 TOML 结构均无效。
 
 `fixed` 必须保持数组长度和原文中的必要空槽。原文纯空白槽的译文必须是精确空字符串；
@@ -56,7 +57,7 @@ translation = ["译文可以按照中文需要重新分行。"]
 - 不导出完全由 Placeholder 保护的内容；
 - 不导出已有当前人工或自动译文的内容。
 
-`--selection rejected` 只导出 Rejected。候选能表示为字符串数组时预填 `translation`；否则
+`--selection rejected` 只导出 Rejected。候选能表示为非空字符串数组时预填 `translation`；否则
 保留候选 JSON 和确定原因作为注释，`translation = []`，由使用者填写。`--selection all`
 导出全部当前条目并预填当前有效译文或可表示的 Rejected 候选。
 
@@ -74,7 +75,7 @@ Rejected 只有在原文、完整 Group 语境和项目语言对仍与候选建�
 重复、未知或带未知字段的 ID 会使导出失败。导出文件不包含上下文、术语、hash 或数据库
 身份；没有选中条目时写出空文件。输出目标必须是普通非 reparse 文件。
 
-所有权不再依附 Manual。`att mv|mz ownership export` 导出全部 Extract Unit；
+RPG Maker 所有权使用独立的 `att mv|mz ownership export` 导出全部 Extract Unit；
 `att mv|mz|generic translation export` 导出全部当前 Unit，格式见
 [CLI 规格](../runtime/cli.md#5-manual-输出)。
 
@@ -88,11 +89,11 @@ Rejected 只有在原文、完整 Group 语境和项目语言对仍与候选建�
 - ID 是否重复并仍指向当前条目；
 - `source` 与当前原文是否逐项一致；
 - `type`、数组形状、固定行数和必要空槽；
-- 控制字符、RPG Maker 控制码和当前必要 Placeholder。
+- 控制字符、RPG Maker 控制码和当前必要 Placeholder；
 - 原文非空槽或正文没有被译成空字符串或纯空白。
 
 Placeholder 预期来自当前原文已经建立的 binding。Manual 不要求同一正则在译文标签或自然语言
-上下文中再次命中原片段；例如由英文标签 lookbehind 保护的凭据，在标签汉化后仍按源文片段、
+上下文中再次命中原片段；例如由英文标签 lookbehind 保护的编号，在标签汉化后仍按源文片段、
 数量、顺序、wrapper 和槽位验收。无法唯一归属的重复或重叠片段，以及剩余译文中新命中的
 Placeholder，仍会报错。
 
@@ -104,10 +105,17 @@ Placeholder，仍会报错。
 `manual apply` 在一个数据库事务中执行与 `check` 相同的检查。存在任何错误时不修改任何
 条目；全部结构有效时，只应用非空 `translation`，未填写项跳过。
 
-人工译文优先于自动译文。应用人工译文会清除同一位置的自动译文和 Rejected 候选，不触发
-模型请求、全局规则修改、重新翻译或无关译文失效。原文、实际写回结构或强验收契约变化后，
-ATT 用统一候选验收重新检查当前人工正文；仍合法则保留，确定违反强不变量时正文与来源转入
-Rejected，WriteBack 不使用它。术语、文风、语言比例和布局等 Review 不会使人工译文失效。
+人工译文优先于自动译文。应用时清除同一位置的自动译文和 Rejected 候选，其他位置保持原状态。
+
+后续变化按两类处理：
+
+- 原文、位置、项目语言对或实际写回结构改变，使人工译文不再适用时，旧记录保留为过期正文，
+  不作为 Current 导出或写回；
+- 适用性仍匹配、但 Placeholder 等强验收契约改变时，按当前契约重新验收。合法正文继续使用；
+  违反强不变量的正文及来源转入 Rejected，供人工修订。
+
+术语、文风、语言比例和布局等 Review 不改变人工译文的适用性。完整状态边界见
+[SQLite 规格](../runtime/sqlite.md#2-自动译文与人工译文)。
 
 ## 5. 需要上下文时
 
@@ -123,5 +131,6 @@ local context = ctx.translation.context(ids)
 local terms = ctx.terminology.list()
 ```
 
-不要为每条译文分别启动一次 Lua。少量剩余条目优先使用 Manual；只有证据表明问题属于系统
-规则时，才修改 Placeholder、语言或其他全局规则并重新运行 Translate。
+批量取得上下文后，在同一份 Manual 中集中填写并应用。少量剩余条目直接补译；只有证据表明
+问题来自系统规则时，才修改 Placeholder、语言或其他全局规则。需要重新请求当前 Rejected
+条目时，显式使用 Translate 的 `--retry-rejected`。

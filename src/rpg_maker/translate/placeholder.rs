@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use crate::rpg_maker::RpgMakerEngine;
 use crate::rpg_maker::asset::RpgMakerAssetOwner;
-use crate::rpg_maker::model::TextUnitRole;
-use crate::rpg_maker::text::{RpgMakerLocation, RpgMakerSource, StandardDataFile, TextGroupKind};
+use crate::rpg_maker::model::{DirectTextPart, TextProjectionRecipe, TextUnitRole};
+use crate::rpg_maker::text::{
+    RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile, TextGroupKind,
+};
 use crate::translation::placeholder::{
     CompiledBuiltinPlaceholderRule, PlaceholderOrderPolicy, PlaceholderService,
     candidate_placeholder_bindings_are_source_subset,
@@ -44,11 +46,11 @@ enum RpgMakerTextConsumer {
     Message,
 }
 
-/// 只由 ATT Builtin 已确认的标准物理位置推导出的默认控制符范围。
+/// 由标准物理字段及其消费者推导出的默认控制符范围。
 ///
-/// Rules 与插件参数没有标准消费者证明，始终得到 Plain；它们只能使用精确 ID 的
-/// Custom 规则。`format_arguments` 表示当前位置确定调用了 `String.format`，源中
-/// 即使出现 `%0` 或超出实参数量的 `%N` 也仍由运行时消费，因而照常保护。
+/// Rules 按写回配方的实际目标继承标准字段控制契约。`format_arguments` 表示当前位置
+/// 确定调用了 `String.format`；源中的 `%0` 或超出实参数量的 `%N` 也由运行时消费，
+/// 因而照常保护。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RpgMakerBuiltinPlaceholderProfile {
     consumer: RpgMakerTextConsumer,
@@ -75,6 +77,9 @@ impl RpgMakerBuiltinPlaceholderProfile {
     }
 
     pub(crate) fn for_identity(engine: RpgMakerEngine, identity: &TranslationUnitIdentity) -> Self {
+        if let Some((target, command_code)) = identity.physical_control_target() {
+            return physical_target_profile(engine, target, *command_code);
+        }
         Self::for_location(
             engine,
             identity.owner(),
@@ -82,6 +87,22 @@ impl RpgMakerBuiltinPlaceholderProfile {
             identity.group_location(),
             identity.role(),
         )
+    }
+
+    pub(crate) fn for_recipes(
+        engine: RpgMakerEngine,
+        owner: RpgMakerAssetOwner,
+        kind: TextGroupKind,
+        location: &RpgMakerLocation,
+        role: &TextUnitRole,
+        recipes: &[TextProjectionRecipe],
+    ) -> Self {
+        if owner == RpgMakerAssetOwner::Rules {
+            return physical_control_target(role, recipes).map_or(Self::PLAIN, |(target, code)| {
+                physical_target_profile(engine, target, code)
+            });
+        }
+        Self::for_location(engine, owner, kind, location, role)
     }
 
     pub(crate) fn for_location(
@@ -126,6 +147,74 @@ impl RpgMakerBuiltinPlaceholderProfile {
     }
 }
 
+pub(crate) fn physical_control_target<'a>(
+    role: &TextUnitRole,
+    recipes: &'a [TextProjectionRecipe],
+) -> Option<(&'a RpgMakerLocation, Option<i64>)> {
+    recipes.iter().find_map(|recipe| {
+        let TextProjectionRecipe::Direct(recipe) = recipe else {
+            return None;
+        };
+        recipe
+            .parts()
+            .iter()
+            .any(|part| match part {
+                DirectTextPart::TextSlot { role: candidate }
+                | DirectTextPart::LineSlot {
+                    role: candidate, ..
+                } => candidate == role,
+                DirectTextPart::Literal(_) => false,
+            })
+            .then_some((recipe.target(), recipe.event_command_code()))
+    })
+}
+
+fn physical_target_profile(
+    engine: RpgMakerEngine,
+    target: &RpgMakerLocation,
+    command_code: Option<i64>,
+) -> RpgMakerBuiltinPlaceholderProfile {
+    use RpgMakerBuiltinPlaceholderProfile as Profile;
+    use RpgMakerLocationStep::{ArrayIndex, ObjectKey};
+    if let Some((_, parameter, item)) = target.standard_event_parameter() {
+        return match (command_code, parameter, item) {
+            (Some(401), 0, None) | (Some(320), 1, None) => Profile::MESSAGE,
+            (Some(405), 0, None) | (Some(325), 1, None) | (Some(102), 0, Some(_)) => {
+                Profile::EXTENDED
+            }
+            (Some(101), 4, None) if engine == RpgMakerEngine::Mz => Profile::EXTENDED,
+            _ => Profile::PLAIN,
+        };
+    }
+    let RpgMakerSource::Data(file) = target.source() else {
+        return Profile::PLAIN;
+    };
+    if *file != StandardDataFile::System {
+        return match target.steps() {
+            [ArrayIndex(_), ObjectKey(field)] => database_field_profile(engine, *file, field),
+            _ => Profile::PLAIN,
+        };
+    }
+    match target.steps() {
+        [ObjectKey(terms), ObjectKey(basic), ArrayIndex(index)]
+            if terms == "terms" && basic == "basic" =>
+        {
+            system_field_profile(&format!("terms.basic[{index}]"))
+        }
+        [ObjectKey(terms), ObjectKey(params), ArrayIndex(index)]
+            if terms == "terms" && params == "params" =>
+        {
+            system_field_profile(&format!("terms.params[{index}]"))
+        }
+        [ObjectKey(terms), ObjectKey(messages), ObjectKey(key)]
+            if terms == "terms" && messages == "messages" =>
+        {
+            system_message_profile(&format!("terms.messages.{key}"))
+        }
+        _ => Profile::PLAIN,
+    }
+}
+
 fn database_profile(
     engine: RpgMakerEngine,
     location: &RpgMakerLocation,
@@ -137,7 +226,15 @@ fn database_profile(
     let Some(field) = scalar_field(role) else {
         return RpgMakerBuiltinPlaceholderProfile::PLAIN;
     };
-    match (*file, field) {
+    database_field_profile(engine, *file, field)
+}
+
+fn database_field_profile(
+    engine: RpgMakerEngine,
+    file: StandardDataFile,
+    field: &str,
+) -> RpgMakerBuiltinPlaceholderProfile {
+    match (file, field) {
         (StandardDataFile::Skills, "message1" | "message2") => {
             RpgMakerBuiltinPlaceholderProfile::EXTENDED.with_format()
         }
@@ -188,6 +285,10 @@ fn system_profile(
     let Some(field) = scalar_field(role) else {
         return RpgMakerBuiltinPlaceholderProfile::PLAIN;
     };
+    system_field_profile(field)
+}
+
+fn system_field_profile(field: &str) -> RpgMakerBuiltinPlaceholderProfile {
     match field {
         "terms.basic[0]" | "terms.basic[8]" => RpgMakerBuiltinPlaceholderProfile::MESSAGE,
         "terms.basic[2]" | "terms.basic[4]" | "terms.basic[6]" => {
@@ -753,10 +854,20 @@ mod tests {
             RpgMakerSource::data(StandardDataFile::Items),
             scalar("description"),
             "",
-        );
-        assert!(
-            protected_originals(&service, RpgMakerEngine::Mz, &rules_description, r"\C[2]")
-                .is_empty()
+        )
+        .with_physical_control_target(Some((
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![
+                    RpgMakerLocationStep::index(1),
+                    RpgMakerLocationStep::key("description"),
+                ],
+            ),
+            None,
+        )));
+        assert_eq!(
+            protected_originals(&service, RpgMakerEngine::Mz, &rules_description, r"\C[2]"),
+            [r"\C[2]"]
         );
     }
 

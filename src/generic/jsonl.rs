@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostic::{
     Diagnostic, FileSystemDiagnosticContext, FileSystemDiagnosticStage, FileSystemIssue,
     FileSystemOperation, FileSystemOrdinalKeyPhase, FileSystemProblem, GenericDiagnosticStage,
-    GenericIssue, GenericJsonErrorCategory, GenericJsonlLocation, GenericProblem,
-    GenericTextViolation, IoFailure, SafeIdentifier, SafePath,
+    GenericIssue, GenericJsonErrorCategory, GenericJsonlFieldProblem, GenericJsonlLocation,
+    GenericJsonlValueKind, GenericProblem, GenericTextViolation, IoFailure, SafeIdentifier,
+    SafePath, SafeText,
 };
 use crate::execution::CooperativeCancellation;
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
@@ -286,6 +287,7 @@ pub(crate) enum GenericJsonlError {
         serde_line: usize,
         serde_column: usize,
         source: serde_json::Error,
+        field_problem: Option<GenericJsonlFieldProblem>,
     },
     InvalidGroup {
         path: PathBuf,
@@ -686,11 +688,13 @@ fn group_problem(
             serde_line,
             serde_column,
             source,
+            field_problem,
         } => Some(GenericProblem::InvalidJson {
             location: jsonl_location(path, *line),
             json_line: *serde_line,
             json_column: *serde_column,
             category: GenericJsonErrorCategory::from(JsonErrorCategory::from(source)),
+            field_problem: field_problem.clone(),
         }),
         GenericJsonlError::InvalidGroup { source, .. } => group_problem(source, location),
         GenericJsonlError::BlankField { field } => Some(GenericProblem::BlankField {
@@ -997,6 +1001,11 @@ pub(crate) fn parse_file_with_cancellation(
                     line,
                     serde_line,
                     serde_column,
+                    field_problem: diagnose_group_field(
+                        json_line.as_bytes(),
+                        &source,
+                        cancellation,
+                    )?,
                     source,
                 });
             }
@@ -1025,6 +1034,99 @@ pub(crate) fn parse_file_with_cancellation(
         groups,
         raw_bytes,
     })
+}
+
+/// 只在严格反序列化失败后检查固定字段，公开字段位置与期望类型，保留值正文在内部。
+fn diagnose_group_field(
+    json_line: &[u8],
+    source: &serde_json::Error,
+    cancellation: &CooperativeCancellation,
+) -> Result<Option<GenericJsonlFieldProblem>, GenericJsonlError> {
+    if !source.is_data() {
+        return Ok(None);
+    }
+    let mut reader = CancellableSliceReader::new(json_line, cancellation);
+    let value = serde_json::from_reader::<_, serde_json::Value>(&mut reader);
+    ensure_not_cancelled(cancellation)?;
+    let Ok(value) = value else {
+        return Ok(None);
+    };
+    diagnose_jsonl_object(&value, "", true, cancellation)
+}
+
+fn diagnose_jsonl_object(
+    value: &serde_json::Value,
+    path: &str,
+    group: bool,
+    cancellation: &CooperativeCancellation,
+) -> Result<Option<GenericJsonlFieldProblem>, GenericJsonlError> {
+    ensure_not_cancelled(cancellation)?;
+    let Some(object) = value.as_object() else {
+        return Ok(Some(GenericJsonlFieldProblem::TypeMismatch {
+            field: SafeText::new(if path.is_empty() { "Group" } else { path }),
+            expected: GenericJsonlValueKind::Object,
+        }));
+    };
+    let fields: &[&str] = if group {
+        &["id", "kind", "units"]
+    } else {
+        &["id", "text"]
+    };
+    let field_path = |name: &str| {
+        SafeText::new(if path.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{path}.{name}")
+        })
+    };
+    for (field, value) in object {
+        if !fields.contains(&field.as_str()) {
+            return Ok(Some(GenericJsonlFieldProblem::UnknownField {
+                field: field_path(field),
+            }));
+        }
+        let expected = if field == "units" {
+            GenericJsonlValueKind::Array
+        } else {
+            GenericJsonlValueKind::String
+        };
+        let valid = match expected {
+            GenericJsonlValueKind::String => value.is_string(),
+            GenericJsonlValueKind::Array => value.is_array(),
+            GenericJsonlValueKind::Object => value.is_object(),
+        };
+        if !valid {
+            return Ok(Some(GenericJsonlFieldProblem::TypeMismatch {
+                field: field_path(field),
+                expected,
+            }));
+        }
+        // Value 保持属性出现顺序；在 units 所在位置检查其内容，再继续后面的 Group 字段。
+        // 缺失字段留到对象结束时检查，与严格反序列化的失败位置保持一致。
+        if field == "units" {
+            for (index, unit) in value
+                .as_array()
+                .expect("已确认 units 是数组")
+                .iter()
+                .enumerate()
+            {
+                if let Some(problem) = diagnose_jsonl_object(
+                    unit,
+                    &format!("units[{}]", index + 1),
+                    false,
+                    cancellation,
+                )? {
+                    return Ok(Some(problem));
+                }
+            }
+        }
+    }
+    Ok(fields
+        .iter()
+        .find(|field| !object.contains_key(**field))
+        .map(|field| GenericJsonlFieldProblem::MissingField {
+            field: field_path(field),
+        }))
 }
 
 fn validate_utf8_with_cancellation(
@@ -2151,17 +2253,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_diagnostic_excludes_unstructured_serde_text_and_input_payload() {
+    fn invalid_json_diagnostic_identifies_unknown_field_without_input_values() {
         const SENTINEL: &str = "PRIVATE_JSON_SENTINEL";
         let source = format!(
-            "{{\"id\":\"g\",\"kind\":\"k\",\"units\":[{{\"id\":\"u\",\"text\":\"x\"}}],\"{SENTINEL}\":true}}"
+            "{{\"id\":\"g\",\"kind\":\"k\",\"units\":[{{\"id\":\"u\",\"text\":\"{SENTINEL}\"}}],\"extra\":true}}"
         );
         let error = parse_file(PathBuf::from("nested/bad.jsonl"), source.into_bytes())
             .expect_err("未知字段必须失败");
-        assert!(
-            matches!(&error, GenericJsonlError::InvalidJson { source, .. } if source.to_string().contains(SENTINEL)),
-            "测试输入必须确保 serde 原始错误确实携带 sentinel"
-        );
 
         let report = DiagnosticReport::new(
             StateEffect::Unchanged,
@@ -2181,6 +2279,8 @@ mod tests {
 
         let rendered = render_diagnostic_report(&report, &UiLocalizer::new(UiLocale::English));
         assert!(rendered.contains("nested/bad.jsonl:line1"));
+        assert!(rendered.contains("extra"));
+        assert!(rendered.contains("not allowed"));
         for internal in [
             "json_category=",
             "json_column=",
@@ -2192,5 +2292,118 @@ mod tests {
             );
         }
         assert!(!rendered.contains(SENTINEL));
+    }
+
+    #[test]
+    fn invalid_json_diagnostic_identifies_missing_and_mistyped_unit_fields() {
+        for (source, field, explanation) in [
+            (
+                r#"{"id":"g","kind":"k","units":[{"id":"u","text":17}]}"#,
+                "units[1].text",
+                "string",
+            ),
+            (
+                r#"{"id":"g","kind":"k","units":[{"id":"u"}]}"#,
+                "units[1].text",
+                "missing",
+            ),
+            (r#"{"id":"g","kind":"k","units":{}}"#, "units", "array"),
+        ] {
+            let error = parse_file(PathBuf::from("bad.jsonl"), source.as_bytes().to_vec())
+                .expect_err("字段不符合 JSONL 契约");
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                error.diagnostic(GenericDiagnosticStage::Extract),
+            );
+            let rendered = render_diagnostic_report(&report, &UiLocalizer::new(UiLocale::English));
+            assert!(rendered.contains(field), "{rendered}");
+            assert!(rendered.contains(explanation), "{rendered}");
+            assert!(rendered.contains("bad.jsonl:line1"), "{rendered}");
+            assert!(!rendered.contains("column"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn invalid_json_diagnostic_fields_do_not_inherit_another_failure_column() {
+        for (source, column, problem) in [
+            (
+                r#"{"id":"g","kind":"k","units":[{"id":"u","text":17}],"extra":true}"#,
+                49,
+                GenericJsonlFieldProblem::TypeMismatch {
+                    field: SafeText::new("units[1].text"),
+                    expected: GenericJsonlValueKind::String,
+                },
+            ),
+            (
+                r#"{"id":"g","units":[{"id":"u"}],"extra":true}"#,
+                29,
+                GenericJsonlFieldProblem::MissingField {
+                    field: SafeText::new("units[1].text"),
+                },
+            ),
+            (
+                r#"{"units":[{"id":"u","text":"value"}]}"#,
+                37,
+                GenericJsonlFieldProblem::MissingField {
+                    field: SafeText::new("id"),
+                },
+            ),
+            (
+                r#"{"id":"g","id":"duplicate","kind":"k","units":[{"id":"u","text":17}]}"#,
+                14,
+                GenericJsonlFieldProblem::TypeMismatch {
+                    field: SafeText::new("units[1].text"),
+                    expected: GenericJsonlValueKind::String,
+                },
+            ),
+        ] {
+            let error = parse_file(PathBuf::from("bad.jsonl"), source.as_bytes().to_vec())
+                .expect_err("无效字段或重复键必须返回诊断");
+            let GenericJsonlError::InvalidJson {
+                serde_column,
+                field_problem,
+                ..
+            } = &error
+            else {
+                panic!("应返回 JSON 格式错误：{error:?}");
+            };
+            assert_eq!(*serde_column, column, "{source}");
+            assert_eq!(field_problem.as_ref(), Some(&problem), "{source}");
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                error.diagnostic(GenericDiagnosticStage::Extract),
+            );
+            let localizer = UiLocalizer::new(UiLocale::English);
+            let rendered = render_diagnostic_report(&report, &localizer);
+            assert!(rendered.contains(problem.field().as_str()), "{rendered}");
+            assert!(rendered.contains("bad.jsonl:line1"), "{rendered}");
+            assert!(!rendered.contains("column"), "{rendered}");
+        }
+
+        for source in [
+            r#"{"id":}"#,
+            r#"{"id":"g","id":"duplicate","kind":"k","units":[{"id":"u","text":"value"}]}"#,
+        ] {
+            let error = parse_file(PathBuf::from("bad.jsonl"), source.as_bytes().to_vec())
+                .expect_err("语法或重复字段错误必须保留解析位置");
+            let GenericJsonlError::InvalidJson {
+                serde_column,
+                field_problem,
+                ..
+            } = &error
+            else {
+                panic!("应返回 JSON 格式错误：{error:?}");
+            };
+            assert!(field_problem.is_none());
+            let report = DiagnosticReport::new(
+                StateEffect::Unchanged,
+                error.diagnostic(GenericDiagnosticStage::Extract),
+            );
+            let rendered = render_diagnostic_report(&report, &UiLocalizer::new(UiLocale::English));
+            assert!(
+                rendered.contains(&format!("line 1, column {serde_column}")),
+                "{rendered}"
+            );
+        }
     }
 }

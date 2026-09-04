@@ -1301,6 +1301,7 @@ fn encode_rejected_unit(
         .map_err(ResultStoragePlanError::Content)?;
     let translation_json = candidate
         .translation()
+        .filter(|lines| !lines.is_empty())
         .map(serde_json::to_string)
         .transpose()
         .map_err(ResultStoragePlanError::Content)?;

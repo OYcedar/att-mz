@@ -445,6 +445,11 @@ pub(crate) enum UiMessage<'a> {
     CliProjectLuaScriptHelp,
     CliProjectLuaArgumentsHelp,
     CliManualFileHelp,
+    CliJsonlFileHelp,
+    CliRetryRejectedHelp,
+    CliManualSelectionHelp,
+    CliManualIdsHelp,
+    CliLayoutRulesHelp,
     CliUsageHeading,
     CliCommandsHeading,
     CliOptionsHeading,
@@ -547,6 +552,15 @@ pub(crate) enum UiMessage<'a> {
     DiagnosticJsonPosition {
         line: u64,
         column: u64,
+    },
+    DiagnosticInputFailure {
+        code: &'a str,
+    },
+    DiagnosticInputField {
+        field: &'a str,
+    },
+    DiagnosticExpectedType {
+        expected: &'a str,
     },
     DiagnosticResponseItem {
         item: u64,
@@ -802,6 +816,9 @@ pub(crate) enum UiMessage<'a> {
     LogPhaseStarted {
         phase: &'a str,
     },
+    LogPhaseName {
+        phase: &'a str,
+    },
     LogPhaseCompleted {
         phase: &'a str,
     },
@@ -904,6 +921,11 @@ impl UiMessage<'_> {
             Self::CliProjectLuaScriptHelp => "cli-project-lua-script-help",
             Self::CliProjectLuaArgumentsHelp => "cli-project-lua-arguments-help",
             Self::CliManualFileHelp => "cli-manual-file-help",
+            Self::CliJsonlFileHelp => "cli-jsonl-file-help",
+            Self::CliRetryRejectedHelp => "cli-retry-rejected-help",
+            Self::CliManualSelectionHelp => "cli-manual-selection-help",
+            Self::CliManualIdsHelp => "cli-manual-ids-help",
+            Self::CliLayoutRulesHelp => "cli-layout-rules-help",
             Self::CliUsageHeading => "cli-usage-heading",
             Self::CliCommandsHeading => "cli-commands-heading",
             Self::CliOptionsHeading => "cli-options-heading",
@@ -951,6 +973,9 @@ impl UiMessage<'_> {
             Self::DiagnosticProviderType { .. } => "diagnostic-provider-type",
             Self::DiagnosticProviderMessage { .. } => "diagnostic-provider-message",
             Self::DiagnosticJsonPosition { .. } => "diagnostic-json-position",
+            Self::DiagnosticInputFailure { .. } => "diagnostic-input-failure",
+            Self::DiagnosticInputField { .. } => "diagnostic-input-field",
+            Self::DiagnosticExpectedType { .. } => "diagnostic-expected-type",
             Self::DiagnosticResponseItem { .. } => "diagnostic-response-item",
             Self::DiagnosticArrayItem { .. } => "diagnostic-array-item",
             Self::DiagnosticTokenPosition { .. } => "diagnostic-token-position",
@@ -1036,6 +1061,7 @@ impl UiMessage<'_> {
             Self::LogLuaPrint { .. } => "log-lua-print",
             Self::LogPlanResolved { .. } => "log-plan-resolved",
             Self::LogPhaseStarted { .. } => "log-phase-started",
+            Self::LogPhaseName { .. } => "log-phase-name",
             Self::LogPhaseCompleted { .. } => "log-phase-completed",
             Self::LogPhaseStopped { .. } => "log-phase-stopped",
             Self::LogCancellationRequested { .. } => "log-cancellation-requested",
@@ -1276,7 +1302,9 @@ impl UiMessage<'_> {
                 set_text(&mut arguments, "command", command);
                 set_text(&mut arguments, "source", source);
             }
-            Self::LogPhaseStarted { phase } | Self::LogPhaseCompleted { phase } => {
+            Self::LogPhaseStarted { phase }
+            | Self::LogPhaseCompleted { phase }
+            | Self::LogPhaseName { phase } => {
                 set_text(&mut arguments, "phase", phase);
             }
             Self::LogPhaseStopped { phase, outcome } => {
@@ -1358,8 +1386,14 @@ impl UiMessage<'_> {
             Self::DiagnosticImpactValue { effect } => {
                 set_text(&mut arguments, "effect", effect);
             }
-            Self::DiagnosticResolutionValue { code } | Self::DiagnosticFailureValue { code } => {
+            Self::DiagnosticResolutionValue { code }
+            | Self::DiagnosticFailureValue { code }
+            | Self::DiagnosticInputFailure { code } => {
                 set_text(&mut arguments, "code", code);
+            }
+            Self::DiagnosticInputField { field } => set_text(&mut arguments, "field", field),
+            Self::DiagnosticExpectedType { expected } => {
+                set_text(&mut arguments, "expected", expected)
             }
             Self::DiagnosticConfigurationRuleValue {
                 code,
@@ -1531,6 +1565,11 @@ impl UiMessage<'_> {
             | Self::CliProjectLuaScriptHelp
             | Self::CliProjectLuaArgumentsHelp
             | Self::CliManualFileHelp
+            | Self::CliJsonlFileHelp
+            | Self::CliRetryRejectedHelp
+            | Self::CliManualSelectionHelp
+            | Self::CliManualIdsHelp
+            | Self::CliLayoutRulesHelp
             | Self::CliUsageHeading
             | Self::CliCommandsHeading
             | Self::CliOptionsHeading
@@ -2156,6 +2195,11 @@ mod tests {
             UiMessage::CliProjectLuaScriptHelp,
             UiMessage::CliProjectLuaArgumentsHelp,
             UiMessage::CliManualFileHelp,
+            UiMessage::CliJsonlFileHelp,
+            UiMessage::CliRetryRejectedHelp,
+            UiMessage::CliManualSelectionHelp,
+            UiMessage::CliManualIdsHelp,
+            UiMessage::CliLayoutRulesHelp,
             UiMessage::CliUsageHeading,
             UiMessage::CliCommandsHeading,
             UiMessage::CliOptionsHeading,
@@ -2228,6 +2272,13 @@ mod tests {
                 message: "try later",
             },
             UiMessage::DiagnosticJsonPosition { line: 1, column: 2 },
+            UiMessage::DiagnosticInputFailure {
+                code: "unknown_field",
+            },
+            UiMessage::DiagnosticInputField {
+                field: "units[1].text",
+            },
+            UiMessage::DiagnosticExpectedType { expected: "string" },
             UiMessage::DiagnosticResponseItem { item: 2 },
             UiMessage::DiagnosticArrayItem { item: 3 },
             UiMessage::DiagnosticTokenPosition { position: 4 },
@@ -2428,6 +2479,9 @@ mod tests {
                 source: "explicit",
             },
             UiMessage::LogPhaseStarted { phase: "scan" },
+            UiMessage::LogPhaseName {
+                phase: "builtin_documents",
+            },
             UiMessage::LogPhaseCompleted { phase: "scan" },
             UiMessage::LogPhaseStopped {
                 phase: "scan",
