@@ -59,7 +59,7 @@ function parseTaskBlock(userMessage) {
         throw new Error("active unit text 必须是字符串数组");
       }
       seenIds.add(unit.id);
-      activeUnits.push({ id: unit.id, text: unit.text });
+      activeUnits.push({ id: unit.id, type: unit.type, text: unit.text });
     }
   }
   if (activeUnits.length === 0) {
@@ -90,7 +90,11 @@ function translateLine(line) {
 function buildAssistantContent(activeUnits) {
   const translations = {};
   for (const unit of activeUnits) {
-    translations[unit.id] = unit.text.map(translateLine);
+    translations[unit.id] = unit.text.map((line) =>
+      unit.type === "strict" && /^\p{White_Space}*$/u.test(line) && !line.includes("\f")
+        ? ""
+        : translateLine(line),
+    );
   }
   return JSON.stringify({
     think: "本地性能 Provider 已按当前 TaskBlock 生成确定性译文。",

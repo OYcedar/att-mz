@@ -40,9 +40,9 @@ Generic JSONL，而不是增加无效的 RPG Maker Rules。
 - `terms.toml` 收录游戏名、角色名和核心专名。译名用于稳定性能测试输出，不代表作品的官方
   中文译名，通用界面文字不进入术语表。
 
-这些资产已通过当前发行版的 `init`、`extract` 和 `translate` 生产入口验证，四个样本的
-Translate 都得到 complete 终态且没有剩余位置；Generic 样本还通过了 `write-back`。以后修改
-样本资产时，必须重新做同等范围的验证，不能只检查 TOML 或 JSONL 语法。
+场景通过当前 `init`、`extract`、`translate` 和 `write-back` 生产入口消费这些资产，要求
+Translate 得到 complete 终态且 WriteBack 完成发布。修改样本资产后，重新运行受影响样本
+的完整场景验证；TOML 或 JSONL 语法检查只用于定位输入问题。
 
 ## 运行环境
 
@@ -91,7 +91,8 @@ pwsh -NoProfile
 
 ## 证据和清理
 
-每个场景都使用新的发行根、来源副本、项目数据库和输出目录。计时前后会核对 Manual 导出、
+每个场景都使用新的发行根、来源副本、项目数据库和输出目录。计时前后会以
+`manual export --selection all` 核对完整来源和已保存译文，再核对
 最终输出树、模型任务消息、任务终态和项目日志；任一结果不等价时立即停止，已有计时作废。
 
 默认结果写入 `tmp/performance/<时间>/`：

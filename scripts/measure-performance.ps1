@@ -801,9 +801,7 @@ function Invoke-Scenario {
         $initArguments = @(
             '--ui-language', 'en', $Sample.engine, 'init', '--name', $projectName,
             '--path', $Sample.game_root, '--source-language', $Sample.source_language,
-            '--target-language', 'zh-Hans', '--dialogue-max-fullwidth-chars', '40',
-            '--scrolling-text-max-fullwidth-chars', '40',
-            '--help-description-max-fullwidth-chars', '34'
+            '--target-language', 'zh-Hans'
         )
         $extractArguments = @(
             '--ui-language', 'en', $Sample.engine, 'extract', '--name', $projectName,
@@ -822,7 +820,7 @@ function Invoke-Scenario {
     $extractedManualFile = Join-Path $scenarioRoot 'manual-after-extract.toml'
     $commands.manual_after_extract = Invoke-CapturedProcess -FilePath $att -Arguments @(
         '--ui-language', 'en', $Sample.engine, 'manual', 'export', '--name', $projectName,
-        $extractedManualFile
+        '--selection', 'all', $extractedManualFile
     ) -WorkingDirectory $RepositoryRoot -Name 'manual-after-extract' `
         -EvidenceDirectory $scenarioEvidence
 
@@ -842,7 +840,7 @@ function Invoke-Scenario {
     $manualFile = Join-Path $scenarioRoot 'manual.toml'
     $commands.manual_export = Invoke-CapturedProcess -FilePath $att -Arguments @(
         '--ui-language', 'en', $Sample.engine, 'manual', 'export', '--name', $projectName,
-        $manualFile
+        '--selection', 'all', $manualFile
     ) -WorkingDirectory $RepositoryRoot -Name 'manual-export' -EvidenceDirectory $scenarioEvidence
 
     $projectRoot = Join-Path $runtimeRoot "projects\$($Sample.engine)\$projectName"
