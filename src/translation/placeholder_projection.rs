@@ -1010,12 +1010,13 @@ pub(crate) fn bind_source_placeholder_literals_in_lines_with_cancellation<E>(
             group_indices.push(group_index);
         }
     }
-    let occurrences = match index_original_placeholder_occurrences_with_cancellation(
+    let mut occurrences = match index_original_placeholder_occurrences_with_cancellation(
         lines,
         scans,
         &groups,
         placeholders,
         &group_indices,
+        None,
         &mut ensure_running,
     )? {
         Ok(occurrences) => occurrences,
@@ -1023,51 +1024,107 @@ pub(crate) fn bind_source_placeholder_literals_in_lines_with_cancellation<E>(
     };
 
     let mut replacements = Vec::<OriginalPlaceholderLiteralReplacement<'_>>::new();
-    for (group_index, group) in groups.iter().enumerate() {
-        ensure_running()?;
-        let matched = &occurrences.by_group[group_index];
-        if matched.count == 0 {
-            continue;
-        }
-        let original = placeholders[group.representative].original();
-        let missing = group
-            .bindings
-            .iter()
-            .copied()
-            .filter(|binding_index| token_counts[*binding_index] == 0)
-            .collect::<Vec<_>>();
-        // 相同原片段全部以自然顺序出现时，源 binding 顺序能够确定其身份；与已有 token
-        // 混排时，最终顺序检查继续证明相对位置。数量多或少都无法唯一归属。
-        if matched.count != missing.len() {
-            return Ok(Err(ambiguous_source_original(
-                original,
-                &mut ensure_running,
-            )?));
-        }
-        for (&binding_index, &(line_index, start, end)) in missing.iter().zip(&matched.positions) {
+    let mut complete_positions = false;
+    loop {
+        let previous_replacement_count = replacements.len();
+        let mut unresolved = Vec::new();
+        for &group_index in &group_indices {
             ensure_running()?;
-            replacements.push(OriginalPlaceholderLiteralReplacement {
-                line_index,
-                start,
-                end,
-                token: placeholders[binding_index].token(),
-                original,
-            });
+            let group = &groups[group_index];
+            let matched = &occurrences.by_group[group_index];
+            if matched.count == 0 {
+                continue;
+            }
+            let original = placeholders[group.representative].original();
+            let missing = group
+                .bindings
+                .iter()
+                .copied()
+                .filter(|binding_index| token_counts[*binding_index] == 0)
+                .collect::<Vec<_>>();
+            // 数量与自然顺序共同确定原片段的身份；超数可能来自其他已知原片段内部。
+            if matched.count != missing.len() {
+                unresolved.push(group_index);
+                continue;
+            }
+            for (&binding_index, &(line_index, start, end)) in
+                missing.iter().zip(&matched.positions)
+            {
+                ensure_running()?;
+                replacements.push(OriginalPlaceholderLiteralReplacement {
+                    line_index,
+                    start,
+                    end,
+                    token: placeholders[binding_index].token(),
+                    original,
+                });
+            }
         }
-    }
 
-    stable_sort_original_replacements_with_cancellation(&mut replacements, &mut ensure_running)?;
-    for pair in replacements.windows(2) {
-        ensure_running()?;
-        let [previous, current] = pair else {
-            unreachable!("windows(2) 始终返回两个元素");
+        stable_sort_original_replacements_with_cancellation(
+            &mut replacements,
+            &mut ensure_running,
+        )?;
+        for pair in replacements.windows(2) {
+            ensure_running()?;
+            let [previous, current] = pair else {
+                unreachable!("windows(2) 始终返回两个元素");
+            };
+            if previous.line_index == current.line_index && current.start < previous.end {
+                return Ok(Err(ambiguous_source_original(
+                    current.original,
+                    &mut ensure_running,
+                )?));
+            }
+        }
+        let Some(&first_unresolved) = unresolved.first() else {
+            break;
         };
-        if previous.line_index == current.line_index && current.start < previous.end {
+        if replacements.len() == previous_replacement_count {
             return Ok(Err(ambiguous_source_original(
-                current.original,
+                placeholders[groups[first_unresolved].representative].original(),
                 &mut ensure_running,
             )?));
         }
+
+        let mut occupied = vec![Vec::new(); lines.len()];
+        for replacement in &replacements {
+            ensure_running()?;
+            occupied[replacement.line_index].push((replacement.start, replacement.end));
+        }
+        if complete_positions {
+            // 后续归属只过滤已枚举位置，不再扫描正文。相邻保护段分别保留边界。
+            for &group_index in &unresolved {
+                let matched = &mut occurrences.by_group[group_index];
+                let mut output = 0;
+                for input in 0..matched.positions.len() {
+                    ensure_running()?;
+                    let (line_index, start, end) = matched.positions[input];
+                    if !original_range_is_occupied(&occupied[line_index], start, end) {
+                        matched.positions[output] = matched.positions[input];
+                        output += 1;
+                    }
+                }
+                matched.positions.truncate(output);
+                matched.count = output;
+            }
+        } else {
+            // 正常输入只索引一次并限制证据位置数量；有歧义时只为未决原串补齐位置。
+            occurrences = match index_original_placeholder_occurrences_with_cancellation(
+                lines,
+                scans,
+                &groups,
+                placeholders,
+                &unresolved,
+                Some(&occupied),
+                &mut ensure_running,
+            )? {
+                Ok(occurrences) => occurrences,
+                Err(source) => return Ok(Err(SourceBoundPlaceholderError::Projection(source))),
+            };
+            complete_positions = true;
+        }
+        group_indices = unresolved;
     }
 
     let changed = !replacements.is_empty();
@@ -1153,6 +1210,7 @@ fn index_original_placeholder_occurrences_with_cancellation<E>(
     groups: &[OriginalPlaceholderGroup],
     placeholders: &[AppliedPlaceholder],
     groups_requiring_scan: &[usize],
+    bound_original_ranges: Option<&[Vec<(usize, usize)>]>,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<OriginalPlaceholderOccurrenceIndex, LanguageTextProjectionError>, E> {
     debug_assert_eq!(lines.len(), scans.len());
@@ -1176,6 +1234,7 @@ fn index_original_placeholder_occurrences_with_cancellation<E>(
             placeholders,
             *group_index,
             by_group,
+            bound_original_ranges,
             ensure_running,
         );
     }
@@ -1229,11 +1288,20 @@ fn index_original_placeholder_occurrences_with_cancellation<E>(
                     if token_ranges_overlap(scan.token_ranges(), start, end) {
                         continue;
                     }
+                    if bound_original_ranges.is_some_and(|ranges| {
+                        original_range_is_occupied(&ranges[line_index], start, end)
+                    }) {
+                        continue;
+                    }
 
                     debug_assert!(pattern_index < pattern_count);
                     let group_index = groups_requiring_scan[pattern_index];
                     let matched = &mut by_group[group_index];
-                    let retained_limit = groups[group_index].bindings.len().saturating_add(1);
+                    let retained_limit = if bound_original_ranges.is_some() {
+                        usize::MAX
+                    } else {
+                        groups[group_index].bindings.len().saturating_add(1)
+                    };
                     if matched.positions.len() < retained_limit {
                         matched.positions.push((line_index, start, end));
                     }
@@ -1259,6 +1327,7 @@ fn index_single_original_placeholder_occurrences_with_cancellation<E>(
     placeholders: &[AppliedPlaceholder],
     group_index: usize,
     mut by_group: Vec<OriginalPlaceholderOccurrences>,
+    bound_original_ranges: Option<&[Vec<(usize, usize)>]>,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Result<OriginalPlaceholderOccurrenceIndex, LanguageTextProjectionError>, E> {
     let pattern = placeholders[groups[group_index].representative]
@@ -1307,8 +1376,16 @@ fn index_single_original_placeholder_occurrences_with_cancellation<E>(
             }
             let end = byte_index + 1;
             let start = end - pattern.len();
-            if !token_ranges_overlap(scan.token_ranges(), start, end) {
-                let retained_limit = groups[group_index].bindings.len().saturating_add(1);
+            if !token_ranges_overlap(scan.token_ranges(), start, end)
+                && !bound_original_ranges.is_some_and(|ranges| {
+                    original_range_is_occupied(&ranges[line_index], start, end)
+                })
+            {
+                let retained_limit = if bound_original_ranges.is_some() {
+                    usize::MAX
+                } else {
+                    groups[group_index].bindings.len().saturating_add(1)
+                };
                 let occurrences = &mut by_group[group_index];
                 if occurrences.positions.len() < retained_limit {
                     occurrences.positions.push((line_index, start, end));
@@ -1324,6 +1401,11 @@ fn index_single_original_placeholder_occurrences_with_cancellation<E>(
         #[cfg(all(test, feature = "release-stress"))]
         scanned_lines,
     }))
+}
+
+fn original_range_is_occupied(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    let next = ranges.partition_point(|(range_start, _)| *range_start <= start);
+    next != 0 && end <= ranges[next - 1].1
 }
 
 fn build_original_placeholder_matcher_with_cancellation<E>(
@@ -2325,6 +2407,28 @@ mod tests {
         assert_eq!(lines, [format!("{token} protected")]);
     }
 
+    #[test]
+    fn confirmed_originals_keep_partially_intersecting_matches_ambiguous() {
+        let placeholders = [
+            applied_with_original("⟦ATT_FIRST_WHOLE_0000⟧", "abc"),
+            applied_with_original("⟦ATT_SECOND_WHOLE_0001⟧", "bcd"),
+        ];
+        let bindings = PlaceholderBindingIndex::new(&placeholders).expect("索引应有效");
+        let mut lines = vec!["abcd bcd".to_owned()];
+        let scans = vec![bindings.scan(&lines[0])];
+        assert!(matches!(
+            bind_source_placeholder_literals_in_lines_with_cancellation(
+                &mut lines,
+                &placeholders,
+                &bindings,
+                &scans,
+                || Ok::<_, Infallible>(()),
+            )
+            .expect("测试没有请求取消"),
+            Err(SourceBoundPlaceholderError::AmbiguousOriginal { original }) if original == "bcd"
+        ));
+    }
+
     #[cfg(feature = "release-stress")]
     #[test]
     fn release_stress_source_original_matcher_scans_each_candidate_line_once() {
@@ -2361,6 +2465,7 @@ mod tests {
             &groups,
             &placeholders,
             &group_indices,
+            None,
             || Ok::<_, Infallible>(()),
         )
         .expect("测试没有请求取消")

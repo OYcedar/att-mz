@@ -724,6 +724,28 @@ mod tests {
             ),
             Err(GenericPlaceholderError::ManualTranslationMismatch)
         ));
+
+        let nested = r#"[{"order":"preserve","pattern":"\\[box:(?<text>(?:\\[name\\]|[^]])*)\\]"},{"order":"preserve","pattern":"\\[name\\]"}]"#;
+        let original = "Hello [box:[name]]";
+        for translation in [original, "你好 [box:[name]]"] {
+            validate_manual_translation_placeholders(nested, "description", original, translation)
+                .expect("内部完整 Placeholder 中的 ] 不应计为 wrapper 结束符");
+        }
+        for translation in [
+            "你好 [box:]",
+            "你好 [box:[name][name]]",
+            "你好 [box:][name]",
+        ] {
+            assert!(matches!(
+                validate_manual_translation_placeholders(
+                    nested,
+                    "description",
+                    original,
+                    translation,
+                ),
+                Err(GenericPlaceholderError::ManualTranslationMismatch)
+            ));
+        }
     }
 
     #[test]

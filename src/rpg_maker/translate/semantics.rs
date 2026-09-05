@@ -1243,6 +1243,82 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_candidate_keeps_a_builtin_control_opaque_during_raw_revalidation() {
+        use crate::rpg_maker::asset::RpgMakerAssetOwner;
+        use crate::rpg_maker::model::{ScalarFieldKey, TextUnitRole};
+        use crate::rpg_maker::text::{
+            RpgMakerLocation, RpgMakerLocationStep, RpgMakerSource, StandardDataFile,
+        };
+
+        let semantics = semantics_with(
+            RpgMakerEngine::Mz,
+            Vec::new(),
+            vec![PlaceholderRuleDefinition::new(
+                Some(vec!["database_entry".to_owned()]),
+                r"\\iw\[(?<text>(?:\\v\[[0-9]+\]|[^]])*)\]",
+            )],
+        );
+        let original = r"\iw[\v[2]]物語";
+        let translated = r"\iw[\v[2]]故事 abc123";
+        let identity = TranslationUnitIdentity::new(
+            RpgMakerAssetOwner::Builtin,
+            TextGroupKind::DatabaseEntry,
+            RpgMakerLocation::value(
+                RpgMakerSource::data(StandardDataFile::Items),
+                vec![RpgMakerLocationStep::index(1)],
+            ),
+            TextUnitRole::Scalar(ScalarFieldKey::new("description").expect("描述字段应有效")),
+            TextUnitContent::Value(original.to_owned()),
+            "{}",
+        );
+        let placeholders_match = |candidate: &str| {
+            semantics
+                .candidate_placeholders_match_with_cancellation(
+                    &identity,
+                    &TextUnitContent::Value(candidate.to_owned()),
+                    || Ok::<_, Infallible>(()),
+                )
+                .expect("测试没有请求取消")
+                .expect("候选应能完成规则扫描")
+        };
+        for candidate in [original, translated] {
+            assert!(
+                placeholders_match(candidate),
+                "内建控制符中的 ] 不应计为另一个 wrapper 结束符：{candidate}"
+            );
+        }
+
+        let prepared = semantics
+            .prepare(TextGroupKind::DatabaseEntry, original)
+            .expect("wrapper 与内建控制符应分别建立源 binding");
+        assert_eq!(
+            prepared
+                .placeholders()
+                .iter()
+                .map(AppliedPlaceholder::original)
+                .collect::<Vec<_>>(),
+            [r"\iw[", r"\v[2]", "]"]
+        );
+        let token_candidate = prepared.model_text().replace("物語", "故事 abc123");
+        for candidate in [
+            translated.to_owned(),
+            token_candidate.clone(),
+            token_candidate.replace(prepared.placeholders()[1].token(), r"\v[2]"),
+        ] {
+            assert_eq!(
+                prepared.accept(candidate).expect("模型候选应可恢复"),
+                PreparedTranslationAcceptance::Accepted(translated.to_owned())
+            );
+        }
+        for candidate in [r"\iw[]故事", r"\iw[\v[2]\v[2]]故事", r"\iw[]\v[2]故事"] {
+            assert!(
+                !placeholders_match(candidate),
+                "内部控制符缺失、重复或移出 wrapper 时应拒绝：{candidate}"
+            );
+        }
+    }
+
+    #[test]
     fn candidate_source_binding_survives_a_translated_lookbehind_label() {
         let semantics = semantics_with(
             RpgMakerEngine::Mz,
