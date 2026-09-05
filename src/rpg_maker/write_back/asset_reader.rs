@@ -1930,7 +1930,7 @@ fn logical_group_source_contexts(groups: &[GroupBuilder]) -> HashMap<String, Sha
                         .expect("已经从规范持久编码解出的 Unit 顺序键必须能重新编码")
                 })
                 .collect::<Vec<_>>();
-            let context = crate::translation::rpg_maker_group_source_context(
+            let context = crate::rpg_maker::applicability::rpg_maker_group_source_context(
                 &definition.group_kind_raw,
                 units.iter().zip(&encoded_unit_orders).map(|(unit, order)| {
                     (
@@ -2192,7 +2192,7 @@ fn assemble_snapshot(
             .units
             .into_iter()
             .map(|unit| {
-                let expected = crate::translation::rpg_maker_applicability(
+                let expected = crate::rpg_maker::applicability::rpg_maker_applicability(
                     source_language,
                     target_language,
                     owner.storage_name(),

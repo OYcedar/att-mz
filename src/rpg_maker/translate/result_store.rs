@@ -3201,7 +3201,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("临时目录应可创建");
         let database_path = directory.path().join("request-failed").join("project.db");
         let identity = scalar_identity(1, "name", "翻訳対象", "{}");
-        let previous_state = crate::translation::unrelated_rpg_maker_applicability_for_test();
+        let previous_state =
+            crate::rpg_maker::applicability::unrelated_rpg_maker_applicability_for_test();
         create_unit_database(
             &database_path,
             &[StoredUnit::new(

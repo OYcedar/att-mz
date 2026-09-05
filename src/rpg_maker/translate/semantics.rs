@@ -614,18 +614,19 @@ pub(crate) fn group_context_fingerprint_with_cancellation<'a, E>(
             identity.source_context_json().to_owned(),
         ));
     }
-    let fingerprint = crate::translation::rpg_maker_group_source_context_with_cancellation(
-        kind.storage_name(),
-        encoded_units.iter().map(|(role, order, source, context)| {
-            (
-                role.as_str(),
-                order.as_slice(),
-                source.as_str(),
-                context.as_str(),
-            )
-        }),
-        ensure_running,
-    )?;
+    let fingerprint =
+        crate::rpg_maker::applicability::rpg_maker_group_source_context_with_cancellation(
+            kind.storage_name(),
+            encoded_units.iter().map(|(role, order, source, context)| {
+                (
+                    role.as_str(),
+                    order.as_slice(),
+                    source.as_str(),
+                    context.as_str(),
+                )
+            }),
+            ensure_running,
+        )?;
     Ok(Ok(GroupContextFingerprint::new(fingerprint)))
 }
 

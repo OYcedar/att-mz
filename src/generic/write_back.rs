@@ -1,5 +1,7 @@
 //! Generic JSONL 写回候选的构造与往返验证。
 
+pub(crate) mod materialization;
+
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;

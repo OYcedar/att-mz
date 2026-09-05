@@ -45,7 +45,7 @@ use crate::project_name::ProjectName;
 use crate::rpg_maker::RpgMakerLayout;
 use crate::rpg_maker::extract::document::RpgMakerDocumentReadingConfig;
 use crate::runtime::cpu::CpuExecutorConfig;
-use crate::runtime::filesystem::{DirectoryPublisherConfig, SystemFileSystemConfig};
+use crate::runtime::filesystem::DirectoryPublisherConfig;
 use crate::runtime::llm::{
     LlmProxyConfiguration, OpenAiCompatibleClient, OpenAiEndpoint, OpenAiExecutorConfiguration,
     OpenAiProtocol,
@@ -966,7 +966,6 @@ impl ConfiguredGenericWriteBackCommand {
 
 pub(crate) struct CommonCommandConfiguration {
     projects_root: PathBuf,
-    filesystem: SystemFileSystemConfig,
     sqlite: RusqliteStorageConfiguration,
 }
 
@@ -974,17 +973,12 @@ impl CommonCommandConfiguration {
     fn build(projects_root: &Path) -> Self {
         Self {
             projects_root: projects_root.to_path_buf(),
-            filesystem: build_file_system_configuration(),
             sqlite: build_sqlite_configuration(),
         }
     }
 
     pub(crate) fn projects_root(&self) -> &Path {
         &self.projects_root
-    }
-
-    pub(crate) const fn filesystem(&self) -> &SystemFileSystemConfig {
-        &self.filesystem
     }
 
     pub(crate) const fn sqlite(&self) -> &RusqliteStorageConfiguration {
@@ -1264,10 +1258,6 @@ impl ConfiguredWriteBackCommand {
 
 fn build_cpu_configuration() -> CpuExecutorConfig {
     CpuExecutorConfig::production()
-}
-
-fn build_file_system_configuration() -> SystemFileSystemConfig {
-    SystemFileSystemConfig::production()
 }
 
 fn build_directory_publisher_configuration(

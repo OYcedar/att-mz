@@ -1808,9 +1808,7 @@ mod tests {
     type SnapshotDatabaseResponses = VecDeque<Result<(), SnapshotDatabaseError<FakeError>>>;
     use crate::fingerprint::Sha256Fingerprint;
     use crate::rpg_maker::project_database::{ProjectDatabaseReconciliation, ProjectDatabaseState};
-    use crate::runtime::filesystem::{
-        DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
-    };
+    use crate::runtime::filesystem::{DirectoryPublisherConfig, SystemFileSystem};
 
     fn find_entry_by_windows_name(parent: &Path, expected: &[u16]) -> PathBuf {
         fs::read_dir(parent)
@@ -3327,8 +3325,7 @@ mod tests {
         let seed = temporary.path().join("seed");
         fs::create_dir(&seed).expect("应建立候选种子目录");
         let target = temporary.path().join("target");
-        let file_system =
-            SystemFileSystem::new(SystemFileSystemConfig::production()).expect("应建立文件系统根");
+        let file_system = SystemFileSystem::new().expect("应建立文件系统根");
         let publisher = file_system.directory_publisher(
             DirectoryPublisherConfig::production(temporary.path().join("locks"))
                 .expect("锁目录配置应合法"),
@@ -3470,8 +3467,7 @@ mod tests {
         fs::write(replacement_data.join("Actors.json"), b"[]").expect("应建立替换数据");
         fs::write(replacement_js.join("rmmz_core.js"), b"new core").expect("应建立替换脚本");
 
-        let file_system =
-            SystemFileSystem::new(SystemFileSystemConfig::production()).expect("应建立文件系统根");
+        let file_system = SystemFileSystem::new().expect("应建立文件系统根");
         let layout =
             ProjectWorkspaceLayout::from_workspace_root(workspace.clone(), RpgMakerLayout::MZ);
         assert!(

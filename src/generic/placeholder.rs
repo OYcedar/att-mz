@@ -91,14 +91,6 @@ impl GenericPlaceholderService {
             .map(|result| result.map_err(GenericPlaceholderError::Compilation))
     }
 
-    pub(crate) fn compile_resource_with_cancellation<E>(
-        &self,
-        definitions: Vec<GenericPlaceholderRuleDefinition>,
-        ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Result<GenericCompiledPlaceholderRules, GenericPlaceholderError>, E> {
-        self.compile_with_cancellation(definitions, ensure_running)
-    }
-
     /// 按当前项目完整 Extract Unit 自然 ID 集编译规则。执行 Translate、Manual 或
     /// WriteBack 前必须使用这个入口；资源快照的无上下文语法检查不能代替它。
     pub(crate) fn compile_for_ids_with_cancellation<E>(

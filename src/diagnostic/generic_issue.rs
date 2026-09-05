@@ -180,7 +180,6 @@ pub(crate) enum GenericProjectDatabaseProblem {
         expected: usize,
         actual: i64,
     },
-    CompiledTranslationResourcesMismatch,
     ForeignKeyViolation {
         table: SafeIdentifier,
     },
@@ -202,10 +201,6 @@ pub(crate) enum GenericProjectDatabaseProblem {
     },
     InvalidUtf16Path {
         actual_bytes: usize,
-    },
-    InvalidUtf8Path {
-        valid_up_to: usize,
-        error_len: Option<usize>,
     },
 }
 
@@ -245,9 +240,6 @@ impl GenericProjectDatabaseProblem {
             Self::TranslationResourceCount { .. } => {
                 "generic.project.database.translation_resource_count"
             }
-            Self::CompiledTranslationResourcesMismatch => {
-                "generic.project.database.compiled_resources_mismatch"
-            }
             Self::ForeignKeyViolation { .. } => "generic.project.database.foreign_key_violation",
             Self::QuickCheckFailed => "generic.project.database.quick_check_failed",
             Self::UnextractedProjectHasAssets { .. } => {
@@ -259,7 +251,6 @@ impl GenericProjectDatabaseProblem {
                 "generic.project.database.invalid_fingerprint_length"
             }
             Self::InvalidUtf16Path { .. } => "generic.project.database.invalid_utf16_path",
-            Self::InvalidUtf8Path { .. } => "generic.project.database.invalid_utf8_path",
         }
     }
 
@@ -398,17 +389,9 @@ impl GenericProjectDatabaseProblem {
             Self::InvalidUtf16Path { actual_bytes } => {
                 vec![("actual_bytes", actual_bytes.to_string())]
             }
-            Self::InvalidUtf8Path {
-                valid_up_to,
-                error_len,
-            } => vec![
-                ("valid_up_to", valid_up_to.to_string()),
-                ("error_len", optional_number(*error_len)),
-            ],
             Self::InvalidProjectName
             | Self::MissingProjectRow
             | Self::ManualTranslationStateFailure
-            | Self::CompiledTranslationResourcesMismatch
             | Self::QuickCheckFailed => Vec::new(),
         }
     }

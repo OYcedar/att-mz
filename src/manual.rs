@@ -2556,14 +2556,15 @@ fn load_generic_entries(
         let automatic_state: Option<Vec<u8>> = row.get(9)?;
         let project_source_language: String = row.get(21)?;
         let project_target_language: String = row.get(22)?;
-        let expected_automatic_applicability = crate::translation::generic_automatic_applicability(
-            &project_source_language,
-            &project_target_language,
-            &group_id,
-            &unit_id,
-            &source_text,
-            group_context,
-        );
+        let expected_automatic_applicability =
+            crate::generic::applicability::generic_automatic_applicability(
+                &project_source_language,
+                &project_target_language,
+                &group_id,
+                &unit_id,
+                &source_text,
+                group_context,
+            );
         let automatic = match (automatic, automatic_state) {
             (None, None) => None,
             (Some(translation), Some(state)) => {
@@ -2996,7 +2997,7 @@ fn load_rpg_maker_applicability(
             .flat_map(|index| groups[*index].units.iter())
             .collect::<Vec<_>>();
         units.sort_by(|left, right| left.semantic_order_key.cmp(&right.semantic_order_key));
-        let context = crate::translation::rpg_maker_group_source_context(
+        let context = crate::rpg_maker::applicability::rpg_maker_group_source_context(
             &definition.kind,
             units.iter().map(|unit| {
                 (
@@ -3026,7 +3027,7 @@ fn load_rpg_maker_applicability(
             .map_err(|_| {
                 ManualDatabaseError::InvalidProject("RPG Maker 自动译文写回结构无效".to_owned())
             })?;
-            let current = crate::translation::rpg_maker_applicability(
+            let current = crate::rpg_maker::applicability::rpg_maker_applicability(
                 &source_language,
                 &target_language,
                 &group.owner,
@@ -4078,7 +4079,6 @@ fn readable_array_number(
     }
 }
 
-#[cfg(windows)]
 fn decode_windows_path(bytes: &[u8]) -> Result<PathBuf, ManualDatabaseError> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -4092,11 +4092,6 @@ fn decode_windows_path(bytes: &[u8]) -> Result<PathBuf, ManualDatabaseError> {
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .collect::<Vec<_>>();
     Ok(PathBuf::from(OsString::from_wide(&units)))
-}
-
-#[cfg(not(windows))]
-fn decode_windows_path(_: &[u8]) -> Result<PathBuf, ManualDatabaseError> {
-    unreachable!("ATT 只支持 Windows")
 }
 
 #[cfg(test)]
@@ -4909,7 +4904,7 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
         let group_context = Sha256Fingerprint::from_bytes([81; 32]);
-        let current_state = crate::translation::generic_automatic_applicability(
+        let current_state = crate::generic::applicability::generic_automatic_applicability(
             "ja",
             "zh-Hans",
             "g",
@@ -5269,7 +5264,7 @@ mod tests {
 
         let actual = load_rpg_maker_applicability(&connection)
             .expect("Manual 应建立跨 owner 完整 Group 适用性");
-        let complete_context = crate::translation::rpg_maker_group_source_context(
+        let complete_context = crate::rpg_maker::applicability::rpg_maker_group_source_context(
             "database_entry",
             [
                 (
@@ -5296,7 +5291,7 @@ mod tests {
             .expect("Builtin Unit 应有适用性");
         assert_eq!(
             *builtin,
-            crate::translation::rpg_maker_applicability(
+            crate::rpg_maker::applicability::rpg_maker_applicability(
                 "ja",
                 "zh-Hans",
                 "builtin",
@@ -5309,7 +5304,7 @@ mod tests {
                 complete_context,
             )
         );
-        let owner_only = crate::translation::rpg_maker_group_source_context(
+        let owner_only = crate::rpg_maker::applicability::rpg_maker_group_source_context(
             "database_entry",
             [(
                 builtin_role.as_str(),

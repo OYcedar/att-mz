@@ -915,7 +915,7 @@ mod tests {
     use crate::rpg_maker::model::{DirectTextPart, ProjectionModelError, TextProjectionRecipe};
     use crate::rpg_maker::text::MapId;
     #[cfg(feature = "release-stress")]
-    use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
+    use crate::runtime::filesystem::SystemFileSystem;
     #[cfg(feature = "release-stress")]
     use crate::storage::file_system::FileReader;
 
@@ -955,8 +955,7 @@ mod tests {
             "测试输入必须真实超过 17 MiB"
         );
 
-        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
-            .expect("生产文件系统应启动");
+        let file_system = SystemFileSystem::new().expect("生产文件系统应启动");
         let source = file_system
             .read_file(path)
             .await

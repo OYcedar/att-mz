@@ -967,9 +967,7 @@ mod tests {
 
     use super::*;
     use crate::rpg_maker::write_back::rewriter::RpgMakerRewrittenFile;
-    use crate::runtime::filesystem::{
-        DirectoryPublisherConfig, SystemFileSystem, SystemFileSystemConfig,
-    };
+    use crate::runtime::filesystem::{DirectoryPublisherConfig, SystemFileSystem};
 
     use crate::storage::file_system::{
         BoundScopedDirectory, DirectoryRecoveryError, DirectoryRecoveryOutcome,
@@ -1698,8 +1696,7 @@ mod tests {
             "ja".to_owned(),
             "zh-Hans".to_owned(),
         );
-        let file_system =
-            SystemFileSystem::new(SystemFileSystemConfig::production()).expect("应建立文件系统根");
+        let file_system = SystemFileSystem::new().expect("应建立文件系统根");
         let bootstrap = read_optional_bootstrap_files(&file_system, project.layout().source_root())
             .await
             .expect("真实启动壳读取不应失败")

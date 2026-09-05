@@ -1782,7 +1782,6 @@ fn try_frame_asset_bytes(
     Ok(())
 }
 
-#[cfg(windows)]
 fn frame_path(hasher: &mut Sha256FramedHasher, tag: u8, path: &Path) {
     use std::os::windows::ffi::OsStrExt;
 
@@ -1792,11 +1791,6 @@ fn frame_path(hasher: &mut Sha256FramedHasher, tag: u8, path: &Path) {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     hasher.frame(tag, &units);
-}
-
-#[cfg(not(windows))]
-fn frame_path(hasher: &mut Sha256FramedHasher, tag: u8, path: &Path) {
-    hasher.frame(tag, path.as_os_str().as_encoded_bytes());
 }
 
 #[cfg(test)]

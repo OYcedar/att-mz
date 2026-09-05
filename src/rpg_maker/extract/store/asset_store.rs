@@ -2428,7 +2428,7 @@ fn group_source_context_fingerprint<'a>(
     group_kind: &str,
     units: impl ExactSizeIterator<Item = (&'a str, &'a [u8], &'a str, &'a str)>,
 ) -> Sha256Fingerprint {
-    crate::translation::rpg_maker_group_source_context(group_kind, units)
+    crate::rpg_maker::applicability::rpg_maker_group_source_context(group_kind, units)
 }
 
 type EncodedClaim = EncodedMutationClaim;
@@ -3945,7 +3945,7 @@ mod tests {
             )]
             .into_iter(),
         );
-        let previous_state = crate::translation::rpg_maker_applicability(
+        let previous_state = crate::rpg_maker::applicability::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             snapshot.owner.storage_name(),
@@ -3996,7 +3996,7 @@ mod tests {
                 )
             }),
         );
-        let current_state = crate::translation::rpg_maker_applicability(
+        let current_state = crate::rpg_maker::applicability::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             snapshot.owner.storage_name(),
@@ -4784,7 +4784,7 @@ mod tests {
             &description_role,
         )
         .expect("描述配方形状应可编码");
-        let previous_applicability = crate::translation::rpg_maker_applicability(
+        let previous_applicability = crate::rpg_maker::applicability::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             owner.storage_name(),
@@ -4796,7 +4796,7 @@ mod tests {
             &description_unit.source_context_json,
             old_group_context,
         );
-        let current_applicability = crate::translation::rpg_maker_applicability(
+        let current_applicability = crate::rpg_maker::applicability::rpg_maker_applicability(
             "ja",
             "zh-Hans",
             owner.storage_name(),

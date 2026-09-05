@@ -15,7 +15,7 @@ use crate::llm::{
     ApiKeyRedactor, ChatMessage, ChatMessageRole, LlmRequestError, LlmRequestExecutor,
     LlmRequestFailure,
 };
-use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
+use crate::runtime::filesystem::SystemFileSystem;
 use crate::runtime::llm::{OpenAiCompatibleExecutor, OpenAiProtocol};
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::storage::file_system::FileReader;
@@ -72,24 +72,22 @@ pub(crate) async fn run_test_command(
         .iter()
         .map(ConfiguredTestClient::api_key_redactor)
         .collect::<Vec<_>>();
-    let file_system = match SystemFileSystem::new_with_performance(
-        SystemFileSystemConfig::production(),
-        Arc::new(RunPerformanceCounters::default()),
-    ) {
-        Ok(file_system) => file_system,
-        Err(source) => {
-            return TestCommandReport {
-                clients: Vec::new(),
-                total_clients,
-                interrupted: false,
-                command_diagnostics: vec![DiagnosticReport::new(
-                    StateEffect::Unchanged,
-                    source.diagnostic(),
-                )],
-                redactors,
-            };
-        }
-    };
+    let file_system =
+        match SystemFileSystem::new_with_performance(Arc::new(RunPerformanceCounters::default())) {
+            Ok(file_system) => file_system,
+            Err(source) => {
+                return TestCommandReport {
+                    clients: Vec::new(),
+                    total_clients,
+                    interrupted: false,
+                    command_diagnostics: vec![DiagnosticReport::new(
+                        StateEffect::Unchanged,
+                        source.diagnostic(),
+                    )],
+                    redactors,
+                };
+            }
+        };
 
     let mut clients = Vec::with_capacity(total_clients);
     let mut interrupted = false;

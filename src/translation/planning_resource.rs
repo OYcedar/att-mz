@@ -1784,7 +1784,7 @@ mod tests {
     #[cfg(feature = "release-stress")]
     use crate::runtime::cpu::{CpuExecutorConfig, RayonCpuExecutor};
     #[cfg(feature = "release-stress")]
-    use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemConfig};
+    use crate::runtime::filesystem::SystemFileSystem;
 
     #[test]
     fn planning_resource_labels_remove_windows_verbatim_prefixes() {
@@ -2545,8 +2545,7 @@ mod tests {
         drop(file);
         assert!(std::fs::metadata(&path).expect("应读取文件元数据").len() > 9 * 1024 * 1024);
 
-        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
-            .expect("生产文件系统应启动");
+        let file_system = SystemFileSystem::new().expect("生产文件系统应启动");
         let cpu = RayonCpuExecutor::start(CpuExecutorConfig::production())
             .expect("生产 CPU 执行器应启动");
         let service =

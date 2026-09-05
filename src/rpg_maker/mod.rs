@@ -2,6 +2,7 @@
 //!
 //! 应用入口只选择受信引擎布局；项目、提取、翻译及写回均由本模块拥有。
 
+pub(crate) mod applicability;
 pub(crate) mod asset;
 pub(crate) mod asset_storage;
 pub(crate) mod bootstrap;

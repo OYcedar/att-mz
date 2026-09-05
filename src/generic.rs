@@ -3,13 +3,15 @@
 //! 外部操作者负责生成和消费 JSONL；本模块只拥有固定 JSONL 契约、动态来源同步、
 //! 翻译任务规划、结果验收以及 JSONL 候选输出。
 
+pub(crate) mod applicability;
 mod identity;
 mod jsonl;
 mod placeholder;
 mod project;
 mod task_record;
 mod translate;
-mod write_back;
+pub(crate) mod user_message;
+pub(crate) mod write_back;
 
 pub(crate) use placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
@@ -37,7 +39,6 @@ pub(crate) use translate::{
 pub(crate) use write_back::{
     GenericWriteBackCandidate, GenericWriteBackError, GenericWriteBackTextOptions,
     build_write_back_candidate_with_cancellation, compile_generic_layout_rules,
-    validate_materialized_write_back_file_with_cancellation,
 };
 
 #[cfg(test)]

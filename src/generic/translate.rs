@@ -3573,7 +3573,7 @@ pub(crate) fn automatic_translation_state_fingerprint(
     source_text: &str,
     group_context: Sha256Fingerprint,
 ) -> Sha256Fingerprint {
-    crate::translation::generic_automatic_applicability(
+    crate::generic::applicability::generic_automatic_applicability(
         language_pair.source().as_str(),
         language_pair.target().as_str(),
         key.group_id(),
@@ -3590,7 +3590,7 @@ fn automatic_translation_state_fingerprint_with_cancellation(
     group_context: Sha256Fingerprint,
     cancellation: &CooperativeCancellation,
 ) -> Result<Sha256Fingerprint, GenericPlanningError> {
-    crate::translation::generic_automatic_applicability_with_cancellation(
+    crate::generic::applicability::generic_automatic_applicability_with_cancellation(
         language_pair.source().as_str(),
         language_pair.target().as_str(),
         key.group_id(),

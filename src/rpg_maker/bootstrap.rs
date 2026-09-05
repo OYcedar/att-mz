@@ -483,9 +483,7 @@ mod tests {
 
     use super::*;
     use crate::diagnostic::FileSystemPathViolation;
-    use crate::runtime::filesystem::{
-        SystemFileSystem, SystemFileSystemConfig, SystemFileSystemError,
-    };
+    use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
 
     #[derive(Clone)]
     enum FakeEntry {
@@ -693,8 +691,7 @@ mod tests {
         fs::write(&html_origin, b"<title>source</title>").expect("应建立 HTML 硬链接来源");
         fs::hard_link(&html_origin, &html_path).expect("本地 NTFS 应支持 HTML 硬链接");
 
-        let file_system = SystemFileSystem::new(SystemFileSystemConfig::production())
-            .expect("应建立真实文件系统根");
+        let file_system = SystemFileSystem::new().expect("应建立真实文件系统根");
         for (root, rejected) in [
             (package_linked_root.as_path(), package_path.as_path()),
             (html_linked_root.as_path(), html_path.as_path()),

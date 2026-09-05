@@ -1300,7 +1300,7 @@ fn translation_state_context_with_applicability_cancellation<E>(
     };
     let source_content_json = serde_json::to_string(identity.source_content())
         .expect("受信 TextUnitContent 必须可序列化为规范 JSON");
-    let applicability = crate::translation::rpg_maker_applicability_with_cancellation(
+    let applicability = crate::rpg_maker::applicability::rpg_maker_applicability_with_cancellation(
         language_pair.source().as_str(),
         language_pair.target().as_str(),
         identity.owner().storage_name(),
@@ -4216,7 +4216,8 @@ pattern = '保護対象'
             "{}",
         );
         let previous_translation = TextUnitContent::Value("仍可恢复的旧译文".to_owned());
-        let previous_state = crate::translation::unrelated_rpg_maker_applicability_for_test();
+        let previous_state =
+            crate::rpg_maker::applicability::unrelated_rpg_maker_applicability_for_test();
         let corpus = RpgMakerTranslationCorpus::new(vec![RpgMakerTranslationGroup::new(
             TextGroupKind::DatabaseEntry,
             group_location,
