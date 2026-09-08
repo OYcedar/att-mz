@@ -35,8 +35,19 @@ Agent 审校原意、上下文、语气和自然度；随 Skill 的 `translation
 `--generic-input` 指定 JSONL 输入。脚本没有报告问题，只能说明已执行的检查没有发现，不能代替
 完整语义审校。
 
-处理静态发现时，先查看 `review-groups.jsonl`，再展开相应 Review 组。将确认的问题按自然 ID
-导出到 Manual，集中修订、apply、重新导出并复查。
+按以下顺序读取静态 QA 结果：
+
+1. 查看 `qa-summary.json` 的 `qa_status`、`counts`、`revision_ids` 和 `unverified`，明确当前发现
+   与验证范围。`needs_review` 表示存在发现；`unverified` 表示仍缺验证；`clean` 只覆盖本次已执行检查。
+2. 从 `findings.jsonl` 读取 `analysis_status=confirmed_fact` 的记录，核对未翻译、Rejected、空译文
+   或结构不一致等确定状态。结合语言判断和实际消费者，区分需要修订的条目与有依据保留原文的条目。
+3. 按 `unverified` 指出的缺口补充来源、写回或外部映射证据；需要实际界面观察的部分进入人工检查清单。
+4. 查看 `review-groups.jsonl`，按原因选择并展开需要审核的组。这里仅汇总 `heuristic_review` 发现；
+   Review 组为零仍可能存在确定状态或未验证项。
+
+将确认需修订的问题与语义审校发现合并，按自然 ID 导出到 Manual，集中修订、apply、重新导出并复查。
+若使用 `translation_qa.py manual` 生成候选 ID 文件，它默认包含 `revision_ids`，可通过重复传入
+`--review-group` 添加已审核组中的 ID；只有来源位置或运行场景的发现仍需回到相应调查与验证步骤。
 
 ## 4. 检查 WriteBack
 

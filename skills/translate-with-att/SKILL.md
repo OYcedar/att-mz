@@ -23,8 +23,8 @@ ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agen
 随包 Python 工具在 Python 3.11 或更新环境中运行。没有 Python 时，按相应指南完成调查和对账，
 并在交付中说明实际采用的方法。
 
-当 RPG Maker MV 项目同时具有数万翻译单元、大量活动插件、嵌套插件参数和多种玩家界面时，
-读取[大型、高插件 MV 经验](references/game-type-large-plugin-heavy-mv.md)。
+RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写回或大量 QA 候选时，
+读取[大型、插件密集的 MV 经验](references/game-type-large-plugin-heavy-mv.md)中对应的处理方法。
 
 ## 1. 调查
 
@@ -43,9 +43,9 @@ RPG Maker 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、�
 真实游戏消费者以及能区分边界的正反例审核候选，再写入当前项目决策。`analysis_status=confirmed`
 只确认扫描所得的结构观察，玩家可见正文边界和最终所有者仍由消费者证据确定。
 
-项目选择或消费者证据有误时，修改生成的 decisions、Rules 和 Placeholder Rules。Manual 只编辑
-译文字段；Manual ID、scan/finalize 产物以及 audit/preflight 结果使用相应工具重新生成，以生成结果
-完成对账。
+项目选择或消费者证据有误时，修改所有权或 Placeholder 的审核决定，再由 finalize 或 preflight
+重新生成规则与报告。自行编写的规则按对应规格维护；Survey 产物的更新和核对方式见下方项目调查指南。
+Manual 只编辑译文字段，条目 ID 和原文通过 ATT 重新导出。
 
 使用 RPG Maker Survey 时，按[项目调查指南](../../docs/guides/translation-project.md#2-调查可见文本)
 填写决定并保留来源绑定，再用同一次 finalize 产物继续 Extract、audit 与 preflight。
@@ -71,8 +71,8 @@ MV/MZ 导出 ownership，使用 Survey 的项目继续运行 audit，核对每�
 普通任务继续使用完整发行文件，不建立游戏私有脚本分支。`att.exe` 与现行规格冲突时，暂停翻译
 流水线并在 ATT 语义所有者处修复根因，脚本随后对齐修复后的正确投影。
 
-Survey 辅助程序更新后，从最早受影响阶段重新生成 decisions、Rules、Placeholder Rules、Manual
-ID、audit 和 preflight 结果，然后重新执行 Extract、ownership export、audit 和 preflight。
+Survey 辅助程序更新后，按[项目指南中的产物依赖](../../docs/guides/translation-project.md#4-extract)
+从最早受影响阶段重新生成后续产物。audit 使用本轮 ownership 导出，preflight 使用本轮完整 Manual 和计划。
 
 Extract 完成后导出完整 Manual：
 
@@ -116,8 +116,9 @@ Incomplete 中的 Partial、Unavailable 和未开始 Task 按恢复指南处理�
 - 源语言残留、模型说明、异常转义和布局风险。
 
 独立 Generic 使用 `--generic-input` 提供同源 JSONL；RPG Maker 使用相应调查与所有权证据。
-按 Review 组审核静态发现，并把语义审校确认的问题一起按自然 ID 导出到 Manual，集中修订、
-apply、重新导出并复查。报告分别说明静态检查、Agent 语义审校和仍需人工实机观察的场景。
+先查看 QA 摘要中的确定状态和未验证项，再按验收指南审核 Review 组。把确认的问题与语义审校发现
+合并，按自然 ID 导出到 Manual，集中修订、apply、重新导出并复查。报告分别说明静态检查、
+Agent 语义审校和仍需人工实机观察的场景。
 
 ## 6. WriteBack
 

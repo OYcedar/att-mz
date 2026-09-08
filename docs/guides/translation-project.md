@@ -33,9 +33,11 @@
 
 暂时缺少消费者证据的位置记录为 `unresolved`，并把对应场景加入人工实机调查清单。
 
-使用 Survey 时，保留 `ownership-decisions.jsonl` 中的 `game_root` 与 `members` 来源绑定，
-填写 owner 和相应证据。关系组中存在不同所有者时，用 `rpg_maker_survey.py members` 导出
-逐候选决定，以这些行替换原 `group:*` 决定。
+先用 `rpg_maker_survey.py scan` 建立调查目录，再审核关系组和实际消费者。Builtin 位置由扫描结果
+单独投影；`ownership-decisions.jsonl` 中的待审核位置使用 `rules`、`generic`、`exclude` 或
+`unresolved`。填写决定时保留 `game_root` 与 `members` 来源绑定；排除项填写 `reason` 和 `evidence`。
+关系组中存在不同所有者时，用 `rpg_maker_survey.py members` 导出逐候选决定，以这些行替换原
+`group:*` 决定。
 
 Generic 决定的 `extract_group_unit_write_back_mapping.groups` 指定本行候选所属的语义组。
 每个候选按本行自然顺序恰好出现一次；不同决定中相关的正文填写相同 id、kind，并由 finalize
@@ -48,7 +50,13 @@ Generic 决定的 `extract_group_unit_write_back_mapping.groups` 指定本行候
 
 同一决定也可列出多个独立组。其余 Generic 证据说明实际消费者、可见正文及往返位置。
 组名表达[完整语境](../generic/jsonl.md#3-从源格式建立-group-与文件范围)，不由调查分组或 owner 决定。
-Preflight 使用同一次 finalize 的 `coverage.json` 与 `rules-manifest.json`；输入变化后从对应阶段重建产物。
+
+决定修改后重新运行 `rpg_maker_survey.py finalize`，生成配套的 `rules.toml`、`rules-manifest.json`、
+`coverage.json` 和 Generic 材料。计划目录由工具生成；直接修改其中的 Rules 会使 audit 报告
+Rules 与 manifest 不一致。扫描候选本身有误时，按翻译 Skill 的工具修复流程处理，再重新生成计划。
+
+自行按[规则规格](../rpg-maker/rules.md)编写的 Rules 或 Placeholder 文件作为独立项目输入维护，
+通过 ATT 实际提取、导出与写回核对。修改后的规则不能继续使用未同步的 Survey 计划作为一致性证据。
 
 ## 3. 建立项目所有权
 
@@ -85,7 +93,24 @@ Builtin、Rules 或 JSONL 执行 Extract。完成后：
 3. 导出 `--selection all` 的完整 Manual；
 4. 把完整 Manual 固定为本轮术语与翻译语料。
 
-来源、所有权、Rules 或 JSONL 变化时重新 Extract，并更新依赖该语料的术语与 QA。
+Survey 路径的产物按以下依赖交接：
+
+`scan → 审核决定 → finalize → Extract → ownership export → audit → manual export --selection all`
+
+来源、所有权、Rules、JSONL 或辅助程序变化时，从最早受影响的阶段重跑，更新后续产物、术语与 QA；
+仍与当前来源绑定一致的审核决定可继续使用。MV/MZ 游戏来源变化时先再次 Init 更新冻结副本，再 Extract。
+
+需要检查 RPG Maker Placeholder 候选时，在完整 Manual 导出后运行 `translation_preflight.py`：
+
+1. 首次提供本轮 `--manual`、同源 `--survey` 和同一次 finalize 的 `--coverage`，不带 `--decisions`。
+   用 `--output` 指定检查目录；重新生成既有目录时加 `--replace`。`rules-manifest.json` 保持在
+   `coverage.json` 同目录，供工具核对。
+2. 阅读 `placeholder-candidates.jsonl`，根据实际消费者选择候选的保护方式或保留待确认状态。将审核
+   JSONL 保存在产物目录之外，再传入 `--decisions`，配合 `--replace` 更新同一个 `--output` 目录。
+3. 检查生成的 `preflight.json` 和 `placeholder-rules.toml`，把确认的规则交给 Translate；未解决项
+   保留调查入口和验证边界。保护方式变化时修改审核决定并重新生成规则。
+
+Manual、Survey 或 coverage 变化后，先重新运行不带 `--decisions` 的译前检查，再基于新候选审核。
 
 ## 5. 术语
 
@@ -117,7 +142,8 @@ Partial、Unavailable 和未开始 Task，以及失败或取消的运行，按
 - Generic 外部映射与组合项目的唯一所有权。
 
 Agent 负责完整译文的语义审校。`translation_qa.py` 提供覆盖、结构、控制符、字面术语和残留等
-静态检查，将发现聚合为 Review 组。独立 Generic 通过 `--generic-input` 提供同源 JSONL；
+静态检查。按[译文质量检查](acceptance.md#3-检查译文质量)先处理摘要中的确定状态和未验证项，
+再审核由启发式发现组成的 Review 组。独立 Generic 通过 `--generic-input` 提供同源 JSONL；
 RPG Maker 使用对应的调查与所有权证据。审核发现后用 Manual 集中修订，再重新导出和复查。
 
 ## 8. WriteBack
