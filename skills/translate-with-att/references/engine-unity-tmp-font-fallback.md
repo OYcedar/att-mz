@@ -11,6 +11,9 @@
 这些证据不证明 Unity 中实际加载、渲染、描边和布局正常，也不证明任何平台已经审核通过。
 本条目不表示 ATT 已实现 Unity 原生提取、资源回填或插件生成。
 
+上述验证只覆盖当时的目标构建。下文 Windows IL2CPP 类型树恢复路径依据 UnityPy 实现，当前
+材料未提供该路径的目标游戏实测记录；具体解析与序列化往返需在目标构建上验证。
+
 ## 从显示问题定位消费者
 
 - 截图出现方框时，先查看当前游戏日志。TMP 缺字警告可同时给出 Unicode、字体资产名称和
@@ -37,7 +40,10 @@
 ## 静态资源修复
 
 - 在隔离副本上使用与目标 Unity 版本相符的资源读取工具。MonoBehaviour 类型树缺失导致
-  读取失败时，不把失败当作“没有字体资产”；根据同一游戏的 Managed 程序集恢复类型信息。
+  读取失败时，不把失败当作“没有字体资产”；按运行时选择同一游戏构建的类型信息来源。
+  Mono 使用 `Managed` 程序集；Windows IL2CPP 使用 `GameAssembly.dll` 与
+  `<游戏名>_Data/il2cpp_data/Metadata/global-metadata.dat`。加载方法参照
+  [UnityPy 类型树生成实现](https://github.com/K0lb3/UnityPy/blob/master/UnityPy/helpers/TypeTreeGenerator.py)。
 - 大型资源文件先按类型及 MonoBehaviour 头部名称筛选候选，再生成类型树和完整反序列化。
   对所有组件无差别展开，可能把字体调查变成整份游戏数据的昂贵解析。UnityPy 可用
   `parse_monobehaviour_head()` 做候选筛选，但正式读写仍需完整类型信息。
