@@ -84,24 +84,24 @@ def normalized_file_target_path(url: str) -> Path | None:
 def matching_content_targets(
     targets: Sequence[CdpTarget],
     *,
-    expected_content_root: Path,
+    expected_game_root: Path,
     expected_entry: Path,
 ) -> tuple[CdpTarget, ...]:
-    """返回 URL 精确落在期望内容根且等于自然入口的 page/webview。"""
+    """返回 URL 精确落在期望游戏根且等于自然入口的 page/webview。"""
 
-    content_root = expected_content_root.resolve(strict=True)
+    game_root = expected_game_root.resolve(strict=True)
     entry = expected_entry.resolve(strict=True)
     try:
-        entry.relative_to(content_root)
+        entry.relative_to(game_root)
     except ValueError as error:
-        raise ValueError("expected_entry 必须位于 expected_content_root 内") from error
+        raise ValueError("expected_entry 必须位于 expected_game_root 内") from error
     result: list[CdpTarget] = []
     for target in targets:
         path = normalized_file_target_path(target.url)
         if path is None:
             continue
         try:
-            path.relative_to(content_root)
+            path.relative_to(game_root)
         except ValueError:
             continue
         if path == entry:
@@ -112,14 +112,14 @@ def matching_content_targets(
 def unique_content_target(
     targets: Sequence[CdpTarget],
     *,
-    expected_content_root: Path,
+    expected_game_root: Path,
     expected_entry: Path,
 ) -> CdpTarget:
-    """要求页面目标唯一对应期望内容根的自然入口。"""
+    """要求页面目标唯一对应期望游戏根的自然入口。"""
 
     matching = matching_content_targets(
         targets,
-        expected_content_root=expected_content_root,
+        expected_game_root=expected_game_root,
         expected_entry=expected_entry,
     )
     if not matching:
@@ -328,7 +328,7 @@ def wait_for_page_target(
     port: int,
     *,
     timeout: float,
-    expected_content_root: Path,
+    expected_game_root: Path,
     expected_entry: Path,
     process_exited: Callable[[], bool] | None = None,
 ) -> CdpTarget:
@@ -344,7 +344,7 @@ def wait_for_page_target(
             if targets:
                 return unique_content_target(
                     targets,
-                    expected_content_root=expected_content_root,
+                    expected_game_root=expected_game_root,
                     expected_entry=expected_entry,
                 )
         except CdpProtocolError:

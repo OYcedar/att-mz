@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, NoReturn, TextIO, cast
 
 # Skill 目录是发行资源，入口进程不得把解释器缓存写回包内。
@@ -48,7 +48,7 @@ from att_toolbox.nwjs import (
     wait_for_page_target,
 )
 from att_toolbox.png import decode_png_size
-from att_toolbox.rpg import discover_game, require_game_root
+from att_toolbox.rpg import GameInfo, discover_game, require_game_root, resolve_main_html
 
 _SCENARIOS = ("title", "new_game", "dialogue", "menu", "quest_log", "options", "save")
 _DRAW_KINDS = frozenset({"Bitmap.drawText", "Window_Base.drawText", "Window_Base.drawTextEx"})
@@ -101,30 +101,17 @@ def _owned_process_exited(process: subprocess.Popen[bytes]) -> bool:
     return process.poll() is not None
 
 
-def _runtime_entry(content_root: Path) -> Path:
-    package_path = require_file_within(content_root / "package.json", content_root, "NW.js package.json")
-    try:
-        package = cast(object, json.loads(package_path.read_text(encoding="utf-8-sig")))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+def _runtime_entry(game: GameInfo) -> Path:
+    entry = resolve_main_html(
+        game.game_root,
+        (game.game_root, game.content_root),
+    )
+    if entry is None:
         fail(
-            str(package_path),
-            f"NW.js package.json 无法读取（{type(error).__name__}）",
-            "恢复目标游戏的完整入口配置",
+            str(game.game_root),
+            "NW.js package.json 没有指向游戏范围内的有效 HTML 入口",
+            "恢复游戏根或内容根的 package.json，并填写相对于该配置文件的本地 HTML main",
         )
-    if not isinstance(package, Mapping):
-        fail(str(package_path), "NW.js package.json 根值不是 object", "恢复目标游戏的完整入口配置")
-    main = cast(Mapping[object, object], package).get("main")
-    if not isinstance(main, str) or not main.strip():
-        fail(str(package_path), "NW.js package.json 缺少有效 main", "填写该内容根实际使用的 HTML 入口")
-    normalized = main.replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
-    relative = PurePosixPath(normalized)
-    if relative.is_absolute() or ".." in relative.parts or ":" in normalized:
-        fail(
-            str(package_path), "NW.js main 不是内容根内的自然相对路径", "恢复目标游戏实际使用的本地 HTML 入口"
-        )
-    entry = require_file_within(content_root.joinpath(*relative.parts), content_root, "NW.js HTML 入口")
-    if entry.suffix.casefold() not in {".htm", ".html"}:
-        fail(str(entry), "NW.js main 不是 HTML 入口", "恢复 RPG Maker 实际使用的 HTML 入口")
     return entry
 
 
@@ -1065,7 +1052,7 @@ def main() -> int:
 
     game = discover_game(game_argument)
     game_root = require_game_root(game)
-    runtime_entry = _runtime_entry(game.content_root)
+    runtime_entry = _runtime_entry(game)
     executable = require_file_within(game_root / "Game.exe", game_root, "NW.js Game.exe")
     protect_outputs([output], inputs=[game_root], forbidden_roots=[game_root], replace=False)
     work = output.resolve(strict=False).with_name(f".{output.name}.runtime")
@@ -1200,7 +1187,7 @@ def main() -> int:
         target = wait_for_page_target(
             port,
             timeout=startup_timeout,
-            expected_content_root=game.content_root,
+            expected_game_root=game_root,
             expected_entry=runtime_entry,
             process_exited=lambda: _owned_process_exited(process),
         )

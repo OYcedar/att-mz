@@ -24,7 +24,15 @@ from .js import (
     static_code_targets,
 )
 from .resources import classify_resource_reference
-from .rpg import GameInfo, PluginInfo, actual_path, iter_string_leaves, normalized_path, plugin_script_path
+from .rpg import (
+    GameInfo,
+    PluginInfo,
+    actual_path,
+    iter_string_leaves,
+    normalized_path,
+    plugin_script_path,
+    resolve_main_html,
+)
 from .rpg_control_codes import is_structural_blank
 from .survey_identity import rule_manual_id
 from .survey_io import decode_text
@@ -49,13 +57,6 @@ _PLUGIN_SCHEMA_DIRECTIVE = re.compile(
 )
 ReadOnce = Callable[[Path], tuple[bytes, FileSnapshot]]
 _HTML_LINE_BREAK = re.compile(r"\r\n|\r|\n")
-
-
-@dataclass(frozen=True, slots=True)
-class _MainHtmlResolution:
-    html: Path
-    package: Path
-    package_document: Mapping[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,61 +194,19 @@ class _TitleElementParser(HTMLParser):
         )
 
 
-def _package_main_html(
-    package: Path,
-    existing: Mapping[Path, Path],
-    game_root: Path,
-    read_once: ReadOnce,
-) -> _MainHtmlResolution | None:
-    raw, _snapshot = read_once(existing[package])
-    root = parse_json_text(decode_text(raw, existing[package]), str(existing[package]))
-    if not isinstance(root, dict) or not isinstance(root.get("main"), str):
-        return None
-    main = cast(str, root["main"])
-    split = urlsplit(main)
-    if split.scheme or split.netloc:
-        return None
-    target = (existing[package].parent / unquote(split.path)).resolve(strict=False)
-    if (
-        target not in existing
-        or not target.is_relative_to(game_root)
-        or target.suffix.lower() not in {".htm", ".html"}
-    ):
-        return None
-    return _MainHtmlResolution(
-        html=existing[target],
-        package=existing[package],
-        package_document=root,
-    )
-
-
-def _main_html_resolution(
-    game: GameInfo,
-    game_root: Path,
-    files: Sequence[Path],
-    read_once: ReadOnce,
-) -> _MainHtmlResolution | None:
-    existing = {path.resolve(strict=True): path for path in files}
-    candidates: list[Path] = []
-    for root in (game.supplied_root, game.content_root, game_root):
-        package = (root / "package.json").resolve(strict=False)
-        if package in existing and package not in candidates:
-            candidates.append(package)
-    for package in candidates:
-        if (resolved := _package_main_html(package, existing, game_root, read_once)) is not None:
-            return resolved
-    return None
-
-
 def _main_html(
     game: GameInfo,
     game_root: Path,
     files: Sequence[Path],
     read_once: ReadOnce,
 ) -> Path | None:
-    resolved = _main_html_resolution(game, game_root, files, read_once)
+    resolved = resolve_main_html(
+        game_root,
+        (game.supplied_root, game.content_root, game_root),
+        read_bytes=lambda path: read_once(path)[0],
+    )
     if resolved is not None:
-        return resolved.html
+        return resolved
     existing = {path.resolve(strict=True): path for path in files}
     fallback = (game.content_root / "index.html").resolve(strict=False)
     return existing.get(fallback)
@@ -314,19 +273,15 @@ def bootstrap_title_consumers(
     target = (game_root / Path(*main.split("/"))).resolve(strict=False)
     if target not in existing or not target.is_relative_to(game_root):
         return None
-    resolved = _MainHtmlResolution(
-        html=existing[target],
-        package=package_path,
-        package_document=package_document,
-    )
-    window = resolved.package_document.get("window")
+    html_path = existing[target]
+    window = package_document.get("window")
     package_title_matches = isinstance(window, dict) and window.get("title") == game_title
-    raw_html, _snapshot = read_once(resolved.html)
-    html = decode_text(raw_html, resolved.html)
+    raw_html, _snapshot = read_once(html_path)
+    html = decode_text(raw_html, html_path)
     html_title = _matching_main_html_title(html, game_title)
     return BootstrapTitleConsumers(
-        package=resolved.package.resolve(strict=True),
-        main_html=resolved.html.resolve(strict=True),
+        package=package_path.resolve(strict=True),
+        main_html=html_path.resolve(strict=True),
         package_window_title=package_title_matches,
         main_html_title_line=html_title.line if html_title is not None else None,
         main_html_title_lines=(

@@ -21,12 +21,12 @@ from urllib.parse import unquote
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape as escape_xml
 
-from att_skill_tools import fail, safe_walk_files, toml_string
+from att_skill_tools import ToolError, fail, safe_walk_files, toml_string
 
 from att_toolbox.font_metadata import FontCoverage, check_font_coverage
 from att_toolbox.font_transaction import ByteMutation, sha256_bytes
 from att_toolbox.js import JavaScriptLiteral, loader_call_for_literal, scan_javascript, static_code_targets
-from att_toolbox.rpg import plugin_script_path, read_plugins
+from att_toolbox.rpg import plugin_script_path, read_plugins, resolve_main_html
 
 FONT_SUFFIXES = frozenset({".eot", ".otf", ".ttf", ".woff", ".woff2"})
 _SCANNED_TEXT_SUFFIXES = frozenset(
@@ -539,42 +539,33 @@ def _runtime_javascript_paths(
             continue
         active.add(script.resolve(strict=True))
 
-    package_path = content_root / "package.json"
     try:
-        package = cast(object, json.loads(package_path.read_text(encoding="utf-8-sig")))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        package = None
-    if isinstance(package, dict):
-        main = cast(dict[object, object], package).get("main")
-        if isinstance(main, str):
-            main_value = main.replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
-            try:
-                html = (content_root / Path(*PurePosixPath(main_value).parts)).resolve(strict=False)
-                html.relative_to(content_root)
-            except ValueError:
-                html = None
-            if html is not None and html.is_file() and html.suffix.casefold() in {".htm", ".html"}:
-                try:
-                    html_text = html.read_text(encoding="utf-8-sig")
-                except (OSError, UnicodeError):
-                    reviews.append(
-                        ReviewItem(
-                            html.relative_to(game_root).as_posix(),
-                            None,
-                            "runtime_html_unreadable",
-                            "",
-                        )
-                    )
-                else:
-                    for match in _HTML_SCRIPT_SRC.finditer(html_text):
-                        target = _content_code_target(
-                            match.group("value"),
-                            source=html,
-                            content_root=content_root,
-                            code_paths=code_paths,
-                        )
-                        if target is not None:
-                            active.add(target)
+        html = resolve_main_html(game_root, (game_root, content_root))
+    except (OSError, ToolError):
+        html = None
+        reviews.append(ReviewItem("package.json", None, "runtime_package_unreadable", ""))
+    if html is not None:
+        try:
+            html_text = html.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            reviews.append(
+                ReviewItem(
+                    html.relative_to(game_root).as_posix(),
+                    None,
+                    "runtime_html_unreadable",
+                    "",
+                )
+            )
+        else:
+            for match in _HTML_SCRIPT_SRC.finditer(html_text):
+                target = _content_code_target(
+                    match.group("value"),
+                    source=html,
+                    content_root=content_root,
+                    code_paths=code_paths,
+                )
+                if target is not None:
+                    active.add(target)
 
     pending = sorted(active, key=lambda path: path.relative_to(content_root).as_posix().casefold())
     while pending:

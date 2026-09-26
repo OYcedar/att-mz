@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "_shared"))
 
@@ -202,6 +203,53 @@ def require_game_root(game: GameInfo) -> Path:
     """返回已经由显式范围或标准运行入口确认的完整游戏根。"""
 
     return game.game_root
+
+
+def resolve_main_html(
+    game_root: Path,
+    package_roots: Sequence[Path],
+    *,
+    read_bytes: Callable[[Path], bytes] = Path.read_bytes,
+) -> Path | None:
+    """按显式入口优先级解析 NW.js main，并保持目标在同一游戏范围内。"""
+
+    seen: set[Path] = set()
+    for root in package_roots:
+        package = root / "package.json"
+        if not package.exists():
+            continue
+        package = require_file_within(package, game_root, "NW.js package.json")
+        if package in seen:
+            continue
+        seen.add(package)
+        raw = read_bytes(package)
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            fail(
+                str(package),
+                f"NW.js package.json 不是有效 UTF-8：字节位置 {error.start}",
+                "恢复目标游戏的完整入口配置",
+            )
+        document = parse_json_text(text, str(package))
+        if not isinstance(document, dict):
+            continue
+        main = document.get("main")
+        if not isinstance(main, str):
+            continue
+        split = urlsplit(main)
+        if split.scheme or split.netloc or not split.path:
+            continue
+        target = package.parent / unquote(split.path)
+        resolved = target.resolve(strict=False)
+        if (
+            not resolved.is_relative_to(game_root)
+            or resolved.suffix.lower() not in {".htm", ".html"}
+            or not resolved.is_file()
+        ):
+            continue
+        return require_file_within(target, game_root, "NW.js HTML 入口")
+    return None
 
 
 def _extract_json_array(text: str, object_name: str) -> list[JsonValue]:
