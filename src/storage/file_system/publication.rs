@@ -242,7 +242,6 @@ impl<E> DirectoryRecoveryError<E> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn source_error(&self) -> &E {
         &self.source
     }

@@ -69,7 +69,9 @@ use crate::project_lease::{
 };
 use crate::project_name::ProjectName;
 use crate::runtime::cpu::CpuExecutorUnavailable;
-use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
+use crate::runtime::filesystem::{
+    SystemDirectoryPublisher, SystemFileSystem, SystemFileSystemError,
+};
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     ProjectLogAmount, ProjectLogCommand, ProjectLogEngine, ProjectLogPhase, RunPlanValueSource,
@@ -77,8 +79,9 @@ use crate::runtime::project_log::{
 use crate::runtime::windows::WindowsFsError;
 use crate::storage::file_system::{
     DirectoryDiscardError, DirectoryPrepareError, DirectoryPublishError, DirectoryPublishIntent,
-    DirectorySourceMapping, DirectoryStageRequest, DirectoryStageRequestError, ReadFileError,
-    RecoverableDirectoryPublisher, StagingCleanupFailure,
+    DirectoryRecoveryError, DirectoryRecoveryOutcome, DirectorySourceMapping,
+    DirectoryStageRequest, DirectoryStageRequestError, ReadFileError,
+    RecoverableDirectoryPublisher, StagedDirectory, StagingCleanupFailure,
 };
 use crate::translation::candidate_validation::ReviewFinding;
 use crate::translation::layout_rules::LayoutRuleSet;
@@ -2032,6 +2035,211 @@ fn write_back_rejects_manual_translation_when_placeholder_rules_change() {
         ),
         "WriteBack 必须使用与 Translate 相同的强校验，不能因译文来源是 Manual 而跳过"
     );
+}
+
+#[tokio::test]
+async fn cancellation_after_successful_prepare_cleans_scratch_and_allows_retry() {
+    let (temporary, store, project_name) = generic_write_back_recovery_fixture();
+    let (stored, live) = store.ensure_input_current().expect("输入复查应该通过");
+    let project = stored.project().clone();
+    let workspace_root = project.workspace_root().to_path_buf();
+    let output_root = project.write_back_root();
+    fs::create_dir(&output_root).expect("应该可建立已有输出");
+    fs::write(output_root.join("previous.txt"), b"previous").expect("应该可保存已有输出");
+    let candidate = build_write_back_candidate(&stored, &live, &GenericUnitMap::new())
+        .expect("应该可建立写回候选");
+    let file_system = SystemFileSystem::new().expect("应该可建立文件运行能力");
+    let publisher = file_system.directory_publisher(
+        crate::runtime::filesystem::DirectoryPublisherConfig::production(
+            temporary.path().join("publish-locks"),
+        )
+        .expect("发布锁配置应该合法"),
+    );
+    let cancellation = CooperativeCancellation::default();
+    let result = publish_generic_write_back(
+        CancelAfterPreparedPublisher {
+            inner: publisher.clone(),
+            cancellation: cancellation.clone(),
+        },
+        project_name.clone(),
+        project.clone(),
+        candidate,
+        cancellation,
+        GenericWriteBackPublicationGate::default(),
+        None,
+        generic_terminal_occurrence_slot(),
+        || panic!("prepare 交付时取消不得进入发布"),
+    )
+    .await;
+
+    assert!(matches!(result, Err(GenericCommandError::Cancelled)));
+    assert!(!workspace_root.join(WRITE_BACK_SCRATCH_NAME).exists());
+    assert!(
+        !workspace_root
+            .join(".directory-publish/write_back/stage")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(output_root.join("previous.txt")).unwrap(),
+        b"previous"
+    );
+
+    let candidate = build_write_back_candidate(&stored, &live, &GenericUnitMap::new())
+        .expect("取消后应该可再次建立候选");
+    publish_generic_write_back(
+        publisher,
+        project_name,
+        project,
+        candidate,
+        CooperativeCancellation::default(),
+        GenericWriteBackPublicationGate::default(),
+        None,
+        generic_terminal_occurrence_slot(),
+        || {},
+    )
+    .await
+    .expect("清理完成后同一项目应该可直接重跑");
+    assert!(output_root.join("scene.jsonl").is_file());
+    assert!(!output_root.join("previous.txt").exists());
+    file_system
+        .shutdown()
+        .await
+        .expect("文件运行能力应该可终结");
+}
+
+struct CancelAfterPreparedPublisher {
+    inner: SystemDirectoryPublisher,
+    cancellation: CooperativeCancellation,
+}
+
+impl RecoverableDirectoryPublisher for CancelAfterPreparedPublisher {
+    type Error = Box<SystemFileSystemError>;
+    type StagingState = <SystemDirectoryPublisher as RecoverableDirectoryPublisher>::StagingState;
+
+    async fn recover(
+        &self,
+        target_root: PathBuf,
+    ) -> Result<DirectoryRecoveryOutcome, DirectoryRecoveryError<Self::Error>> {
+        self.inner.recover(target_root).await
+    }
+
+    async fn prepare(
+        &self,
+        request: DirectoryStageRequest,
+    ) -> Result<StagedDirectory<Self::StagingState>, DirectoryPrepareError<Self::Error>> {
+        let staged = self.inner.prepare(request).await?;
+        self.cancellation.request();
+        Ok(staged)
+    }
+
+    async fn publish(
+        &self,
+        staged: StagedDirectory<Self::StagingState>,
+    ) -> Result<(), DirectoryPublishError<Self::Error>> {
+        self.inner.publish(staged).await
+    }
+
+    async fn discard(
+        &self,
+        staged: StagedDirectory<Self::StagingState>,
+    ) -> Result<(), DirectoryDiscardError<Self::Error>> {
+        self.inner.discard(staged).await
+    }
+}
+
+#[tokio::test]
+async fn publish_recovers_missing_target_before_selecting_replace_intent() {
+    let (temporary, store, project_name) = generic_write_back_recovery_fixture();
+    let (stored, live) = store.ensure_input_current().expect("输入复查应该通过");
+    let project = stored.project().clone();
+    let workspace_root = project.workspace_root().to_path_buf();
+    let output_root = project.write_back_root();
+    fs::create_dir(&output_root).expect("应该可建立已有输出");
+    fs::write(output_root.join("previous.txt"), b"previous").expect("应该可保存已有输出");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::filesystem::publication::tests::publisher_subprocess_entrypoint",
+            "--nocapture",
+        ])
+        .env("FILESYSTEM_PUBLISHER_CHILD_MODE", "abort:original-move")
+        .env("FILESYSTEM_PUBLISHER_CHILD_TARGET", &output_root)
+        .env("FILESYSTEM_PUBLISHER_CHILD_SOURCE", project.source_root())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("应该可在真实目录交换后中止子进程");
+    assert!(!status.success(), "故障子进程必须在旧目标移动后中止");
+    assert!(!output_root.exists(), "恢复前目标应该暂时缺失");
+    assert!(
+        workspace_root
+            .join(".directory-publish/write_back/backup")
+            .is_dir()
+    );
+    let candidate = build_write_back_candidate(&stored, &live, &GenericUnitMap::new())
+        .expect("应该可建立写回候选");
+    let file_system = SystemFileSystem::new().expect("应该可建立文件运行能力");
+    let publisher = file_system.directory_publisher(
+        crate::runtime::filesystem::DirectoryPublisherConfig::production(
+            temporary.path().join("publish-locks"),
+        )
+        .expect("发布锁配置应该合法"),
+    );
+
+    publish_generic_write_back(
+        publisher,
+        project_name,
+        project,
+        candidate,
+        CooperativeCancellation::default(),
+        GenericWriteBackPublicationGate::default(),
+        None,
+        generic_terminal_occurrence_slot(),
+        || {},
+    )
+    .await
+    .expect("同一次 WriteBack 应该先恢复旧目录再成功发布新候选");
+
+    assert!(output_root.join("scene.jsonl").is_file());
+    assert!(!output_root.join("previous.txt").exists());
+    assert!(!workspace_root.join(WRITE_BACK_SCRATCH_NAME).exists());
+    assert_eq!(
+        fs::read_dir(workspace_root.join(".directory-publish/write_back"))
+            .unwrap()
+            .count(),
+        0,
+        "成功发布后应该清理全部受管恢复产物"
+    );
+    file_system
+        .shutdown()
+        .await
+        .expect("文件运行能力应该可终结");
+}
+
+fn generic_write_back_recovery_fixture() -> (tempfile::TempDir, GenericProjectStore, ProjectName) {
+    let temporary = tempfile::tempdir().expect("应该可建立 Generic 写回测试目录");
+    let source_root = temporary.path().join("source");
+    fs::create_dir(&source_root).expect("应该可建立输入目录");
+    fs::write(
+        source_root.join("scene.jsonl"),
+        concat!(
+            r#"{"id":"group","kind":"dialogue","units":["#,
+            r#"{"id":"unit","text":"原文"}]}"#,
+            "\n"
+        ),
+    )
+    .expect("应该可写入 Generic 输入");
+    let project_name: ProjectName = "write-back-recovery".parse().unwrap();
+    let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
+        project_name: project_name.clone(),
+        workspace_root: temporary.path().join("project"),
+        source_root: Some(source_root),
+        source_language: Some(LanguageId::parse("ja").unwrap()),
+        target_language: Some(LanguageId::parse("zh-Hans").unwrap()),
+    })
+    .expect("Generic 项目应该可初始化");
+    store.extract().expect("Generic 输入应该可提取");
+    (temporary, store, project_name)
 }
 
 #[tokio::test]

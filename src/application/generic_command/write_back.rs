@@ -47,9 +47,7 @@ use crate::progress::ProgressSnapshot;
 use crate::project_lease::{ProjectCommandLeaseProvider, ProjectCommandLeaseService};
 use crate::project_name::ProjectName;
 use crate::runtime::cpu::RayonCpuExecutor;
-use crate::runtime::filesystem::{
-    SystemDirectoryPublisher, SystemFileSystem, SystemFileSystemError,
-};
+use crate::runtime::filesystem::{SystemFileSystem, SystemFileSystemError};
 use crate::runtime::performance::RunPerformanceCounters;
 use crate::runtime::project_log::{
     DiagnosticScope, GenericPublicationSummary as ProjectLogGenericPublicationSummary,
@@ -389,8 +387,8 @@ pub(super) fn begin_generic_write_back_publication(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn publish_generic_write_back(
-    publisher: SystemDirectoryPublisher,
+pub(super) async fn publish_generic_write_back<P>(
+    publisher: P,
     project_name: ProjectName,
     project: GenericProject,
     candidate: GenericWriteBackCandidate,
@@ -399,10 +397,32 @@ pub(super) async fn publish_generic_write_back(
     project_log: Option<ProjectLogHandle>,
     publication_occurrence: GenericTerminalOccurrenceSlot,
     publication_started: impl FnOnce() + Send,
-) -> Result<GenericCommandOutput, GenericCommandError> {
+) -> Result<GenericCommandOutput, GenericCommandError>
+where
+    P: RecoverableDirectoryPublisher<Error = Box<SystemFileSystemError>>,
+{
     if cancellation.is_requested() {
         return Err(GenericCommandError::Cancelled);
     }
+    let target_root = project.write_back_root();
+    publisher
+        .recover(target_root.clone())
+        .await
+        .map_err(|source| {
+            if cancellation.is_requested()
+                && matches!(
+                    source.source_error().as_ref(),
+                    SystemFileSystemError::Cancelled { .. }
+                        | SystemFileSystemError::Windows(WindowsFsError::LockCancelled { .. })
+                )
+            {
+                GenericCommandError::Cancelled
+            } else {
+                let report = source.diagnostic_report();
+                GenericCommandError::reported(source, report)
+            }
+        })?;
+    ensure_generic_operation_running(&cancellation)?;
     let workspace_root = project.workspace_root().to_path_buf();
     let translated_units = candidate.translated_units();
     let retained_source_units = candidate.retained_source_units();
@@ -431,7 +451,6 @@ pub(super) async fn publish_generic_write_back(
         };
     }
 
-    let target_root = project.write_back_root();
     let request = (|| {
         let publish_intent = publish_intent_for(&target_root)
             .map_err(|source| Box::new(generic_scratch_command_error(source)))?;
@@ -462,10 +481,6 @@ pub(super) async fn publish_generic_write_back(
             ));
         }
     };
-    if cancellation.is_requested() {
-        return discard_after_failure(&publisher, staged, GenericCommandError::Cancelled).await;
-    }
-
     if let Err(source) = cleanup_write_back_source(&workspace_root, &scratch_root) {
         let report = generic_scratch_report(
             &source,
