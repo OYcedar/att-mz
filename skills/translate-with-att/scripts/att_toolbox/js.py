@@ -304,7 +304,14 @@ def scan_javascript(text: str) -> JavaScriptScan:
     index = 0
     line = 1
     can_start_regex = True
-    ambiguous_slash_context = False
+    previous_token = ""
+    statement_start = True
+    parentheses: list[tuple[str, int]] = []
+    braces: list[bool] = []
+    pending_function: str | None = None
+    pending_classes: list[tuple[int, int, bool]] = []
+    pending_control = False
+    closed_parenthesis = ""
     while index < len(text):
         start = index
         character = text[index]
@@ -340,7 +347,8 @@ def scan_javascript(text: str) -> JavaScriptScan:
             line += text.count("\n", start, end)
             index = end
             can_start_regex = False
-            ambiguous_slash_context = False
+            previous_token = "literal"
+            statement_start = False
             continue
         if character == "`":
             fragments, end, closed, dynamic, expressions = _template(text, index)
@@ -391,7 +399,8 @@ def scan_javascript(text: str) -> JavaScriptScan:
             line += text.count("\n", start, end)
             index = end
             can_start_regex = False
-            ambiguous_slash_context = False
+            previous_token = "literal"
+            statement_start = False
             continue
         if character == "/":
             if can_start_regex:
@@ -404,18 +413,32 @@ def scan_javascript(text: str) -> JavaScriptScan:
                 line += text.count("\n", start, end)
                 index = end
                 can_start_regex = False
-                ambiguous_slash_context = False
+                previous_token = "literal"
+                statement_start = False
                 continue
-            if ambiguous_slash_context:
-                warnings.append({"line": line, "kind": "ambiguous_slash_treated_as_division"})
             index += 2 if index + 1 < len(text) and text[index + 1] == "=" else 1
             can_start_regex = True
-            ambiguous_slash_context = False
+            previous_token = "/"
+            statement_start = False
             continue
         if character.isalpha() or character in "_$":
             end = _identifier_end(text, index)
-            can_start_regex = text[index:end] in _REGEX_PREFIX_KEYWORDS
-            ambiguous_slash_context = False
+            token = text[index:end]
+            is_keyword = previous_token != "."
+            if is_keyword and token == "function":
+                pending_function = "function_statement" if statement_start else "function_expression"
+            if is_keyword and token == "class":
+                pending_classes.append((len(parentheses), len(braces), statement_start))
+            pending_control = is_keyword and (
+                token in {"if", "while", "for", "with", "switch", "catch"}
+                or (pending_control and token == "await")
+            )
+            can_start_regex = is_keyword and token in _REGEX_PREFIX_KEYWORDS
+            statement_start = is_keyword and (
+                token in {"else", "do", "try", "finally"}
+                or (statement_start and token in {"async", "export", "default"})
+            )
+            previous_token = token
             index = end
             continue
         if character.isdigit():
@@ -423,19 +446,80 @@ def scan_javascript(text: str) -> JavaScriptScan:
             while index < len(text) and (text[index].isalnum() or text[index] in "._"):
                 index += 1
             can_start_regex = False
-            ambiguous_slash_context = False
+            previous_token = "literal"
+            statement_start = False
             continue
-        if character in ")]}":
-            can_start_regex = False
-            ambiguous_slash_context = True
-        elif character in "([{,;:=!?&|+-*%^~<>":
+        if character.isspace():
+            if character == "\n":
+                line += 1
+            index += 1
+            continue
+        if text.startswith("=>", index):
+            previous_token = "=>"
             can_start_regex = True
-            ambiguous_slash_context = False
+            statement_start = False
+            index += 2
+            continue
+        if text.startswith(("++", "--"), index):
+            # 后缀更新表达式后仍是除法；前缀更新保留对操作数的期待。
+            previous_token = text[index : index + 2]
+            statement_start = False
+            index += 2
+            continue
+        if character == "(":
+            parentheses.append(
+                (pending_function or ("control" if pending_control else "expression"), len(braces))
+            )
+            pending_function = None
+            pending_control = False
+            can_start_regex = True
+            statement_start = False
+        elif character == ")":
+            closed_parenthesis = parentheses.pop()[0] if parentheses else "expression"
+            # 控制语句的右括号后开始语句；调用或分组的右括号后继续表达式。
+            can_start_regex = closed_parenthesis == "control"
+            statement_start = can_start_regex
+        elif character == "{":
+            function_body = previous_token == ")" and closed_parenthesis.startswith("function_")
+            if (
+                pending_classes
+                and pending_classes[-1][:2] == (len(parentheses), len(braces))
+                and not function_body
+            ):
+                closes_statement = pending_classes.pop()[2]
+            else:
+                closes_statement = statement_start or (
+                    function_body and closed_parenthesis == "function_statement"
+                )
+            braces.append(closes_statement)
+            statement_start = statement_start or previous_token in {")", "=>"}
+            can_start_regex = True
+        elif character == "}":
+            can_start_regex = braces.pop() if braces else True
+            statement_start = can_start_regex
+        elif character == "]":
+            can_start_regex = False
+            statement_start = False
+        elif character in "[,;:=!?&|+-*%^~<>":
+            can_start_regex = True
+            statement_start = character == ";" and (not parentheses or parentheses[-1][1] < len(braces))
+            if (
+                character == ":"
+                and pending_classes
+                and pending_classes[-1][:2]
+                == (
+                    len(parentheses),
+                    len(braces),
+                )
+            ):
+                pending_classes.pop()
         elif character == ".":
             can_start_regex = False
-            ambiguous_slash_context = False
-        if character == "\n":
-            line += 1
+            statement_start = False
+        if character != "*":
+            pending_function = None
+        pending_control = False
+        previous_token = character
         index += 1
     return JavaScriptScan(literals=tuple(literals), code="".join(masked), warnings=tuple(warnings))
 
