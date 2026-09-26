@@ -985,7 +985,15 @@ fn preprocess_scope(
             .map_err(|()| ScopePreprocessingFailure::Cancelled)?
             .map_err(ScopePreprocessingFailure::Invalid)?;
             let not_applicable = prepared.status() != PreparedTranslationStatus::Active;
-            let candidate_contract_valid = match asset.translation.as_ref() {
+            // 过期自动正文只作为后续提交的 CAS 基线保留；当前规则不能把它改绑到
+            // 新语言对或新 Group 语境的 Rejected。人工正文已经由 Reader 核对适用性。
+            let applicable_translation = asset.translation.as_ref().filter(|_| {
+                asset.manual
+                    || asset
+                        .translation_state
+                        .is_some_and(|state| state_context.is_current(state))
+            });
+            let candidate_contract_valid = match applicable_translation {
                 Some(translation) => {
                     match semantics.candidate_placeholders_match_with_cancellation(
                         &asset.identity,
@@ -1013,16 +1021,10 @@ fn preprocess_scope(
                         && state_context.is_current(rejected.planning_state())
                 });
             let skipped_rejected = current_rejected && !retry_rejected;
-            let current = asset.translation.as_ref().is_some_and(|_translation| {
-                candidate_contract_valid
-                    && (asset.manual
-                        || asset
-                            .translation_state
-                            .is_some_and(|state| state_context.is_current(state)))
-            });
+            let current = applicable_translation.is_some() && candidate_contract_valid;
             let invalidated = asset.translation.is_some() && !current;
-            let invalidation_violation = (asset.translation.is_some() && !candidate_contract_valid)
-                .then_some((
+            let invalidation_violation =
+                (applicable_translation.is_some() && !candidate_contract_valid).then_some((
                     ProvenInvariantViolation::PlaceholderMismatch,
                     if asset.manual {
                         TranslationOrigin::Manual
@@ -4251,6 +4253,95 @@ pattern = '保護対象'
             Some((&previous_translation, previous_state)),
             "成功结果必须以请求开始前保留的旧译文作并发 CAS"
         );
+    }
+
+    #[tokio::test]
+    async fn outdated_automatic_translation_keeps_its_state_under_new_placeholder_rules() {
+        let original_group = group(
+            RpgMakerSource::data(StandardDataFile::Items),
+            1,
+            "薬草 TOKEN",
+            Some("药草"),
+        );
+        let identity = original_group.assets()[0].identity().clone();
+        let previous_state = translation_state_for(&identity);
+        let previous_translation = TextUnitContent::Value("药草".to_owned());
+        let placeholder_path = PathBuf::from("C:/input/new-placeholders.toml");
+
+        for (case, target_language, add_sibling) in [
+            ("目标语言变化", "en", false),
+            ("完整 Group 语境变化", "zh-Hans", true),
+        ] {
+            let reader = TranslationPlanningResourceReadingService::new(
+                MemoryFileReader {
+                    files: Arc::new(BTreeMap::from([(
+                        placeholder_path.clone(),
+                        b"[[rule]]\norder = 'preserve'\npattern = 'TOKEN'\n".to_vec(),
+                    )])),
+                },
+                ImmediateCpu,
+            );
+            let planner = RpgMakerTranslationTaskPlanningService::<_, _, ()>::new(
+                reader,
+                translation_resources_for("ja", target_language),
+                Pcre2PlaceholderService::new().expect("内置占位符应该可编译"),
+                ImmediateCpu,
+            );
+            let mut assets = original_group.clone().into_assets();
+            if add_sibling {
+                assets.push(RpgMakerTranslationAsset::with_rejected_semantic_order_key(
+                    TranslationUnitIdentity::new(
+                        RpgMakerAssetOwner::Builtin,
+                        TextGroupKind::DatabaseEntry,
+                        identity.group_location().clone(),
+                        TextUnitRole::Scalar(
+                            ScalarFieldKey::new("description").expect("字段键应合法"),
+                        ),
+                        TextUnitContent::Value("新しい説明です".to_owned()),
+                        "{}",
+                    ),
+                    RpgMakerSemanticOrderKey::new(Vec::new(), 1),
+                    "[]".to_owned(),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            let corpus = RpgMakerTranslationCorpus::new(vec![RpgMakerTranslationGroup::new(
+                TextGroupKind::DatabaseEntry,
+                identity.group_location().clone(),
+                assets,
+            )]);
+
+            let (_, preparation, tasks) = planner
+                .plan(
+                    &project_with_languages("ja", target_language),
+                    &profile(10_000),
+                    corpus,
+                    RpgMakerTranslationInput::new(None, Some(placeholder_path.clone())),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{case} 后应保留旧正文并继续规划：{error}"))
+                .into_parts();
+
+            assert!(
+                preparation.invalidations().is_empty(),
+                "{case} 后，新规则不得清除旧自动正文或重写其适用性"
+            );
+            assert_eq!(preparation.rejected_after_preparation(), 0, "{case}");
+            let expected = tasks
+                .iter()
+                .flat_map(RpgMakerExecutableTask::expected_outputs)
+                .find(|expected| expected.identity() == &identity)
+                .unwrap_or_else(|| panic!("{case} 后必须请求该 Unit 的新译文"));
+            assert_eq!(
+                expected.expected_previous(),
+                Some((&previous_translation, previous_state)),
+                "{case} 后成功结果仍须按读取的旧正文和旧状态提交"
+            );
+            assert_ne!(expected.state_context().applicability(), previous_state);
+            assert!(!expected.was_current_rejected(), "{case}");
+        }
     }
 
     #[tokio::test]
