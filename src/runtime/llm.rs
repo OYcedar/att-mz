@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter, clock::Clock};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
 use secrecy::{ExposeSecret, SecretString};
@@ -406,12 +406,11 @@ impl OpenAiCompatibleExecutor {
 
         let job = self.lifecycle.register()?;
 
-        wait_for_rate(client, &self.lifecycle).await?;
-        self.lifecycle.wait_for_retry_gate().await?;
         let active_permit =
             wait_for_active(Arc::clone(&self.active_capacity), &self.lifecycle).await?;
-        // 等待活动许可期间可能刚收到新的 Retry-After；发送前必须再次观察共享门控。
-        self.lifecycle.wait_for_retry_gate().await?;
+        // 取得活动许可后，在发送边界同时满足服务门控和 RPM，避免提前领取的令牌
+        // 在等待 Retry-After 或活动许可期间积累成额外突发。
+        wait_for_request_gate(client, &self.lifecycle).await?;
 
         on_attempt_started();
         let network_phase = AtomicU8::new(encode_network_phase(HttpTransportPhase::Request));
@@ -1470,33 +1469,25 @@ fn parse_responses_stream_event_with_provider(
     }
 }
 
-async fn wait_for_rate(
+async fn wait_for_request_gate(
     client: &OpenAiCompatibleClient,
     lifecycle: &LlmLifecycle,
 ) -> Result<(), LlmRequestError<OpenAiCompatibleError>> {
-    if !lifecycle.is_accepting() {
-        return Err(lifecycle.stopped_wait_error());
-    }
-    let Some(rate_limiter) = &client.rate_limiter else {
-        return if lifecycle.is_accepting() {
-            Ok(())
-        } else {
-            Err(lifecycle.stopped_wait_error())
+    loop {
+        lifecycle.wait_for_retry_gate().await?;
+        let Some(rate_limiter) = &client.rate_limiter else {
+            return Ok(());
         };
-    };
-    let stopped = lifecycle.wait_for_stop();
-    tokio::pin!(stopped);
-    let ready = rate_limiter.until_ready();
-    tokio::pin!(ready);
-    let admitted = tokio::select! {
-        biased;
-        () = &mut stopped => false,
-        () = &mut ready => true,
-    };
-    if admitted && lifecycle.is_accepting() {
-        Ok(())
-    } else {
-        Err(lifecycle.stopped_wait_error())
+        let wait = match rate_limiter.check() {
+            Ok(()) => return Ok(()),
+            Err(not_until) => not_until.wait_time_from(rate_limiter.clock().now()),
+        };
+        tokio::select! {
+            biased;
+            () = lifecycle.wait_for_stop() => return Err(lifecycle.stopped_wait_error()),
+            () = tokio::time::sleep(wait) => {}
+        }
+        // 速率等待期间服务可能再次冷却或等待错误分类，醒来后重新检查全部门控。
     }
 }
 
@@ -2194,7 +2185,7 @@ impl LlmLifecycle {
                         return Ok(());
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => return Ok(()),
+                () = tokio::time::sleep_until(deadline) => {},
             }
         }
     }
@@ -4137,6 +4128,25 @@ mod tests {
             .expect("忽略超长共享等待不应失败");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_gate_expiry_still_waits_for_pending_service_classification() {
+        let lifecycle = LlmLifecycle::new(Duration::from_secs(1));
+        lifecycle.extend_retry_gate(Some(Duration::from_millis(40)));
+        let waiting = lifecycle.wait_for_retry_gate();
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+
+        lifecycle.hold_service_decision();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), &mut waiting)
+                .await
+                .is_err(),
+            "冷却结束时，尚未完成的错误分类仍须阻止新请求"
+        );
+        lifecycle.resolve_service_decision();
+        waiting.await.expect("错误分类完成后应恢复准入");
+    }
+
     #[tokio::test]
     async fn fatal_http_provider_message_is_redacted_and_sanitized_before_error_storage() {
         let body = serde_json::json!({
@@ -5186,16 +5196,16 @@ mod tests {
         let client = client_with_rate("http://127.0.0.1:1/v1/chat/completions", Map::new(), 60, 2);
         let lifecycle = LlmLifecycle::new(Duration::from_secs(60));
 
-        wait_for_rate(&client, &lifecycle)
+        wait_for_request_gate(&client, &lifecycle)
             .await
             .expect("burst 内第一个请求应立即准入");
-        wait_for_rate(&client, &lifecycle)
+        wait_for_request_gate(&client, &lifecycle)
             .await
             .expect("burst 内第二个请求应立即准入");
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
-                wait_for_rate(&client, &lifecycle)
+                wait_for_request_gate(&client, &lifecycle)
             )
             .await
             .is_err(),
@@ -5220,6 +5230,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requests_after_shared_cooldown_still_obey_the_rate_burst() {
+        let server = spawn_test_server(
+            (0..3)
+                .map(|_| success_response("response", "request", "[]"))
+                .collect(),
+            false,
+        );
+        let client = client_with_rate(&server.endpoint, Map::new(), 600, 1);
+        let executor = executor(3);
+        executor
+            .lifecycle
+            .extend_retry_gate(Some(Duration::from_millis(300)));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let messages = [ChatMessage::new(
+            ChatMessageRole::User,
+            "rate-after-cooldown",
+        )];
+        let responses = futures_util::future::join_all((0..3).map(|_| {
+            let attempts = Arc::clone(&attempts);
+            executor.request_with_attempt_observer(
+                &client,
+                &messages,
+                Box::new(move || {
+                    attempts
+                        .lock()
+                        .expect("请求观察锁不应中毒")
+                        .push(std::time::Instant::now());
+                }),
+            )
+        }))
+        .await;
+        assert!(responses.iter().all(Result::is_ok));
+        executor.shutdown().await;
+        server.worker.join().expect("测试服务器应正常退出");
+
+        let attempts = attempts.lock().expect("请求观察锁不应中毒");
+        assert_eq!(attempts.len(), 3);
+        for pair in attempts.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) >= Duration::from_millis(90),
+                "600 RPM、burst=1 的发送间隔应约为 100ms，冷却不能额外积累突发：{attempts:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn business_cancellation_wakes_a_request_waiting_for_rate() {
         let client = Arc::new(client_with_rate(
             "http://127.0.0.1:1/v1/chat/completions",
@@ -5228,14 +5284,14 @@ mod tests {
             1,
         ));
         let executor = executor(1);
-        wait_for_rate(client.as_ref(), &executor.lifecycle)
+        wait_for_request_gate(client.as_ref(), &executor.lifecycle)
             .await
             .expect("burst 内第一个请求应立即准入");
 
         let waiting_executor = executor.clone();
         let waiting_client = Arc::clone(&client);
         let mut waiting = tokio::spawn(async move {
-            wait_for_rate(waiting_client.as_ref(), &waiting_executor.lifecycle).await
+            wait_for_request_gate(waiting_client.as_ref(), &waiting_executor.lifecycle).await
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(10), &mut waiting)
@@ -5300,14 +5356,14 @@ mod tests {
             1,
         ));
         let lifecycle = Arc::new(LlmLifecycle::new(Duration::from_secs(60)));
-        wait_for_rate(client.as_ref(), lifecycle.as_ref())
+        wait_for_request_gate(client.as_ref(), lifecycle.as_ref())
             .await
             .expect("首个 burst 令牌应立即可用");
 
         let waiting_client = Arc::clone(&client);
         let waiting_lifecycle = Arc::clone(&lifecycle);
         let waiting = tokio::spawn(async move {
-            wait_for_rate(waiting_client.as_ref(), waiting_lifecycle.as_ref()).await
+            wait_for_request_gate(waiting_client.as_ref(), waiting_lifecycle.as_ref()).await
         });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished(), "第二次准入应先等待速率令牌");

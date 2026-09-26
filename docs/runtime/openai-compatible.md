@@ -154,6 +154,7 @@ SSE 事件或成功信封。
 并受 Client `max_retry_after_ms` 约束。Translate 按 Client `retry_delays_ms` 执行有限重试；
 本地等待不消耗重试次数。普通 429 的 `Retry-After` 对同一 Client 的所有请求生效：等待结束前，
 其他 worker 也不能发出下一次请求。
+冷却或活动许可等待结束后，新请求仍受当前 RPM 和 burst 约束；等待不会额外积累可同时发送的请求。
 
 运行根把 HTTP 状态、供应商稳定 code/type、标准 `error.message`、`Retry-After` 和类型化
 失败事实交给调用方，让多次逻辑 attempt 能汇总到同一条任务记录。服务状态只根据 HTTP
