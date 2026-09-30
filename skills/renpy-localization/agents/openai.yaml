@@ -1,4 +1,4 @@
 interface:
   display_name: "Ren'Py 游戏汉化"
-  short_description: "通过 ATT Generic 衔接 Ren'Py 提取、界面写回、字体与独立补丁验证"
-  default_prompt: "使用 $renpy-localization，按当前 ATT Generic 契约完成 Ren'Py 汉化或返修，验证来源映射、实际消费者及交付产物，区分静态检查与人工实机验收。"
+  short_description: "通过 ATT Generic 衔接 Ren'Py 提取、界面显示、字体与独立补丁验证"
+  default_prompt: "使用 $renpy-localization，按当前 ATT Generic 契约完成 Ren'Py 汉化或返修，验证来源映射、实际显示调用及交付产物，区分静态检查与人工实机验收。"
