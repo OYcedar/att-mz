@@ -26,6 +26,9 @@ ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agen
 RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写回或大量 QA 候选时，
 读取[大型、插件密集的 MV 经验](references/game-type-large-plugin-heavy-mv.md)中对应的处理方法。
 
+Ren'Py 项目通过 Generic JSONL 翻译时，读取 [Ren'Py 汉化技能](../renpy-localization/SKILL.md)，
+补充原生翻译模板、硬编码界面、反向转换、字体与独立补丁的检查。
+
 ## 1. 调查
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
