@@ -406,6 +406,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] API key không được để trống
     [api_key_surrounding_whitespace] API key không được có khoảng trắng ở hai đầu
     [api_key_invalid_header] Không thể biểu diễn API key dưới dạng giá trị HTTP Header
+    [http_headers_invalid] Tên và giá trị tiêu đề HTTP phải hợp lệ, không được trùng tên bất kể chữ hoa hay chữ thường hoặc ghi đè tiêu đề xác thực, định tuyến hay phân khung thông điệp
     [strict_json_invalid] Giá trị phải là JSON nghiêm ngặt (dòng={ $line }, cột={ $column })
     [json_object_required] Giá trị phải là đối tượng JSON
     [reserved_request_field] Trường này thuộc sở hữu giao thức yêu cầu và không thể bị ghi đè

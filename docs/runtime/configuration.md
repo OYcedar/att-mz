@@ -157,6 +157,20 @@ DNS、TCP、TLS、发送、读取以及连接、读取、总超时，并说明�
 及所选协议的 `messages` 或 `input` 不出现在这里；Responses 的 `background` 也由 ATT
 固定为 `false`，不接受后台任务。`api_key` 按字面读取，ATT 不展开环境变量。
 
+Client 可选 `headers` 字符串表，省略时为空。例如需要客户端身份和固定会话路由的服务可配置：
+
+```toml
+[llm.clients.primary.headers]
+user-agent = "ATT/1.3.1"
+x-opencode-session = "att-current-project"
+```
+
+名称和值必须是合法 HTTP Header，名称不区分大小写且不得重复；不得覆盖 Authorization、
+Proxy-Authorization、Content-Type、Content-Length、Host、Transfer-Encoding、Connection、
+Trailer 或 Upgrade。配置错误在发送前拒绝；诊断可定位字段名，不回显请求头值。请求头只用于
+选中 Client 的 HTTP 请求，不进入翻译任务记录或 Debug。会话标识由操作者为真实项目指定，
+续译时保持稳定；使用 ATT 自己的 User-Agent，不冒充其他客户端。
+
 发行模板不启用 `rate_limit`。只有模型服务确实规定 RPM 时才增加：
 
 ```toml

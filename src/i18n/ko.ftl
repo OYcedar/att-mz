@@ -406,6 +406,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] API key는 비워 둘 수 없습니다
     [api_key_surrounding_whitespace] API key 앞뒤에 공백을 둘 수 없습니다
     [api_key_invalid_header] API key를 HTTP Header 값으로 표현할 수 없습니다
+    [http_headers_invalid] HTTP 헤더 이름과 값은 유효해야 하며, 대소문자를 구분하지 않는 중복 및 인증·라우팅·메시지 구분 헤더 덮어쓰기는 허용되지 않습니다
     [strict_json_invalid] 값은 엄격한 JSON이어야 합니다(줄={ $line }, 열={ $column })
     [json_object_required] 값은 JSON 객체여야 합니다
     [reserved_request_field] 이 필드는 요청 프로토콜이 소유하므로 재정의할 수 없습니다

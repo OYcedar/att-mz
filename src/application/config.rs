@@ -1706,6 +1706,7 @@ fn build_llm_client(
     raw: RawLlmClientConfiguration,
 ) -> Result<BuiltLlmClient, ConfigurationValueError> {
     let protocol = OpenAiProtocol::from(raw.protocol);
+    let headers = validate_llm_headers(format!("{field}.headers").as_str(), raw.headers)?;
     let url = Url::parse(&raw.url).map_err(|_| {
         invalid(
             format!("{field}.url").as_str(),
@@ -1867,7 +1868,8 @@ fn build_llm_client(
         request_timeout,
         rate_limit,
         parameters,
-    );
+    )
+    .with_headers(headers);
     Ok(BuiltLlmClient {
         executor: SelectedLlmExecutorConfiguration {
             runtime: OpenAiExecutorConfiguration::new(
@@ -1882,6 +1884,37 @@ fn build_llm_client(
         client,
         request,
     })
+}
+
+fn validate_llm_headers(
+    field: &str,
+    raw: BTreeMap<String, String>,
+) -> Result<reqwest::header::HeaderMap, ConfigurationValueError> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let invalid_headers = || invalid(field, ConfigurationValueRule::HttpHeadersInvalid);
+    let mut headers = HeaderMap::new();
+    for (name, value) in raw {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid_headers())?;
+        if matches!(
+            name.as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "content-type"
+                | "content-length"
+                | "host"
+                | "transfer-encoding"
+                | "connection"
+                | "trailer"
+                | "upgrade"
+        ) || headers.contains_key(&name)
+        {
+            return Err(invalid_headers());
+        }
+        let mut value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| invalid_headers())?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    Ok(headers)
 }
 
 fn validate_llm_url(field: &str, url: &Url) -> Result<(), ConfigurationValueError> {
@@ -3084,7 +3117,9 @@ impl ConfigurationFieldContract {
                 Some(IndexedTableKind::Table)
             }
             [llm, clients, _, rate_limit]
-                if llm == "llm" && clients == "clients" && rate_limit == "rate_limit" =>
+                if llm == "llm"
+                    && clients == "clients"
+                    && matches!(rate_limit.as_str(), "rate_limit" | "headers") =>
             {
                 Some(IndexedTableKind::Table)
             }
@@ -3102,6 +3137,11 @@ impl ConfigurationFieldContract {
 
     fn field_kind(path: &[String]) -> Option<ConfigurationTomlValueKind> {
         let kind = match path {
+            [llm, clients, _, headers, _]
+                if llm == "llm" && clients == "clients" && headers == "headers" =>
+            {
+                ConfigurationTomlValueKind::String
+            }
             [prompts, field]
                 if prompts == "prompts"
                     && matches!(field.as_str(), "thinking_output" | "source_echo") =>
@@ -4546,6 +4586,8 @@ struct RawSelectedTranslationProfileConfiguration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLlmClientConfiguration {
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     url: String,
     #[serde(default)]
     protocol: RawOpenAiProtocol,
@@ -4605,6 +4647,52 @@ mod tests {
     const EXAMPLE_TARGET_CHARACTERS: &str = "target_task_user_message_characters = 24000";
     const EXAMPLE_CLIENT_STREAM: &str = "stream = false";
     const EXAMPLE_CLIENT_PARAMETERS: &str = "parameters = '''\n{}\n'''";
+
+    #[test]
+    fn llm_headers_configuration_defaults_validates_and_hides_values() {
+        let directory = TestDirectory::new();
+        let example = include_str!("../../config.example.toml");
+        let default_path = directory.write("headers-default.toml", example);
+        let ConfiguredRpgMakerCommand::Translate(default) =
+            load_configuration(&default_path, translate_command("primary")).expect("默认配置有效")
+        else {
+            panic!("应建立 Translate 配置")
+        };
+        assert!(default.client().headers().is_empty());
+        let source = example.replacen(
+            "[llm.clients.primary]",
+            "[llm.clients.primary]\nheaders = { \"x-opencode-session\" = \"session-sentinel\", \"user-agent\" = \"ATT/1.3.0\" }",
+            1,
+        );
+        let path = directory.write("headers-valid.toml", &source);
+        let ConfiguredRpgMakerCommand::Translate(configured) =
+            load_configuration(&path, translate_command("primary")).expect("请求头配置有效")
+        else {
+            panic!("应建立 Translate 配置")
+        };
+        assert_eq!(
+            configured.client().headers()["x-opencode-session"],
+            "session-sentinel"
+        );
+        assert!(!format!("{:?}", configured.client()).contains("session-sentinel"));
+        for headers in [
+            r#"{ "bad name" = "value" }"#,
+            r#"{ "x-session" = "line\nbreak" }"#,
+            r#"{ "Authorization" = "Bearer forbidden" }"#,
+            r#"{ "Content-Type" = "text/plain" }"#,
+            r#"{ "Host" = "other.test" }"#,
+            r#"{ "x-session" = "one", "X-Session" = "two" }"#,
+            r#"{ "x-session" = 42 }"#,
+        ] {
+            let source = example.replacen(
+                "[llm.clients.primary]",
+                &format!("[llm.clients.primary]\nheaders = {headers}"),
+                1,
+            );
+            let path = directory.write("headers-invalid.toml", &source);
+            assert!(load_configuration(&path, translate_command("primary")).is_err());
+        }
+    }
 
     #[test]
     fn repository_example_is_valid_for_every_command() {

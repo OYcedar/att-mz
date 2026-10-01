@@ -406,6 +406,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] API key 不能為空白
     [api_key_surrounding_whitespace] API key 不能包含前後空白
     [api_key_invalid_header] API key 無法表示為 HTTP Header 值
+    [http_headers_invalid] HTTP 請求標頭的名稱和值必須合法，名稱不得重複（不區分大小寫），不得覆蓋認證、路由或訊息分幀標頭
     [strict_json_invalid] 值必須是嚴格 JSON（列={ $line }，欄={ $column }）
     [json_object_required] 值必須是 JSON 物件
     [reserved_request_field] 此欄位由請求協定擁有，不能覆寫

@@ -411,6 +411,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] API key не должен быть пустым
     [api_key_surrounding_whitespace] API key не должен содержать пробелы по краям
     [api_key_invalid_header] API key нельзя представить как значение HTTP Header
+    [http_headers_invalid] Имена и значения HTTP-заголовков должны быть допустимыми; дубликаты без учёта регистра и переопределение заголовков авторизации, маршрутизации и границ сообщений запрещены
     [strict_json_invalid] Значение должно быть строгим JSON (строка={ $line }, столбец={ $column })
     [json_object_required] Значение должно быть объектом JSON
     [reserved_request_field] Поле принадлежит протоколу запроса и не может быть переопределено

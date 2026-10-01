@@ -406,6 +406,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] API key を空白にできません
     [api_key_surrounding_whitespace] API key の前後に空白を含められません
     [api_key_invalid_header] API key を HTTP Header 値として表現できません
+    [http_headers_invalid] HTTP ヘッダーの名前と値は有効である必要があり、大文字小文字を区別しない重複や認証・ルーティング・メッセージ境界ヘッダーの上書きは禁止です
     [strict_json_invalid] 値は厳密な JSON でなければなりません（行={ $line }、列={ $column }）
     [json_object_required] 値は JSON オブジェクトでなければなりません
     [reserved_request_field] このフィールドはリクエストプロトコルが所有しているため上書きできません
