@@ -170,6 +170,7 @@ Proxy-Authorization、Content-Type、Content-Length、Host、Transfer-Encoding�
 Trailer 或 Upgrade。配置错误在发送前拒绝；诊断可定位字段名，不回显请求头值。请求头只用于
 选中 Client 的 HTTP 请求，不进入翻译任务记录或 Debug。会话标识由操作者为真实项目指定，
 续译时保持稳定；使用 ATT 自己的 User-Agent，不冒充其他客户端。
+服务专用固定请求头与自定义头的合并规则见 [HTTP 请求规格](openai-compatible.md#2-请求)。
 
 发行模板不启用 `rate_limit`。只有模型服务确实规定 RPM 时才增加：
 

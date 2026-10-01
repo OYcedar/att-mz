@@ -83,6 +83,80 @@ fn root_test_checks_each_unique_client_once_without_touching_projects() {
 }
 
 #[test]
+fn root_test_preserves_service_headers_and_sends_unique_openrouter_metadata() {
+    for stream in [false, true] {
+        let root = tempfile::tempdir().expect("应创建测试目录");
+        let listener = TcpListener::bind("[::1]:0").expect("应建立本地 HTTP 代理");
+        let port = listener.local_addr().expect("应取得监听地址").port();
+        let responses = if stream {
+            vec![
+                (
+                    200,
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"OK\"}]}]}}\n\n",
+                ),
+                (
+                    200,
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    200,
+                    r#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}]}"#,
+                ),
+                (
+                    200,
+                    r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"content":"OK"}}]}"#,
+                ),
+            ]
+        };
+        let server = MockServer::responses(listener, responses);
+        let source = test_configuration(port)
+            .replace("stream = false", &format!("stream = {stream}"))
+            .replace(
+                &format!("http://[::1]:{port}/v1"),
+                "http://openrouter.ai/api/v1",
+            )
+            .replace("proxy = false", &format!("proxy = \"http://[::1]:{port}\""));
+        let source = format!(
+            "{source}\n[llm.clients.a-responses.headers]\nX-OpenRouter-Metadata = \"disabled\"\nx-opencode-session = \"responses-session\"\nuser-agent = \"ATT/1.3.1\"\n\
+             [llm.clients.z-chat.headers]\nx-openrouter-metadata = \"enabled\"\nx-opencode-session = \"chat-session\"\nuser-agent = \"ATT/1.3.1\"\n"
+        );
+        let executable = stage_att_executable(root.path());
+        fs::write(root.path().join("config.toml"), source).expect("应写入测试配置");
+        let output = Command::new(executable)
+            .args(["--ui-language", "zh-Hans", "test"])
+            .output()
+            .expect("应运行 att test");
+        assert!(
+            output.status.success(),
+            "stream={stream}, stderr={}",
+            text(&output.stderr)
+        );
+        let requests = server.finish().expect("本地代理应在时限内完成");
+        assert_eq!(requests.len(), 2);
+        for (request, session) in requests.iter().zip(["responses-session", "chat-session"]) {
+            let headers = request.split("\r\n\r\n").next().expect("请求应包含 Header");
+            let metadata_values = headers
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("x-openrouter-metadata")
+                        .then(|| value.trim())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(metadata_values, ["enabled"], "stream={stream}");
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains(&format!("x-opencode-session: {session}")));
+            assert!(headers.contains("user-agent: att/1.3.1"));
+            assert_eq!(headers.matches("authorization:").count(), 1);
+            assert_eq!(headers.matches("content-type: application/json").count(), 1);
+        }
+    }
+}
+
+#[test]
 fn root_test_continues_after_a_client_failure() {
     let root = tempfile::tempdir().expect("应创建测试目录");
     let listener = TcpListener::bind("[::1]:0").expect("应建立 Mock HTTP 服务");

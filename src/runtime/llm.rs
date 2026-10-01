@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter, clock::Clock};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -27,7 +27,7 @@ use crate::llm::{
 };
 use crate::user_text::sanitize_user_text;
 
-const OPENROUTER_METADATA_HEADER: &str = "X-OpenRouter-Metadata";
+const OPENROUTER_METADATA_HEADER: &str = "x-openrouter-metadata";
 const OPENROUTER_METADATA_ENABLED: &str = "enabled";
 const MAX_PROVIDER_NAME_BYTES: usize = 128;
 
@@ -395,18 +395,19 @@ impl OpenAiCompatibleExecutor {
         client: &OpenAiCompatibleClient,
         request_body: Vec<u8>,
     ) -> reqwest::RequestBuilder {
-        let request = self
-            .client
+        let mut headers = client.headers.clone();
+        if client.openrouter_metadata {
+            headers.insert(
+                OPENROUTER_METADATA_HEADER,
+                HeaderValue::from_static(OPENROUTER_METADATA_ENABLED),
+            );
+        }
+        self.client
             .post(client.url.clone())
-            .headers(client.headers.clone())
+            .headers(headers)
             .header(CONTENT_TYPE, "application/json")
             .bearer_auth(client.api_key.expose_secret())
-            .body(request_body);
-        if client.openrouter_metadata {
-            request.header(OPENROUTER_METADATA_HEADER, OPENROUTER_METADATA_ENABLED)
-        } else {
-            request
-        }
+            .body(request_body)
     }
 
     async fn execute_request(
@@ -2942,20 +2943,34 @@ mod tests {
             ("https://openrouter.ai.example.test/api/v1", false),
             ("https://example.test/openrouter.ai/api/v1", false),
         ] {
-            let client = client(url, Map::new());
-            assert_eq!(client.openrouter_metadata(), expected, "endpoint={url}");
-            let request = executor
-                .request_builder(&client, Vec::new())
-                .build()
-                .expect("测试请求应可建立");
-            assert_eq!(
-                request
+            for configured in [None, Some("enabled"), Some("disabled")] {
+                let mut headers = HeaderMap::new();
+                if let Some(value) = configured {
+                    headers.insert(OPENROUTER_METADATA_HEADER, HeaderValue::from_static(value));
+                }
+                let client = client(url, Map::new()).with_headers(headers);
+                assert_eq!(client.openrouter_metadata(), expected, "endpoint={url}");
+                let request = executor
+                    .request_builder(&client, Vec::new())
+                    .build()
+                    .expect("测试请求应可建立");
+                let values = request
                     .headers()
-                    .get(OPENROUTER_METADATA_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-                expected.then_some(OPENROUTER_METADATA_ENABLED),
-                "endpoint={url}"
-            );
+                    .get_all(OPENROUTER_METADATA_HEADER)
+                    .iter()
+                    .map(|value| value.to_str().expect("测试请求头值有效"))
+                    .collect::<Vec<_>>();
+                let expected_value = if expected {
+                    Some(OPENROUTER_METADATA_ENABLED)
+                } else {
+                    configured
+                };
+                assert_eq!(
+                    values,
+                    expected_value.into_iter().collect::<Vec<_>>(),
+                    "endpoint={url}, configured={configured:?}"
+                );
+            }
         }
     }
 

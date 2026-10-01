@@ -66,9 +66,10 @@ Client 的可选 `headers` 按配置边界校验后的 HeaderMap 发送，适用
 认证、正文类型及路由/消息分帧 Header 仍由 ATT 和 HTTP 运行根拥有，不能被自定义 Header 覆盖。
 Header 名称和值不写入 Debug、CLI、项目日志或任务记录；它们不改变既有译文的 Current 身份。
 
-当完成后的 Endpoint host 精确为 `openrouter.ai` 时，ATT 同时发送
-`X-OpenRouter-Metadata: enabled`，让 OpenRouter 在响应中提供本次请求的路由结果。其他 host
-沿用基础 Header 集合；不通过路径、模型名或请求参数猜测服务身份。
+当完成后的 Endpoint host 精确为 `openrouter.ai` 时，ATT 固定发送唯一的
+`X-OpenRouter-Metadata: enabled`，让 OpenRouter 在响应中提供本次请求的路由结果。自定义
+`headers` 中的同名项按不区分大小写由此固定值替换。其他 host 保留自定义 Header 的原值，
+省略时不自动添加这项元数据 Header；服务身份只按 Endpoint host 判断。
 
 `connect_timeout_ms` 管 DNS、TCP 与 TLS 建连，`read_timeout_ms` 管每次响应头、完整 JSON、
 错误正文或 SSE chunk 的读取，`request_timeout_ms` 是从开始发送到完整响应终止的外围总
