@@ -413,6 +413,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] يجب ألا يكون API key فارغًا
     [api_key_surrounding_whitespace] يجب ألا يحتوي API key على مسافات طرفية
     [api_key_invalid_header] لا يمكن تمثيل API key كقيمة HTTP Header
+    [http_headers_invalid] يجب أن تكون أسماء وقيم ترويسات HTTP صالحة، دون تكرار بصرف النظر عن حالة الأحرف أو تجاوز ترويسات المصادقة أو التوجيه أو تأطير الرسائل
     [strict_json_invalid] يجب أن تكون القيمة JSON صارمًا (السطر={ $line }، العمود={ $column })
     [json_object_required] يجب أن تكون القيمة كائن JSON
     [reserved_request_field] هذا الحقل مملوك لبروتوكول الطلب ولا يمكن تجاوزه

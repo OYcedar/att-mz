@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter, clock::Clock};
-use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use reqwest::{Client, Proxy, StatusCode, redirect};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -110,6 +110,7 @@ pub(crate) struct OpenAiCompatibleClient {
     max_concurrent_requests: NonZeroUsize,
     request_timeout: Duration,
     parameters: Arc<Map<String, Value>>,
+    headers: HeaderMap,
     api_key_redactor: Arc<ApiKeyRedactor>,
     rate_limiter: Option<Arc<DefaultDirectRateLimiter>>,
 }
@@ -149,6 +150,7 @@ impl OpenAiCompatibleClient {
             max_concurrent_requests,
             request_timeout,
             parameters,
+            headers: HeaderMap::new(),
             api_key_redactor,
             rate_limiter,
         }
@@ -186,6 +188,16 @@ impl OpenAiCompatibleClient {
 
     pub(crate) fn api_key_redactor(&self) -> Arc<ApiKeyRedactor> {
         Arc::clone(&self.api_key_redactor)
+    }
+
+    pub(crate) fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        &self.headers
     }
 }
 
@@ -386,6 +398,7 @@ impl OpenAiCompatibleExecutor {
         let request = self
             .client
             .post(client.url.clone())
+            .headers(client.headers.clone())
             .header(CONTENT_TYPE, "application/json")
             .bearer_auth(client.api_key.expose_secret())
             .body(request_body);
@@ -4306,6 +4319,45 @@ mod tests {
 
         executor.shutdown().await;
         server.worker.join().expect("测试服务器应正常退出");
+    }
+
+    #[tokio::test]
+    async fn local_server_observes_configured_session_headers_on_both_protocols() {
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let response = match protocol {
+                OpenAiProtocol::ChatCompletions => success_response("body", "request", "[]"),
+                OpenAiProtocol::Responses => responses_success_response("[]"),
+            };
+            let server = spawn_test_server(vec![response.clone(), response], false);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-opencode-session",
+                "att-project-session".parse().expect("合法请求头"),
+            );
+            headers.insert("user-agent", "ATT/1.3.0".parse().expect("合法请求头"));
+            let client =
+                client_with_protocol(&server.endpoint, protocol, Map::new()).with_headers(headers);
+            let executor = executor(1);
+            for _ in 0..2 {
+                executor
+                    .request(&client, &[ChatMessage::new(ChatMessageRole::User, "[]")])
+                    .await
+                    .expect("请求成功");
+            }
+            for _ in 0..2 {
+                let request = server
+                    .requests
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("收到请求");
+                let headers = request_headers(&request).to_ascii_lowercase();
+                assert!(headers.contains("x-opencode-session: att-project-session"));
+                assert!(headers.contains("user-agent: att/1.3.0"));
+                assert!(headers.contains("content-type: application/json"));
+                assert!(headers.contains("authorization: bearer test-secret"));
+            }
+            executor.shutdown().await;
+            server.worker.join().expect("服务器正常退出");
+        }
     }
 
     #[tokio::test]

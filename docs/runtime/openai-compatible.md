@@ -62,6 +62,10 @@ Responses 的 `input`，role 与字符串 content 保持不变。Client 的严�
 的 `background` 固定为 `false`，这些字段都不得由 parameters 覆盖。ATT 不执行后台任务轮询。
 供应商私有字段原样发给供应商，ATT 自己不解释。API key 只以 Bearer Header 的形式发送。
 
+Client 的可选 `headers` 按配置边界校验后的 HeaderMap 发送，适用于两个协议和两种流式设置。
+认证、正文类型及路由/消息分帧 Header 仍由 ATT 和 HTTP 运行根拥有，不能被自定义 Header 覆盖。
+Header 名称和值不写入 Debug、CLI、项目日志或任务记录；它们不改变既有译文的 Current 身份。
+
 当完成后的 Endpoint host 精确为 `openrouter.ai` 时，ATT 同时发送
 `X-OpenRouter-Metadata: enabled`，让 OpenRouter 在响应中提供本次请求的路由结果。其他 host
 沿用基础 Header 集合；不通过路径、模型名或请求参数猜测服务身份。

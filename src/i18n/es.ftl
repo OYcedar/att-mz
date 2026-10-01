@@ -409,6 +409,7 @@ diagnostic-configuration-rule-value = { $code ->
     [api_key_blank] La API key no puede estar vacía
     [api_key_surrounding_whitespace] La API key no puede tener espacios al principio o al final
     [api_key_invalid_header] La API key no se puede representar como valor HTTP Header
+    [http_headers_invalid] Los nombres y valores de las cabeceras HTTP deben ser válidos, sin duplicados que solo difieran en mayúsculas ni cambios en las cabeceras de autenticación, enrutamiento o delimitación de mensajes
     [strict_json_invalid] El valor debe ser JSON estricto (línea={ $line }, columna={ $column })
     [json_object_required] El valor debe ser un objeto JSON
     [reserved_request_field] El campo pertenece al protocolo de solicitud y no se puede sobrescribir
