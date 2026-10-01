@@ -161,7 +161,7 @@ Client 可选 `headers` 字符串表，省略时为空。例如需要客户端�
 
 ```toml
 [llm.clients.primary.headers]
-user-agent = "ATT/1.3.1"
+user-agent = "ATT/1.3.2"
 x-opencode-session = "att-current-project"
 ```
 
