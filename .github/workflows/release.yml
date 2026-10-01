@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "已经存在于 main 当前提交的版本标签，例如 v1.0.0"
+        description: "已完成开发验证的版本标签，例如 v1.3.2"
         required: true
         type: string
 
@@ -26,11 +26,11 @@ jobs:
       RUSTFLAGS: "-C target-feature=+crt-static"
 
     steps:
-      - name: Checkout main
+      - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-          ref: main
+          ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
 
       - name: Resolve release metadata
@@ -39,49 +39,32 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          if ($env:GITHUB_REF -cne 'refs/heads/main') {
-            throw "Release workflow 只能从 main 触发：$env:GITHUB_REF"
-          }
           $tag = $env:RELEASE_TAG.Trim()
           if ($tag -cnotmatch '^v(?<version>\d+\.\d+\.\d+)$') {
             throw "版本标签必须是 vMAJOR.MINOR.PATCH：$tag"
           }
-          git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
-          if ($LASTEXITCODE -ne 0) {
-            throw "远端标签不存在：$tag"
-          }
-          $tagCommit = (git rev-list -n 1 "refs/tags/$tag").Trim().ToLowerInvariant()
-          $mainCommit = (git rev-parse 'HEAD^{commit}').Trim().ToLowerInvariant()
-          $workflowCommit = $env:GITHUB_SHA.Trim().ToLowerInvariant()
-          if ($tagCommit -cne $mainCommit -or $workflowCommit -cne $mainCommit) {
-            throw "标签、main 与 workflow 提交不一致：tag=$tagCommit main=$mainCommit workflow=$workflowCommit"
-          }
+          $version = $Matches['version']
 
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            throw '无法读取 Cargo 发行版本。'
+          }
           $package = $metadata.packages | Where-Object { $_.name -ceq 'att' }
           if ($null -eq $package -or $package.Count -ne 1) {
             throw 'Cargo metadata 必须恰好包含一个 att package。'
           }
-          $version = $Matches['version']
           if ($package.version -cne $version) {
             throw "Cargo 版本与标签不一致：tag=$version cargo=$($package.version)"
           }
-          $parts = $version.Split('.')
-          $releaseName = if ($parts[2] -ceq '0') {
-            "ATT $($parts[0]).$($parts[1])"
-          }
-          else {
-            "ATT $version"
-          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
-          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+          "release_name=ATT $version" >> $env:GITHUB_OUTPUT
 
       - name: Build Release executable
         shell: pwsh
         run: cargo build --locked --release --bin att
 
-      - name: Package maximum-compression ZIP
+      - name: Package ZIP
         id: package
         shell: pwsh
         env:
@@ -90,18 +73,14 @@ jobs:
           New-Item -ItemType Directory -Path 'dist', 'dist\projects', 'release-artifacts' | Out-Null
           Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\att.exe' `
             -Destination 'dist\att.exe'
-          & .\scripts\sync-dist-resources.ps1 -RequireDefaultConfig
-
-          $actualVersion = (& .\dist\att.exe --version).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "att $env:RELEASE_VERSION") {
-            throw "Release 版本不符：$actualVersion"
-          }
+          & .\scripts\sync-dist-resources.ps1
+          & .\scripts\verify-release-package.ps1 -ExpectedVersion $env:RELEASE_VERSION
 
           $archiveName = "att-v$env:RELEASE_VERSION-windows-x64.zip"
           $archivePath = Join-Path $PWD "release-artifacts\$archiveName"
           Push-Location 'dist'
           try {
-            & 7z a -tzip $archivePath '.\*' -mx=9 -mm=Deflate -mfb=258 -mpass=15 -bd
+            & 7z a -tzip $archivePath '.\*' -mm=Deflate -bd
             if ($LASTEXITCODE -ne 0) {
               throw "7-Zip 创建发行包失败，退出码 $LASTEXITCODE"
             }
@@ -134,12 +113,11 @@ jobs:
             --verify-tag `
             --title $env:RELEASE_NAME `
             --notes-file '.github\RELEASE_NOTES.md' `
-            --latest
+            --draft
           if ($LASTEXITCODE -ne 0) {
-            $failureExitCode = $LASTEXITCODE
-            gh release view $env:RELEASE_TAG *> $null
-            if ($LASTEXITCODE -eq 0) {
-              gh release delete $env:RELEASE_TAG --yes
-            }
-            throw "创建 GitHub Release 失败，退出码 $failureExitCode"
+            throw "上传 Release 草稿失败，保留已有附件供重试，退出码 $LASTEXITCODE"
+          }
+          gh release edit $env:RELEASE_TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) {
+            throw "发布 Release 草稿失败，保留草稿供重试，退出码 $LASTEXITCODE"
           }

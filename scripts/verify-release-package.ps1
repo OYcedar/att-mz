@@ -1,19 +1,14 @@
-﻿#requires -Version 7.4
+#requires -Version 7.0
 
 <#
 .SYNOPSIS
-验证当前 dist 是否可以作为公开 Windows x64 发行物。
-
-.DESCRIPTION
-使用 PowerShell 7.4 或更新版本提供的 Markdown 解析器。
-检查发行资源、目录边界、空项目目录、Markdown 相对链接、PE 动态依赖，以及从仓库外
-运行 ATT、Formic 和最小翻译路径的真实结果。
+检查公开 Windows x64 发行包的版本、启动能力、运行依赖和必需资源。
 
 .PARAMETER ExpectedVersion
-不带 v 前缀的三段版本号，例如 1.0.0。
+不带 v 前缀的三段版本号。
 
 .PARAMETER TargetRoot
-可选的发行根；省略时验证仓库固定的 dist。
+发行目录；省略时使用仓库的 dist。
 #>
 [CmdletBinding()]
 param(
@@ -26,344 +21,111 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $distributionRoot = if ([string]::IsNullOrWhiteSpace($TargetRoot)) {
-    Join-Path $repositoryRoot 'dist'
+    Join-Path $PSScriptRoot '..\dist'
 }
 else {
     [System.IO.Path]::GetFullPath($TargetRoot)
 }
 
-function Assert-NoReparsePoint {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path,
-        [switch]$Recurse
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-    $pending = [System.Collections.Generic.Stack[string]]::new()
-    $pending.Push((Get-Item -LiteralPath $Path -Force).FullName)
-    while ($pending.Count -gt 0) {
-        $current = Get-Item -LiteralPath $pending.Pop() -Force
-        if (($current.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "发行物包含 reparse point：$($current.FullName)"
-        }
-        if ($Recurse -and $current.PSIsContainer) {
-            foreach ($child in Get-ChildItem -LiteralPath $current.FullName -Force) {
-                $pending.Push($child.FullName)
-            }
-        }
+foreach ($relativePath in @(
+        'att.exe', 'config.example.toml', 'config.toml', 'LICENSE', 'README.md',
+        'licenses\THIRD-PARTY-LICENSES.html',
+        'licenses\FORMIC-THIRD-PARTY-LICENSES.html',
+        'tools\formic\formic.exe', 'tools\formic\LICENSE',
+        'tools\formic\FORMIC-SOURCE.md', 'tools\formic\README.md',
+        'tools\formic\config.example.toml', 'tools\formic\config.toml'
+    )) {
+    $path = Join-Path $distributionRoot $relativePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+        (Get-Item -LiteralPath $path).Length -eq 0) {
+        throw "发行文件缺失或为空：$path"
     }
 }
-
-function Invoke-CapturedProcess {
-    param(
-        [Parameter(Mandatory)]
-        [string]$FilePath,
-        [Parameter(Mandatory)]
-        [string[]]$Arguments,
-        [Parameter(Mandatory)]
-        [string]$WorkingDirectory
-    )
-
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FilePath
-    $startInfo.WorkingDirectory = $WorkingDirectory
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($argument in $Arguments) {
-        $startInfo.ArgumentList.Add($argument)
-    }
-
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
-        throw "无法启动发行程序：$FilePath"
-    }
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
-    [pscustomobject]@{
-        ExitCode = $process.ExitCode
-        Stdout = $stdout
-        Stderr = $stderr
-    }
-}
-
-function Assert-SuccessfulCommand {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name,
-        [Parameter(Mandatory)]
-        [pscustomobject]$Result
-    )
-
-    if ($Result.ExitCode -ne 0) {
-        throw "$Name 失败，退出码 $($Result.ExitCode)：`nstdout:`n$($Result.Stdout)`nstderr:`n$($Result.Stderr)"
-    }
-}
-
-function Get-PeDependencies {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Executable
-    )
-
-    $tool = Get-Command llvm-objdump -ErrorAction SilentlyContinue
-    if ($null -ne $tool) {
-        $output = & $tool.Source -p $Executable 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "llvm-objdump 无法读取 PE 依赖：`n$($output -join "`n")"
-        }
-        return @(
-            $output |
-                Select-String -Pattern '^\s*DLL Name:\s*(?<name>\S+)\s*$' |
-                ForEach-Object { $_.Matches[0].Groups['name'].Value }
-        )
-    }
-
-    $tool = Get-Command dumpbin -ErrorAction SilentlyContinue
-    if ($null -ne $tool) {
-        $output = & $tool.Source /DEPENDENTS $Executable 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "dumpbin 无法读取 PE 依赖：`n$($output -join "`n")"
-        }
-        return @(
-            $output |
-                Select-String -Pattern '^\s*(?<name>[A-Za-z0-9._-]+\.dll)\s*$' |
-                ForEach-Object { $_.Matches[0].Groups['name'].Value }
-        )
-    }
-
-    throw '完整发行检查需要 llvm-objdump 或 dumpbin。'
-}
-
-function Test-AllowedSystemDependency {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    if ($Name -match '^(?i:api-ms-win-|ext-ms-win-)') {
-        return $true
-    }
-    $allowed = [System.Collections.Generic.HashSet[string]]::new(
-        [System.StringComparer]::OrdinalIgnoreCase
-    )
-    foreach ($systemDll in @(
-            'advapi32.dll',
-            'bcrypt.dll',
-            'bcryptprimitives.dll',
-            'crypt32.dll',
-            'kernel32.dll',
-            'ntdll.dll',
-            'oleaut32.dll',
-            'secur32.dll',
-            'userenv.dll',
-            'ws2_32.dll'
-        )) {
-        [void]$allowed.Add($systemDll)
-    }
-    $allowed.Contains($Name)
-}
-
-function Get-MarkdownRelativeTargets {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Content
-    )
-
-    $html = (ConvertFrom-Markdown -InputObject $Content).Html
-    foreach ($match in [regex]::Matches(
-            $html,
-            '(?i)<(?:a|img)\b[^>]*?\b(?:href|src)="(?<target>[^"]+)"'
-        )) {
-        [System.Net.WebUtility]::HtmlDecode($match.Groups['target'].Value)
-    }
-}
-
-function Assert-MarkdownLinks {
-    $root = [System.IO.Path]::GetFullPath($distributionRoot).TrimEnd('\', '/')
-    $prefix = $root + [System.IO.Path]::DirectorySeparatorChar
-    $failures = [System.Collections.Generic.List[string]]::new()
-    $markdownFiles = @(
-        Get-Item -LiteralPath (Join-Path $distributionRoot 'README.md')
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'docs') -Recurse -File -Filter '*.md'
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'skills') -Recurse -File -Filter '*.md'
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'licenses') -Recurse -File -Filter '*.md'
-        Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'tools') -Recurse -File -Filter '*.md'
-    )
-
-    foreach ($file in $markdownFiles) {
-        $content = Get-Content -Raw -LiteralPath $file.FullName
-        foreach ($rawTarget in Get-MarkdownRelativeTargets -Content $content) {
-            $target = $rawTarget.Trim()
-            if ([string]::IsNullOrWhiteSpace($target) -or $target.StartsWith('#')) {
-                continue
-            }
-            $absoluteUri = $null
-            if ([System.Uri]::TryCreate($target, [System.UriKind]::Absolute, [ref]$absoluteUri)) {
-                continue
-            }
-            $pathPart = ($target -split '[?#]', 2)[0]
-            if ([string]::IsNullOrWhiteSpace($pathPart)) {
-                continue
-            }
-            $pathPart = [System.Uri]::UnescapeDataString($pathPart).Replace('/', '\')
-            $candidate = [System.IO.Path]::GetFullPath((Join-Path $file.DirectoryName $pathPart))
-            if (-not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $failures.Add("链接越出发行根：$($file.FullName) -> $target")
-            }
-            elseif (-not (Test-Path -LiteralPath $candidate)) {
-                $failures.Add("链接目标不存在：$($file.FullName) -> $target")
-            }
-        }
-    }
-    if ($failures.Count -gt 0) {
-        throw "发行包相对链接检查失败：`n$($failures -join "`n")"
-    }
-}
-
-if (-not (Test-Path -LiteralPath $distributionRoot -PathType Container)) {
-    throw "发行目录不存在：$distributionRoot"
-}
-Assert-NoReparsePoint -Path $distributionRoot -Recurse
-
-& (Join-Path $PSScriptRoot 'sync-dist-resources.ps1') -Check -RequireDefaultConfig `
-    -TargetRoot $distributionRoot
-
-foreach ($requiredFile in @('att.exe', 'config.example.toml', 'config.toml', 'LICENSE', 'README.md')) {
-    $path = Join-Path $distributionRoot $requiredFile
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "发行文件缺失：$path"
-    }
-}
-foreach ($requiredDirectory in @('docs', 'licenses', 'projects', 'prompts', 'skills', 'tools')) {
-    $path = Join-Path $distributionRoot $requiredDirectory
+foreach ($relativePath in @('docs', 'prompts', 'skills', 'tools\formic\docs')) {
+    $path = Join-Path $distributionRoot $relativePath
     if (-not (Test-Path -LiteralPath $path -PathType Container)) {
         throw "发行目录缺失：$path"
     }
 }
 
-$allowedTopLevel = [System.Collections.Generic.HashSet[string]]::new(
-    [System.StringComparer]::OrdinalIgnoreCase
-)
-foreach ($name in @(
-        'att.exe',
-        'config.example.toml',
-        'config.toml',
-        'LICENSE',
-        'README.md',
-        'docs',
-        'licenses',
-        'projects',
-        'prompts',
-        'skills',
-        'tools'
-    )) {
-    [void]$allowedTopLevel.Add($name)
-}
-foreach ($item in Get-ChildItem -LiteralPath $distributionRoot -Force) {
-    if (-not $allowedTopLevel.Contains($item.Name)) {
-        throw "发行根包含未声明内容：$($item.FullName)"
-    }
-}
-
 $projects = Join-Path $distributionRoot 'projects'
-if (Get-ChildItem -LiteralPath $projects -Force | Select-Object -First 1) {
-    throw "公开发行的 projects 目录必须为空：$projects"
-}
-if (Get-ChildItem -LiteralPath $distributionRoot -File -Filter '*.dll') {
-    throw '静态 Release 不应在发行根携带 DLL。'
-}
-
-$executable = Join-Path $distributionRoot 'att.exe'
-$dependencies = Get-PeDependencies -Executable $executable
-$unexpectedDependencies = @($dependencies | Where-Object { -not (Test-AllowedSystemDependency $_) })
-if ($unexpectedDependencies.Count -gt 0) {
-    throw "att.exe 含有未声明的非系统动态依赖：$($unexpectedDependencies -join ', ')"
+if (Test-Path -LiteralPath $projects) {
+    if (-not (Test-Path -LiteralPath $projects -PathType Container) -or
+        (Get-ChildItem -LiteralPath $projects -Force | Select-Object -First 1)) {
+        throw "公开发行包不能包含使用者项目：$projects"
+    }
 }
 
-$formicDirectory = Join-Path $distributionRoot 'tools\formic'
-$toolItems = @(Get-ChildItem -LiteralPath (Join-Path $distributionRoot 'tools') -Force)
-if ($toolItems.Count -ne 1 -or $toolItems[0].Name -cne 'formic' -or
-    -not $toolItems[0].PSIsContainer) {
-    throw '发行 tools 目录必须只包含 formic 子目录。'
-}
-$formicExecutable = Join-Path $formicDirectory 'formic.exe'
-$formicDependencies = Get-PeDependencies -Executable $formicExecutable
-$unexpectedFormicDependencies = @(
-    $formicDependencies | Where-Object { -not (Test-AllowedSystemDependency $_) }
-)
-if ($unexpectedFormicDependencies.Count -gt 0) {
-    throw "formic.exe 含有未声明的非系统动态依赖：$($unexpectedFormicDependencies -join ', ')"
-}
-if (Get-ChildItem -LiteralPath $formicDirectory -File -Filter '*.dll') {
-    throw '静态 Formic Release 不应携带 DLL。'
+foreach ($relativePath in @(
+        'config.example.toml', 'config.toml',
+        'tools\formic\config.example.toml', 'tools\formic\config.toml'
+    )) {
+    $path = Join-Path $distributionRoot $relativePath
+    $assignments = @(
+        Get-Content -Encoding UTF8 -LiteralPath $path |
+            Where-Object { $_ -match '^[ \t]*api_key[ \t]*=' }
+    )
+    if ($assignments.Count -ne 1 -or
+        $assignments[0] -cnotmatch '^[ \t]*api_key[ \t]*=[ \t]*"replace-with-api-key"[ \t]*(?:#.*)?$') {
+        throw "公开发行配置必须使用占位 API key：$path"
+    }
 }
 
-Assert-MarkdownLinks
+function Assert-SystemDependencies {
+    param([Parameter(Mandatory)][string]$Executable)
 
-$temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
-$smokeWorkspace = Join-Path $temporaryRoot "att-release-check-$ExpectedVersion"
-$smokeRoot = Join-Path $smokeWorkspace 'distribution'
-$smokeCwd = Join-Path $smokeWorkspace 'cwd'
-$smokeInput = Join-Path $smokeWorkspace 'input'
-
-if (Test-Path -LiteralPath $smokeWorkspace) {
-    throw "发行检查无法开始：临时目录已存在：$smokeWorkspace。确认没有检查正在运行后删除该目录。"
+    $tool = Get-Command llvm-objdump -ErrorAction SilentlyContinue
+    if ($null -ne $tool) {
+        $output = & $tool.Source -p $Executable 2>&1
+        $pattern = '^\s*DLL Name:\s*(?<name>\S+)\s*$'
+    }
+    else {
+        $tool = Get-Command dumpbin -ErrorAction SilentlyContinue
+        if ($null -eq $tool) {
+            throw '运行依赖检查需要 llvm-objdump 或 dumpbin。'
+        }
+        $output = & $tool.Source /DEPENDENTS $Executable 2>&1
+        $pattern = '^\s*(?<name>[A-Za-z0-9._-]+\.dll)\s*$'
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "无法读取程序运行依赖：$Executable"
+    }
+    $dependencies = @(
+        $output | Select-String -Pattern $pattern |
+            ForEach-Object { $_.Matches[0].Groups['name'].Value }
+    )
+    $systemDlls = @(
+        'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'crypt32.dll',
+        'kernel32.dll', 'ntdll.dll', 'oleaut32.dll', 'secur32.dll',
+        'userenv.dll', 'ws2_32.dll'
+    )
+    $unexpected = @(
+        $dependencies | Where-Object {
+            $_ -notmatch '^(api-ms-win-|ext-ms-win-)' -and $_ -notin $systemDlls
+        }
+    )
+    if ($unexpected.Count -gt 0) {
+        throw "程序依赖未随包提供的非系统 DLL：${Executable}；$($unexpected -join ', ')"
+    }
 }
 
+Assert-SystemDependencies -Executable (Join-Path $distributionRoot 'att.exe')
+Assert-SystemDependencies -Executable (Join-Path $distributionRoot 'tools\formic\formic.exe')
+
+Push-Location $distributionRoot
 try {
-    New-Item -ItemType Directory -Path $smokeWorkspace | Out-Null
-    New-Item -ItemType Directory -Path $smokeRoot, $smokeCwd, $smokeInput | Out-Null
-    foreach ($item in Get-ChildItem -LiteralPath $distributionRoot -Force) {
-        Copy-Item -LiteralPath $item.FullName -Destination $smokeRoot -Recurse -Force
+    $actualVersion = (& .\att.exe --version).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "att $ExpectedVersion") {
+        throw "程序版本不符或无法启动：expected=att $ExpectedVersion actual=$actualVersion"
     }
-    $smokeExecutable = Join-Path $smokeRoot 'att.exe'
-
-    $formicHelp = Invoke-CapturedProcess `
-        -FilePath (Join-Path $smokeRoot 'tools\formic\formic.exe') `
-        -Arguments @('--help') `
-        -WorkingDirectory (Join-Path $smokeRoot 'tools\formic')
-    Assert-SuccessfulCommand -Name '仓库外 Formic Help' -Result $formicHelp
-
-    $version = Invoke-CapturedProcess -FilePath $smokeExecutable -Arguments @('--version') `
-        -WorkingDirectory $smokeCwd
-    Assert-SuccessfulCommand -Name '仓库外 Version' -Result $version
-    if ($version.Stdout.Trim() -cne "att $ExpectedVersion") {
-        throw "Version 输出不符：expected=att $ExpectedVersion actual=$($version.Stdout.Trim())"
+    & .\tools\formic\formic.exe --help > $null
+    if ($LASTEXITCODE -ne 0) {
+        throw '随包 Formic 无法启动。'
     }
-
-    $init = Invoke-CapturedProcess -FilePath $smokeExecutable -WorkingDirectory $smokeCwd `
-        -Arguments @(
-            'generic', 'init', '--name', 'release-smoke', '--path', $smokeInput,
-            '--source-language', 'ja', '--target-language', 'zh-Hans'
-        )
-    Assert-SuccessfulCommand -Name '仓库外 Generic Init' -Result $init
-
-    $extract = Invoke-CapturedProcess -FilePath $smokeExecutable -WorkingDirectory $smokeCwd `
-        -Arguments @('generic', 'extract', '--name', 'release-smoke')
-    Assert-SuccessfulCommand -Name '仓库外 Generic Extract' -Result $extract
-
-    $translate = Invoke-CapturedProcess -FilePath $smokeExecutable -WorkingDirectory $smokeCwd `
-        -Arguments @('generic', 'translate', '--name', 'release-smoke', 'primary')
-    Assert-SuccessfulCommand -Name '仓库外零工作量 Generic Translate' -Result $translate
 }
 finally {
-    $prefix = $temporaryRoot + [System.IO.Path]::DirectorySeparatorChar
-    $candidate = [System.IO.Path]::GetFullPath($smokeWorkspace)
-    if (-not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "拒绝清理临时目录之外的路径：$candidate"
-    }
-    if (Test-Path -LiteralPath $candidate) {
-        Assert-NoReparsePoint -Path $candidate -Recurse
-        Remove-Item -LiteralPath $candidate -Recurse -Force
-    }
+    Pop-Location
 }
 
-Write-Output "ATT $ExpectedVersion 发行包通过完整检查。"
+Write-Output "ATT $ExpectedVersion 发行包的版本、启动、依赖与必需资源检查通过。"

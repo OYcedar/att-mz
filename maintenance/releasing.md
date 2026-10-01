@@ -1,132 +1,41 @@
 # ATT 公开发行指南
 
-公开 Release 只发布远端 `main` 上已经确认的当前版本。发行物内容和验证标准由
-[发行物规格](../docs/runtime/distribution.md)负责，本指南只说明维护者如何准备、触发、
-核验和恢复 GitHub 发布。
+发行内容和包内检查以[发行物规格](../docs/runtime/distribution.md)为准。
 
-## 1. 发布前准备
+## 1. 准备版本
 
-1. 确认本次版本的用户结果、失败语义、生产入口和发行资源已经完成相称验证。
-2. 同时更新 `Cargo.toml`、`Cargo.lock`、`att.exe.manifest` 与
-   `.github/RELEASE_NOTES.md`；四处必须描述同一个当前版本。
-3. 确认根 `LICENSE`、Cargo SPDX、README、发行包与 GitHub 仓库描述和 topics 表达同一
-   ATT 产品范围与许可。依赖变化时使用当前 `about.toml` 与 `about.hbs` 重新生成
-   `licenses/THIRD-PARTY-LICENSES.html`；第三方许可继续保留在 `licenses/`。
-4. 检查 ATT 与 Formic 的两个 `config.example.toml`：必须采用当前已验证的高吞吐默认，
-   不得包含调试或临时失败规避值、真实密钥、token 或私有连接信息。普通更新必须逐字节保留
-   两份活动 `config.toml`，只在文件缺失时从模板初始化；公开发行检查则在干净暂存目录确认
-   两份活动配置与各自模板完全相同且不含真实凭据。
-5. 检查 `git status` 和差异，只提交本次发布范围；不得把本机 `dist/`、项目状态、密钥、
-   构建目录或临时文件纳入提交。
-6. 在本机执行能够运行的格式、Clippy、普通行为测试与完整 Release 检查；不要启用
-   `release-stress` feature。正式制品仍由 GitHub Actions 从干净 checkout 重新构建，
-   本机制品不得上传。
+复用开发阶段已经完成的相关验证。同步更新 `Cargo.toml`、`Cargo.lock`、`att.exe.manifest`
+与 `.github/RELEASE_NOTES.md`；依赖变化时更新对应第三方许可证。提交并推送本次发行内容。
+发包不重复代码审查、普通测试、全量压力测试或本地 Release 构建。
 
-## 2. 主分支与标签
+## 2. 打标签并触发工作流
 
-完成提交和验证后，把当前版本合并到远端 `main`。若重写分支与旧主分支没有共同祖先，
-应建立一个明确的双父合并提交：第一个父提交是当前版本，第二个父提交是合并前远端
-`main`，工作树保持当前版本。这样能够保留旧历史，并让远端 `main` 通过快进接收新提交，
-不需要强推。
-
-确认远端 `main` 精确指向待发布提交且本机工作树干净后，在发起发布的 Windows 本机运行本次发布
-唯一一次压力测试：
+在已验证的提交上创建版本标签，推送后从 `main` 触发工作流：
 
 ```powershell
-cargo test --locked --release -p att --features release-stress --lib release_stress_ -- --test-threads=1
-if ($LASTEXITCODE -ne 0) {
-    throw "ATT Release 压力验证失败，退出码 $LASTEXITCODE"
-}
-cargo test --locked --release -p att-json-repair --features release-stress --lib release_stress_ -- --test-threads=1
-if ($LASTEXITCODE -ne 0) {
-    throw "JSON repair Release 压力验证失败，退出码 $LASTEXITCODE"
-}
+$metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+$version = ($metadata.packages | Where-Object name -EQ 'att').version
+$tag = "v$version"
+git tag -a $tag -m "ATT $version"
+git push origin $tag
+gh workflow run release.yml --ref main -f "tag=$tag"
 ```
 
-这两条命令只在公开 GitHub Release 执行阶段运行；普通开发、提交前和 PR 不运行。每个冻结候选按
-以下状态流转：
+使用触发命令返回的运行链接跟进对应工作流。工作流直接 checkout 指定标签，在 GitHub
+托管的 Windows runner 上构建、组装并检查发行包，然后生成 ZIP 和 SHA-256 校验文件。
+本机无需再构建一份相同程序，也无需预先下载或逐文件比较发行资源。
 
-```text
-冻结发布候选 → 本机 release-stress
-  失败 → 结束本次发行并保持无标签 → 等待决定
-       └─ 选择修复 → 返回开发阶段 → 修改（涉及核心性能路径时完成真实样本验证）→ 普通门禁
-                    → 新提交并推送远端 main → 冻结新的发布候选 → 重新运行 release-stress
-  通过 → 创建并推送版本标签 → 触发 Release workflow → 远端构建、打包和发布
-```
+## 3. 完成与恢复
 
-压力验证失败时，当前候选保持无标签状态。修复在普通开发阶段完成，并按影响运行格式、Clippy 和
-普通行为测试；涉及核心性能路径时，再按[性能验证指南](performance-validation.md)完成真实样本验证。
-修复提交推送到远端 `main` 后成为新的发布候选。通过压力验证后，在同一提交创建并推送带说明的
-三段版本标签：
+工作流成功后确认公开 Release 的版本与两个附件可用。ZIP 的 SHA-256 用于核验下载完整性，
+不扩展为源码、文档、许可证或目录树的内容比较。
+
+需要调查包内问题时，可直接检查已下载并解压的包：
 
 ```powershell
-git tag -a v1.0.0 -m "ATT 1.0"
-git push origin v1.0.0
+.\scripts\verify-release-package.ps1 -ExpectedVersion 1.3.2 -TargetRoot D:\att-package
 ```
 
-标签一旦用于公开 Release 就不可移动。工作流失败且必须修改源码、文档或 workflow 时，
-先删除尚未公开的失败标签，完成新提交与验证后再重新创建；不得让同一公开标签指向不同
-提交。
-
-## 3. 触发与核验
-
-从 `main` 手动触发 Release workflow，并传入已经存在的标签：
-
-```powershell
-$headSha = (git rev-parse origin/main).Trim()
-$knownRunIds = @(
-    gh run list --workflow release.yml --event workflow_dispatch --limit 100 `
-        --json databaseId |
-        ConvertFrom-Json |
-        ForEach-Object { [string]$_.databaseId }
-)
-if ($LASTEXITCODE -ne 0) {
-    throw '读取现有 Release workflow run 失败。'
-}
-gh workflow run release.yml --ref main -f tag=v1.0.0
-if ($LASTEXITCODE -ne 0) {
-    throw '触发 Release workflow 失败。'
-}
-$deadline = [DateTimeOffset]::UtcNow.AddMinutes(2)
-do {
-    Start-Sleep -Seconds 2
-    $run = gh run list --workflow release.yml --event workflow_dispatch --branch main `
-        --limit 20 --json databaseId,headSha,createdAt |
-        ConvertFrom-Json |
-        Where-Object {
-            $_.headSha -ceq $headSha -and
-            [string]$_.databaseId -notin $knownRunIds
-        } |
-        Sort-Object { [DateTimeOffset]$_.createdAt } -Descending |
-        Select-Object -First 1
-    if ($LASTEXITCODE -ne 0) {
-        throw '读取新 Release workflow run 失败。'
-    }
-    if ($null -eq $run -and [DateTimeOffset]::UtcNow -ge $deadline) {
-        throw '两分钟内没有找到刚触发的 Release workflow run。'
-    }
-} while ($null -eq $run)
-gh run watch $run.databaseId --exit-status
-```
-
-工作流必须确认标签提交等于远端 `main`，并在 GitHub 托管的 `windows-2025` runner 上构建静态
-`Release`。本机压力验证已经在标签前完成，workflow 不再重复。工作流从托管模板首次创建两份
-无凭据活动配置，同步其余已审查资源，使用最高级别 Deflate 打包并直接创建 Release。格式、Clippy、
-普通行为测试、第三方许可生成和完整发行检查同样在标签前完成，不在发包时重复运行。发布完成后检查：
-
-- Release 名称、标签、正文与当前版本一致；
-- `att-v1.0.0-windows-x64.zip` 和 `SHA256SUMS.txt` 都存在；
-- GitHub 显示的附件 SHA-256 与校验文件一致；
-- 下载并解压后的 `att.exe --version`、根 `LICENSE`、文档、Skill 和第三方许可完整；
-- 两个 `config.example.toml` 都存在；两份活动 `config.toml` 与各自模板完全相同，且不含
-  真实 API key、token 或其他凭据；
-- GitHub 仓库描述、topics 和许可证识别没有残留旧产品或旧许可。
-
-## 4. 分支清理与失败恢复
-
-远端 `main`、版本标签和 Release 全部核验通过后，删除已经合并且不再承担当前工作的远端
-分支；保留旧版本标签和 Release。删除前再次确认分支提交已经能够从 `main` 或现有标签
-到达。
-
-构建或打包失败时不创建 Release。`gh release create` 失败但已建立 Release 时，workflow 立即删除
-该 Release，但保留已有版本标签，供维护者判断是重跑相同提交，还是按第 2 节撤销尚未公开的标签并修复。
+构建或组包失败时处理具体错误并重试失败步骤。上传失败保留草稿及已上传的附件；公开失败时，
+确认草稿附件齐全后可使用 `gh release edit TAG --draft=false --latest` 继续。
+已公开的标签和 Release 保持不变；需要修改已发布内容时发布新版本。

@@ -1,137 +1,67 @@
 # ATT 发行物现行规格
 
-`dist/` 是 ATT 面向使用者的完整发行包。它必须在目标 Windows x64 环境中独立工作；
-源码仓库、构建目录、调用命令时的当前工作目录和其他 ATT 安装都不是发行资源来源。
+ATT 发布 Windows x64 静态 Release。发行包包含程序、配置模板、Prompt、使用文档、Skill、
+许可证和随包 Formic，使用者可以从包内完成安装与运行。
 
-## 1. 唯一发行根
+## 1. 发行内容
 
-实际运行的 `att.exe` 所在目录是唯一发行根。固定布局为：
+实际运行的 `att.exe` 所在目录是发行根：
 
 ```text
 <att-dir>/att.exe
 <att-dir>/config.toml
 <att-dir>/config.example.toml
 <att-dir>/LICENSE
-<att-dir>/projects/<mv|mz|generic>/<project-name>/
-<att-dir>/prompts/
 <att-dir>/README.md
 <att-dir>/docs/
+<att-dir>/prompts/
 <att-dir>/skills/
 <att-dir>/licenses/
 <att-dir>/tools/formic/
 ```
 
-程序固定从该目录读取 `config.toml`，并使用同目录下的 `projects/` 和 `prompts/`；
-不接受外部配置或资源根，也不把源码目录或调用 cwd 当作备用位置。`projects/` 可以在首次
-Init 前不存在，由 ATT 在实际需要时建立。游戏、JSONL、Rules、术语、Placeholder、Lua
-等 CLI 显式路径仍按[配置规格](configuration.md#6-路径与敏感信息)从调用 cwd 解析。
+| 内容 | 用途与来源 |
+| --- | --- |
+| `att.exe` | 当前版本的 Windows x64 静态 Release 程序 |
+| `config.example.toml` | 仓库中的 ATT 配置模板，API key 使用占位值 |
+| `config.toml` | 首次从模板创建的活动配置 |
+| `LICENSE` | ATT 的 `AGPL-3.0-only` 许可正文 |
+| `README.md`、`docs/`、`prompts/`、`skills/` | 当前仓库的使用者资源 |
+| `licenses/` | ATT 与 Formic 的第三方许可证；依赖变化时更新对应内容 |
+| `tools/formic/` | 静态 `formic.exe`、许可、来源说明、配置模板、README 和用户文档 |
 
-发行根中的项目和发布目标需要满足[目录发布的存储条件](directory-publishing.md#3-候选目录)：
-本地固定磁盘、NTFS、大小写不敏感的目录。安装时选择符合这些条件的可写目录。
+ATT 与 Formic 只依赖目标 Windows 提供的系统 DLL。公开包由干净 checkout 组装，
+不携带使用者项目、真实凭据、源码构建目录或开发缓存。`projects/` 由运行过程按需创建；
+公开包携带该目录时保持为空。
 
-发行包中的 Skill 也以同一目录为产品与知识根，只使用包内的程序、配置、项目、Prompt
-和文档。缺少本次任务需要的包内资源时，应报告发行缺口，不能从源码仓库、其他安装或
-任务目录拼接替代内容。
+配置、项目、Prompt 和包内资源的路径规则见[配置规格](configuration.md)。Skill 中的 Python
+辅助程序是可选工具，发行包不捆绑 Python。文档与 Skill 使用包内资源和有效的外部资料链接。
+项目和写回目标的存储条件见[目录发布规格](directory-publishing.md#3-候选目录)。
 
-根 `config.example.toml` 和 `tools/formic/config.example.toml` 是托管模板；各自的
-`config.toml` 是实际读取的活动配置。干净发行包首次从模板创建活动配置，使用者填写后
-属于本地状态，普通资源更新不能覆盖。
+## 2. 资源复制与使用者状态
 
-## 2. 完整发行集合
+`scripts/sync-dist-resources.ps1` 从仓库复制上述托管资源，默认目标为 `dist/`，也可通过
+`-TargetRoot` 指定发行目录。托管目录更新时清理已失效的资源；ATT 与 Formic 的活动
+`config.toml` 已存在时保持原样，缺失时才从各自模板创建。脚本不修改 `att.exe` 或 `projects/`。
 
-当前发行包由以下内容组成：
+资源复制以文件操作成功为结果。发行验收不比较源码和包内资源的逐文件摘要、字节、换行格式
+或目录全集；许可证和文档的 CRLF/LF 差异不构成发行失败。
 
-| 内容 | 发行要求 |
-|---|---|
-| `att.exe` | 目标 Windows x64 平台的 ATT `Release` 构建结果 |
-| 非系统运行依赖 | 当前 `Release` 制品实际需要且受支持 Windows 环境不保证提供的运行库，放在程序可直接加载的位置；精确集合以当前制品的依赖检查为准 |
-| `config.example.toml` | 与仓库根同名文件内容完全相同，是 ATT 当前不含真实凭据、高吞吐发行默认的托管模板 |
-| `config.toml` | 干净公开发行中与根 `config.example.toml` 内容完全相同；首次配置后属于本地使用者状态，普通资源更新不得覆盖 |
-| `LICENSE` | 与仓库根 `LICENSE` 完全相同，是 ATT 自有代码和文档的 `AGPL-3.0-only` 许可正文 |
-| `README.md` | 与仓库根 `README.md` 完全相同 |
-| `docs/` | 与仓库 `docs/` 的完整文件集合和内容完全相同 |
-| `prompts/` | 与仓库 `prompts/` 的完整文件集合和内容完全相同 |
-| `skills/` | 与仓库 `skills/` 的完整文件集合和内容完全相同 |
-| `licenses/` | 与仓库 `licenses/` 的完整文件集合和内容完全相同；`THIRD-PARTY-LICENSES.html` 对应 ATT 依赖，`FORMIC-THIRD-PARTY-LICENSES.html` 对应随包 Formic 依赖 |
-| `tools/formic/` | 当前 Formic Windows x64 静态 `Release`：`formic.exe`、许可与来源说明、配置模板、README、完整用户文档和首次创建后保留的活动配置；不得携带 DLL |
-| `projects/` | 运行期项目工作区；不属于仓库资源同步集合，已有项目内容不能被发行资源同步覆盖或删除 |
+## 3. 构建、检查与发布
 
-`docs/`、`prompts/`、`skills/`、`licenses/`、两个配置模板和 Formic 的程序与用户文档都是发行
-托管资源，必须与当前仓库权威来源一致。两份活动 `config.toml` 只在干净发行根中要求与
-各自模板完全相同；普通更新遇到已有活动配置时必须逐字节保留，不能把它的内容差异当作资源
-不同。目录内多出源码中已不存在的托管文件、缺少托管文件或任一托管文件内容不同，才表示
-发行资源不一致。
+Release workflow 从明确的版本标签 checkout，使用锁定工具链和依赖构建静态程序，
+在空发行目录复制资源并创建占位配置。标签固定发布内容，后续 `main` 的推进不改变该标签。
+标签、Cargo 版本、Windows manifest 和程序 `--version` 使用同一版本号。
 
-## 3. 包内自足与链接
+`scripts/verify-release-package.ps1` 只检查指定发行包自身：
 
-使用者只靠发行包就能读取现行文档、按照 Skill 组织任务并执行 ATT。所有指向发行文件的
-相对链接必须在包内解析到实际文件；文档或 Skill 不能通过本地链接指向源码仓库、构建
-目录或维护者机器上的路径。明确指向外部资料的 Web 链接不属于包内文件链接。
+- 程序、配置、Prompt、Skill、文档和许可证等必需资源存在；
+- 公开配置使用占位 API key，包中没有使用者项目；
+- ATT 与 Formic 只依赖系统 DLL，并能启动；ATT 的版本与标签一致。
 
-Skill 可以随包提供标准库 Python 辅助程序，用于加速调查和准备材料；这些程序是可选工具，
-不是 `att.exe` 的运行依赖，发行包不捆绑或自动安装 Python。环境已有 Python 3.11 或更新
-版本时 Skill 优先调用；没有时必须说明并继续使用文档规定的人工调查流程。辅助程序不得从
-源码仓库读取资源，也不得把使用者游戏或项目内容写进发行包。测试代码、测试材料、Python
-开发配置和缓存放在 Skill 目录之外，不得随 `skills/` 同步。
+这些检查在远端组装发行包后执行一次。开发阶段已经取得的格式、Clippy、行为与性能验证结果
+直接复用；发包不另行要求本地构建、业务流程复测、文档链接扫描或全量压力测试。
 
-仓库的 `docs/` 作为完整集合发布，保存当前产品规格和完成发行内任务所需的指南。
-只供源码维护使用的资料放在该同步集合之外。`AGENTS.md`、
-`maintenance/`、源码、测试、构建目录与缓存、历史版本文件都不进入发行包。根
-两个 `config.example.toml` 是允许且必须存在的托管模板。
-当前同步脚本会直接拒绝发行根下的 `AGENTS.md`、`maintenance/`、`src/`、`tests/` 和
-`target/`；完整发行检查同时确认其余禁止内容。
-
-## 4. 同步与验证责任
-
-仓库脚本 `scripts/sync-dist-resources.ps1` 负责以下资源映射：
-
-- `README.md`、`LICENSE`、`config.example.toml` → `dist/` 下的同名文件；
-- `dist/config.toml` 不存在时，从根 `config.example.toml` 首次创建；已经存在时逐字节保留；
-- `licenses/`、`docs/`、`prompts/`、`skills/` → `dist/` 下的同名目录；
-- `tools/formic/` 中的程序、许可、来源说明、配置模板、README 和完整用户文档 → 发行包同名目录；活动
-  `config.toml` 缺失时从模板创建，已经存在时逐字节保留。
-
-普通执行同步这些资源；`-Check` 只比较映射后的文件集合和逐文件 SHA-256，并检查脚本明确
-列出的开发材料。普通检查只要求活动配置存在，不把它与模板作摘要比较；公开发行检查才要求
-二者完全相同。该脚本不修改或证明 `att.exe` 和 `projects/` 的状态，也不代替包内链接与
-独立运行检查。
-同步 Formic 时以本节列出的当前托管集合直接收敛目录：删除不在当前集合中的文件或目录，并替换
-当前托管资源；已有活动 `config.toml` 始终逐字节保留。该收敛不使用历史文件名清单，也不触碰
-发行根中的 `projects/`；ATT 与 Formic 的活动配置仍按前述使用者状态规则保留。
-
-脚本默认操作仓库 `dist/`；公开发行验证可以用 `-TargetRoot` 指向新建的干净暂存目录。
-无论目标在哪里，脚本都只从当前仓库权威资源读取，并拒绝操作目标根之外的路径。
-
-完整发行检查因此同时承担以下责任：
-
-1. 确认 `att.exe` 是当前目标平台的 `Release` 构建结果，并能从发行根启动；
-2. 确认 `formic.exe --help` 能从随包目录启动、只依赖受支持 Windows 的系统 DLL，并且许可与用户文档已经随包提供；
-3. 执行资源同步检查，确认映射文件没有缺失、陈旧副本或内容差异；
-4. 确认两个托管配置模板采用已经验证的高吞吐默认且不含秘密；检查干净公开发行时，还必须
-   确认两份活动配置逐字节等于各自模板，并且不含真实 API key、token 等凭据；
-5. 检查包内相对链接全部有效，并确认禁止内容没有进入发行包；
-6. 从源码仓库之外调用实际发行程序，确认 ATT 的固定配置、项目和 Prompt 路径只依赖发行根。
-
-只有上述程序、依赖、资源、链接和独立运行检查共同通过，才能把 `dist/` 视为完整发行物。
-
-## 5. 公开 Release
-
-公开 Release 只由 `.github/workflows/release.yml` 从远端 `main` 当前提交上的现有版本标签
-构建。标签使用 `vMAJOR.MINOR.PATCH`，版本必须同时等于 `Cargo.toml`、`Cargo.lock`、CLI
-`--version` 和 Windows manifest 中的版本；标签提交必须就是触发时的远端 `main`。
-
-标签建立前完成格式、Clippy、普通行为测试、第三方许可重生成、PE 依赖和本规格第 4 节完整检查。
-普通测试不启用 `release-stress` feature；合成的大容量、超深结构和墙钟性能回归不属于提交前或
-PR 门禁。正式发布提交和版本冻结后，由发起发布的 Windows 本机在推送版本标签、触发 workflow
-和远端打包前，分别运行根 crate 与 `att-json-repair` crate 的 `release-stress` 测试组；这是该组
-唯一的执行入口。通过压力验证的候选才可创建版本标签并进入远端发包；失败候选保持无标签状态。
-修复完成相称的普通验证，形成并推送新提交到远端 `main` 后成为新的发布候选，重新执行同一压力门禁。
-
-Release workflow 不重复普通检查或 `release-stress`。它在 GitHub 托管的 `windows-2025` runner
-上使用锁定工具链和依赖构建静态 `att.exe`，从空的 `dist/` 同步托管资源并首次创建两份活动配置，
-再确认活动配置与各自模板完全相同且不含真实凭据，校验 `att.exe --version`、打包并发布。
-`projects/` 作为空目录进入压缩包。
-
-正式附件固定为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 和 `SHA256SUMS.txt`。ZIP 使用
-兼容 Windows 常用解压工具的标准 Deflate，并采用可用工具的最高压缩级别。同一 job 完成构建、
-打包和 GitHub Release 创建，不上传或下载中间 artifact。
+正式附件为 `att-vMAJOR.MINOR.PATCH-windows-x64.zip` 与 `SHA256SUMS.txt`。ZIP 使用标准
+Deflate 压缩；SHA-256 用于下载完整性校验。工作流先上传草稿和附件，再公开 Release。
+上传或公开失败时保留已有草稿供恢复，已经公开的标签和 Release 保持不变。

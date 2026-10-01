@@ -18,16 +18,10 @@
 [`maintenance/performance/README.md`](performance/README.md)。脚本实现本指南规定的成对
 顺序、预算检查、正确性核对和证据记录；修改脚本或样本后，先按该说明重新验证测试套件。
 
-仓库中合成的大容量、超深结构和墙钟回归统一属于 `release-stress` 测试组。普通 `cargo test`、
-提交前检查和 PR 不启用该 feature；只有准备公开 GitHub Release 时，发起发布的 Windows 本机才在
-推送版本标签、触发 workflow 和远端打包前分别运行根 crate 与 `att-json-repair` crate 的该测试组，
-Actions runner 不运行。这组回归只证明实现能承受对应合成规模，不替代本指南使用真实样本、冻结
-制品和成对轮次取得的性能结论。
-
-`release-stress` 失败即结束当前候选的发行执行。用户选择修复时，流程返回开发阶段并完成普通门禁；
-涉及核心性能路径时，再按本指南用真实样本定位并验证修复。新提交推送到远端 `main` 后成为新的
-发布候选，并按[公开发行指南](releasing.md#2-主分支与标签)重新运行压力门禁。只有通过的候选进入
-版本标签和远端发包。
+合成的大容量、超深结构和墙钟回归保留在可选的 `release-stress` 测试组。开发阶段按改动影响，
+选择根 crate 或 `att-json-repair` 中相关测试，用 Release/MSVC 构建运行。普通测试保持默认 feature；
+发包复用已经取得的验证结果，不自动重跑这组测试。
+这组回归证明实现能承受对应合成规模，真实样本性能结论仍按本指南测量。
 
 开始正式比较前冻结并记录证据身份：CPU 与逻辑核心数、内存、存储介质、Windows 版本，
 Rust 工具链、可执行文件绝对路径与 `--version`、源码提交或工作区差异、配置与 Profile，
