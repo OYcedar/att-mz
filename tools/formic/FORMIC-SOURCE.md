@@ -1,17 +1,17 @@
 # Formic 程序与源码来源
 
-本目录提供 Formic 0.3.0 的 Windows x64 修订制品，运行时直接调用同目录的 `formic.exe`。
+本目录提供 Formic 0.3.0 的 Windows x64 本机修订制品，运行时直接调用同目录的 `formic.exe`。
 
 | 项目 | 当前制品 |
 | --- | --- |
 | 源码仓库 | [yexi-by/formic](https://github.com/yexi-by/formic) |
-| 源码提交 | [f54d0fb](https://github.com/yexi-by/formic/commit/f54d0fb308dbda5611b7780d6e4474bfba67eb56) |
-| 来源状态 | 已推送到源码仓库 `master`，可公开获取 |
+| 源码提交 | `d710c49fdd11371eea30396705be9e50faaec4b5` |
+| 来源状态 | 已在本机 Formic 工程提交，尚未推送远端 |
 | 编译器 | Rust 1.97.1 |
 | 构建目标 | `x86_64-pc-windows-msvc`，Release，静态 C Runtime |
-| `formic.exe` SHA-256 | `b25bd10097b404cb03bbce30d74d094cf65b5bd30782da2b1c882fd64dcc4825` |
+| `formic.exe` SHA-256 | `65a4031ccb5508bae3318e96f1e03a39e4811e63d15ce030ec1e9f4124119fda` |
 
-通过上表的源码提交链接可以获取并核验本制品对应的精确源码。
+当前修订的精确源码保存在本机 Formic 工程。公开分发前先把上表提交推送到源码仓库，确保对应源码可获取。
 
 ## 从对应源码构建
 
