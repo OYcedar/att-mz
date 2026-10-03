@@ -29,6 +29,10 @@ RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写�
 Ren'Py 项目通过 Generic JSONL 翻译时，读取 [Ren'Py 汉化技能](../renpy-localization/SKILL.md)，
 补充原生翻译模板、硬编码界面、反向转换、字体与独立补丁的检查。
 
+RPG Developer Bakin 项目通过外部适配器接入 Generic 时，读取
+[Bakin 原生资源往返与播放器消费者](references/engine-bakin-native-roundtrip.md)，
+补充二进制目录、控制码、窗口标题、原生菜单和内嵌字体的调查与验证。
+
 ## 1. 调查
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
