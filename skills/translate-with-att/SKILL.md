@@ -29,6 +29,10 @@ RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写�
 Ren'Py 项目通过 Generic JSONL 翻译时，读取 [Ren'Py 汉化技能](../renpy-localization/SKILL.md)，
 补充原生翻译模板、硬编码界面、反向转换、字体与独立补丁的检查。
 
+Kirikiri / KAG / TJS 项目通过 Generic 接入，或汉化后出现标题与菜单漏翻、对象重名、控制符混排时，
+读取 [Kirikiri 显示消费者与补丁加载经验](references/engine-kirikiri-kag-tjs.md)，
+核对显示与内部身份、实际加载入口、动态表达式及游戏侧回填；该指引不表示 ATT 原生支持此引擎。
+
 ## 1. 调查
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
