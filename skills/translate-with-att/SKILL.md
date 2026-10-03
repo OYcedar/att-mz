@@ -29,6 +29,10 @@ RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写�
 Ren'Py 项目通过 Generic JSONL 翻译时，读取 [Ren'Py 汉化技能](../renpy-localization/SKILL.md)，
 补充原生翻译模板、硬编码界面、反向转换、字体与独立补丁的检查。
 
+发现 TyranoScript 场景与 Electron `app.asar` 容器时，读取
+[TyranoScript／Electron ASAR 经验](references/engine-tyrano-electron-asar.md)，
+补充显示消费者、Generic 映射、标签拓扑、字体、流式回填和独立补丁的检查。
+
 ## 1. 调查
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
@@ -81,84 +85,3 @@ Extract 完成后导出完整 Manual：
 
 ```powershell
 att <mv或mz或generic> manual export --name <项目名> --selection all <工作目录>\final-manual.toml
-```
-
-这份 Manual 是本轮术语和翻译的完整语料。来源、Rules、所有权或 Extract 发生变化时，重新导出
-Manual，并用新语料更新术语和后续 QA。
-
-需要检查 RPG Maker Placeholder 候选时，在 Translate 前运行随包
-`translation_preflight.py`，把确认的保护规则交给 ATT。
-
-## 3. 术语
-
-读取 `skills/extract-game-terminology/SKILL.md`，从完整 Manual 制作最终 `terminology.toml`。
-Agent 可以直接完成全部语料；大量独立语料分片也可以交给随包 Formic 生成候选，再由 Agent
-统一筛选和定译。最终术语文件由 ATT `translate --terms` 读取。
-
-## 4. Translate
-
-使用当前 ATT 配置、术语和 Placeholder 运行对应引擎的 Translate。命令结束后按 Translate 规格
-确认 NoWork、Complete 或 Incomplete 的汇总，以及失败或取消时已经保留的进度，再导出当前译文：
-
-```powershell
-att <mv或mz或generic> translation export --name <项目名> <工作目录>\translations.jsonl
-```
-
-Incomplete 中的 Partial、Unavailable 和未开始 Task 按恢复指南处理。当前 Rejected 只有显式
-`--retry-rejected` 才重新请求；也可以用 `manual export --selection rejected` 导出修订。
-少量剩余、语境歧义和已经定位的质量问题使用 Manual TOML 集中补译或修订。
-
-## 5. QA
-
-按 `docs/guides/acceptance.md` 检查完整译文。Agent 负责原意、目标语自然度、上下文、人物语气、
-叙事和专名译法的全量审校。随包 `translation_qa.py` 提供以下静态检查：
-
-- 可见文本覆盖和所有权；
-- 术语表的字面匹配；
-- Placeholder、控制符、空槽、结构和换行；
-- 源语言残留、模型说明、异常转义和布局风险。
-
-独立 Generic 使用 `--generic-input` 提供同源 JSONL；RPG Maker 使用相应调查与所有权证据。
-先查看 QA 摘要中的确定状态和未验证项，再按验收指南审核 Review 组。把确认的问题与语义审校发现
-合并，按自然 ID 导出到 Manual，集中修订、apply、重新导出并复查。报告分别说明静态检查、
-Agent 语义审校和仍需人工实机观察的场景。
-
-## 6. WriteBack
-
-QA 修订完成后执行对应引擎的 WriteBack。已经确认具体位置和显示宽度时使用排版规则；规则文件
-按 `docs/translation/write-back-layout-rules.md` 编写。
-
-RPG Maker 输出部署到隔离游戏副本。Generic 输出交给本任务已经确定的外部反向转换，并核对每个
-JSONL Unit 与实际来源位置。组合项目按真实加载顺序合并，确保每个位置采用唯一译文。
-
-## 7. 字体与封包
-
-RPG Maker 游戏按[字体工具指南](../../docs/guides/nwjs-font-tools.md#2-递归字体调查替换与恢复)
-在隔离副本中执行 `manage_rpg_maker_fonts.py apply`；需要修改前比较或只读调查时先用 `inspect`。
-可选字体包括随 Skill 提供的 Noto Sans CJK SC、Noto Serif CJK SC 和霞鹜文楷 GB。
-其他引擎按实际字体加载方式处理。根据完整译文字符集检查 glyph 覆盖，并保留游戏使用的字体
-名称与加载关系。
-
-Unity 项目出现 TMP 中文方框、需要选择静态字体补丁或运行时字体插件时，读取
-[Unity TMP 字体修复与 MOD 交付经验](references/engine-unity-tmp-font-fallback.md)。
-
-封包时汇总 WriteBack、Generic 外部结果、字体和游戏原有资源，生成独立交付目录。交付目录完成
-结构解析、可见文本残留、字体覆盖和启动文件检查后，向任务发起者提供人工实机检查清单。实机
-验证由任务发起者指定的人工完成，重点覆盖标题、菜单、主要对话、插件界面、换行、裁切和存档。
-
-## 实玩反馈返修
-
-收到截图、原文、场景和触发步骤后，先定位真实来源和所有者，再从最早受影响的阶段继续：
-
-- 新来源进入调查、所有权和 Extract；
-- 术语变化更新术语表并审校受影响译文；
-- 误译和排版问题进入 Manual、QA、WriteBack 与重新封包；
-- 字体问题进入字体引用、glyph 覆盖和相关场景复查。
-
-每轮交付说明译本目录、覆盖范围、静态 QA 结果、人工实机检查项和仍待确认的翻译位置。
-
-## 状态恢复
-
-命令失败、Incomplete、取消或状态不明时，读取
-`docs/guides/diagnosis-and-recovery.md`，根据当前项目状态选择恢复动作。恢复沿用现有项目、输入、
-术语、Manual 和 WriteBack 结果，使已经确认的翻译继续成为后续工作的基础。
