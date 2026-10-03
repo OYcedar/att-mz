@@ -33,6 +33,10 @@ Kirikiri / KAG / TJS 项目通过 Generic 接入，或汉化后出现标题与�
 读取 [Kirikiri 显示消费者与补丁加载经验](references/engine-kirikiri-kag-tjs.md)，
 核对显示与内部身份、实际加载入口、动态表达式及游戏侧回填；该指引不表示 ATT 原生支持此引擎。
 
+RPG Developer Bakin 项目通过外部适配器接入 Generic 时，读取
+[Bakin 原生资源往返与播放器消费者](references/engine-bakin-native-roundtrip.md)，
+补充二进制目录、控制码、窗口标题、原生菜单和内嵌字体的调查与验证。
+
 ## 1. 调查
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
