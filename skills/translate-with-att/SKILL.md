@@ -37,6 +37,10 @@ RPG Developer Bakin 项目通过外部适配器接入 Generic 时，读取
 [Bakin 原生资源往返与播放器消费者](references/engine-bakin-native-roundtrip.md)，
 补充二进制目录、控制码、窗口标题、原生菜单和内嵌字体的调查与验证。
 
+发现 TyranoScript 场景与 Electron `app.asar` 容器时，读取
+[TyranoScript／Electron ASAR 经验](references/engine-tyrano-electron-asar.md)，
+补充显示消费者、Generic 映射、标签拓扑、字体、流式回填和独立补丁的检查。
+
 ## 1. 调查
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
