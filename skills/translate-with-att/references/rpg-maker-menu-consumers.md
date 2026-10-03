@@ -50,7 +50,9 @@ symbol、handler 和布尔状态分别有自己的用途，不应一同改写。
 
 为已确认的显示位置保存来源字段、显示调用、技术 symbol、可见条件、ATT 自然 ID 和部署
 位置。按当前 Rules 或 Generic 合约纳入提取，不用注释、编辑器参数说明或 Survey 候选代替
-正式所有权。少量补提取沿现有项目继续，核对原有已接受条目未变。
+正式所有权。少量补提取沿现有项目继续，核对未变来源的既有译文得到保留。补提取改变 Group
+语境时，按 [Extract 的继承规则](../../../docs/rpg-maker/extraction.md#4-冲突继承和提交)
+核对自动译文适用性；保留了正文，不代表它仍是 Current。
 
 补译后检查 remaining、rejected、WriteBack，回读发行文件并确认参数值等于 ATT 输出；保留
 参数键、symbol、handler、资源路径和数值配置。已登记译文全部 current 或无源语言字母，只
