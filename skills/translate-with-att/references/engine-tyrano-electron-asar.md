@@ -99,15 +99,19 @@ Electron 把 ASAR 作为虚拟目录读取；把松散脚本放到旁边，并�
 
 ## 明确要求 SDR 或报告 HDR 色彩问题时
 
-这属于应用启动与渲染调查，不能因汉化而自动修改。记录目标 Electron／Chromium 版本，检查
-其支持的色彩与 HDR 开关，在主进程 `ready` 之前注册并保留已有启动配置。调用时机参考
+这属于应用启动与渲染调查，不能因汉化而自动修改。记录目标平台与 Electron／Chromium 版本，
+检查其支持的色彩与 HDR 开关，在主进程 `ready` 之前注册并保留已有启动配置。调用时机参考
 [Electron 命令行开关文档](https://www.electronjs.org/docs/latest/api/command-line-switches)。
 
-真实材料中使用了 `force-color-profile=srgb`、`force-raster-color-profile=srgb`，以及
-`disable-features` 中的 `UseHDRTransferFunction`、`EnableExternalDisplayHDR10Mode`。
-该记录仅有语法、静态注册与注册顺序证据，尚无显示器输出证据；这些名字也不是所有 Chromium
-版本的稳定接口。下一次任务先核对目标版本支持，再选择必要项，合并原有 disable-features
-而非覆盖已有列表。未知或未生效开关不能算成功修复。
+`force-color-profile=srgb` 与 `force-raster-color-profile=srgb` 分别指定显示色彩空间与
+光栅化色彩空间；按目标版本的[Chromium 开关定义](https://chromium.googlesource.com/chromium/src/+/HEAD/ui/display/display_switches.cc)
+核对支持情况，再根据问题选择必要项。静态注册成功只能证明参数已设置，显示结果仍需验证。
+
+`UseHDRTransferFunction`、`EnableExternalDisplayHDR10Mode` 的定义位于
+[Chromium 的 ChromeOS 编译分支](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/ui/display/display_features.cc)。
+Windows Electron 没有对应的 feature 实现，将它们写入 `disable-features` 不会关闭该平台
+的 HDR。需要调整其他受支持 feature 时，合并原有列表，保留已有启动设置；未知或未生效
+开关不能算成功修复。
 
 改动纳入可重复重建的启动输入，随下一次正常启动生效。分别报告静态注册、实际进程参数和
 物理显示结果；不把应用参数等同于关闭 Windows HDR／Auto HDR，也不扩展为系统设置修改。
