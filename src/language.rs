@@ -11,6 +11,7 @@ use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use icu_properties::{CodePointMapData, props::Script};
 use language_tags::{LanguageTag, ParseError as LanguageTagParseError, ValidationError};
 
 const LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
@@ -715,6 +716,22 @@ pub(crate) trait LanguageModule: Send + Sync {
         translation: &LanguageText,
     ) -> Result<Option<LanguageResidual>, LanguageModuleError>;
 
+    /// 检查候选是否完全缺少目标书写系统；这不是语言识别或强验收。
+    fn target_script_missing_with_cancellation(
+        &self,
+        target: &LanguageId,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<bool, LanguageOperationCancelled> {
+        target_script_missing_with_cancellation(
+            target,
+            translation,
+            &BTreeSet::new(),
+            TermComparison::Exact,
+            ensure_running,
+        )
+    }
+
     fn analyze_source_with_cancellation(
         &self,
         text: &LanguageText,
@@ -964,6 +981,21 @@ pub(crate) struct JapaneseLanguageAnalysis {
 }
 
 impl LanguageModule for JapaneseLanguageModule {
+    fn target_script_missing_with_cancellation(
+        &self,
+        target: &LanguageId,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<bool, LanguageOperationCancelled> {
+        target_script_missing_with_cancellation(
+            target,
+            translation,
+            &self.residual_policy.allowed_terms,
+            TermComparison::Exact,
+            ensure_running,
+        )
+    }
+
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
         match self.analyze_source_with_check(text, || Ok::<_, Infallible>(())) {
             Ok(analysis) => analysis,
@@ -1159,6 +1191,21 @@ pub(crate) struct EnglishLanguageAnalysis {
 }
 
 impl LanguageModule for EnglishLanguageModule {
+    fn target_script_missing_with_cancellation(
+        &self,
+        target: &LanguageId,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<bool, LanguageOperationCancelled> {
+        target_script_missing_with_cancellation(
+            target,
+            translation,
+            &self.residual_policy.allowed_terms,
+            TermComparison::AsciiInsensitive,
+            ensure_running,
+        )
+    }
+
     fn analyze_source(&self, text: &LanguageText) -> LanguageAnalysis {
         match self.analyze_source_with_check(text, || Ok::<_, Infallible>(())) {
             Ok(analysis) => analysis,
@@ -1511,19 +1558,8 @@ fn first_japanese_residual_with_cancellation<E>(
     allowed_terms: &BTreeSet<String>,
     mut ensure_running: impl FnMut() -> Result<(), E>,
 ) -> Result<Option<String>, E> {
-    let mut ranges = Vec::new();
-    for term in allowed_terms {
-        ensure_running()?;
-        let mut cursor = 0_usize;
-        while let Some(start) =
-            find_language_substring_with_cancellation(text, cursor, term, &mut ensure_running)?
-        {
-            let end = start + term.len();
-            ranges.push((start, end));
-            cursor = end;
-        }
-    }
-    let allowed_ranges = merge_byte_ranges_with_cancellation(ranges, &mut ensure_running)?;
+    let allowed_ranges =
+        exact_term_ranges_with_cancellation(text, allowed_terms, &mut ensure_running)?;
     let mut range_index = 0_usize;
     let mut fragment_start = None;
     let mut fragment_end = 0_usize;
@@ -1570,6 +1606,110 @@ fn first_japanese_residual_with_cancellation<E>(
     } else {
         Ok(None)
     }
+}
+
+fn exact_term_ranges_with_cancellation<E>(
+    text: &str,
+    terms: &BTreeSet<String>,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<(usize, usize)>, E> {
+    let mut ranges = Vec::new();
+    for term in terms {
+        ensure_running()?;
+        let mut cursor = 0_usize;
+        while let Some(start) =
+            find_language_substring_with_cancellation(text, cursor, term, &mut ensure_running)?
+        {
+            let end = start + term.len();
+            ranges.push((start, end));
+            cursor = end;
+        }
+    }
+    merge_byte_ranges_with_cancellation(ranges, ensure_running)
+}
+
+/// 只检查已支持目标的书写系统是否缺失，不推测同一书写系统中的具体语言。
+fn expected_target_scripts(target: &LanguageId) -> Option<&'static [Script]> {
+    let tag = LanguageTag::parse(target.as_str()).expect("LanguageId 已经验证语言标签");
+    if let Some(script) = tag.script() {
+        return match script {
+            "Latn" => Some(&[Script::Latin]),
+            "Hans" | "Hant" | "Hani" => Some(&[Script::Han]),
+            "Jpan" => Some(&[Script::Han, Script::Hiragana, Script::Katakana]),
+            "Kore" => Some(&[Script::Hangul, Script::Han]),
+            "Hang" => Some(&[Script::Hangul]),
+            "Arab" => Some(&[Script::Arabic]),
+            "Cyrl" => Some(&[Script::Cyrillic]),
+            _ => None,
+        };
+    }
+    match tag.primary_language() {
+        "zh" => Some(&[Script::Han]),
+        "ja" => Some(&[Script::Han, Script::Hiragana, Script::Katakana]),
+        "ko" => Some(&[Script::Hangul, Script::Han]),
+        "en" | "fr" | "es" | "vi" => Some(&[Script::Latin]),
+        "ar" => Some(&[Script::Arabic]),
+        "ru" => Some(&[Script::Cyrillic]),
+        _ => None,
+    }
+}
+
+fn target_script_missing_with_cancellation<E>(
+    target: &LanguageId,
+    translation: &LanguageText,
+    allowed_terms: &BTreeSet<String>,
+    comparison: TermComparison,
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    ensure_running()?;
+    let Some(expected) = expected_target_scripts(target) else {
+        return Ok(false);
+    };
+    let scripts = CodePointMapData::<Script>::new();
+    let mut has_other_letters = false;
+    for text in natural_texts(translation) {
+        ensure_running()?;
+        let ranges = match comparison {
+            TermComparison::Exact => {
+                exact_term_ranges_with_cancellation(text, allowed_terms, &mut ensure_running)?
+            }
+            TermComparison::AsciiInsensitive => ascii_insensitive_term_ranges_with_cancellation(
+                text,
+                allowed_terms,
+                &mut ensure_running,
+            )?,
+        };
+        let mut range_index = 0;
+        let mut next_check = 0;
+        for (offset, character) in text.char_indices() {
+            ensure_language_text_progress(offset, &mut next_check, &mut ensure_running)?;
+            while ranges
+                .get(range_index)
+                .is_some_and(|(_, end)| *end <= offset)
+            {
+                ensure_running()?;
+                range_index += 1;
+            }
+            if ranges
+                .get(range_index)
+                .is_some_and(|(start, end)| *start <= offset && offset < *end)
+                || !character.is_alphabetic()
+            {
+                continue;
+            }
+            let script = scripts.get(character);
+            if expected.contains(&script) {
+                ensure_running()?;
+                return Ok(false);
+            }
+            // Common/Inherited（如部分字母修饰符）不能独立证明另一种书写系统。
+            if script != Script::Common && script != Script::Inherited {
+                has_other_letters = true;
+            }
+        }
+    }
+    ensure_running()?;
+    Ok(has_other_letters)
 }
 
 #[derive(Clone)]
@@ -1838,6 +1978,126 @@ mod tests {
             JapaneseResidualPolicy::new(non_zero(2), ["カタカナ名".to_owned()])
                 .expect("日文残留策略有效"),
         )
+    }
+
+    #[test]
+    fn target_script_review_detects_third_language_without_rejecting_text() {
+        let module = japanese_module();
+        for (target, candidate, missing) in [
+            ("zh-Hans", "Continue", true),
+            ("zh-Hant-TW", "Continue", true),
+            ("zh-Hans", "Продолжить", true),
+            ("zh-Hans", "こんにちは", true),
+            ("zh-Hans", "继续 Continue", false),
+            ("zh-Hans", "𠀀", false),
+            ("zh-Hans", "123 … 🎮", false),
+            ("en-US", "继续", true),
+            ("fr", "Continuer", false),
+            ("ja", "名前", false),
+            ("ja", "カナ", false),
+            ("ko", "계속", false),
+            ("ru", "Продолжить", false),
+            ("ar", "متابعة", false),
+            ("sr-Latn", "Continue", false),
+            ("sr-Cyrl", "Continue", true),
+            ("zh-Latn", "Continue", false),
+            ("de", "Continue", false),
+            ("en-Brai", "Continue", false),
+        ] {
+            assert_eq!(
+                module
+                    .target_script_missing_with_cancellation(
+                        &LanguageId::parse(target).expect("测试目标语言应有效"),
+                        &LanguageText::natural(candidate),
+                        &mut || Ok(()),
+                    )
+                    .expect("语言检查应完成"),
+                missing,
+                "目标 {target} 的书写系统检查失败",
+            );
+        }
+    }
+
+    #[test]
+    fn target_script_review_ignores_opaque_text_and_allowed_terms() {
+        let module = JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(
+                NonZeroUsize::new(1).expect("常量非零"),
+                ["Page Up".to_owned()],
+            )
+            .expect("允许词应有效"),
+        );
+        let target = LanguageId::parse("zh-Hans").expect("目标语言应有效");
+        for (text, missing) in [
+            (LanguageText::natural("Page Up"), false),
+            (LanguageText::natural("Page Up please"), true),
+            (LanguageText::natural("page up"), true),
+            (
+                LanguageText::new(vec![LanguageTextSegment::OpaqueBoundary]),
+                false,
+            ),
+            (
+                LanguageText::new(vec![
+                    LanguageTextSegment::NaturalText("Continue".to_owned()),
+                    LanguageTextSegment::OpaqueBoundary,
+                    LanguageTextSegment::NaturalText("继续".to_owned()),
+                ]),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                module
+                    .target_script_missing_with_cancellation(&target, &text, &mut || Ok(()),)
+                    .expect("语言检查应完成"),
+                missing
+            );
+        }
+
+        let english = EnglishLanguageModule::new(
+            EnglishTranslationDetectionPolicy::new(
+                NonZeroUsize::new(1).expect("常量非零"),
+                NonZeroUsize::new(1).expect("常量非零"),
+                [],
+            )
+            .expect("英文准入策略应有效"),
+            EnglishResidualPolicy::new(
+                NonZeroUsize::new(1).expect("常量非零"),
+                NonZeroUsize::new(1).expect("常量非零"),
+                ["Menu".to_owned()],
+            )
+            .expect("允许词应有效"),
+        );
+        for (candidate, missing) in [("MENU", false), ("Menus", true)] {
+            assert_eq!(
+                english
+                    .target_script_missing_with_cancellation(
+                        &target,
+                        &LanguageText::natural(candidate),
+                        &mut || Ok(()),
+                    )
+                    .expect("语言检查应完成"),
+                missing
+            );
+        }
+    }
+
+    #[test]
+    fn target_script_review_checks_cancellation_during_long_text() {
+        let module = japanese_module();
+        let mut checks = 0;
+        let result = module.target_script_missing_with_cancellation(
+            &LanguageId::parse("zh-Hans").expect("目标语言应有效"),
+            &LanguageText::natural("A".repeat(512 * 1024)),
+            &mut || {
+                checks += 1;
+                if checks >= 4 {
+                    Err(LanguageOperationCancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err(LanguageOperationCancelled));
     }
 
     fn english_module() -> EnglishLanguageModule {
