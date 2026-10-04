@@ -47,6 +47,7 @@ pub(crate) enum ProvenInvariantViolation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewFinding {
     SourceResidual,
+    TargetScriptMissing,
     NonStopFinish,
 }
 
@@ -70,6 +71,10 @@ impl<T> ValidatedCandidate<T> {
             value,
             reviews: vec![finding],
         }
+    }
+
+    pub(crate) fn with_reviews(value: T, reviews: Vec<ReviewFinding>) -> Self {
+        Self { value, reviews }
     }
 
     pub(crate) fn into_parts(self) -> (T, Vec<ReviewFinding>) {
