@@ -109,7 +109,7 @@ def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
 
 
 def projected_write_back_text(rows: list[dict[str, JsonValue]]) -> tuple[str, int]:
-    """投影当前 WriteBack 正文；未接受条目仍会写回原文。"""
+    """投影当前 WriteBack 各行并以换行隔开；未接受条目使用原文。"""
 
     values: list[str] = []
     translated = 0
@@ -120,7 +120,7 @@ def projected_write_back_text(rows: list[dict[str, JsonValue]]) -> tuple[str, in
         else:
             lines = cast(list[object], row["source"])
         values.extend(cast(str, value) for value in lines)
-    return "".join(values), translated
+    return "\n".join(values), translated
 
 
 def translation_export_identity(path: Path, rows: Sequence[Mapping[str, JsonValue]]) -> dict[str, JsonValue]:

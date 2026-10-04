@@ -135,6 +135,14 @@ ATT 写回字符投影证据。
 分别说明是否写入、是否无需写入和质量结论。字体工具没有发现问题时仍为 scoped `unverified`；
 缺少任一已检查字符会成为 `needs_review`，并使 `review_required` 为 true，即使静态引用 Review 为空。
 
+字符覆盖在收集字符集前保留各行、各条目和各补充文件的边界。根据
+[Unicode 变体序列的显示规则](https://www.unicode.org/faq/vs.html)，附在基础字符后的变体选择符
+不要求独立字形；工具用 Unicode cmap 4/12/13 检查基础字符，普通结合字符仍参与缺字检查。
+孤立或紧随空白、控制字符、结合字符及另一选择符的变体选择符记录在
+`coverage.unattached_variation_selectors`，并以 `unattached_variation_selector` 进入 Review，
+与 `missing_characters` 的真实缺字分开。这个静态检查没有验证 cmap format 14 或指定变体的
+实际显示；需要保持特定变体字形时，仍须在游戏运行环境中检查。
+
 恢复：
 
 ```powershell

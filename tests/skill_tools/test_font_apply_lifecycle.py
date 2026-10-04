@@ -62,7 +62,9 @@ class FontApplyLifecycleTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(original)
             mutations.append(ByteMutation(name, original, f"new-{number}".encode()))
-        coverage = FontCoverage(glyph_count=2, checked_characters="字体", missing_characters="")
+        coverage = FontCoverage(
+            glyph_count=2, checked_characters="字体", missing_characters="", unattached_variation_selectors=""
+        )
         return FontPlan(
             game_root=game,
             content_root=game,

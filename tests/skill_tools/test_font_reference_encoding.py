@@ -410,7 +410,7 @@ class FontReferenceEncodingTests(unittest.TestCase):
 
             with patch(
                 "att_toolbox.font_references.check_font_coverage",
-                return_value=FontCoverage("", "", 1),
+                return_value=FontCoverage("", "", 1, ""),
             ):
                 plan = build_font_plan(
                     game_root=game_root,
@@ -458,7 +458,7 @@ class FontReferenceEncodingTests(unittest.TestCase):
 
             with patch(
                 "att_toolbox.font_references.check_font_coverage",
-                return_value=FontCoverage("", "", 1),
+                return_value=FontCoverage("", "", 1, ""),
             ):
                 plan = build_font_plan(
                     game_root=game_root,
@@ -502,7 +502,7 @@ class FontReferenceEncodingTests(unittest.TestCase):
 
             with patch(
                 "att_toolbox.font_references.check_font_coverage",
-                return_value=FontCoverage("", "", 1),
+                return_value=FontCoverage("", "", 1, ""),
             ):
                 plan = build_font_plan(
                     game_root=game_root,
@@ -541,7 +541,7 @@ class FontReferenceEncodingTests(unittest.TestCase):
 
             with patch(
                 "att_toolbox.font_references.check_font_coverage",
-                return_value=FontCoverage("", "", 1),
+                return_value=FontCoverage("", "", 1, ""),
             ):
                 plan = build_font_plan(
                     game_root=game_root,
@@ -644,7 +644,7 @@ class FontReferenceEncodingTests(unittest.TestCase):
 
             with patch(
                 "att_toolbox.font_references.check_font_coverage",
-                return_value=FontCoverage("", "", 1),
+                return_value=FontCoverage("", "", 1, ""),
             ):
                 plan = build_font_plan(
                     game_root=game_root,

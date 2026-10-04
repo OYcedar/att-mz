@@ -3170,6 +3170,15 @@ def build_font_plan(
     alias_matcher = _AliasMatcher.for_aliases(alias_mapping)
     references: list[FontReference] = []
     reviews: list[ReviewItem] = [*runtime_reviews, *alias_reviews]
+    if coverage.unattached_variation_selectors:
+        reviews.append(
+            ReviewItem(
+                "字符覆盖文本",
+                None,
+                "unattached_variation_selector",
+                " ".join(f"U+{ord(character):04X}" for character in coverage.unattached_variation_selectors),
+            )
+        )
     if coverage.missing_characters:
         reviews.append(
             ReviewItem(

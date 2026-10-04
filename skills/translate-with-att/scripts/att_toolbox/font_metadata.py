@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,41 @@ class FontCoverage:
     checked_characters: str
     missing_characters: str
     glyph_count: int
+    unattached_variation_selectors: str
+
+
+def font_text_characters(text: str) -> tuple[str, str]:
+    """收集所需字形与未附着的变体选择符，保留序列关系直到分类完成。"""
+
+    characters: set[str] = set()
+    unattached: set[str] = set()
+    can_attach = False
+    for character in text:
+        codepoint = ord(character)
+        # Unicode Variation_Selector 属性；普通结合字符仍需要检查字形。
+        is_selector = (
+            0x180B <= codepoint <= 0x180D
+            or codepoint == 0x180F
+            or 0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+        )
+        if is_selector:
+            if not can_attach:
+                unattached.add(character)
+            can_attach = False
+            continue
+        can_attach = not character.isspace() and unicodedata.category(character) not in {
+            "Cc",
+            "Cf",
+            "Cs",
+            "Cn",
+            "Mn",
+            "Mc",
+            "Me",
+        }
+        if character not in {"\ufeff", "\ufffe", "\xffff"} and not character.isspace():
+            characters.add(character)
+    return "".join(sorted(characters, key=ord)), "".join(sorted(unattached, key=ord))
 
 
 def _u16(data: bytes, offset: int) -> int:
@@ -138,14 +174,13 @@ def check_font_coverage(
     extra_characters: str = "",
 ) -> FontCoverage:
     characters = set(_BASELINE_CHARACTERS)
-    characters.update(extra_characters)
+    checked_extra, unattached_extra = font_text_characters(extra_characters)
+    characters.update(checked_extra)
+    unattached = set(unattached_extra)
     for path in extra_texts:
-        characters.update(path.read_text(encoding="utf-8-sig"))
-    characters = {
-        character
-        for character in characters
-        if character not in {"\ufeff", "\ufffe", "\xffff"} and not character.isspace()
-    }
+        checked_text, unattached_text = font_text_characters(path.read_text(encoding="utf-8-sig"))
+        characters.update(checked_text)
+        unattached.update(unattached_text)
     codepoints = font_codepoints(font)
     checked = "".join(sorted(characters, key=ord))
     missing = "".join(character for character in checked if ord(character) not in codepoints)
@@ -153,4 +188,5 @@ def check_font_coverage(
         checked_characters=checked,
         missing_characters=missing,
         glyph_count=len(codepoints),
+        unattached_variation_selectors="".join(sorted(unattached, key=ord)),
     )

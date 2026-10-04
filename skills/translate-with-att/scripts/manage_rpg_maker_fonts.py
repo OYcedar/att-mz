@@ -32,6 +32,7 @@ from att_skill_tools import (
     run_cli,
     write_json,
 )
+from att_toolbox.font_metadata import font_text_characters
 from att_toolbox.fonts import (
     FontGameLockRelease,
     FontPlan,
@@ -108,19 +109,6 @@ def _coverage_paths(arguments: argparse.Namespace) -> tuple[Path, ...]:
     return tuple(require_file(path, "字符覆盖文本") for path in cast(list[Path], arguments.coverage_text))
 
 
-def _visible_characters(text: str) -> str:
-    return "".join(
-        sorted(
-            {
-                character
-                for character in text
-                if character not in {"\ufeff", "\ufffe", "\xffff"} and not character.isspace()
-            },
-            key=ord,
-        )
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class _CoverageProjection:
     translation_path: Path | None
@@ -157,7 +145,7 @@ def _coverage_projection(arguments: argparse.Namespace) -> _CoverageProjection:
         identity,
         project_text,
         additional_paths,
-        "".join(additional_parts),
+        "\n".join(additional_parts),
     )
 
 
@@ -174,7 +162,7 @@ def _plan(arguments: argparse.Namespace, coverage: _CoverageProjection) -> FontP
         game_root=game_root,
         content_root=game.content_root,
         selected_font=font,
-        coverage_characters=coverage.project_text + coverage.additional_text,
+        coverage_characters=f"{coverage.project_text}\n{coverage.additional_text}",
     )
 
 
@@ -255,8 +243,8 @@ def _font_report(
         }
         for mutation in plan.mutations
     ]
-    project_characters = _visible_characters(coverage.project_text)
-    additional_characters = _visible_characters(coverage.additional_text)
+    project_characters, _project_unattached = font_text_characters(coverage.project_text)
+    additional_characters, _additional_unattached = font_text_characters(coverage.additional_text)
     missing = set(plan.coverage.missing_characters)
     project_missing = "".join(character for character in project_characters if character in missing)
     additional_missing = "".join(character for character in additional_characters if character in missing)
@@ -288,6 +276,7 @@ def _font_report(
             "checked_characters": plan.coverage.checked_characters,
             "missing_characters": plan.coverage.missing_characters,
             "missing_count": len(plan.coverage.missing_characters),
+            "unattached_variation_selectors": plan.coverage.unattached_variation_selectors,
         },
         "font_assets": assets,
         "font_aliases": aliases,
@@ -304,7 +293,7 @@ def _font_report(
             "项目字符只从当前 ATT Translation export 投影；该投影未与同源 Survey、coverage、"
             "实际 WriteBack 和运行副本绑定，因此字体报告只给出 scoped/unverified 结论；"
             "coverage-text 只证明补充文本自身；"
-            "review 只包含动态、无法解析或未证明消费者的字体事实。"
+            "review 包含缺字、未附着的变体选择符，以及动态、无法解析或未证明消费者的字体事实。"
         ),
     }
 
