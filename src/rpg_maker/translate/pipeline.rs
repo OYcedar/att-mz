@@ -3021,6 +3021,9 @@ fn task_response_protocol_report(
                     ReviewFinding::SourceResidual => {
                         RpgMakerTaskResponseReviewProblem::SourceResidual
                     }
+                    ReviewFinding::TargetScriptMissing => {
+                        RpgMakerTaskResponseReviewProblem::TargetScriptMissing
+                    }
                     ReviewFinding::NonStopFinish => {
                         unreachable!("候选级 Review 不会产生 finish reason")
                     }
