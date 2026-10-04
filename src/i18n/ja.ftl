@@ -355,6 +355,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] translation 配列の項目に受理できないテキストがあります
     [response_blank_line_mismatch] translation 配列が必須の空スロットと非空スロットの位置を保持していません
     [response_source_residual] 受理された翻訳に原文言語が残っているため確認が必要です
+        [response_target_script_missing] 受理された翻訳に文字がありますが、対象言語の文字体系が見つからないため確認が必要です
     [response_finish_requires_review] モデルが最終状態以外の理由で停止したため、返された結果の確認が必要です
     [response_thinking_empty] 必須の think フィールドが空か、空白文字のみです
     [response_no_usable_output] Assistant 応答に使用可能な出力がありません

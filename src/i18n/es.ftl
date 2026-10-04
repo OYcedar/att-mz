@@ -358,6 +358,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] Un elemento de la matriz translation contiene texto que no puede aceptarse
     [response_blank_line_mismatch] La matriz translation no conservó las posiciones obligatorias de los espacios vacíos y no vacíos
     [response_source_residual] La traducción aceptada aún contiene texto del idioma de origen y debe revisarse
+        [response_target_script_missing] La traducción aceptada contiene letras pero no la escritura esperada del idioma de destino; debe revisarse
     [response_finish_requires_review] El modelo se detuvo por un motivo no final; debe revisarse el resultado devuelto
     [response_thinking_empty] El campo think obligatorio está vacío o solo contiene caracteres de espacio en blanco
     [response_no_usable_output] La respuesta Assistant no contiene ninguna salida utilizable
