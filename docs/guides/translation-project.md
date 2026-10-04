@@ -115,8 +115,8 @@ Manual、Survey 或 coverage 变化后，先重新运行不带 `--decisions` 的
 ## 5. 术语
 
 使用[游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md)从完整 Manual 生成
-`terminology.toml`。Agent 可以直接处理全部语料；大量独立 Scope 可以由随包 Formic 生成候选，
-再由 Agent 在完整语料中统一筛选和定译。
+`terminology.toml`。Formic 可选初筛原文术语候选；当前负责翻译的 Agent 按该 Skill 在完整 Manual
+中核对全部出现位置和上下文，完成筛选、去重、统一定译和最终术语文件核对。
 
 术语完成后按[术语规格](../translation/terminology.md)交给 Translate。
 
@@ -141,7 +141,9 @@ Partial、Unavailable 和未开始 Task，以及失败或取消的运行，按
 - 源语言残留、异常转义和模型说明；
 - Generic 外部映射与组合项目的唯一所有权。
 
-Agent 负责完整译文的语义审校。`translation_qa.py` 提供覆盖、结构、控制符、字面术语和残留等
+当前负责翻译的 Agent 直接对照原文、译文和相关上下文完成语义审校，外部模型工具的用途按
+[翻译 Skill 的 QA 流程](../../skills/translate-with-att/SKILL.md#5-qa)执行。
+`translation_qa.py` 提供覆盖、结构、控制符、字面术语和残留等
 静态检查。按[译文质量检查](acceptance.md#3-检查译文质量)先处理摘要中的确定状态和未验证项，
 再审核由启发式发现组成的 Review 组。独立 Generic 通过 `--generic-input` 提供同源 JSONL；
 RPG Maker 使用对应的调查与所有权证据。审核发现后用 Manual 集中修订，再重新导出和复查。

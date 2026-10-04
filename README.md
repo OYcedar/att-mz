@@ -91,8 +91,9 @@ ATT 将游戏格式、翻译状态和模型请求分开处理：
 具体失败与恢复方式见[诊断与恢复指南](docs/guides/diagnosis-and-recovery.md)。
 图片文字、特殊脚本和非标准插件内容由 Agent 根据实际结构选择相应工具处理。
 
-完整流程从[翻译 Skill](skills/translate-with-att/SKILL.md)进入；大规模术语候选可使用随包
-[Formic](tools/formic/README.md)，启用前单独配置其模型服务。
+完整流程从[翻译 Skill](skills/translate-with-att/SKILL.md)进入；大量原文的术语初筛可选用随包
+[Formic](tools/formic/README.md)，职责边界见[游戏术语表制作 Skill](skills/extract-game-terminology/SKILL.md)。
+启用 Formic 前单独配置其模型服务。
 
 ## 反馈与联系
 

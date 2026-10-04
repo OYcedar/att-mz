@@ -12,6 +12,10 @@ description: 使用已打包 ATT 完成 RPG Maker MV、MZ、Generic 或组合项
 ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agent 负责调查文本来源、确定所有者、
 制作术语、审校译文和处理游戏特有内容。命令、格式和状态以实际 `att.exe` 同目录的现行文档为准。
 
+常规游戏翻译任务中，Formic 原则上只用于从原文初筛术语候选；术语校验、定译、最终术语表核对
+和译文语义审校由当前负责翻译的 Agent 直接完成。用户明确指定 Formic 的其他用途时，按其具体
+要求执行。
+
 ## 使用当前发行
 
 1. 确认 `att.exe`、发行根、游戏原版、目标目录、源语言、目标语言和翻译范围。
@@ -107,9 +111,9 @@ Manual，并用新语料更新术语和后续 QA。
 
 ## 3. 术语
 
-读取 `skills/extract-game-terminology/SKILL.md`，从完整 Manual 制作最终 `terminology.toml`。
-Agent 可以直接完成全部语料；大量独立语料分片也可以交给随包 Formic 生成候选，再由 Agent
-统一筛选和定译。最终术语文件由 ATT `translate --terms` 读取。
+读取[游戏术语表制作 Skill](../extract-game-terminology/SKILL.md)，由当前 Agent 从完整 Manual
+制作并核对最终 `terminology.toml`。Formic 可选初筛原文候选；候选的筛选、全部出现位置与上下文
+的校验、去重、统一定译和最终文件核对都由当前 Agent 自己完成，再交给 ATT `translate --terms`。
 
 ## 4. Translate
 
@@ -126,8 +130,10 @@ Incomplete 中的 Partial、Unavailable 和未开始 Task 按恢复指南处理�
 
 ## 5. QA
 
-按 `docs/guides/acceptance.md` 检查完整译文。Agent 负责原意、目标语自然度、上下文、人物语气、
-叙事和专名译法的全量审校。随包 `translation_qa.py` 提供以下静态检查：
+按 `docs/guides/acceptance.md` 检查完整译文。当前 Agent 直接对照原文、译文和游戏上下文，审校
+原意、目标语自然度、人物语气、叙事和专名译法；缺少语境时补查相关来源或消费者。常规任务
+不另行启动 Formic 全量译文审校、多轮整库检索等付费外部模型作业。随包 `translation_qa.py`
+提供以下静态检查：
 
 - 可见文本覆盖和所有权；
 - 术语表的字面匹配；

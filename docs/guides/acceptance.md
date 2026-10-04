@@ -30,7 +30,8 @@ Generic 项目同时核对外部来源、JSONL、WriteBack 和实际消费者之
 - 标点、换行、数组形状、UI 长度和可读性；
 - 源语言残留、模型说明、JSON 痕迹和异常转义。
 
-Agent 审校原意、上下文、语气和自然度；随 Skill 的 `translation_qa.py scan` 读取完整导出和
+当前负责翻译的 Agent 按[翻译 Skill 的 QA 流程](../../skills/translate-with-att/SKILL.md#5-qa)
+直接核对原意、上下文、语气和自然度；随 Skill 的 `translation_qa.py scan` 读取完整导出和
 同源证据，提供覆盖、结构、控制符、字面术语、残留和布局风险的静态检查。独立 Generic 使用
 `--generic-input` 指定 JSONL 输入。脚本没有报告问题，只能说明已执行的检查没有发现，不能代替
 完整语义审校。
