@@ -11,7 +11,10 @@ use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use icu_properties::{CodePointMapData, props::Script};
+use icu_properties::{
+    CodePointMapData,
+    props::{GeneralCategory, GeneralCategoryGroup, Script},
+};
 use language_tags::{LanguageTag, ParseError as LanguageTagParseError, ValidationError};
 
 const LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
@@ -1666,6 +1669,7 @@ fn target_script_missing_with_cancellation<E>(
         return Ok(false);
     };
     let scripts = CodePointMapData::<Script>::new();
+    let categories = CodePointMapData::<GeneralCategory>::new();
     let mut has_other_letters = false;
     for text in natural_texts(translation) {
         ensure_running()?;
@@ -1693,7 +1697,7 @@ fn target_script_missing_with_cancellation<E>(
             if ranges
                 .get(range_index)
                 .is_some_and(|(start, end)| *start <= offset && offset < *end)
-                || !character.is_alphabetic()
+                || !GeneralCategoryGroup::Letter.contains(categories.get(character))
             {
                 continue;
             }
@@ -1991,7 +1995,11 @@ mod tests {
             ("zh-Hans", "继续 Continue", false),
             ("zh-Hans", "𠀀", false),
             ("zh-Hans", "123 … 🎮", false),
+            ("zh-Hans", "Ⅰ Ⅷ", false),
+            ("zh-Hans", "Ⓐ Ⓜ", false),
             ("en-US", "继续", true),
+            ("en-US", "继续 Ⅰ", true),
+            ("en-US", "继续 Ⓐ", true),
             ("fr", "Continuer", false),
             ("ja", "名前", false),
             ("ja", "カナ", false),
@@ -2013,7 +2021,7 @@ mod tests {
                     )
                     .expect("语言检查应完成"),
                 missing,
-                "目标 {target} 的书写系统检查失败",
+                "目标 {target}、候选 {candidate:?} 的书写系统检查失败",
             );
         }
     }

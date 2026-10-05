@@ -1642,6 +1642,12 @@ fn serve_chat_completion(listener: TcpListener, translation: &str) -> Result<(),
 
 #[test]
 fn missing_target_script_is_visible_without_rejection_or_automatic_retry() {
+    for (translation, source_residual) in [("Continue", false), ("こんにちは", true)] {
+        assert_target_script_review_keeps_current(translation, source_residual);
+    }
+}
+
+fn assert_target_script_review_keeps_current(translation: &'static str, source_residual: bool) {
     let temporary = tempfile::tempdir().expect("目标书写系统测试目录应可建立");
     let root = temporary.path();
     let input = root.join("input");
@@ -1690,7 +1696,7 @@ fn missing_target_script_is_visible_without_rejection_or_automatic_retry() {
         "Extract",
         &run_att(root, &["generic", "extract", "--name", PROJECT]),
     );
-    let server = thread::spawn(move || serve_chat_completion(listener, "Continue"));
+    let server = thread::spawn(move || serve_chat_completion(listener, translation));
     let translated = run_att(root, &["generic", "translate", "--name", PROJECT, "local"]);
     server
         .join()
@@ -1706,7 +1712,8 @@ fn missing_target_script_is_visible_without_rejection_or_automatic_retry() {
         log.contains("expected target-language script"),
         "日志必须呈现具体 Review：{log}"
     );
-    assert!(!log.contains("Continue"), "项目日志不得输出候选正文");
+    assert_eq!(log.contains("source-language text"), source_residual);
+    assert!(!log.contains(translation), "项目日志不得输出候选正文");
     let task_records = workspace.join("task-records");
     let run = fs::read_dir(task_records)
         .unwrap()
@@ -1716,6 +1723,7 @@ fn missing_target_script_is_visible_without_rejection_or_automatic_retry() {
         .path();
     let record = fs::read_to_string(run.join("task-000001.md")).unwrap();
     assert!(record.contains("expected target-language script"));
+    assert_eq!(record.contains("source-language text"), source_residual);
     let exported = root.join("translations.jsonl");
     assert_success(
         "export",
@@ -1733,13 +1741,13 @@ fn missing_target_script_is_visible_without_rejection_or_automatic_retry() {
     );
     let current = read_single_jsonl_group(&exported);
     assert_eq!(current["state"], "current");
-    assert_eq!(current["translation"], serde_json::json!(["Continue"]));
+    assert_eq!(current["translation"], serde_json::json!([translation]));
     assert_success(
         "WriteBack",
         &run_att(root, &["generic", "write-back", "--name", PROJECT]),
     );
     let output = read_single_jsonl_group(&workspace.join("write_back/story.jsonl"));
-    assert_eq!(output["units"][0]["text"], "Continue");
+    assert_eq!(output["units"][0]["text"], translation);
     // 服务已经结束；Current 的再次 Translate 仍成功，不能把 Review 变成重试。
     assert_success(
         "Current retry",

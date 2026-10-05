@@ -2717,10 +2717,10 @@ fn validate_and_restore_translation_at(
             },
         });
     }
-    Ok(match review {
-        Some(finding) => ValidatedCandidate::with_review(restored, finding),
-        None => ValidatedCandidate::clean(restored),
-    })
+    Ok(ValidatedCandidate::with_reviews(
+        restored,
+        review.into_iter().collect(),
+    ))
 }
 
 #[cfg(test)]

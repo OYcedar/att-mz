@@ -59,20 +59,6 @@ pub(crate) struct ValidatedCandidate<T> {
 }
 
 impl<T> ValidatedCandidate<T> {
-    pub(crate) fn clean(value: T) -> Self {
-        Self {
-            value,
-            reviews: Vec::new(),
-        }
-    }
-
-    pub(crate) fn with_review(value: T, finding: ReviewFinding) -> Self {
-        Self {
-            value,
-            reviews: vec![finding],
-        }
-    }
-
     pub(crate) fn with_reviews(value: T, reviews: Vec<ReviewFinding>) -> Self {
         Self { value, reviews }
     }

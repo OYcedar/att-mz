@@ -2988,12 +2988,10 @@ fn clone_generic_validation_result(
     match result {
         Ok(value) => {
             append_generic_response_text(&mut cloned, value.value(), cancellation)?;
-            let cloned = match value.reviews() {
-                [] => ValidatedCandidate::clean(cloned),
-                [finding] => ValidatedCandidate::with_review(cloned, finding.clone()),
-                _ => unreachable!("当前候选验收每个目标最多产生一个 Review"),
-            };
-            Ok(Ok(cloned))
+            Ok(Ok(ValidatedCandidate::with_reviews(
+                cloned,
+                value.reviews().to_vec(),
+            )))
         }
         Err(problem) => {
             ensure_generic_response_processing_running(cancellation)?;

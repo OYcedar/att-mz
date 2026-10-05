@@ -56,8 +56,8 @@ allowed_terms = ["Page Up", "Page Down"]
 - `minimum_copied_word_count` 与 `minimum_copied_letter_count` 是译后源文复制检查阈值；
   只有译文中从本 Unit 原文复制的连续英文片段同时达到两个阈值，才报告
   `source_residual`；
-- `allowed_terms` 只参与译后源文复制检查。匹配项仍参与译前判断和临时 ID 分配，但允许
-  原样保留在译文中，不触发 `source_residual`；它适合专名、按键名、协议词、单个字母和
+- `allowed_terms` 参与译后源文复制和目标书写系统检查。匹配项仍参与译前判断和临时 ID 分配，
+  但在两项译后检查中排除；它适合专名、按键名、协议词、单个字母和
   确实必须保留的短语；
 - `ignored_terms` 与 `allowed_terms` 都按 ASCII 大小写不敏感匹配，支持多词短语；以英文字母
   开头或结尾的配置项只在对应字母边界匹配，避免短词误伤更长单词；
@@ -66,7 +66,8 @@ allowed_terms = ["Page Up", "Page Down"]
 
 ## 目标书写系统检查
 
-候选验收在 Placeholder 恢复和自然文本投影之后，另外检查项目目标语言的预期书写系统。
+Generic、MV/MZ 的模型响应验收在 Placeholder 恢复和自然文本投影之后，另外检查项目
+目标语言的预期书写系统。
 排除不透明保护段和源语言模块的 `allowed_terms` 后，整个 Unit 含有其他书写系统的字母，
 却没有任何目标书写系统字母时，追加 `target_script_missing` Review。例如日译中返回完整
 英文，即使没有日语假名，也会提示复核。数字、标点、符号、完全保护的内容和仅由允许词组成
@@ -77,7 +78,10 @@ allowed_terms = ["Page Up", "Page Down"]
 `ko`（谚文、汉字）、`en/fr/es/vi`（拉丁字母）、`ar`（阿拉伯字母）、`ru`（西里尔字母）的区域
 变体。其他主语言或显式 script 不猜测，不产生此项 Review；这不表示已经验证目标语言。
 
-本检查使用 Unicode Script 属性，是保守的书写系统提示，不是语义语言识别。它不能区分
+本检查只统计 Unicode General_Category 为 Letter（`Lu/Ll/Lt/Lm/Lo`）的字符，再读取 Script
+属性。罗马数字 `Ⅰ`、带圈符号 `Ⓐ` 等即使具有 Alphabetic 属性，也不参与缺失判断或充当
+目标文字证据；字符类别见 [Unicode UAX #44](https://www.unicode.org/reports/tr44/#General_Category_Values)。
+本检查是保守的书写系统提示，不是语义语言识别。它不能区分
 共用汉字的中日文本、拉丁字母语言、简繁体，也不能证明混合译文的每一段均已翻译。已有源语
 残留检查独立执行，两个 Review 可以同时出现。项目日志和模型任务记录保存自然 Unit 位置
 及原因，不将疑似问题正文写入项目日志。两类 Review 均不改变 Current、Rejected、任务完成
