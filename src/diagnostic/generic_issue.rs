@@ -952,6 +952,7 @@ pub(crate) enum GenericResponseTextProblem {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GenericResponseReviewFinding {
     SourceResidual,
+    TargetScriptMissing,
     NonStopFinish,
 }
 
@@ -959,6 +960,7 @@ impl GenericResponseReviewFinding {
     const fn code_suffix(self) -> &'static str {
         match self {
             Self::SourceResidual => "source_residual",
+            Self::TargetScriptMissing => "target_script_missing",
             Self::NonStopFinish => "non_stop_finish",
         }
     }
@@ -1350,10 +1352,16 @@ impl GenericTaskResponseProblem {
                 GenericResponseReviewFinding::SourceResidual => {
                     "generic.translation.review.source_residual"
                 }
+                GenericResponseReviewFinding::TargetScriptMissing => {
+                    "generic.translation.review.target_script_missing"
+                }
             },
             Self::DestinationReview { finding, .. } => match finding {
                 GenericResponseReviewFinding::SourceResidual => {
                     "generic.translation.review.destination.source_residual"
+                }
+                GenericResponseReviewFinding::TargetScriptMissing => {
+                    "generic.translation.review.destination.target_script_missing"
                 }
                 GenericResponseReviewFinding::NonStopFinish => {
                     "generic.translation.review.destination.non_stop_finish"
@@ -1374,6 +1382,9 @@ impl GenericTaskResponseProblem {
             Self::ResponseReview { finding } | Self::DestinationReview { finding, .. } => {
                 match finding {
                     GenericResponseReviewFinding::SourceResidual => "response_source_residual",
+                    GenericResponseReviewFinding::TargetScriptMissing => {
+                        "response_target_script_missing"
+                    }
                     GenericResponseReviewFinding::NonStopFinish => {
                         "response_finish_requires_review"
                     }

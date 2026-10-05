@@ -1640,6 +1640,121 @@ fn serve_chat_completion(listener: TcpListener, translation: &str) -> Result<(),
         .map_err(|error| format!("刷新模型响应失败：{error}"))
 }
 
+#[test]
+fn missing_target_script_is_visible_without_rejection_or_automatic_retry() {
+    for (translation, source_residual) in [("Continue", false), ("こんにちは", true)] {
+        assert_target_script_review_keeps_current(translation, source_residual);
+    }
+}
+
+fn assert_target_script_review_keeps_current(translation: &'static str, source_residual: bool) {
+    let temporary = tempfile::tempdir().expect("目标书写系统测试目录应可建立");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("输入目录应可建立");
+    fs::write(
+        input.join("story.jsonl"),
+        concat!(
+            r#"{"id":"story","kind":"dialogue","units":[{"id":"body","text":"続ける"}]}"#,
+            "\n",
+        ),
+    )
+    .expect("输入应可写入");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    write_client_switch_distribution(root, "local", &endpoint, "local-test-model");
+    // 验证正式默认的旁路任务记录，包括已接受 ID 上的 Review。
+    let config = distribution_root(root).join("config.toml");
+    let contents = fs::read_to_string(&config).expect("配置应可读取");
+    fs::write(
+        &config,
+        contents.replace("record_translation_tasks = false\n", ""),
+    )
+    .expect("任务记录默认配置应可写入");
+    assert_success(
+        "Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                PROJECT,
+                "--path",
+                input.to_str().unwrap(),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "Extract",
+        &run_att(root, &["generic", "extract", "--name", PROJECT]),
+    );
+    let server = thread::spawn(move || serve_chat_completion(listener, translation));
+    let translated = run_att(root, &["generic", "translate", "--name", PROJECT, "local"]);
+    server
+        .join()
+        .expect("模型服务不得 panic")
+        .expect("模型请求应完成");
+    assert_success("Translate", &translated);
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    let logs = project_log_paths(&workspace.join("logs"));
+    let log = fs::read_to_string(logs.last().expect("应有模型运行日志")).unwrap();
+    assert!(
+        log.contains("expected target-language script"),
+        "日志必须呈现具体 Review：{log}"
+    );
+    assert_eq!(log.contains("source-language text"), source_residual);
+    assert!(!log.contains(translation), "项目日志不得输出候选正文");
+    let task_records = workspace.join("task-records");
+    let run = fs::read_dir(task_records)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let record = fs::read_to_string(run.join("task-000001.md")).unwrap();
+    assert!(record.contains("expected target-language script"));
+    assert_eq!(record.contains("source-language text"), source_residual);
+    let exported = root.join("translations.jsonl");
+    assert_success(
+        "export",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "translation",
+                "export",
+                "--name",
+                PROJECT,
+                exported.to_str().unwrap(),
+            ],
+        ),
+    );
+    let current = read_single_jsonl_group(&exported);
+    assert_eq!(current["state"], "current");
+    assert_eq!(current["translation"], serde_json::json!([translation]));
+    assert_success(
+        "WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    let output = read_single_jsonl_group(&workspace.join("write_back/story.jsonl"));
+    assert_eq!(output["units"][0]["text"], translation);
+    // 服务已经结束；Current 的再次 Translate 仍成功，不能把 Review 变成重试。
+    assert_success(
+        "Current retry",
+        &run_att(root, &["generic", "translate", "--name", PROJECT, "local"]),
+    );
+}
+
 fn serve_authentication_failure(listener: TcpListener) -> Result<(), String> {
     let (mut stream, _) = listener
         .accept()

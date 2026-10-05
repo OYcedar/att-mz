@@ -355,6 +355,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] Một mục trong mảng translation chứa văn bản không thể được chấp nhận
     [response_blank_line_mismatch] Mảng translation không giữ nguyên các vị trí trống và không trống bắt buộc
     [response_source_residual] Bản dịch đã được chấp nhận vẫn chứa ngôn ngữ nguồn và cần được xem lại
+        [response_target_script_missing] Bản dịch đã chấp nhận có chữ nhưng không có hệ chữ dự kiến của ngôn ngữ đích; cần xem lại
     [response_finish_requires_review] Mô hình dừng vì lý do chưa hoàn tất; kết quả trả về cần được xem lại
     [response_thinking_empty] Trường think bắt buộc bị trống hoặc chỉ chứa khoảng trắng
     [response_no_usable_output] Phản hồi Assistant không có đầu ra dùng được

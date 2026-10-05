@@ -1114,6 +1114,7 @@ fn generic_response_review_diagnostic(
     };
     let finding = match review.finding() {
         ReviewFinding::SourceResidual => GenericResponseReviewFinding::SourceResidual,
+        ReviewFinding::TargetScriptMissing => GenericResponseReviewFinding::TargetScriptMissing,
         ReviewFinding::NonStopFinish => GenericResponseReviewFinding::NonStopFinish,
     };
     generic_task_response_diagnostic(

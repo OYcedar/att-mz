@@ -360,6 +360,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] Элемент массива translation содержит текст, который нельзя принять
     [response_blank_line_mismatch] Массив translation не сохранил обязательные пустые и непустые позиции
     [response_source_residual] Принятый перевод всё ещё содержит исходный язык и требует проверки
+        [response_target_script_missing] Принятый перевод содержит буквы, но не ожидаемую письменность целевого языка; требуется проверка
     [response_finish_requires_review] Модель остановилась по нефинальной причине; возвращённый результат требует проверки
     [response_thinking_empty] Обязательное поле think пусто или содержит только пробельные символы
     [response_no_usable_output] Ответ Assistant не содержит пригодных результатов

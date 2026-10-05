@@ -358,6 +358,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] A translation array item contains text that cannot be accepted
     [response_blank_line_mismatch] The translation did not preserve the required blank and non-blank array slots
     [response_source_residual] The accepted translation still contains source-language text and needs review
+        [response_target_script_missing] The accepted translation has letters but none in the expected target-language script; review it
     [response_finish_requires_review] The model stopped for a non-final reason; the returned result needs review
     [response_thinking_empty] The required think field is empty or contains only whitespace
     [response_no_usable_output] The assistant response contains no usable output

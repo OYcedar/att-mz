@@ -875,6 +875,7 @@ pub(crate) struct GenericValidationFact {
     kind: String,
     protected: GenericProtectedText,
     analysis: LanguageAnalysis,
+    target_language: crate::language::LanguageId,
 }
 
 /// 一次 Generic Translate 的领域准备结果。
@@ -1182,6 +1183,7 @@ pub(crate) fn prepare_generic_translation(
                             kind: clone_generic_cpu_text(group.kind(), cancellation)?,
                             protected,
                             analysis,
+                            target_language: snapshot.project().language_pair().target().clone(),
                         },
                     ));
                 }
@@ -2877,7 +2879,20 @@ fn validate_generic_candidate_fact_with_cancellation(
         }
         Err(LanguageOperationCancelled) => return Err(GenericPlanningError::Cancelled.into()),
     };
-    let review = residual.is_some().then_some(ReviewFinding::SourceResidual);
+    let mut reviews = Vec::new();
+    if residual.is_some() {
+        reviews.push(ReviewFinding::SourceResidual);
+    }
+    if language_module
+        .target_script_missing_with_cancellation(&fact.target_language, &language_text, &mut || {
+            ensure_generic_language_running(cancellation)
+        })
+        .map_err(|LanguageOperationCancelled| {
+            GenericPreparationError::from(GenericPlanningError::Cancelled)
+        })?
+    {
+        reviews.push(ReviewFinding::TargetScriptMissing);
+    }
     ensure_generic_response_processing_running(cancellation)?;
     let final_translation = match rebuild_original_placeholders_with_cancellation(
         &candidate_protected,
@@ -2891,10 +2906,10 @@ fn validate_generic_candidate_fact_with_cancellation(
         return Ok(Err(GenericResponseDestinationProblem::ReservedToken));
     }
     ensure_generic_response_processing_running(cancellation)?;
-    Ok(Ok(match review {
-        Some(finding) => ValidatedCandidate::with_review(final_translation, finding),
-        None => ValidatedCandidate::clean(final_translation),
-    }))
+    Ok(Ok(ValidatedCandidate::with_reviews(
+        final_translation,
+        reviews,
+    )))
 }
 
 fn rebuild_original_placeholders_with_cancellation(
@@ -2973,12 +2988,10 @@ fn clone_generic_validation_result(
     match result {
         Ok(value) => {
             append_generic_response_text(&mut cloned, value.value(), cancellation)?;
-            let cloned = match value.reviews() {
-                [] => ValidatedCandidate::clean(cloned),
-                [finding] => ValidatedCandidate::with_review(cloned, finding.clone()),
-                _ => unreachable!("当前候选验收每个目标最多产生一个 Review"),
-            };
-            Ok(Ok(cloned))
+            Ok(Ok(ValidatedCandidate::with_reviews(
+                cloned,
+                value.reviews().to_vec(),
+            )))
         }
         Err(problem) => {
             ensure_generic_response_processing_running(cancellation)?;
@@ -3812,6 +3825,7 @@ mod tests {
                     ),
                     kind: "dialogue".to_owned(),
                     analysis: language_module.analyze_source(&language_text),
+                    target_language: LanguageId::parse("zh-Hans").expect("目标语言应有效"),
                     protected,
                 },
                 || Ok::<_, std::convert::Infallible>(()),
@@ -3856,7 +3870,26 @@ mod tests {
         )
         .expect("源语言残留只进入 Review，不应丢弃合法候选");
         assert_eq!(residual.value(), "こんにちは {name}");
-        assert_eq!(residual.reviews(), &[ReviewFinding::SourceResidual]);
+        assert_eq!(
+            residual.reviews(),
+            &[
+                ReviewFinding::SourceResidual,
+                ReviewFinding::TargetScriptMissing,
+            ]
+        );
+        let wrong_script = validate_generic_candidate(
+            &key,
+            &format!("Continue {token}"),
+            &facts,
+            &rules,
+            &language_module,
+        )
+        .expect("目标书写系统缺失只进入 Review");
+        assert_eq!(wrong_script.value(), "Continue {name}");
+        assert_eq!(
+            wrong_script.reviews(),
+            &[ReviewFinding::TargetScriptMissing]
+        );
     }
 
     #[test]
