@@ -362,6 +362,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] يحتوي عنصر في مصفوفة translation على نص لا يمكن قبوله
     [response_blank_line_mismatch] لم تحافظ مصفوفة translation على الخانات الفارغة وغير الفارغة المطلوبة
     [response_source_residual] لا تزال الترجمة المقبولة تحتوي على نص بلغة المصدر وتحتاج إلى مراجعة
+        [response_target_script_missing] تحتوي الترجمة المقبولة على حروف ولكنها لا تتضمن نظام الكتابة المتوقع للغة الهدف وتحتاج إلى مراجعة
     [response_finish_requires_review] توقف النموذج لسبب غير نهائي؛ تحتاج النتيجة المعادة إلى مراجعة
     [response_thinking_empty] حقل think المطلوب فارغ أو يحتوي على مسافات بيضاء فقط
     [response_no_usable_output] لا تحتوي استجابة Assistant على إخراج قابل للاستخدام

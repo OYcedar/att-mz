@@ -358,6 +358,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] Un élément du tableau translation contient du texte qui ne peut pas être accepté
     [response_blank_line_mismatch] Le tableau translation n'a pas conservé les emplacements vides et non vides requis
     [response_source_residual] La traduction acceptée contient encore du texte source et doit être révisée
+        [response_target_script_missing] La traduction acceptée contient des lettres mais pas l’écriture attendue de la langue cible ; une vérification est nécessaire
     [response_finish_requires_review] Le modèle s'est arrêté pour une raison non finale ; le résultat renvoyé doit être révisé
     [response_thinking_empty] Le champ think obligatoire est vide ou ne contient que des caractères d'espacement
     [response_no_usable_output] La réponse Assistant ne contient aucune sortie utilisable

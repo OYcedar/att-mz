@@ -355,6 +355,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] translation 배열 항목에 허용할 수 없는 텍스트가 있습니다
     [response_blank_line_mismatch] translation 배열이 필수 빈 슬롯과 비어 있지 않은 슬롯의 위치를 유지하지 않았습니다
     [response_source_residual] 수락된 번역문에 원문 언어가 남아 있어 검토가 필요합니다
+        [response_target_script_missing] 수락된 번역문에 문자가 있지만 대상 언어의 예상 문자 체계가 없어 검토가 필요합니다
     [response_finish_requires_review] 모델이 최종 상태가 아닌 이유로 중지되어 반환된 결과를 검토해야 합니다
     [response_thinking_empty] 필수 think 필드가 비어 있거나 공백만 포함합니다
     [response_no_usable_output] Assistant 응답에 사용할 수 있는 출력이 없습니다

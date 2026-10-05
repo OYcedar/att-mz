@@ -1905,6 +1905,7 @@ mod tests {
             "response_line_text_invalid",
             "response_blank_line_mismatch",
             "response_source_residual",
+            "response_target_script_missing",
             "response_finish_requires_review",
             "response_thinking_empty",
             "response_no_usable_output",

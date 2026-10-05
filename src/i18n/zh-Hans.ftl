@@ -355,6 +355,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] translation 数组项包含无法验收的文本
     [response_blank_line_mismatch] translation 数组未保持必需的空槽与非空槽位置
     [response_source_residual] 已接受的译文仍含源语言文本，需要复核
+        [response_target_script_missing] 已接受的译文含文字，但缺少目标语言预期的书写系统，需要复核
     [response_finish_requires_review] 模型因非最终原因停止；返回结果需要复核
     [response_thinking_empty] 必填的 think 字段为空或仅含空白
     [response_no_usable_output] Assistant 响应没有可用输出

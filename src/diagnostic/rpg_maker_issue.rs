@@ -1917,18 +1917,21 @@ pub(crate) enum RpgMakerTaskResponseUnitProblem {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RpgMakerTaskResponseReviewProblem {
     SourceResidual,
+    TargetScriptMissing,
 }
 
 impl RpgMakerTaskResponseReviewProblem {
     const fn code(self) -> &'static str {
         match self {
             Self::SourceResidual => "rpg_maker.translation.review.unit.source_residual",
+            Self::TargetScriptMissing => "rpg_maker.translation.review.unit.target_script_missing",
         }
     }
 
     const fn code_suffix(self) -> &'static str {
         match self {
             Self::SourceResidual => "source_residual",
+            Self::TargetScriptMissing => "target_script_missing",
         }
     }
 }
@@ -2118,6 +2121,10 @@ impl RpgMakerTaskResponseProblem {
                 finding: RpgMakerTaskResponseReviewProblem::SourceResidual,
                 ..
             } => "response_source_residual",
+            Self::UnitReview {
+                finding: RpgMakerTaskResponseReviewProblem::TargetScriptMissing,
+                ..
+            } => "response_target_script_missing",
             Self::ModelResponseUnusable => "response_no_usable_output",
             Self::AllOutputsRejected => "response_all_outputs_rejected",
             Self::ThinkingEmpty { .. } => "response_thinking_empty",

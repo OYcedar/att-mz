@@ -355,6 +355,7 @@ diagnostic-failure-value = { $code ->
     [response_line_text_invalid] translation 陣列項目包含無法驗收的文字
     [response_blank_line_mismatch] translation 陣列未保持必要的空槽與非空槽位置
     [response_source_residual] 已接受的譯文仍含來源語言文字，需要複核
+        [response_target_script_missing] 已接受的譯文含文字，但缺少目標語言預期的書寫系統，需要複核
     [response_finish_requires_review] 模型因非最終原因停止；傳回結果需要複核
     [response_thinking_empty] 必填的 think 欄位為空或僅含空白
     [response_no_usable_output] Assistant 回應沒有可用輸出

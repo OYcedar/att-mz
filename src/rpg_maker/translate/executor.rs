@@ -1840,6 +1840,7 @@ fn accept_translation_lines_candidate_at_with_cancellation(
             placeholder_bindings,
             language_analysis,
             language_module,
+            target_language: semantics.language_pair().target(),
         },
         invariant_location,
         &mut ensure_running,
@@ -2325,6 +2326,7 @@ fn validate_and_restore_translation_lines(
             placeholder_bindings: &placeholder_bindings,
             language_analysis,
             language_module,
+            target_language: &LanguageId::parse("zh-Hans").expect("测试目标语言应有效"),
         },
         TranslationCandidateInvariantLocation::PreparedCandidate,
         || Ok(()),
@@ -2342,6 +2344,7 @@ struct TranslationLinesValidationContract<'a> {
     placeholder_bindings: &'a PlaceholderBindingIndex,
     language_analysis: &'a crate::language::LanguageAnalysis,
     language_module: &'a dyn LanguageModule,
+    target_language: &'a LanguageId,
 }
 
 fn validate_and_restore_translation_lines_at_with_cancellation(
@@ -2360,6 +2363,7 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
         placeholder_bindings,
         language_analysis,
         language_module,
+        target_language,
     } = contract;
     let mut initial_scans = Vec::with_capacity(lines.len());
     for line in &lines {
@@ -2518,7 +2522,18 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
             Err(LanguageOperationCancelled) => return Err(ResponseProcessingCancelled),
         }
     };
-    let review = residual.is_some().then_some(ReviewFinding::SourceResidual);
+    let mut reviews = Vec::new();
+    if residual.is_some() {
+        reviews.push(ReviewFinding::SourceResidual);
+    }
+    let mut language_check =
+        || ensure_running().map_err(|ResponseProcessingCancelled| LanguageOperationCancelled);
+    if language_module
+        .target_script_missing_with_cancellation(target_language, &normalized, &mut language_check)
+        .map_err(|LanguageOperationCancelled| ResponseProcessingCancelled)?
+    {
+        reviews.push(ReviewFinding::TargetScriptMissing);
+    }
     let mut restored = Vec::with_capacity(lines.len());
     let mut segment_offset = 0;
     for (line_index, projection) in line_projections.iter().enumerate() {
@@ -2603,10 +2618,7 @@ fn validate_and_restore_translation_lines_at_with_cancellation(
         }
     }
     ensure_running()?;
-    Ok(Ok(match review {
-        Some(finding) => ValidatedCandidate::with_review(restored, finding),
-        None => ValidatedCandidate::clean(restored),
-    }))
+    Ok(Ok(ValidatedCandidate::with_reviews(restored, reviews)))
 }
 
 #[cfg(test)]
@@ -4557,6 +4569,39 @@ mod tests {
             } if *id == task_id(5)
         )));
         assert_eq!(result.diagnostics().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn response_processor_accepts_and_reports_missing_target_script() {
+        let processor =
+            TranslationTaskResponseProcessingService::new(InlineCpu, translation_resources());
+        let result = processor
+            .process(
+                &task_with_output_count(1),
+                LlmResponse::new(
+                    r#"{"0":["Continue⟦ATT_ACTOR_NAME_WHOLE_0000⟧"]}"#,
+                    LlmFinishReason::Stop,
+                ),
+                1,
+            )
+            .await
+            .expect("非阻断 Review 应正常完成");
+        assert_eq!(result.accepted().len(), 1);
+        assert!(result.unresolved().is_empty());
+        assert!(result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::CandidateReview {
+                finding: ReviewFinding::TargetScriptMissing,
+                ..
+            }
+        )));
+        assert!(!result.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            TranslationProtocolDiagnostic::CandidateReview {
+                finding: ReviewFinding::SourceResidual,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
