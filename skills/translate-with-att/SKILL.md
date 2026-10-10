@@ -30,6 +30,10 @@ ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agen
 RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写回或大量 QA 候选时，
 读取[大型、插件密集的 MV 经验](references/game-type-large-plugin-heavy-mv.md)中对应的处理方法。
 
+RPG Maker VX Ace／RGSS3 项目通过 Generic 接入时，读取
+[VX Ace 汉化技能](../rpg-maker-vx-ace-localization/SKILL.md)，补充 Marshal、脚本、字体与消息排版。
+普通汉化保留现有视觉设计；仅在用户主动明确要求美化时进入该技能的界面现代化流程。
+
 Ren'Py 项目通过 Generic JSONL 翻译时，读取 [Ren'Py 汉化技能](../renpy-localization/SKILL.md)，
 补充原生翻译模板、硬编码界面、反向转换、字体与独立补丁的检查。
 
@@ -54,7 +58,7 @@ Unity / Naninovel 项目通过 Generic 接入，或资源已译而自定义标�
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
 唯一所有者。图片文字交给图像翻译流程，资源路径、内部键、控制符和协议外壳保留其技术含义。
 
-RPG Maker 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、事件、活动插件参数、插件源码
+RPG Maker MV/MZ 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、事件、活动插件参数、插件源码
 和自定义数据。根据真实结构把来源交给：
 
 - Builtin：ATT 原生覆盖的位置；

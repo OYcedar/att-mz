@@ -1,0 +1,4 @@
+interface:
+  display_name: "VX Ace／RGSS3 游戏汉化"
+  short_description: "通过 ATT Generic 处理 VX Ace 汉化与返修；美化仅按用户主动明确要求执行"
+  default_prompt: "使用 $rpg-maker-vx-ace-localization 处理这款 VX Ace 游戏的汉化或返修，核对真实文本消费者、字体、排版与写回结果，区分离线检查和实机验收。"
