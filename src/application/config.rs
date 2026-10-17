@@ -525,7 +525,7 @@ impl ConfiguredRpgMakerCommand {
                     command,
                     ManualOperation::TranslationExport,
                     common,
-                    false,
+                    true,
                 )?,
             )),
             RpgMakerCommandArguments::Lua(arguments) => {
@@ -571,7 +571,7 @@ pub(crate) enum ConfiguredGenericCommand {
     Lua(ConfiguredProjectLuaCommand),
 }
 
-/// Manual export 读取语言模块筛选待译项；check/apply 只校验结构。
+/// Manual export 筛选待译项，Translation export 计算语言 Review；check/apply 只校验结构。
 pub(crate) struct ConfiguredManualCommand {
     operation: ManualOperation,
     project_name: ProjectName,
@@ -899,7 +899,7 @@ impl ConfiguredGenericCommand {
                     command,
                     ManualOperation::TranslationExport,
                     common,
-                    false,
+                    true,
                 )?,
             )),
             GenericCommand::Lua(arguments) => {

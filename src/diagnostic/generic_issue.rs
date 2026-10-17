@@ -2088,6 +2088,7 @@ impl GenericProblem {
             Self::SerializeJson { .. } => DiagnosticResolution::ReportBug,
             Self::TaskResponse { problem, .. } => match problem {
                 GenericTaskResponseProblem::ResponseReview { .. }
+                | GenericTaskResponseProblem::UnexpectedId { .. }
                 | GenericTaskResponseProblem::DestinationReview { .. } => {
                     DiagnosticResolution::ReviewTranslation
                 }

@@ -81,7 +81,7 @@ minimum_copied_letter_count = 4
 allowed_terms = ["Page Up", "Page Down"]
 ```
 
-每种语言类型只接受自己声明的字段。Translate 校验全部定义，再按项目源语言精确选择模块。
+每种语言类型只接受自己声明的字段。Translate 和 Translation export 校验全部定义，再按项目源语言精确选择模块。
 英语的 `ignored_terms` 改变译前准入；`allowed_terms` 用于确认哪些英文可以保留在译文中，
 不改变译前判断或临时 ID 分配。完整语义见[语言规格](../translation/language.md)。
 

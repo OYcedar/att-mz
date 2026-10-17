@@ -178,6 +178,32 @@ fn manual_export_check_and_apply_work_for_mv_and_mz() {
             &run_att(root, apply),
         );
 
+        let translations = root.join(format!("{engine}-translations.jsonl"));
+        let mut export = arguments(&[engine, "translation", "export", "--name", PROJECT]);
+        export.push(translations.as_os_str().to_owned());
+        assert_success(
+            &format!("{engine} Translation export"),
+            &run_att(root, export),
+        );
+        let records: Vec<Value> = fs::read_to_string(&translations)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0]["source_language"], "ja");
+        let exported_name = records
+            .iter()
+            .find(|row| row["manual_id"] == "Items.json:1:name")
+            .unwrap();
+        assert_eq!(exported_name["state"], "current");
+        assert!(exported_name["reviews"].as_array().unwrap().is_empty());
+        assert!(
+            records
+                .iter()
+                .any(|row| row["manual_id"] == "Items.json:1:description"
+                    && row["state"] == "pending")
+        );
+
         let workspace = distribution_root(root)
             .join("projects")
             .join(engine)

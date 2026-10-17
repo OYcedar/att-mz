@@ -27,9 +27,14 @@ def _translation_row(
     translation: list[str],
     *,
     unit_type: str = "free",
+    reviews: list[str] | None = None,
+    natural_source: list[str | None] | None = None,
+    natural_translation: list[str | None] | None = None,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "manual_id": "Map001.json:event1:page1:command1:dialogue",
+        "group": "Map001.json:event1:page1:command1:dialogue",
+        "reviews": reviews or [],
         "source": source,
         "translation": translation,
         "state": "current",
@@ -38,6 +43,20 @@ def _translation_row(
         "owner": "builtin",
         "rule_number": None,
     }
+    if natural_source is not None:
+        result["natural_source"] = natural_source
+    if natural_translation is not None:
+        result["natural_translation"] = natural_translation
+    return result
+
+
+def _export_json(row: dict[str, object]) -> str:
+    return (
+        json.dumps({"source_language": "ja", "target_language": "zh-Hans"})
+        + "\n"
+        + json.dumps(row, ensure_ascii=False)
+        + "\n"
+    )
 
 
 def _term(term: str, translation: str, *triggers: str) -> translation_qa._TerminologyEntry:
@@ -272,9 +291,9 @@ class PlaceholderAndQaFixTests(unittest.TestCase):
         )
         self.assertIn("control_shape_review", {finding["kind"] for finding in findings})
 
-    def test_wrapper_payload_remains_visible_to_residual_review(self) -> None:
+    def test_core_language_review_is_preserved_without_reinterpreting_wrappers(self) -> None:
         findings = translation_qa._translation_findings(
-            _translation_row(["<Help:EnglishText>"], ["<Help:EnglishText>"]),
+            _translation_row(["<Help:EnglishText>"], ["<Help:EnglishText>"], reviews=["source_residual"]),
             [],
         )
         self.assertIn("source_residual", {finding["kind"] for finding in findings})
@@ -323,13 +342,18 @@ class PlaceholderAndQaFixTests(unittest.TestCase):
         self.assertEqual(len(mismatches), 1)
 
         opaque_target = translation_qa._translation_findings(
-            _translation_row(["Foo"], ["<span>错误</span>"]),
+            _translation_row(["Foo"], ["<span>错误</span>"], natural_translation=[None, "错误", None]),
             [_term("Foo", "span")],
         )
         self.assertIn("terminology_mismatch", {finding["kind"] for finding in opaque_target})
 
         split_source = translation_qa._translation_findings(
-            _translation_row([r"魔\C[1]法"], [r"错\C[1]误"]),
+            _translation_row(
+                [r"魔\C[1]法"],
+                [r"错\C[1]误"],
+                natural_source=["魔", None, "法"],
+                natural_translation=["错", None, "误"],
+            ),
             [_term("魔法", "魔法")],
         )
         self.assertNotIn("terminology_mismatch", {finding["kind"] for finding in split_source})
@@ -497,14 +521,14 @@ class JsonlAndLogFixTests(unittest.TestCase):
         row = _translation_row(["before\u2028after"], ["译文"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "translation.jsonl"
-            path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+            path.write_text(_export_json(row), encoding="utf-8")
             self.assertEqual(read_translation_export(path)[0]["source"], ["before\u2028after"])
 
     def test_translation_export_rejects_a_physical_lone_cr(self) -> None:
         row = _translation_row(["source"], ["译文"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "translation.jsonl"
-            path.write_bytes(json.dumps(row, ensure_ascii=False).encode("utf-8") + b"\r")
+            path.write_bytes(_export_json(row).rstrip("\n").encode("utf-8") + b"\r")
 
             with self.assertRaises(ToolError):
                 read_translation_export(path)
@@ -514,7 +538,7 @@ class JsonlAndLogFixTests(unittest.TestCase):
         row["state"] = []
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "translation.jsonl"
-            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            path.write_text(_export_json(row), encoding="utf-8")
             with self.assertRaises(ToolError) as caught:
                 read_translation_export(path)
             self.assertIn("state", caught.exception.reason)

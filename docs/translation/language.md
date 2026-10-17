@@ -87,6 +87,22 @@ Generic、MV/MZ 的模型响应验收在 Placeholder 恢复和自然文本投影
 及原因，不将疑似问题正文写入项目日志。两类 Review 均不改变 Current、Rejected、任务完成
 或 WriteBack 的语义，也不会自动重新请求模型。
 
+## 完整导出的译后 QA
+
+`translation export` 从项目读取语言对，按当前语言模块重新检查全部 Current 正文，包括人工
+译文。源文与译文先通过当前源文 Placeholder binding 建立 NaturalText；不透明键、控制段和
+wrapper 不参与语言检查。导出一次语言对，并逐 Unit 输出 `reviews`，供随包 QA 直接消费。
+
+除前述 `source_residual` 与 `target_script_missing` 外，完整导出还报告：
+
+- `unexpected_script`：自然译文新出现目标书写系统及当前自然原文均没有的字母书写系统，
+  例如中文中混入原文没有的谚文；排除 `allowed_terms`，忽略 Common/Inherited。
+- `replacement_character`：自然译文出现 U+FFFD，而该 Unit 自然原文没有该字符；允许词仍排除。
+
+这些都是审校线索。源文已含同种文字系统、共用汉字、简繁体和语义误译不由此证明正确或错误。
+检查只读取当前状态，不将提示保存为 Rejected，不自动重译。Python QA 不再另做原译文共有
+词语的源语判定，避免把正常保留的按键名或受保护内部键重复报告为残留。
+
 ## 生效时间与结果
 
 Translate 启动时先校验全部语言定义，再按项目的源语言 ID 精确选择模块；找不到

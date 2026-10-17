@@ -128,8 +128,14 @@ class FontCoverageTests(unittest.TestCase):
                         "rejected_candidate_json": '["𠀁"]',
                     },
                 ]
+                for row in rows:
+                    row["group"] = row["manual_id"]
+                    row["reviews"] = []
                 translations.write_text(
-                    "\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8"
+                    json.dumps({"source_language": "ja", "target_language": "zh-Hans"})
+                    + "\n"
+                    + "\n".join(json.dumps(row, ensure_ascii=False) for row in rows),
+                    encoding="utf-8",
                 )
                 first.write_text(additions[0], encoding="utf-8")
                 second.write_text(additions[1], encoding="utf-8")

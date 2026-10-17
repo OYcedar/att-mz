@@ -16,6 +16,7 @@ use icu_properties::{
     props::{GeneralCategory, GeneralCategoryGroup, Script},
 };
 use language_tags::{LanguageTag, ParseError as LanguageTagParseError, ValidationError};
+use serde::Serialize;
 
 const LANGUAGE_TEXT_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 
@@ -714,6 +715,24 @@ pub(crate) trait LanguageModule: Send + Sync {
         translation: &LanguageText,
     ) -> Result<Option<LanguageResidual>, LanguageModuleError>;
 
+    /// 完整译后 QA 的附加提示；与译文有效性及自动重试无关。
+    fn additional_qa_reviews(
+        &self,
+        target: &LanguageId,
+        source: &LanguageText,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Vec<LanguageQaReview>, LanguageOperationCancelled> {
+        additional_qa_reviews(
+            target,
+            source,
+            translation,
+            &BTreeSet::new(),
+            TermComparison::Exact,
+            ensure_running,
+        )
+    }
+
     /// 检查候选是否完全缺少目标书写系统；这不是语言识别或强验收。
     fn target_script_missing_with_cancellation(
         &self,
@@ -979,6 +998,23 @@ pub(crate) struct JapaneseLanguageAnalysis {
 }
 
 impl LanguageModule for JapaneseLanguageModule {
+    fn additional_qa_reviews(
+        &self,
+        target: &LanguageId,
+        source: &LanguageText,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Vec<LanguageQaReview>, LanguageOperationCancelled> {
+        additional_qa_reviews(
+            target,
+            source,
+            translation,
+            &self.residual_policy.allowed_terms,
+            TermComparison::Exact,
+            ensure_running,
+        )
+    }
+
     fn target_script_missing_with_cancellation(
         &self,
         target: &LanguageId,
@@ -1189,6 +1225,23 @@ pub(crate) struct EnglishLanguageAnalysis {
 }
 
 impl LanguageModule for EnglishLanguageModule {
+    fn additional_qa_reviews(
+        &self,
+        target: &LanguageId,
+        source: &LanguageText,
+        translation: &LanguageText,
+        ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+    ) -> Result<Vec<LanguageQaReview>, LanguageOperationCancelled> {
+        additional_qa_reviews(
+            target,
+            source,
+            translation,
+            &self.residual_policy.allowed_terms,
+            TermComparison::AsciiInsensitive,
+            ensure_running,
+        )
+    }
+
     fn target_script_missing_with_cancellation(
         &self,
         target: &LanguageId,
@@ -1711,6 +1764,113 @@ fn target_script_missing_with_cancellation<E>(
     Ok(has_other_letters)
 }
 
+/// 导出当前正文时重新计算的语言提示，不持久化为项目状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LanguageQaReview {
+    SourceResidual,
+    TargetScriptMissing,
+    UnexpectedScript,
+    ReplacementCharacter,
+}
+
+pub(crate) fn translation_qa_reviews(
+    module: &dyn LanguageModule,
+    target: &LanguageId,
+    source: &LanguageText,
+    translation: &LanguageText,
+    ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+) -> Result<Vec<LanguageQaReview>, LanguageOperationCancelled> {
+    let analysis = module.analyze_source_with_cancellation(source, ensure_running)?;
+    let mut reviews = Vec::new();
+    if module
+        .find_source_residual_with_cancellation(&analysis, translation, ensure_running)?
+        .expect("同一语言模块建立的源语分析必须可用于残留检查")
+        .is_some()
+    {
+        reviews.push(LanguageQaReview::SourceResidual);
+    }
+    if module.target_script_missing_with_cancellation(target, translation, ensure_running)? {
+        reviews.push(LanguageQaReview::TargetScriptMissing);
+    }
+    reviews.extend(module.additional_qa_reviews(target, source, translation, ensure_running)?);
+    Ok(reviews)
+}
+
+fn additional_qa_reviews(
+    target: &LanguageId,
+    source: &LanguageText,
+    translation: &LanguageText,
+    allowed_terms: &BTreeSet<String>,
+    comparison: TermComparison,
+    ensure_running: &mut dyn FnMut() -> Result<(), LanguageOperationCancelled>,
+) -> Result<Vec<LanguageQaReview>, LanguageOperationCancelled> {
+    let mut reviews = Vec::new();
+    let scripts = CodePointMapData::<Script>::new();
+    let categories = CodePointMapData::<GeneralCategory>::new();
+    let mut source_scripts = Vec::new();
+    let mut source_has_replacement = false;
+    for text in natural_texts(source) {
+        for character in text.chars() {
+            ensure_running()?;
+            source_has_replacement |= character == '\u{fffd}';
+            if GeneralCategoryGroup::Letter.contains(categories.get(character)) {
+                let script = scripts.get(character);
+                if !source_scripts.contains(&script) {
+                    source_scripts.push(script);
+                }
+            }
+        }
+    }
+    let expected = expected_target_scripts(target);
+    let mut unexpected = false;
+    let mut replacement = false;
+    for text in natural_texts(translation) {
+        let ranges = match comparison {
+            TermComparison::Exact => {
+                exact_term_ranges_with_cancellation(text, allowed_terms, &mut *ensure_running)?
+            }
+            TermComparison::AsciiInsensitive => ascii_insensitive_term_ranges_with_cancellation(
+                text,
+                allowed_terms,
+                &mut *ensure_running,
+            )?,
+        };
+        let mut range_index = 0;
+        for (offset, character) in text.char_indices() {
+            ensure_running()?;
+            while ranges
+                .get(range_index)
+                .is_some_and(|(_, end)| *end <= offset)
+            {
+                range_index += 1;
+            }
+            if ranges
+                .get(range_index)
+                .is_some_and(|(start, end)| *start <= offset && offset < *end)
+            {
+                continue;
+            }
+            replacement |= character == '\u{fffd}' && !source_has_replacement;
+            if let Some(expected) = expected {
+                let script = scripts.get(character);
+                unexpected |= GeneralCategoryGroup::Letter.contains(categories.get(character))
+                    && !expected.contains(&script)
+                    && !source_scripts.contains(&script)
+                    && script != Script::Common
+                    && script != Script::Inherited;
+            }
+        }
+    }
+    if unexpected {
+        reviews.push(LanguageQaReview::UnexpectedScript);
+    }
+    if replacement {
+        reviews.push(LanguageQaReview::ReplacementCharacter);
+    }
+    Ok(reviews)
+}
+
 #[derive(Clone)]
 struct EnglishWord {
     normalized: String,
@@ -2101,6 +2261,52 @@ mod tests {
             },
         );
         assert_eq!(result, Err(LanguageOperationCancelled));
+    }
+
+    #[test]
+    fn full_qa_finds_introduced_scripts_and_corruption_but_respects_protection_and_allowances() {
+        let module = JapaneseLanguageModule::new(
+            JapaneseResidualPolicy::new(NonZeroUsize::new(1).unwrap(), ["Menu".to_owned()])
+                .unwrap(),
+        );
+        let target = LanguageId::parse("zh-Hans").unwrap();
+        let source = LanguageText::natural("説明");
+        let reviews = translation_qa_reviews(
+            &module,
+            &target,
+            &source,
+            &LanguageText::natural("中文한글�"),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            reviews,
+            vec![
+                LanguageQaReview::UnexpectedScript,
+                LanguageQaReview::ReplacementCharacter
+            ]
+        );
+        let protected = LanguageText::new(vec![
+            LanguageTextSegment::OpaqueBoundary,
+            LanguageTextSegment::NaturalText("中文 Menu".to_owned()),
+        ]);
+        assert!(
+            translation_qa_reviews(&module, &target, &source, &protected, &mut || Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+        let unchanged_foreign = LanguageText::natural("Alt説明");
+        assert!(
+            translation_qa_reviews(
+                &module,
+                &target,
+                &unchanged_foreign,
+                &LanguageText::natural("Alt说明"),
+                &mut || Ok(())
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     fn english_module() -> EnglishLanguageModule {

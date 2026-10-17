@@ -401,6 +401,7 @@ pub(crate) struct TranslationTaskRecordDocument {
     ///
     /// 任务记录只呈现这些报告，不能重新从 Outcome 的业务枚举拼接另一套原因文本。
     outcome_diagnostics: Vec<DiagnosticReport>,
+    locations: std::collections::BTreeMap<usize, Vec<String>>,
 }
 
 impl TranslationTaskRecordDocument {
@@ -414,6 +415,19 @@ impl TranslationTaskRecordDocument {
             "任务记录的完成、部分完成或不可用终态必须与权威 Outcome 种类一致"
         );
         let requested_outputs = task.expected_outputs().len();
+        let locations = task
+            .expected_outputs()
+            .iter()
+            .map(|output| {
+                (
+                    output.id().get(),
+                    std::iter::once(output.identity())
+                        .chain(output.propagation_targets())
+                        .map(|identity| identity.readable_id())
+                        .collect(),
+                )
+            })
+            .collect();
         let user_message = task
             .messages()
             .iter()
@@ -430,6 +444,7 @@ impl TranslationTaskRecordDocument {
             provider,
             state,
             outcome_diagnostics: Vec::new(),
+            locations,
         }
     }
 
@@ -516,6 +531,10 @@ fn render_translation_task_record(
     );
     render_final_result(&mut output, &localizer, api_key_redactor, document);
 
+    output.push_str(&crate::translation::task_record::task_record_locations(
+        &document.locations,
+        api_key_redactor,
+    ));
     output.push_str("\n## User\n\n");
     let user = api_key_redactor.redact_text_with_json_strings(&document.user_message);
     output.push_str(&user);
@@ -684,6 +703,7 @@ mod tests {
     #[test]
     fn task_record_renders_the_final_attempt_provider_as_markdown_plain_text() {
         let document = TranslationTaskRecordDocument {
+            locations: std::collections::BTreeMap::new(),
             task_index: RpgMakerTranslationTaskIndex::new(0),
             requested_outputs: 1,
             user_message: "request".to_owned(),

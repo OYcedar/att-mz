@@ -42,13 +42,19 @@ from att_skill_tools import (
     safe_walk_files,
     validate_object_keys,
 )
+from att_toolbox.adapter_verification import read_adapter_report, verify_bindings, verify_report
 from att_toolbox.coverage import coverage_projection
 from att_toolbox.generic_mapping import generic_materials
 from att_toolbox.png import decode_png_size
 from att_toolbox.rpg_control_codes import is_structural_blank
 from att_toolbox.survey import load_survey, survey_game_root, verify_source_baseline
 from att_toolbox.survey_projection import read_rules_manifest
-from att_toolbox.translation_export import read_translation_export
+from att_toolbox.translation_export import (
+    natural_segments,
+    read_translation_document,
+    read_translation_export,
+)
+from att_toolbox.translation_review import adjacent_review
 
 _CONTROL_SHAPE = re.compile(
     r"(?:\\|\x1b)(?:[A-Za-z]+(?:\[[^\]\r\n]*\]|<[^>\r\n]*>)?|[\\{}$.|!><^])|"
@@ -90,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--terminology", type=Path, help="本次 Translate 使用的 terminology.toml")
     scan.add_argument("--write-back", type=Path, help="可选 ATT 当前项目的实际 write_back 目录")
+    scan.add_argument("--adapter-report", type=Path, help="独立 Generic 的最终产物验收报告")
     scan.add_argument(
         "--runtime-report",
         type=Path,
@@ -580,29 +587,6 @@ def _terminology(path: Path | None) -> list[_TerminologyEntry]:
     return output
 
 
-def _display_width(value: str) -> int:
-    visible = _visible_text(value)
-    return sum(
-        0
-        if unicodedata.category(character).startswith("C")
-        else 2
-        if unicodedata.east_asian_width(character) in {"W", "F"}
-        else 1
-        for character in visible
-    )
-
-
-def _layout_limit(manual_id: str) -> int:
-    lowered = manual_id.casefold()
-    if "choice" in lowered:
-        return 28
-    if "dialogue" in lowered or "scrolling" in lowered:
-        return 42
-    if manual_id.startswith("plugins.js:"):
-        return 32
-    return 48
-
-
 def _source_script(character: str) -> str | None:
     """只按原文中可复核的文字序列寻找残留，不把任意非 ASCII 当成源语。"""
 
@@ -644,22 +628,6 @@ def _visible_text(value: str) -> str:
     """保留启发式 wrapper 内可能属于正文的内容，只移除外壳。"""
 
     return _CONTROL_SHAPE.sub(_control_payload, value)
-
-
-def _natural_text_segments(value: str) -> list[str]:
-    """按 Placeholder/OpaqueBoundary 分隔术语可见正文。"""
-
-    segments: list[str] = []
-    start = 0
-    for match in _CONTROL_SHAPE.finditer(value):
-        if match.start() > start:
-            segments.append(value[start : match.start()])
-        if payload := _control_payload(match):
-            segments.append(payload)
-        start = match.end()
-    if start < len(value):
-        segments.append(value[start:])
-    return segments
 
 
 def _control_token(match: re.Match[str]) -> str:
@@ -715,10 +683,6 @@ def _text_tokens(value: str, *, interpret_controls: bool = True) -> set[str]:
         current.append(character)
     finish()
     return tokens
-
-
-def _source_residual_tokens(source: str, translation: str) -> list[str]:
-    return sorted(_text_tokens(source).intersection(_text_tokens(translation)))
 
 
 def _finding(
@@ -787,15 +751,6 @@ def _translation_findings(
                     details={"slot": slot},
                 )
             )
-        residual = _source_residual_tokens(source, translation)
-        if residual:
-            findings.append(
-                _finding(
-                    "source_residual",
-                    manual_id=manual_id,
-                    details={"slot": slot, "words": residual[:10], "translation_preview": translation[:160]},
-                )
-            )
         if unit_type == "free":
             source_controls = _control_tokens(source)
             translation_controls = _control_tokens(translation)
@@ -818,7 +773,8 @@ def _translation_findings(
                     },
                 )
             )
-    limit = _layout_limit(manual_id)
+    for review in cast(list[str], row["reviews"]):
+        findings.append(_finding(review, manual_id=manual_id))
     source_explanation_cues = {
         cue for source in source_lines if (cue := _model_explanation_cue(source)) is not None
     }
@@ -832,19 +788,8 @@ def _translation_findings(
                     details={"slot": slot, "translation_preview": translation[:160]},
                 )
             )
-        width = _display_width(translation)
-        if width > limit:
-            findings.append(
-                _finding(
-                    "layout_risk",
-                    manual_id=manual_id,
-                    details={"slot": slot, "display_width": width, "heuristic_limit": limit},
-                )
-            )
-    source_text = "\n".join(source_lines)
-    translation_text = "\n".join(translation_lines)
-    target_segments = _natural_text_segments(translation_text)
-    for trigger, expected in _selected_terms(source_text, terms):
+    target_segments = natural_segments(row, "translation")
+    for trigger, expected in _selected_terms(natural_segments(row, "source"), terms):
         if not any(expected in segment for segment in target_segments):
             findings.append(
                 _finding(
@@ -856,11 +801,11 @@ def _translation_findings(
     return findings
 
 
-def _selected_terms(source: str, terms: Sequence[_TerminologyEntry]) -> list[tuple[str, str]]:
+def _selected_terms(segments: Sequence[str], terms: Sequence[_TerminologyEntry]) -> list[tuple[str, str]]:
     """按 ATT 的最早起点、同起点最长规则选择互不重叠的术语。"""
 
     selected_entries: dict[int, str] = {}
-    for segment in _natural_text_segments(source):
+    for segment in segments:
         matches: list[tuple[int, int, int, int, str]] = []
         for entry_number, entry in enumerate(terms):
             for trigger_number, trigger in enumerate(entry.triggers):
@@ -1044,15 +989,15 @@ def _generic_write_back_findings(
                 )
             )
             continue
-        residual, introduced = _write_back_residual(source, expected_text, output_text)
-        if residual:
+        _residual, introduced = _write_back_residual(source, expected_text, output_text)
+        if introduced:
             findings.append(
                 _finding(
                     "write_back_source_residual",
                     manual_id=manual_id,
                     details={
                         "candidate_id": recipe.get("candidate_id"),
-                        "words": residual[:10],
+                        "words": introduced[:10],
                         "introduced_words": introduced[:10],
                     },
                 )
@@ -1150,13 +1095,15 @@ def _rpg_write_back_findings(
                 hits_by_id.setdefault(manual_id, set()).add(token)
     for manual_id, words in sorted(hits_by_id.items()):
         introduced = words - expected_tokens_by_id[manual_id]
+        if not introduced:
+            continue
         findings.append(
             _finding(
                 "write_back_source_residual",
                 manual_id=manual_id,
                 details={
                     "path": required_by_id[manual_id],
-                    "words": sorted(words)[:10],
+                    "words": sorted(introduced)[:10],
                     "introduced_words": sorted(introduced)[:10],
                     "scope": "same_output_file_without_unit_recipe",
                 },
@@ -1754,7 +1701,16 @@ def _scan(args: argparse.Namespace) -> int:
     terminology_path = cast(Path | None, args.terminology)
     write_back_path = cast(Path | None, args.write_back)
     runtime_path = cast(Path | None, args.runtime_report)
+    adapter_path = cast(Path | None, args.adapter_report)
     standalone_generic = generic_input_path is not None
+    if adapter_path is not None and (not standalone_generic or write_back_path is None):
+        fail(
+            "--adapter-report",
+            "需要独立 Generic 输入和当前 WriteBack",
+            "同时传入 --generic-input 和 --write-back",
+        )
+    adapter_report = read_adapter_report(adapter_path) if adapter_path is not None else None
+    adapter_report_fact = _file_fact(adapter_path, "外部验收报告") if adapter_path is not None else None
     if standalone_generic:
         if coverage_argument is not None:
             fail("--coverage", "standalone Generic 模式不接受 coverage", "删除 --coverage")
@@ -1808,16 +1764,24 @@ def _scan(args: argparse.Namespace) -> int:
         inputs.append(protected_game_root)
     inputs.extend(
         path
-        for path in (generic_manifest_path, terminology_path, write_back_path, runtime_path)
+        for path in (generic_manifest_path, terminology_path, write_back_path, runtime_path, adapter_path)
         if path is not None
     )
+    adapter_roots: list[Path] = []
+    if adapter_report is not None:
+        for name in ("source_root", "output_root"):
+            value = adapter_report.get(name)
+            if not isinstance(value, str):
+                fail(str(adapter_path), f"缺少 {name}", "重新运行外部验收")
+            adapter_roots.append(Path(value))
     protect_outputs(
         [args.output],
         inputs=inputs,
-        forbidden_roots=[protected_game_root] if protected_game_root is not None else [],
+        forbidden_roots=([protected_game_root] if protected_game_root is not None else []) + adapter_roots,
         replace=args.replace,
     )
-    rows = _read_translation_export(translations_path)
+    document = read_translation_document(translations_path)
+    rows = document.rows
 
     survey: dict[str, JsonValue] | None
     locations: list[dict[str, JsonValue]]
@@ -1897,6 +1861,18 @@ def _scan(args: argparse.Namespace) -> int:
         )
     terms = _terminology(terminology_path)
     findings = [finding for row in rows for finding in _translation_findings(row, terms)]
+    scopes = {
+        identifier: cast(str, recipe["input_file"]) for identifier, recipe in (generic_recipes or {}).items()
+    }
+    findings.extend(
+        adjacent_review(
+            rows,
+            scopes,
+            [(trigger, term.translation) for term in terms for trigger in term.triggers],
+            source_language=document.source_language,
+            target_language=document.target_language,
+        )
+    )
     if not standalone_generic:
         findings.extend(
             _survey_findings(
@@ -1905,9 +1881,7 @@ def _scan(args: argparse.Namespace) -> int:
                 check_builtin=not generic_project,
             )
         )
-    # 现行 Translation export 没有项目目标语言；精确源文残留只能形成 Review，
-    # 即使写回和运行证据齐全，也不能据此证明全量语言方向正确。
-    unverified: list[str] = ["translation_language_pair_unbound"]
+    unverified: list[str] = ["layout_unverified"]
     if standalone_generic:
         unverified.extend(
             [
@@ -1945,6 +1919,29 @@ def _scan(args: argparse.Namespace) -> int:
     findings.extend(runtime_findings)
     unverified.extend(write_back_unverified)
     unverified.extend(runtime_unverified)
+    adapter_summary = None
+    if adapter_report is not None:
+        assert generic_input_root is not None and write_back_root is not None
+        external_findings, external_unverified, adapter_summary = verify_report(
+            adapter_report,
+            translations_path,
+            generic_input_root,
+            write_back_root,
+            rows,
+        )
+        findings.extend(external_findings)
+        unverified = [
+            item
+            for item in unverified
+            if item
+            not in {
+                "generic_external_source_mapping_unverified",
+                "generic_reverse_conversion_unverified",
+                "generic_actual_consumer_unverified",
+                "layout_unverified",
+            }
+        ]
+        unverified.extend(external_unverified)
     unverified = list(dict.fromkeys(unverified))
     if generic_tree is not None:
         refreshed_tree = _read_generic_tree(
@@ -1964,30 +1961,46 @@ def _scan(args: argparse.Namespace) -> int:
             "Translation export 在 QA 期间发生变化",
             "等待导出稳定后重新执行完整 QA",
         )
+    if adapter_report is not None:
+        assert generic_input_root is not None and write_back_root is not None
+        verify_bindings(adapter_report, translations_path, generic_input_root, write_back_root)
+        assert adapter_path is not None
+        if _file_fact(adapter_path, "外部验收报告") != adapter_report_fact:
+            fail(str(adapter_path), "外部验收报告在 QA 期间发生变化", "重新运行 QA")
     for number, finding in enumerate(findings, start=1):
         finding["finding_id"] = f"finding-{number:06d}"
     review_groups = _group_heuristic_findings(findings)
     confirmed_ids = {
         cast(str, finding["manual_id"])
         for finding in findings
-        if finding.get("analysis_status") == "confirmed_fact" and isinstance(finding.get("manual_id"), str)
+        if finding.get("analysis_status") == "confirmed_fact"
+        and finding.get("repair_stage") != "adapter"
+        and isinstance(finding.get("manual_id"), str)
     }
     revision_ids = [cast(str, row["manual_id"]) for row in rows if row["manual_id"] in confirmed_ids]
     status = "needs_review" if findings else "unverified" if unverified else "clean"
     counts = Counter(cast(str, finding["kind"]) for finding in findings)
     heuristic_findings = sum(finding.get("analysis_status") == "heuristic_review" for finding in findings)
+    confirmed_findings = sum(finding.get("analysis_status") == "confirmed_fact" for finding in findings)
     summary: dict[str, JsonValue] = {
         "qa_status": status,
         "translation_export": translation_export_fact,
+        "source_language": document.source_language,
+        "target_language": document.target_language,
         "write_back": write_back_fact,
         "translations": len(rows),
         "findings": len(findings),
         "heuristic_findings": heuristic_findings,
+        "confirmed_findings": confirmed_findings,
         "review_groups": len(review_groups),
         "counts": dict(sorted(counts.items())),
         "revision_ids": revision_ids,
         "unverified": unverified,
     }
+    if adapter_summary is not None:
+        summary["adapter_verification"] = adapter_summary
+        assert adapter_path is not None
+        summary["adapter_report"] = adapter_report_fact
     if generic_tree is not None:
         summary["generic_input"] = generic_tree.fact
     else:
@@ -2020,7 +2033,7 @@ def _scan(args: argparse.Namespace) -> int:
         "\n".join(
             [
                 (
-                    f"译后 QA：{status}；确定问题涉及 {len(revision_ids)} 个自然 Unit，"
+                    f"译后 QA：{status}；确定发现 {confirmed_findings} 项，译文返修涉及 {len(revision_ids)} 个自然 Unit，"
                     f"{heuristic_findings} 项启发式结果已压缩为 {len(review_groups)} 个 Review 组。"
                 ),
                 f"QA 目录：{output_display}",
@@ -2053,6 +2066,27 @@ def _manual(args: argparse.Namespace) -> int:
         fail(path_value, "Translation export 在 QA 后发生变化", "重新运行 translation_qa.py scan")
     protected_inputs = [scan_root, Path(path_value)]
     forbidden_roots: list[Path] = []
+    adapter_fact = summary.get("adapter_report")
+    if isinstance(adapter_fact, dict):
+        adapter_path_value = adapter_fact.get("path")
+        if (
+            not isinstance(adapter_path_value, str)
+            or _file_fact(Path(adapter_path_value), "外部验收报告") != adapter_fact
+        ):
+            fail(str(scan_root), "外部验收报告在 QA 后变化", "重新运行 QA")
+        adapter_report = read_adapter_report(Path(adapter_path_value))
+        generic_binding = adapter_report.get("generic_input")
+        output_binding = adapter_report.get("write_back")
+        if not isinstance(generic_binding, dict) or not isinstance(output_binding, dict):
+            fail(str(scan_root), "外部验收报告缺少输入绑定", "重新运行 QA")
+        generic_path, output_path = generic_binding.get("path"), output_binding.get("path")
+        if not isinstance(generic_path, str) or not isinstance(output_path, str):
+            fail(str(scan_root), "外部验收报告输入路径无效", "重新运行 QA")
+        verify_bindings(adapter_report, Path(path_value), Path(generic_path), Path(output_path))
+        forbidden_roots.extend(
+            Path(cast(str, adapter_report[name])) for name in ("source_root", "output_root")
+        )
+        protected_inputs.append(Path(adapter_path_value))
     survey_game_value = summary.get("survey_game_root")
     if "coverage" in summary:
         if not isinstance(survey_game_value, str) or not survey_game_value:
@@ -2114,6 +2148,10 @@ def _manual(args: argparse.Namespace) -> int:
             manual_id = finding.get("manual_id")
             if isinstance(manual_id, str):
                 requested_ids.add(manual_id)
+            review_ids = finding.get("review_ids", [])
+            if not isinstance(review_ids, list) or any(not isinstance(value, str) for value in review_ids):
+                fail(str(scan_root), "Review 语境 ID 无效", "重新运行 translation_qa.py scan")
+            requested_ids.update(cast(list[str], review_ids))
     translation_rows = _read_translation_export(Path(path_value))
     rows = [
         {"manual_id": cast(str, row["manual_id"])}

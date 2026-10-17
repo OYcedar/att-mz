@@ -7029,6 +7029,7 @@ impl RpgMakerIssue {
             },
             RpgMakerProblem::TaskResponse { problem, .. } => match problem {
                 RpgMakerTaskResponseProblem::NonStopFinish { .. }
+                | RpgMakerTaskResponseProblem::UnknownId { .. }
                 | RpgMakerTaskResponseProblem::UnitReview { .. } => {
                     DiagnosticResolution::ReviewTranslation
                 }

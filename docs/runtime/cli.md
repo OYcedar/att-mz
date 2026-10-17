@@ -160,12 +160,23 @@ Ownership 每行只含自然 ID、owner，以及 Rules 条目的自然规则序�
 {"manual_id":"plugins.js:QuestWindow:Title","owner":"rules","rule_number":7}
 ```
 
-Translation 每行含 `manual_id`、`source`、`translation`、`state`、`origin` 和 `type`；
+Translation 首行只含项目的 `source_language` 与 `target_language`；空项目仍输出该首行。
+随后每行含 `manual_id`、`group`、`source`、`translation`、`state`、`origin`、`type` 和 `reviews`；
 RPG Maker 另含 owner 和 Rules 的 `rule_number`。`state` 为 `pending`、`current` 或
 `rejected`，`origin` 为 `none`、`automatic` 或 `manual`。只有 current 的 `translation` 是
 已经接受的 string array；pending 和 rejected 都是 `null`。Rejected 另含
 `rejected_candidate_json` string，逐字保存原候选 JSON 文本；该文本是诊断材料，不作为外层
 JSONL 的嵌套 JSON 解析。输出始终一行一条完整 JSON，不含数据库 ID、hash 或编码位置。
+
+`group` 是当前完整语义组第一项的自然 Manual ID，表达真实关联而不暴露内部 Group 身份。
+`reviews` 是按当前语言配置和源文 Placeholder binding 重新计算的语言提示数组，含义见
+[语言规格](../translation/language.md)。Translation export 因此读取语言配置，但不构造模型 Client。
+当前没有译文的条目输出空 Review 数组；这些提示不修改数据库正文或状态。
+
+存在不透明保护段时，另输出 `natural_source` 与当前译文的 `natural_translation`。
+它们是由字符串和 `null` 组成的数组；字符串为自然文本，`null` 为不可跨越的不透明边界。
+投影与对应原始行数组按 LF 连接的文本相同时省略，消费者直接使用原始文本。投影以引擎
+源文绑定为准，不能再次用启发式正则把自然文本改判为控制符。
 
 `current` 表示译文对当前源文、实际 Group 语境、项目语言对和强不变量仍可发布；它不表示
 译文由当前 Client、Profile 或 Prompt 生成。保留但不适用于当前事实的正文不作为

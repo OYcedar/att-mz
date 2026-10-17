@@ -26,6 +26,8 @@ ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agen
 
 随包 Python 工具在 Python 3.11 或更新环境中运行。没有 Python 时，按相应指南完成调查和对账，
 并在交付中说明实际采用的方法。
+自行编写转换器时，通过随包 `att_toolbox.translation_export.read_translation_document` 读取
+完整译文导出；项目语言首行与 Unit 记录分别处理，不把首行当作正文。
 
 RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写回或大量 QA 候选时，
 读取[大型、插件密集的 MV 经验](references/game-type-large-plugin-heavy-mv.md)中对应的处理方法。
@@ -54,6 +56,11 @@ Unity / Naninovel 项目通过 Generic 接入，或资源已译而自定义标�
 核对脚本与序列化界面、托管字段赋值及静态缓存、有效资源和原生调用的验证边界。
 
 ## 1. 调查
+
+RealLive 项目通过 Generic 接入时，读取
+[RealLive 原生文字与姓名回填](references/engine-reallive-native-text.md)；已确认 Escude 封包与
+字库布局时，读取 [Escude 封包查找、字库与原生界面](references/engine-escude-native-text.md)。
+先用真实替换文字验证原生读取路径，再进入大批量翻译。
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
 唯一所有者。图片文字交给图像翻译流程，资源路径、内部键、控制符和协议外壳保留其技术含义。
@@ -94,6 +101,8 @@ Manual 只编辑译文字段，条目 ID 和原文通过 ATT 重新导出。
 MV/MZ 导出 ownership，使用 Survey 的项目继续运行 audit，核对每个位置的唯一所有者。
 独立 Generic 核对 JSONL 与外部来源、自然顺序和写回位置的映射，不执行 RPG Maker ownership
 或 Survey 命令。
+外部适配器采用[外部适配器验收](../../docs/generic/adapter-verification.md)的方法与证据契约。
+无修改往返之外，还要覆盖替换分支；不能通过先删除姓名标签或引用外壳掩盖消费者差异。
 
 使用 Survey 时，生成的 Manual ID、ownership 投影、audit 和 preflight 集合必须与同目录 `att.exe` 的实际
 导出逐项一致。出现缺失、多出或不匹配时，以首个不一致的物理位置为反例，追溯分类和编号规则，
@@ -148,6 +157,11 @@ Incomplete 中的 Partial、Unavailable 和未开始 Task 按恢复指南处理�
 - Placeholder、控制符、空槽、结构和换行；
 - 源语言残留、模型说明、异常转义和布局风险。
 
+源语与混入文字提示来自 ATT 当前完整导出。优先审核相邻错位、内容串入和异常扩写组中的
+原译对照；选择 Review 组生成 Manual ID 时会带上相邻语境。模型响应多出编号但要求的译文
+已经全部接受时，结合任务记录 `Locations` 定位整段审校，普通续跑不会修正已经入库的误译。
+不要以自由分行数量变化直接判断串句，也不按启发式相似度自动移动译文。
+
 独立 Generic 使用 `--generic-input` 提供同源 JSONL；RPG Maker 使用相应调查与所有权证据。
 先查看 QA 摘要中的确定状态和未验证项，再按验收指南审核 Review 组。把确认的问题与语义审校发现
 合并，按自然 ID 导出到 Manual，集中修订、apply、重新导出并复查。报告分别说明静态检查、
@@ -178,9 +192,13 @@ RPG Maker 游戏按[字体工具指南](../../docs/guides/nwjs-font-tools.md#2-�
 Unity 项目出现 TMP 中文方框、需要选择静态字体补丁或运行时字体插件时，读取
 [Unity TMP 字体修复与 MOD 交付经验](references/engine-unity-tmp-font-fallback.md)。
 
-封包时汇总 WriteBack、Generic 外部结果、字体和游戏原有资源，生成独立交付目录。交付目录完成
-结构解析、可见文本残留、字体覆盖和启动文件检查后，向任务发起者提供人工实机检查清单。实机
-验证由任务发起者指定的人工完成，重点覆盖标题、菜单、主要对话、插件界面、换行、裁切和存档。
+封包时汇总 WriteBack、Generic 外部结果、字体和游戏原有资源，生成独立交付目录。
+独立 Generic 适配器在原生读取检查前用 `AdapterVerification` 固定文件基线，记录实际源文、
+最终正文、消费者检查及布局测量，再把报告通过 QA 的 `--adapter-report` 汇入。缺少真实测量
+时保留布局未验证，修订封包、字体或验证程序后重新取证；完整契约见外部适配器验收。
+交付目录完成结构解析、可见文本残留、字体覆盖和启动文件检查后，提供人工实机检查清单。
+实机验证由任务发起者指定的人工完成，重点覆盖标题、新游戏入口、菜单、主要对话、插件界面、
+换行、裁切和存档。
 
 ## 实玩反馈返修
 

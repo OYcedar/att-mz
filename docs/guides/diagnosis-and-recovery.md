@@ -161,6 +161,7 @@ Incomplete 是 Translate 的业务结果，进程仍可退出 `0`。Partial、Un
 | Rejected，候选违反控制符或结构契约 | 用 `manual export --selection rejected` 导出并修订；确需重新请求模型时显式使用 `--retry-rejected` |
 | Prompt、Placeholder 或语言规则有可复现的系统性错误 | 修正对应资源；再次 Translate 时显式选择是否重试 Rejected，普通重跑仍跳过它们 |
 | 少量剩余、同文异译或局部质量问题 | 用 Manual 集中补译或修订 |
+| 响应包含多余编号，但要求的译文已全部接受 | 按任务记录 Locations 定位整段原译对照，检查编号错位和上下文串入；普通续跑不会重译当前正文 |
 | 含义不明 | 把全部待查 ID 合并到一次 `ctx.translation.context(ids)`，同时读取 `ctx.terminology.list()` |
 | 仍缺上下文或领域事实 | 记录准确位置、缺失事实和人工调查场景，保留当前项目 |
 

@@ -151,12 +151,14 @@ pub(super) struct GenericTaskRecordDraft {
     pub(super) user_message: String,
     pub(super) raw_assistant: Option<Arc<String>>,
     pub(super) provider: Option<String>,
+    pub(super) locations: std::collections::BTreeMap<usize, Vec<String>>,
 }
 
 pub(super) struct GenericTaskRecordInFlight {
     pub(super) task_index: usize,
     pub(super) requested_outputs: usize,
     pub(super) user_message: String,
+    pub(super) locations: std::collections::BTreeMap<usize, Vec<String>>,
 }
 
 impl GenericTaskRecordInFlight {
@@ -171,6 +173,7 @@ impl GenericTaskRecordInFlight {
             user_message: self.user_message,
             raw_assistant,
             provider,
+            locations: self.locations,
         }
     }
 }
@@ -187,6 +190,7 @@ impl GenericTaskRecordDraft {
             self.provider,
             state,
         )
+        .with_locations(self.locations)
     }
 }
 
@@ -836,6 +840,7 @@ async fn execute_generic_task(
             task_index,
             requested_outputs,
             user_message,
+            locations: task.review_locations(),
         });
     let response_record = record.as_ref().and_then(|_| match &outcome {
         LlmRequestExecutionOutcome::Response { response, .. } => Some(response.shared_content()),

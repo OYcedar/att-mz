@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -27,15 +28,27 @@ EXPORT_FIELDS = {
     "owner",
     "rule_number",
     "rejected_candidate_json",
+    "group",
+    "reviews",
+    "natural_source",
+    "natural_translation",
 }
 
 
-def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
+@dataclass(frozen=True)
+class TranslationExport:
+    source_language: str
+    target_language: str
+    rows: list[dict[str, JsonValue]]
+
+
+def read_translation_document(path: Path) -> TranslationExport:
     """按当前 CLI 契约读取完整导出；任何不完整身份都不能充当下游证据。"""
 
     source = require_file(path, "ATT Translation export JSONL")
     rows: list[dict[str, JsonValue]] = []
     seen: set[str] = set()
+    header: tuple[str, str] | None = None
     for line_number, line in physical_jsonl_lines(read_physical_text(source), str(source)):
         if not line.strip():
             fail(str(source), f"第 {line_number} 行为空", "重新执行 ATT translation export")
@@ -43,8 +56,21 @@ def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
         if not isinstance(raw, dict):
             fail(str(source), f"第 {line_number} 行不是 object", "重新执行 ATT translation export")
         row = dict(raw)
+        if line_number == 1:
+            validate_object_keys(row, str(source), {"source_language", "target_language"})
+            source_language, target_language = row.get("source_language"), row.get("target_language")
+            if (
+                not isinstance(source_language, str)
+                or not source_language.strip()
+                or not isinstance(target_language, str)
+                or not target_language.strip()
+                or source_language == target_language
+            ):
+                fail(str(source), "缺少有效的项目语言首行", "重新执行 ATT translation export")
+            header = source_language, target_language
+            continue
         validate_object_keys(row, f"{source} 第 {line_number} 行", EXPORT_FIELDS)
-        required = {"manual_id", "source", "translation", "state", "origin", "type"}
+        required = {"manual_id", "source", "translation", "state", "origin", "type", "group", "reviews"}
         missing = sorted(required - set(row))
         if missing:
             fail(
@@ -62,6 +88,33 @@ def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
         rejected_candidate = row.get("rejected_candidate_json")
         if not isinstance(manual_id, str) or not manual_id or manual_id in seen:
             fail(str(source), f"第 {line_number} 行 manual_id 无效或重复", "重新执行 ATT translation export")
+        group = row.get("group")
+        reviews = row.get("reviews")
+        if not isinstance(group, str) or (group != manual_id and group not in seen):
+            fail(str(source), f"{manual_id} 的语义组没有对应的首项自然 ID", "重新导出当前项目")
+        if (
+            not isinstance(reviews, list)
+            or any(
+                not isinstance(value, str)
+                or value
+                not in {
+                    "source_residual",
+                    "target_script_missing",
+                    "unexpected_script",
+                    "replacement_character",
+                }
+                for value in reviews
+            )
+            or len(reviews) != len(set(cast(list[str], reviews)))
+        ):
+            fail(str(source), f"{manual_id} 的语言 Review 无效", "重新导出当前项目")
+        for field in ("natural_source", "natural_translation"):
+            if field in row:
+                projection = row[field]
+                if not isinstance(projection, list) or any(
+                    value is not None and not isinstance(value, str) for value in projection
+                ):
+                    fail(str(source), f"{manual_id} 的自然文本投影无效", "重新导出当前项目")
         if not isinstance(source_lines, list) or any(not isinstance(value, str) for value in source_lines):
             fail(str(source), f"{manual_id} 的 source 不是 string array", "重新执行 ATT translation export")
         if (
@@ -103,9 +156,25 @@ def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
                 fail(str(source), f"{manual_id} 的 rejected origin 无效", "重新导出当前项目")
             if not isinstance(rejected_candidate, str) or not rejected_candidate:
                 fail(str(source), f"{manual_id} 缺少 rejected_candidate_json", "重新导出当前项目")
+        if state != "current" and (reviews or "natural_translation" in row):
+            fail(str(source), f"{manual_id} 没有当前译文，不能携带译文审校事实", "重新导出当前项目")
         seen.add(manual_id)
         rows.append(row)
-    return rows
+    if header is None:
+        fail(str(source), "缺少项目语言首行", "重新执行 ATT translation export")
+    return TranslationExport(*header, rows)
+
+
+def read_translation_export(path: Path) -> list[dict[str, JsonValue]]:
+    return read_translation_document(path).rows
+
+
+def natural_segments(row: Mapping[str, JsonValue], field: str) -> list[str]:
+    projection = row.get(f"natural_{field}")
+    if isinstance(projection, list):
+        return [value for value in projection if isinstance(value, str)]
+    lines = row.get(field)
+    return ["\n".join(cast(list[str], lines))] if isinstance(lines, list) else []
 
 
 def projected_write_back_text(rows: list[dict[str, JsonValue]]) -> tuple[str, int]:

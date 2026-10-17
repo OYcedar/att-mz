@@ -1172,7 +1172,21 @@ pub(super) fn generic_accepted_task_diagnostics(
             .with_effect(generic_review_effect(commit, None)),
         );
     }
-    diagnostics.append(&mut response_problem_diagnostics);
+    for report in response_problem_diagnostics.drain(..) {
+        let unexpected = matches!(report.primary().issue(),
+            crate::diagnostic::DiagnosticIssue::Generic(issue)
+                if matches!(issue.problem(), GenericProblem::TaskResponse {
+                    problem: GenericTaskResponseProblem::UnexpectedId { .. }, ..
+                })
+        );
+        diagnostics.push(
+            if unexpected && commit.is_some_and(|commit| commit.committed > 0) {
+                report.with_effect(StateEffect::Applied)
+            } else {
+                report
+            },
+        );
+    }
     for review in reviews {
         let effect = generic_review_effect(commit, Some(review.locator()));
         diagnostics.push(

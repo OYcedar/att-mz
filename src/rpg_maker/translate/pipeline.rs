@@ -3050,7 +3050,10 @@ fn task_response_protocol_report(
     };
     let effect = match &problem {
         RpgMakerTaskResponseProblem::UnitReview { .. } => StateEffect::Applied,
-        RpgMakerTaskResponseProblem::NonStopFinish { .. } if applied_any_output => {
+        RpgMakerTaskResponseProblem::NonStopFinish { .. }
+        | RpgMakerTaskResponseProblem::UnknownId { .. }
+            if applied_any_output =>
+        {
             StateEffect::Applied
         }
         _ => StateEffect::ProgressPreserved,

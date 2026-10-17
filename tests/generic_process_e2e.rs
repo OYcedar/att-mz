@@ -1724,6 +1724,10 @@ fn assert_target_script_review_keeps_current(translation: &'static str, source_r
     let record = fs::read_to_string(run.join("task-000001.md")).unwrap();
     assert!(record.contains("expected target-language script"));
     assert_eq!(record.contains("source-language text"), source_residual);
+    assert!(
+        record.contains("story.jsonl:line1:unit1:text"),
+        "已接受任务应可定位到自然 Manual ID"
+    );
     let exported = root.join("translations.jsonl");
     assert_success(
         "export",
@@ -1739,7 +1743,13 @@ fn assert_target_script_review_keeps_current(translation: &'static str, source_r
             ],
         ),
     );
-    let current = read_single_jsonl_group(&exported);
+    let document = fs::read_to_string(&exported).unwrap();
+    let rows: Vec<serde_json::Value> = document
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows[0]["target_language"], "zh-Hans");
+    let current = &rows[1];
     assert_eq!(current["state"], "current");
     assert_eq!(current["translation"], serde_json::json!([translation]));
     assert_success(

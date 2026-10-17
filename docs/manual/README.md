@@ -14,7 +14,8 @@ att mv|mz|generic manual apply --name NAME FILE.toml
 `FILE.toml` 是必需位置参数。三个引擎使用相同格式和检查语义。
 
 三个命令都要求发行目录中的固定 `config.toml` 存在且 TOML 语法有效。只有 `export` 读取
-其中的语言模块，用于判断哪些当前原文需要翻译；`check` 和 `apply` 不读取或校验语言模块，
+其中的语言模块，用于判断哪些当前原文需要翻译；独立 `translation export` 也读取语言模块，
+用于导出当前正文的非阻断 QA 提示。`check` 和 `apply` 不读取或校验语言模块，
 也不重新做语言分析。
 
 ## 1. 文件格式

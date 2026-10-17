@@ -751,6 +751,31 @@ impl PlannedTask {
         self.outputs.len()
     }
 
+    pub(crate) fn review_locations(&self) -> BTreeMap<usize, Vec<String>> {
+        self.outputs
+            .iter()
+            .map(|(id, destinations)| {
+                (
+                    id.get(),
+                    destinations
+                        .iter()
+                        .map(|destination| {
+                            let (line, unit) = destination
+                                .locator
+                                .natural_position()
+                                .expect("任务记录的传播位置必须来自当前 Extract 自然位置");
+                            readable_generic_unit_id(
+                                destination.locator.relative_path(),
+                                line,
+                                unit,
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn expected_output_ids(&self) -> impl Iterator<Item = TaskId> + '_ {
         self.outputs.keys().copied()

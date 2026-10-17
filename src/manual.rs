@@ -63,7 +63,10 @@ use crate::translation::candidate_validation::{
     CandidateTextShape, ProvenInvariantViolation, validate_candidate_text,
 };
 use crate::translation::placeholder::PlaceholderRuleDefinition;
+
+mod translation_export;
 use crate::translation::planning_resource::CompiledTerminology;
+use translation_export::export_translation_document_with_cancellation;
 
 const MANUAL_SQLITE_CANCELLATION_CHECK_OPERATIONS: i32 = 1_000;
 
@@ -268,20 +271,6 @@ struct ManualDocumentEntry {
 struct ManualOwnershipRecord<'a> {
     manual_id: &'a str,
     owner: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rule_number: Option<usize>,
-}
-
-#[derive(Serialize)]
-struct TranslationExportRecord<'a> {
-    manual_id: &'a str,
-    source: &'a [String],
-    #[serde(flatten)]
-    status: TranslationExportStatus<'a>,
-    #[serde(rename = "type")]
-    kind: ManualTranslationType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    owner: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule_number: Option<usize>,
 }
@@ -633,58 +622,6 @@ fn export_ownership_document_with_cancellation(
                 rule_number,
             })
             .expect("自然 ID、owner 和自然规则序号必须可编码"),
-        );
-        encoded.push('\n');
-    }
-    ensure_manual_document_running(cancellation)?;
-    atomic_replace(path, encoded.as_bytes(), cancellation)?;
-    Ok(index.entries().len())
-}
-
-fn export_translation_document_with_cancellation(
-    path: &Path,
-    index: &ManualTranslationIndex,
-    cancellation: &CooperativeCancellation,
-) -> Result<usize, ManualDocumentError> {
-    ensure_manual_document_running(cancellation)?;
-    let mut encoded = String::new();
-    for entry in index.entries() {
-        ensure_manual_document_running(cancellation)?;
-        let status = match (
-            entry.current_translation.as_deref(),
-            entry.origin,
-            entry.rejected.as_ref(),
-        ) {
-            (Some(translation), Some(origin), _) => TranslationExportStatus::Current {
-                translation,
-                origin: origin.as_str(),
-            },
-            (None, None, Some(rejected)) => TranslationExportStatus::Rejected {
-                translation: (),
-                origin: rejected.origin.as_str(),
-                rejected_candidate_json: &rejected.candidate_json,
-            },
-            (None, None, None) => TranslationExportStatus::Pending {
-                translation: (),
-                origin: "none",
-            },
-            _ => unreachable!("Manual 快照的译文、来源和 Rejected 状态必须一致"),
-        };
-        let (owner, rule_number) = match entry.rpg_maker_owner {
-            Some(ManualRpgMakerOwner::Builtin) => (Some("builtin"), None),
-            Some(ManualRpgMakerOwner::Rules { rule_number }) => (Some("rules"), Some(rule_number)),
-            None => (None, None),
-        };
-        encoded.push_str(
-            &serde_json::to_string(&TranslationExportRecord {
-                manual_id: &entry.id,
-                source: &entry.source,
-                status,
-                kind: entry.kind,
-                owner,
-                rule_number,
-            })
-            .expect("已校验的 Translation export 记录必须可编码"),
         );
         encoded.push('\n');
     }
@@ -1316,6 +1253,7 @@ impl ManualPlaceholderValidator {
 pub(crate) struct ManualProjectSnapshot {
     pub(crate) index: ManualTranslationIndex,
     pub(crate) placeholders: ManualPlaceholderValidator,
+    pub(crate) language: Option<(LanguagePair, Arc<dyn LanguageModule>)>,
 }
 
 /// Lua 高级接口额外读取已失去当前位置的人工译文。
@@ -1372,9 +1310,12 @@ pub(crate) fn execute_generic_manual_command(
     cancellation: &CooperativeCancellation,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
     assert_eq!(
-        matches!(operation, ManualOperation::Export),
+        matches!(
+            operation,
+            ManualOperation::Export | ManualOperation::TranslationExport
+        ),
         language_modules.is_some(),
-        "只有 Manual export 应获得语言模块"
+        "Manual 和 Translation export 应获得语言模块"
     );
     assert_eq!(
         matches!(operation, ManualOperation::Export),
@@ -1424,9 +1365,12 @@ pub(crate) fn execute_rpg_maker_manual_command(
     cancellation: &CooperativeCancellation,
 ) -> Result<ManualCommandSummary, ManualCommandError> {
     assert_eq!(
-        matches!(operation, ManualOperation::Export),
+        matches!(
+            operation,
+            ManualOperation::Export | ManualOperation::TranslationExport
+        ),
         language_modules.is_some(),
-        "只有 Manual export 应获得语言模块"
+        "Manual 和 Translation export 应获得语言模块"
     );
     assert_eq!(
         matches!(operation, ManualOperation::Export),
@@ -1591,7 +1535,7 @@ fn execute_manual_read_operation(
                 export_selection.is_none(),
                 "Translation export 不得获得 Manual 选择"
             );
-            export_translation_document_with_cancellation(file, &snapshot.index, cancellation)
+            export_translation_document_with_cancellation(file, snapshot, cancellation)
                 .map(|entries| ManualCommandSummary::Exported {
                     entries,
                     file: file.to_path_buf(),
@@ -2382,17 +2326,19 @@ impl From<ManualIndexError> for ManualDatabaseError {
     }
 }
 
-fn load_generic_source_language(
+fn load_generic_language_context(
     connection: &Connection,
     language_modules: &LanguageModuleCatalog,
-) -> Result<Arc<dyn LanguageModule>, ManualDatabaseError> {
-    let source: String = connection.query_row(
-        "SELECT source_language FROM generic_project WHERE singleton = 1",
+) -> Result<(LanguagePair, Arc<dyn LanguageModule>), ManualDatabaseError> {
+    let (source, target): (String, String) = connection.query_row(
+        "SELECT source_language, target_language FROM generic_project WHERE singleton = 1",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let source = parse_project_language(&source, "源语言")?;
-    resolve_source_language(language_modules, &source)
+    let target = parse_project_language(&target, "目标语言")?;
+    let module = resolve_source_language(language_modules, &source)?;
+    Ok((LanguagePair::new(source, target), module))
 }
 
 fn load_rpg_maker_language_context(
@@ -2431,8 +2377,8 @@ fn load_generic_manual_command_snapshot(
     connection: &Connection,
     language_modules: Option<&LanguageModuleCatalog>,
 ) -> Result<ManualProjectSnapshot, ManualDatabaseError> {
-    let source_language = language_modules
-        .map(|modules| load_generic_source_language(connection, modules))
+    let language = language_modules
+        .map(|modules| load_generic_language_context(connection, modules))
         .transpose()?;
     let canonical_json: String = connection.query_row(
         "SELECT canonical_json FROM translation_resource WHERE resource_kind = 'placeholder_rules'",
@@ -2461,11 +2407,16 @@ fn load_generic_manual_command_snapshot(
                 ManualDatabaseError::InvalidProject("项目 Placeholder 规则无法编译".to_owned())
             })
         })?;
-    let entries =
-        load_generic_entries(connection, &service, &compiled, source_language.as_deref())?;
+    let entries = load_generic_entries(
+        connection,
+        &service,
+        &compiled,
+        language.as_ref().map(|(_, module)| module.as_ref()),
+    )?;
     Ok(ManualProjectSnapshot {
         index: ManualTranslationIndex::new(entries)?,
         placeholders: ManualPlaceholderValidator::Generic { service, compiled },
+        language,
     })
 }
 
@@ -2793,19 +2744,19 @@ fn load_rpg_maker_manual_command_snapshot(
                 ManualDatabaseError::InvalidProject("项目 Placeholder 规则无法编译".to_owned())
             })
         })?;
-    let semantics = language_modules
+    let language = language_modules
         .map(|modules| load_rpg_maker_language_context(connection, modules))
-        .transpose()?
-        .map(|(language_pair, source_language)| {
-            ResolvedTranslationSemantics::new(
-                engine,
-                language_pair,
-                Arc::new(CompiledTerminology::empty()),
-                service.clone(),
-                compiled.clone(),
-                source_language,
-            )
-        });
+        .transpose()?;
+    let semantics = language.as_ref().map(|(language_pair, source_language)| {
+        ResolvedTranslationSemantics::new(
+            engine,
+            language_pair.clone(),
+            Arc::new(CompiledTerminology::empty()),
+            service.clone(),
+            compiled.clone(),
+            Arc::clone(source_language),
+        )
+    });
     let entries = load_rpg_maker_entries(connection, engine, semantics.as_ref())?;
     Ok(ManualProjectSnapshot {
         index: ManualTranslationIndex::new(entries)?,
@@ -2815,6 +2766,7 @@ fn load_rpg_maker_manual_command_snapshot(
             compiled,
             profiles,
         },
+        language,
     })
 }
 
@@ -4348,9 +4300,30 @@ mod tests {
 
         let index = ManualTranslationIndex::new(vec![current, pending, rejected, rejected_null])
             .expect("测试 ID 必须唯一");
+        let service = GenericPlaceholderService::default();
+        let snapshot = ManualProjectSnapshot {
+            index,
+            placeholders: ManualPlaceholderValidator::Generic {
+                compiled: service.compile(Vec::new()).unwrap(),
+                service,
+            },
+            language: Some((
+                LanguagePair::new(
+                    LanguageId::parse("ja").unwrap(),
+                    LanguageId::parse("zh-Hans").unwrap(),
+                ),
+                Arc::new(crate::language::JapaneseLanguageModule::new(
+                    crate::language::JapaneseResidualPolicy::new(
+                        std::num::NonZeroUsize::new(1).unwrap(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )),
+            )),
+        };
         let count = export_translation_document_with_cancellation(
             &export,
-            &index,
+            &snapshot,
             &CooperativeCancellation::default(),
         )
         .expect("Translation export 应成功");
@@ -4358,9 +4331,10 @@ mod tests {
         assert_eq!(count, 4);
         let document = fs::read_to_string(&export).expect("Translation export 应可读取");
         let lines = document.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         let rows = lines
             .iter()
+            .skip(1)
             .map(|line| {
                 serde_json::from_str::<serde_json::Value>(line).expect("每行必须是完整 JSON")
             })
@@ -4772,6 +4746,7 @@ mod tests {
             "[[translation]]\nid = \"Skills.json:798:name\"\ntype = \"fixed\"\nsource = [\"source\"]\ntranslation = [\"译文\"]\n",
         );
         let snapshot = ManualProjectSnapshot {
+            language: None,
             index,
             placeholders: test_placeholder_validator(),
         };
@@ -5459,6 +5434,7 @@ mod tests {
         let id = current.id.clone();
         let snapshot = ManualProjectLuaSnapshot {
             current: ManualProjectSnapshot {
+                language: None,
                 index: ManualTranslationIndex::new(vec![current]).unwrap(),
                 placeholders: test_placeholder_validator(),
             },
@@ -5574,6 +5550,7 @@ mod tests {
             "[[translation]]\nid = \"Skills.json:798:name\"\ntype = \"fixed\"\nsource = [\"changed\"]\ntranslation = [\"译文\"]\n",
         );
         let snapshot = ManualProjectSnapshot {
+            language: None,
             index,
             placeholders: test_placeholder_validator(),
         };

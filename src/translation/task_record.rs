@@ -628,6 +628,21 @@ pub(crate) fn task_record_output_ids(ids: &[usize]) -> String {
         .join(", ")
 }
 
+/// 供 Agent 从一次请求定位全部代表及传播位置；不成为恢复或提交输入。
+pub(crate) fn task_record_locations(
+    locations: &std::collections::BTreeMap<usize, Vec<String>>,
+    redactor: &ApiKeyRedactor,
+) -> String {
+    if locations.is_empty() {
+        return String::new();
+    }
+    let json = serde_json::to_string_pretty(locations).expect("自然位置表必须可编码");
+    format!(
+        "\n## Locations\n\n{}",
+        markdown_json_fence(&redactor.redact_text_with_json_strings(&json))
+    )
+}
+
 /// 任务文档只向 Fluent 传入稳定事实，并移除终端输出使用的方向隔离符。
 pub(crate) fn task_record_text(localizer: &UiLocalizer, message: UiMessage<'_>) -> String {
     localizer

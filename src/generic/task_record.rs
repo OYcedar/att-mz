@@ -112,6 +112,7 @@ pub(crate) struct GenericTaskRecordDocument {
     raw_assistant: Option<String>,
     provider: Option<String>,
     state: GenericTaskRecordState,
+    locations: std::collections::BTreeMap<usize, Vec<String>>,
 }
 
 impl GenericTaskRecordDocument {
@@ -130,7 +131,16 @@ impl GenericTaskRecordDocument {
             raw_assistant,
             provider,
             state,
+            locations: std::collections::BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn with_locations(
+        mut self,
+        locations: std::collections::BTreeMap<usize, Vec<String>>,
+    ) -> Self {
+        self.locations = locations;
+        self
     }
 }
 
@@ -223,6 +233,10 @@ fn render_generic_task_record(
         output.push_str(&markdown_fence(&rendered, "text"));
     }
 
+    output.push_str(&crate::translation::task_record::task_record_locations(
+        &document.locations,
+        redactor,
+    ));
     output.push_str("\n## User\n\n");
     let user = redactor.redact_text_with_json_strings(&document.user_message);
     output.push_str(&user);

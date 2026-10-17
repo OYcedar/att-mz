@@ -600,11 +600,14 @@ fn generic_review_diagnostics_follow_the_exact_commit_outcome() {
         0,
         1,
         true,
-        vec![generic_response_problem_diagnostic(
-            0,
-            1,
-            &ResponseProblem::MissingId { output_id: 2 },
-        )],
+        vec![
+            generic_response_problem_diagnostic(0, 1, &ResponseProblem::MissingId { output_id: 2 }),
+            generic_response_problem_diagnostic(
+                0,
+                1,
+                &ResponseProblem::UnexpectedId { output_id: 3 },
+            ),
+        ],
         vec![committed_review, conflicted_review],
         Some(&commit),
     );
@@ -618,8 +621,13 @@ fn generic_review_diagnostics_follow_the_exact_commit_outcome() {
             StateEffect::Applied,
             StateEffect::ProgressPreserved,
             StateEffect::Applied,
+            StateEffect::Applied,
             StateEffect::ProgressPreserved,
         ]
+    );
+    assert_eq!(
+        diagnostics[2].primary().issue().resolution(),
+        crate::diagnostic::DiagnosticResolution::ReviewTranslation
     );
 }
 
@@ -711,6 +719,7 @@ fn cancellation_after_request_keeps_task_record_draft() {
     let prepared = cancelled_generic_prepared_task(
         1,
         Some(GenericTaskRecordInFlight {
+            locations: std::collections::BTreeMap::new(),
             task_index: 1,
             requested_outputs: 1,
             user_message: "request".to_owned(),
@@ -738,6 +747,7 @@ fn cancellation_during_response_processing_keeps_received_assistant() {
     let prepared = cancelled_generic_prepared_task(
         1,
         Some(GenericTaskRecordInFlight {
+            locations: std::collections::BTreeMap::new(),
             task_index: 1,
             requested_outputs: 1,
             user_message: "request".to_owned(),

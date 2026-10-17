@@ -75,5 +75,7 @@ Generic WriteBack 必须写 `publication.started` 和唯一 `publication.finishe
 发布完成后，外部操作者仍需消费全部译后 JSONL，并按
 [翻译验收指南](../guides/acceptance.md)核对完整写回、源语残留、组合项目和实际消费者。
 Generic WriteBack 成功只证明 ATT 输出明确，不证明最终游戏已经采用译文。
+外部适配器按[外部适配器验收](adapter-verification.md)验证真实替换文本和最终消费者，并可将
+绑定当前文件的观察、原生检查及布局测量交给 QA 汇总。
 独立 Generic 项目可用随包 `translation_qa.py scan --generic-input <当前 JSONL 根>` 核对完整
 Translation export 和实际 `write_back`；外部来源映射、反向转换与实际消费者仍需按任务事实另行验证。

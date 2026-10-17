@@ -201,6 +201,8 @@ class PublishedCompletionEntrypointTests(unittest.TestCase):
                 translations,
                 {
                     "manual_id": "sample.jsonl:line1:unit1:text",
+                    "group": "sample.jsonl:line1:unit1:text",
+                    "reviews": [],
                     "source": ["Source"],
                     "translation": ["译文"],
                     "state": "current",
@@ -209,6 +211,12 @@ class PublishedCompletionEntrypointTests(unittest.TestCase):
                     "owner": None,
                     "rule_number": None,
                 },
+            )
+            translations.write_text(
+                json.dumps({"source_language": "en", "target_language": "zh-Hans"})
+                + "\n"
+                + translations.read_text(encoding="utf-8"),
+                encoding="utf-8",
             )
             qa = root / "qa"
             qa_args = argparse.Namespace(
@@ -220,6 +228,7 @@ class PublishedCompletionEntrypointTests(unittest.TestCase):
                 terminology=None,
                 write_back=None,
                 runtime_report=None,
+                adapter_report=None,
                 output=qa,
                 replace=False,
             )
