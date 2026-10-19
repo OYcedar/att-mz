@@ -188,10 +188,12 @@ metrics rss_mb=... llm_in_flight=... tool_inflight=... history_kb=... search_avg
 
 ## 9. `scale-metrics.csv`
 
-`scale-metrics.csv` 由 Formic 源码工程中的规模实验生成，随包程序的正常作业不会创建它。需要调查吞吐与内存曲线时，先按[来源记录](../FORMIC-SOURCE.md)取得独立 Formic 源码，再在该工程根目录执行：
+`scale-metrics.csv` 由 ATT workspace 内的 Formic 规模实验生成，随包程序的正常作业不会
+创建它。需要调查吞吐与内存曲线时，先按[来源记录](../FORMIC-SOURCE.md)取得对应的 ATT
+源码，再在 ATT 仓库根目录执行实验；实验程序会按当前 profile 构建 `formic.exe`：
 
-```bash
-cargo run --release --example scale_run -- 5000 1000 8 20
+```powershell
+cargo run --locked --release -p formic --example scale_run -- 5000 1000 8 20
 ```
 
 实验会解析 stderr metrics，并在当前目录生成 `scale-metrics.csv`。CSV 保存采样序号、RSS、历史大小、模型/工具在途数和单元结局，用于画内存与吞吐曲线。

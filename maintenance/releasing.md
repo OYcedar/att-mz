@@ -4,9 +4,18 @@
 
 ## 1. 准备版本
 
-复用开发阶段已经完成的相关验证。同步更新 `Cargo.toml`、`Cargo.lock`、`att.exe.manifest`
-与 `.github/RELEASE_NOTES.md`；依赖变化时更新对应第三方许可证。提交并推送本次发行内容。
+复用开发阶段已经完成的相关验证。ATT 与 Formic 使用根 `Cargo.toml` 中的
+`workspace.package.version`，不单独发布 Formic。同步更新该版本、根 `Cargo.lock`、
+`att.exe.manifest` 与 `.github/RELEASE_NOTES.md`；依赖变化时更新对应第三方许可证。
+Formic 的源码与测试维护在 `crates/formic/`，随包配置模板和用户资料维护在 `tools/formic/`。
+提交并推送本次发行内容。
 发包不重复代码审查、普通测试、全量压力测试或本地 Release 构建。
+
+依赖变化后，在 ATT 根目录重新生成 workspace 的统一第三方许可证：
+
+```powershell
+cargo about generate --workspace --locked --fail about.hbs -o licenses/THIRD-PARTY-LICENSES.html
+```
 
 ## 2. 打标签并触发工作流
 
@@ -22,8 +31,21 @@ gh workflow run release.yml --ref main -f "tag=$tag"
 ```
 
 使用触发命令返回的运行链接跟进对应工作流。工作流直接 checkout 指定标签，在 GitHub
-托管的 Windows runner 上构建、组装并检查发行包，然后生成 ZIP 和 SHA-256 校验文件。
+托管的 Windows runner 上从同一标签构建 ATT 与 Formic，组装并检查发行包，然后生成 ZIP
+和 SHA-256 校验文件。两个程序分别放在发行根和 `tools/formic/`，使用者的调用路径保持不变。
 本机无需再构建一份相同程序，也无需预先下载或逐文件比较发行资源。
+
+需要本地调查构建或组包问题时，在 ATT 根目录复用相同入口：
+
+```powershell
+$env:PCRE2_SYS_STATIC = '1'
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
+cargo build --locked --release -p att -p formic
+```
+
+两个产物位于 `target/x86_64-pc-windows-msvc/release/`。资源同步脚本只维护资源，不复制或
+替换程序；组包时将 `att.exe` 放到发行根、`formic.exe` 放到 `tools/formic/`，再执行包内检查。
+更新已有安装时保留两个活动 `config.toml`，具体规则见发行物规格。
 
 ## 3. 完成与恢复
 

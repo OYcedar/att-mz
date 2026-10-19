@@ -6,7 +6,7 @@
 管理 README.md、LICENSE、config.example.toml、第三方许可证目录、docs、prompts、skills
 和随包 Formic。ATT 与 Formic 的 config.toml 都是使用者的活动配置：已有文件保持原字节
 不变，缺失时才从各自的 config.example.toml 初始化。Formic 目录收敛到当前托管集合。
-不修改 att.exe。
+不修改 att.exe 或 tools/formic/formic.exe；两个程序由构建与打包步骤提供。
 
 .PARAMETER TargetRoot
 可选的发行根；省略时使用仓库固定的 dist。
@@ -53,7 +53,6 @@ $formicActiveConfigDestination = Join-Path $formicDestination 'config.toml'
 $formicFileMappings = @(
     'config.example.toml',
     'FORMIC-SOURCE.md',
-    'formic.exe',
     'LICENSE',
     'README.md'
 )
@@ -182,7 +181,7 @@ try {
         New-Item -ItemType Directory -Path $formicDestination | Out-Null
     }
     $currentFormicItems = @(
-        $formicFileMappings + $formicDirectoryMappings + 'config.toml'
+        $formicFileMappings + $formicDirectoryMappings + 'config.toml' + 'formic.exe'
     )
     foreach ($item in Get-ChildItem -LiteralPath $formicDestination -Force) {
         if ($item.Name -notin $currentFormicItems) {

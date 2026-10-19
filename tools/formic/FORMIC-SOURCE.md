@@ -1,27 +1,33 @@
 # Formic 程序与源码来源
 
-本目录提供 Formic 0.3.0 的 Windows x64 本机修订制品，运行时直接调用同目录的 `formic.exe`。
+Formic 由 ATT 项目统一维护，源码位于 ATT 仓库的
+[`crates/formic/`](https://github.com/yexi-by/att/tree/main/crates/formic)。发行包中的
+`formic.exe` 与 `att.exe` 从同一版本标签构建，使用 workspace 的共同版本、锁定工具链和
+根 `Cargo.lock`。运行时继续调用本目录的 `formic.exe`。
 
-| 项目 | 当前制品 |
-| --- | --- |
-| 源码仓库 | [yexi-by/formic](https://github.com/yexi-by/formic) |
-| 源码提交 | [`45de311ab266ffa7cc606dffbb7463552a559ede`](https://github.com/yexi-by/formic/commit/45de311ab266ffa7cc606dffbb7463552a559ede) |
-| 来源状态 | 已公开推送至源码仓库 |
-| 编译器 | Rust 1.97.1 |
-| 构建目标 | `x86_64-pc-windows-msvc`，Release，静态 C Runtime |
-| `formic.exe` SHA-256 | `1cfd69619d166214dc003aff972ea7419a72984cc029eadff478b08816282dd8` |
+## 取得对应源码
 
-当前修订的精确源码可通过上表源码提交获取。
+运行 `formic.exe --version` 查看版本，在 [ATT 仓库](https://github.com/yexi-by/att)
+检出对应的 `vMAJOR.MINOR.PATCH` 标签，即可取得当前发行程序的完整源码、测试、配置模板
+与维护资料。后续开发和问题反馈均在 ATT 仓库进行。
 
-## 从对应源码构建
+Formic 迁入时采用原仓库的
+[`45de311ab266ffa7cc606dffbb7463552a559ede`](https://github.com/yexi-by/formic/commit/45de311ab266ffa7cc606dffbb7463552a559ede)
+作为源码基线；该引用只用于追溯迁入前的历史。
 
-源码构建和规模实验在独立的 Formic 源码工程中执行。取得上述提交后，在其根目录运行：
+## 从 ATT workspace 构建
+
+在 ATT 仓库根目录运行：
 
 ```powershell
+$env:PCRE2_SYS_STATIC = '1'
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
-cargo +1.97.1 build --locked --release --target x86_64-pc-windows-msvc
+cargo build --locked --release -p att -p formic
 ```
 
-产物位于该工程的 `target/x86_64-pc-windows-msvc/release/formic.exe`。ATT 随包目录提供预构建程序与用户文档，日常使用方法见[快速开始](README.md)。
+两个程序位于 `target/x86_64-pc-windows-msvc/release/`。发行时将 `att.exe` 放在发行根，
+将 `formic.exe` 放在 `tools/formic/`；配置模板和用户文档也由 ATT 仓库中的本目录提供。
+开发验证与规模实验见 [Formic 维护指南](https://github.com/yexi-by/att/blob/main/crates/formic/docs/maintenance.md)，
+完整组包和发布流程见 [ATT 公开发行指南](https://github.com/yexi-by/att/blob/main/maintenance/releasing.md)。
 
-Formic 使用 GNU AGPL v3，许可正文见 [LICENSE](LICENSE)。
+日常使用方法见[快速开始](README.md)。Formic 使用 GNU AGPL v3，许可正文见 [LICENSE](LICENSE)。

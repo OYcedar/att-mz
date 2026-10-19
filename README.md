@@ -95,6 +95,14 @@ ATT 将游戏格式、翻译状态和模型请求分开处理：
 [Formic](tools/formic/README.md)，职责边界见[游戏术语表制作 Skill](skills/extract-game-terminology/SKILL.md)。
 启用 Formic 前单独配置其模型服务。
 
+## 源码维护
+
+ATT 与 Formic 在同一个 Rust workspace 中维护，共用根 `Cargo.lock`、工具链和版本号，
+发行时从同一提交构建 `att.exe` 与 `formic.exe`。Formic 的源码、测试和开发导航位于
+[`crates/formic/`](https://github.com/yexi-by/att/tree/main/crates/formic)；随包使用方法仍见
+[`tools/formic/`](tools/formic/README.md)。构建与发布方法见
+[公开发行指南](https://github.com/yexi-by/att/blob/main/maintenance/releasing.md)。
+
 ## 反馈与联系
 
 欢迎通过 [GitHub Issues](https://github.com/yexi-by/att/issues)反馈问题或建议。

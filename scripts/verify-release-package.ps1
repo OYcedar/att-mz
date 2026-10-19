@@ -31,7 +31,6 @@ else {
 foreach ($relativePath in @(
         'att.exe', 'config.example.toml', 'config.toml', 'LICENSE', 'README.md',
         'licenses\THIRD-PARTY-LICENSES.html',
-        'licenses\FORMIC-THIRD-PARTY-LICENSES.html',
         'tools\formic\formic.exe', 'tools\formic\LICENSE',
         'tools\formic\FORMIC-SOURCE.md', 'tools\formic\README.md',
         'tools\formic\config.example.toml', 'tools\formic\config.toml'
@@ -115,13 +114,15 @@ Assert-SystemDependencies -Executable (Join-Path $distributionRoot 'tools\formic
 
 Push-Location $distributionRoot
 try {
-    $actualVersion = (& .\att.exe --version).Trim()
-    if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "att $ExpectedVersion") {
-        throw "程序版本不符或无法启动：expected=att $ExpectedVersion actual=$actualVersion"
-    }
-    & .\tools\formic\formic.exe --help > $null
-    if ($LASTEXITCODE -ne 0) {
-        throw '随包 Formic 无法启动。'
+    foreach ($program in @(
+            @{ Name = 'att'; Path = '.\att.exe' },
+            @{ Name = 'formic'; Path = '.\tools\formic\formic.exe' }
+        )) {
+        $actualVersion = (& $program.Path --version | Out-String).Trim()
+        $expected = "$($program.Name) $ExpectedVersion"
+        if ($LASTEXITCODE -ne 0 -or $actualVersion -cne $expected) {
+            throw "程序版本不符或无法启动：expected=$expected actual=$actualVersion"
+        }
     }
 }
 finally {

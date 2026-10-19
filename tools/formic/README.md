@@ -6,13 +6,15 @@ Formic 按计划批量执行需要模型判断和工具查证的独立任务。�
 
 ## 1. 使用随包程序
 
-本目录已包含 Windows x64 的 `formic.exe`。以下 PowerShell 命令均在本目录执行：
+ATT 发行包的本目录包含 Windows x64 的 `formic.exe`。以下 PowerShell 命令均在本目录执行：
 
 ```powershell
 .\formic.exe --help
+.\formic.exe --version
 ```
 
-需要从其他目录调用时，使用 `formic.exe` 的完整路径，并显式传入 `--config`。本包提供程序与用户资料；源码位置、提交和构建说明见[来源记录](FORMIC-SOURCE.md)。
+需要从其他目录调用时，使用 `formic.exe` 的完整路径，并显式传入 `--config`。Formic 由 ATT workspace 统一维护、构建和发行；源码位置、对应版本和构建说明见[来源记录](FORMIC-SOURCE.md)。
+`--version` 显示与同包 ATT 一致的版本号，反馈问题时可用它确认当前程序版本。
 
 ## 2. 配置模型
 

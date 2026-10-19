@@ -10,4 +10,4 @@
 | [任务设计](task-design.md) | 判断工作是否适合拆成独立 worker，并编写可验收的 `task.md` |
 | [可观测性与排错](observability.md) | 定位启动或单元失败、阅读 worker 档案、统计和进程指标 |
 
-本目录使用随包的 `formic.exe`。源码构建与开发实验在独立 Formic 源码工程中执行，入口见[来源记录](../FORMIC-SOURCE.md)。
+本目录使用随包的 `formic.exe`。源码由 ATT workspace 中的 `crates/formic/` 维护，构建与开发实验入口见[来源记录](../FORMIC-SOURCE.md)。

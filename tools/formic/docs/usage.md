@@ -4,13 +4,13 @@ Formic 按调用方提供的计划执行独立单元。每个单元由一个 wor
 
 ## 1. 安装与启动条件
 
-ATT 已在本工具目录提供 Windows x64 的 `formic.exe`。在该目录打开 PowerShell 后确认程序可用：
+ATT 发行包在本工具目录提供 Windows x64 的 `formic.exe`。在该目录打开 PowerShell 后确认程序可用：
 
 ```powershell
 .\formic.exe --help
 ```
 
-下文的 PowerShell 示例均从本工具目录调用 `formic.exe`，输入路径替换为自己的任务目录。源码构建需要独立的 Formic 工程，入口和精确提交见[来源记录](../FORMIC-SOURCE.md)。
+下文的 PowerShell 示例均从本工具目录调用 `formic.exe`，输入路径替换为自己的任务目录。源码由 ATT workspace 统一维护，构建入口和对应版本见[来源记录](../FORMIC-SOURCE.md)。
 
 一次作业至少需要：
 
@@ -104,7 +104,7 @@ HTTP MCP 的 bearer 与 header 直接写入对应 server；stdio MCP 的业务�
 模型服务需要客户端身份或会话路由时，在 TOML 顶层填写可选 `headers` 字符串表：
 
 ```toml
-headers = { "user-agent" = "Formic/0.3.0", "x-opencode-session" = "formic-current-job" }
+headers = { "user-agent" = "Formic", "x-opencode-session" = "formic-current-job" }
 ```
 
 省略时不添加自定义请求头。该表用于三种模型协议的全部普通、重试、上下文压缩和自检请求，

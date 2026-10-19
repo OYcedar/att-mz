@@ -79,6 +79,7 @@ ATT 用一个 CLI 聚合多个游戏引擎的翻译能力。统一入口只承�
 
 先做确定当前目标所需的最小只读定位。确认涉及下列主题后，在设计或改动前读完对应权威来源；
 同一行列出多个命令时，只读取本次实际涉及的命令规格。
+表中的翻译、模型与运行时规格针对 ATT 主程序；Formic 自身行为从其维护入口读取对应用户契约。
 
 | 主题 | 必读材料 |
 | --- | --- |
@@ -98,6 +99,7 @@ ATT 用一个 CLI 聚合多个游戏引擎的翻译能力。统一入口只承�
 | 性能目标、核心路径、并发或资源机制 | [性能工程要求](maintenance/performance.md) |
 | 实际测量、性能候选取舍或参数实验 | 先读[性能工程要求](maintenance/performance.md)，再读[性能验证指南](maintenance/performance-validation.md) |
 | 发行资源或 GitHub Release | [发行物规格](docs/runtime/distribution.md)、[公开发行指南](maintenance/releasing.md) |
+| Formic CLI、配置、模型与工具执行、作业状态或输出 | [Formic 维护入口](crates/formic/README.md)、[Formic 文档索引](tools/formic/docs/README.md) |
 | RPG Maker Init、Extract、Rules、Translate 或 WriteBack | 对应的 [Init](docs/rpg-maker/init.md)、[Extract](docs/rpg-maker/extraction.md)、[Rules](docs/rpg-maker/rules.md)、[Translate](docs/rpg-maker/translation.md)或[WriteBack](docs/rpg-maker/write-back.md)规格 |
 | Generic JSONL、Init、Extract、Translate 或 WriteBack | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)或[WriteBack](docs/generic/write-back.md)规格 |
 | 原子数据库 Lua | [Lua 规格](docs/lua/README.md) |

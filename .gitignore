@@ -1,6 +1,13 @@
 /archive/
 /target/
 /tmp/
+/scale-metrics.csv
+/scale-stderr.log
+/crates/formic/scale-metrics.csv
+/crates/formic/scale-stderr.log
+/crates/formic/config.toml
+/tools/formic/config.toml
+/tools/formic/formic.exe
 /测试集/
 /config.toml
 **/*.rs.bk

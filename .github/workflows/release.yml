@@ -49,20 +49,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw '无法读取 Cargo 发行版本。'
           }
-          $package = $metadata.packages | Where-Object { $_.name -ceq 'att' }
-          if ($null -eq $package -or $package.Count -ne 1) {
-            throw 'Cargo metadata 必须恰好包含一个 att package。'
-          }
-          if ($package.version -cne $version) {
-            throw "Cargo 版本与标签不一致：tag=$version cargo=$($package.version)"
+          foreach ($name in @('att', 'formic')) {
+            $packages = @($metadata.packages | Where-Object { $_.name -ceq $name })
+            if ($packages.Count -ne 1) {
+              throw "Cargo metadata 必须恰好包含一个 $name package。"
+            }
+            if ($packages[0].version -cne $version) {
+              throw "Cargo 版本与标签不一致：package=$name tag=$version cargo=$($packages[0].version)"
+            }
           }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
           "release_name=ATT $version" >> $env:GITHUB_OUTPUT
 
-      - name: Build Release executable
+      - name: Build Release executables
         shell: pwsh
-        run: cargo build --locked --release --bin att
+        run: cargo build --locked --release -p att -p formic --bins
 
       - name: Package ZIP
         id: package
@@ -74,6 +76,8 @@ jobs:
           Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\att.exe' `
             -Destination 'dist\att.exe'
           & .\scripts\sync-dist-resources.ps1
+          Copy-Item -LiteralPath 'target\x86_64-pc-windows-msvc\release\formic.exe' `
+            -Destination 'dist\tools\formic\formic.exe'
           & .\scripts\verify-release-package.ps1 -ExpectedVersion $env:RELEASE_VERSION
 
           $archiveName = "att-v$env:RELEASE_VERSION-windows-x64.zip"
