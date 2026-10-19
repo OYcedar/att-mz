@@ -1,16 +1,12 @@
-# ATT 1.3.6
+# ATT 1.3.7
 
-ATT 1.3.6 完善 Generic 外部适配器验收与跨引擎译后审校，并更新游戏汉化 Skill。
+Formic 源码已并入 ATT workspace，由 ATT 统一维护、构建和发行。两个程序从同一版本标签
+构建，源码、测试和维护资料见 [Formic 开发入口](https://github.com/yexi-by/att/blob/v1.3.7/crates/formic/README.md)。
 
-- Generic 外部验收报告绑定译文导出、最终产物和验证输入；输入变化后报告失效。QA 汇总
-  文本消费者、布局检查与未验证范围，区分静态往返成功和实机确认。
-- 增加对白错位、相邻串句的审校候选，保留相邻语境；模型任务诊断提供自然编号和任务记录
-  定位，便于对照原文与模型响应确认问题。
-- 译文导出包含语言对、分组与自然文本视图。导出阶段与翻译阶段共用语言检查，支持项目
-  允许保留的词语；移除缺乏实际字体、字号和文本区域依据的固定宽度提示。
-- 更新 RealLive 与 Escude 的最终原生产物验收说明，补充姓名标签去重、引号对白续行缩进
-  和最终排版核验；新增 VX Ace 汉化参考，并明确按用户要求开展界面美化的边界。
+- 随包 `formic.exe` 使用共同版本号 `1.3.7`，新增 `--version`，便于确认程序版本和反馈问题。
+- Formic 仍位于 `tools/formic/`，既有调用路径与活动配置保留；使用方法见
+  [Formic 用户文档](https://github.com/yexi-by/att/blob/v1.3.7/tools/formic/README.md)。
+- 原 Formic 仓库已归档，后续开发和问题反馈统一在 [ATT 仓库](https://github.com/yexi-by/att)进行。
 
-译文导出 JSONL 格式已更新。升级后请重新导出译文，再执行随包 QA；外部适配器使用随包
-`att_toolbox.translation_export` 读取器接入当前格式，具体见
-[Generic 外部适配器验收契约](https://github.com/yexi-by/att/blob/v1.3.6/docs/generic/adapter-verification.md)。
+升级时请保留 ATT 根目录的 `config.toml`、`tools/formic/config.toml` 和 `projects/`，
+参照新版本配置模板核对字段。
