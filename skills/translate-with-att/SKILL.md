@@ -57,6 +57,9 @@ ATT 原生处理 RPG Maker MV、MZ 和 Generic JSONL；其他引擎通过 Generi
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
 唯一所有者。图片文字交给图像翻译流程，资源路径、内部键、控制符和协议外壳保留其技术含义。
 
+调查正文时，按[排版语义与最终显示验收](../../docs/guides/acceptance.md#41-排版语义与最终显示验收)
+辨认空白和换行的用途，确定任务的排版约定、可重排输入与最终排版责任。
+
 RPG Maker MV/MZ 项目优先使用随包 `rpg_maker_survey.py` 调查标准数据、事件、活动插件参数、插件源码
 和自定义数据。根据真实结构把来源交给：
 
@@ -162,11 +165,9 @@ WriteBack 和运行观察完成后，带上相应证据重新扫描，仍缺少�
 QA 修订完成后执行对应引擎的 WriteBack。已经确认具体位置和显示宽度时使用排版规则；规则文件
 按 `docs/translation/write-back-layout-rules.md` 编写。
 
-未闭合成对符号内的续行由 ATT 按[断行与补空白](../../docs/translation/write-back-layout-rules.md#4-断行与补空白)
-补一个全角空格，`[write_back].complete_continuation_whitespace` 默认开启。核对 ATT 写回和游戏
-最终排版两个阶段：引擎或补丁若合并软换行后重新折行，须在最终换行处按同一规则重建缩进，计算
-断点时先计入缩进的实际宽度；闭合后的新段落恢复正常起点，正常短句和末行不强行填满，窗口高度
-与分页使用同一布局。不能把清除旧缩进后的文本直接交给绘字。
+ATT 的断行与续行补空白遵循[现行规格](../../docs/translation/write-back-layout-rules.md#4-断行与补空白)。
+按调查确定的最终排版分工和[验收方法](../../docs/guides/acceptance.md#41-排版语义与最终显示验收)
+先核对代表样本，再批量处理；复查游戏最终显示行的对齐、段落、断句和宽高。
 
 RPG Maker 输出部署到隔离游戏副本。Generic 输出交给本任务已经确定的外部反向转换，并核对每个
 JSONL Unit 与实际来源位置。组合项目按真实加载顺序合并，确保每个位置采用唯一译文。
@@ -201,7 +202,9 @@ RPG Maker MV/MZ 隔离副本用 `inspect_nwjs_runtime.py smoke` 完成启动验�
 
 - 新来源进入调查、所有权和 Extract；
 - 术语变化更新术语表并审校受影响译文；
-- 误译和排版问题进入 Manual、QA、WriteBack 与重新封包；
+- 误译进入 Manual、QA、WriteBack 与重新封包；
+- 排版问题按[验收方法](../../docs/guides/acceptance.md#41-排版语义与最终显示验收)回到实际负责的
+  阶段，区分正文修订与显示处理，再复查受影响的 QA、WriteBack 和封包结果；
 - 字体问题进入字体引用、glyph 覆盖和相关场景复查。
 
 补丁后出现图像、动画、音频缺失或剧情控制异常时，回到游戏侧适配及运行程序改动，按
