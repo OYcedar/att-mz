@@ -33,7 +33,7 @@ Agent 负责理解游戏、制定规则和审校文字，ATT 负责执行与状�
 编辑 `att.exe` 同目录的 `config.toml`，在现有配置中填写模型服务：
 
 ```toml
-[llm.clients.primary]
+[llm.clients.example]
 protocol = "chat_completions"
 url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"

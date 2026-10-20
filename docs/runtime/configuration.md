@@ -42,7 +42,7 @@ record_translation_tasks = true
 
 [[translation.profiles]]
 id = "primary"
-llm_client = "primary"
+llm_client = "example"
 target_task_user_message_characters = 24000
 ```
 
@@ -122,7 +122,7 @@ complete_continuation_whitespace = true
 项目里已经接受的译文失去 Current，也不授权 Translate 或 WriteBack 删除它们。
 
 ```toml
-[llm.clients.primary]
+[llm.clients.example]
 protocol = "chat_completions"
 url = "https://api.example.com/v1"
 api_key = "replace-with-api-key"
@@ -162,8 +162,8 @@ DNS、TCP、TLS、发送、读取以及连接、读取、总超时，并说明�
 Client 可选 `headers` 字符串表，省略时为空。例如需要客户端身份和固定会话路由的服务可配置：
 
 ```toml
-[llm.clients.primary.headers]
-user-agent = "ATT/1.3.2"
+[llm.clients.example.headers]
+user-agent = "ATT/1.3.7"
 x-opencode-session = "att-current-project"
 ```
 
@@ -177,7 +177,7 @@ Trailer 或 Upgrade。配置错误在发送前拒绝；诊断可定位字段名�
 发行模板不启用 `rate_limit`。只有模型服务确实规定 RPM 时才增加：
 
 ```toml
-[llm.clients.primary.rate_limit]
+[llm.clients.example.rate_limit]
 requests_per_minute = 60
 burst = 8
 ```

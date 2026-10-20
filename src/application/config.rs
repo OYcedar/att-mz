@@ -4660,8 +4660,8 @@ mod tests {
         };
         assert!(default.client().headers().is_empty());
         let source = example.replacen(
-            "[llm.clients.primary]",
-            "[llm.clients.primary]\nheaders = { \"x-opencode-session\" = \"session-sentinel\", \"user-agent\" = \"ATT/1.3.0\" }",
+            "[llm.clients.example]",
+            "[llm.clients.example]\nheaders = { \"x-opencode-session\" = \"session-sentinel\", \"user-agent\" = \"ATT/1.3.0\" }",
             1,
         );
         let path = directory.write("headers-valid.toml", &source);
@@ -4685,8 +4685,8 @@ mod tests {
             r#"{ "x-session" = 42 }"#,
         ] {
             let source = example.replacen(
-                "[llm.clients.primary]",
-                &format!("[llm.clients.primary]\nheaders = {headers}"),
+                "[llm.clients.example]",
+                &format!("[llm.clients.example]\nheaders = {headers}"),
                 1,
             );
             let path = directory.write("headers-invalid.toml", &source);
@@ -5403,7 +5403,7 @@ id = "unused"
             ("profile-id", source.replacen("id = \"primary\"\n", "", 1)),
             (
                 "profile-client",
-                source.replacen("llm_client = \"primary\"\n", "", 1),
+                source.replacen("llm_client = \"example\"\n", "", 1),
             ),
             (
                 "profile-target-task-user-message-characters",
@@ -5439,7 +5439,7 @@ id = "unused"
         let cases = [
             (
                 "selected-profile-missing",
-                source.replacen("llm_client = \"primary\"\n", "", 1),
+                source.replacen("llm_client = \"example\"\n", "", 1),
                 "translation.profiles.llm_client",
                 "缺少必填字段",
                 ConfigurationTomlFailureKind::MissingField,
@@ -5448,7 +5448,7 @@ id = "unused"
             (
                 "client-stream-missing",
                 source.replacen(format!("{EXAMPLE_CLIENT_STREAM}\n").as_str(), "", 1),
-                "llm.clients.primary.stream",
+                "llm.clients.example.stream",
                 "缺少必填字段",
                 ConfigurationTomlFailureKind::MissingField,
                 None,
@@ -5518,7 +5518,7 @@ id = "unused"
                     "max_concurrent_requests = \"TYPE_VALUE_SENTINEL\"",
                     1,
                 ),
-                "llm.clients.primary.max_concurrent_requests",
+                "llm.clients.example.max_concurrent_requests",
                 "字段类型不符合当前配置契约",
                 ConfigurationTomlFailureKind::TypeMismatch {
                     expected: ConfigurationTomlValueKind::Integer,
@@ -5532,7 +5532,7 @@ id = "unused"
                     "stream = [\"STREAM_TYPE_SENTINEL\"]",
                     1,
                 ),
-                "llm.clients.primary.stream",
+                "llm.clients.example.stream",
                 "字段类型不符合当前配置契约",
                 ConfigurationTomlFailureKind::TypeMismatch {
                     expected: ConfigurationTomlValueKind::Boolean,
@@ -5546,7 +5546,7 @@ id = "unused"
                     "api_key = [\"API_KEY_TYPE_SENTINEL\"]",
                     1,
                 ),
-                "llm.clients.primary.api_key",
+                "llm.clients.example.api_key",
                 "字段类型不符合当前配置契约",
                 ConfigurationTomlFailureKind::TypeMismatch {
                     expected: ConfigurationTomlValueKind::String,
@@ -5641,8 +5641,8 @@ id = "unused"
             (
                 "llm",
                 example.replace(
-                    "[llm.clients.primary]",
-                    "[llm]\nunexpected = 1\n\n[llm.clients.primary]",
+                    "[llm.clients.example]",
+                    "[llm]\nunexpected = 1\n\n[llm.clients.example]",
                 ),
             ),
             (
@@ -5655,7 +5655,7 @@ id = "unused"
             (
                 "rate-limit",
                 format!(
-                    "{example}\n[llm.clients.primary.rate_limit]\nrequests_per_minute = 60\nburst = 8\nunexpected = 1\n"
+                    "{example}\n[llm.clients.example.rate_limit]\nrequests_per_minute = 60\nburst = 8\nunexpected = 1\n"
                 ),
             ),
             (
@@ -5724,7 +5724,7 @@ id = "unused"
         for (name, replacement) in [
             (
                 "table-header",
-                format!("[llm.clients.primary.parameters]\nvendor = \"{SENTINEL}\""),
+                format!("[llm.clients.example.parameters]\nvendor = \"{SENTINEL}\""),
             ),
             ("dotted-key", format!("parameters.vendor = \"{SENTINEL}\"")),
             (
@@ -5746,7 +5746,7 @@ id = "unused"
                         expected: ConfigurationTomlValueKind::String,
                     },
                     ..
-                } if resource == "llm.clients.primary.parameters"
+                } if resource == "llm.clients.example.parameters"
             ));
             assert!(
                 !format!("{error:?}\n{error}").contains(SENTINEL),

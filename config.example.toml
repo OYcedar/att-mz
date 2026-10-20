@@ -1,83 +1,99 @@
-# ATT 每次运行都读取 att.exe 同目录的 config.toml。
-# 请填写实际的 API 地址、密钥和模型。服务有限制时再调整并发、超时等值。
-# 未知字段、重复字段或错误类型会导致命令失败。所有 *_ms 值均为毫秒。
+# ATT 配置文件（固定位于 att.exe 同目录的 config.toml）。
+# 首次使用只需填写下方 llm.clients.example 中的接口地址（url）、密钥（api_key）和模型（model），
+# 然后运行 `att test` 测试连接；其余选项保持默认即可。
+# 未知字段、重复字段或类型错误会导致命令报错退出。
 
-# WriteBack 保留正常中文标点，只修复可确定的错配符号，并为未闭合成对符号内的续行补一个全角空格。
-# 两项都只处理正文形式，不改变翻译状态。
+# 写回游戏文件时的文本格式整理（保持默认开启即可）。
 [write_back]
+# 自动修复译文中配对错乱的引号和括号（不影响正常中文标点和人工译文）。
 repair_punctuation = true
+# 对话框内引号等成对符号跨行未闭合时，自动在下一行开头补一个全角空格对齐。
 complete_continuation_whitespace = true
 
-# Prompt 可以要求模型返回可读判断和逐项原文。两个开关互不依赖。
+# 翻译提示词开关（两个开关互不冲突，可独立开启或关闭）。
 [prompts]
+# 让模型在给出译文前先输出简短的翻译思考，有助于提升复杂语境的翻译质量。
 thinking_output = true
+# 让模型在返回译文时一并附上对应原文，便于对照核查，但会增加输出 token 消耗。
 source_echo = false
 
-# primary 是模型服务 ID。协议决定请求格式，地址可以是基础地址或完整端点；stream 必填，
-# true 使用流式响应，false 等待完整 JSON。API key 按字面读取，不解析环境变量。
-[llm.clients.primary]
-# Optional service headers; use this client identity and a stable project session.
-# headers = { "user-agent" = "ATT/1.3.2", "x-opencode-session" = "att-current-project" }
+# 模型服务配置。"example" 是自定义的服务名称，可按需修改或复制多份，供下方 translation.profiles 引用。
+[llm.clients.example]
+# 可选：自定义 HTTP 请求头（不能覆盖 Authorization、Content-Type、Host 等标准头）。
+# headers = { "user-agent" = "ATT/1.3.7", "x-opencode-session" = "att-current-project" }
+# 接口协议：填 "chat_completions"（默认）或 "responses"。
 protocol = "chat_completions"
+# 接口地址：填写带版本前缀的基础地址（如 https://api.example.com/v1）或完整端点地址。
 url = "https://api.example.com/v1"
+# 接口密钥：直接填写实际密钥字符串（不支持读取环境变量）。
 api_key = "replace-with-api-key"
+# 模型名称：填写服务商提供的模型 ID。
 model = "replace-with-model-id"
+# 是否启用流式传输：true 为流式接收，false 为等待完整 JSON 一次性返回。
 stream = false
 
-# 这一组控制单个 Client 的活动 HTTP 请求数及超时。所有 *_ms 值均为毫秒；本地排队时间
-# 不计入 request_timeout_ms。
+# 并发与超时控制（单位均为毫秒，1000 毫秒 = 1 秒）：
+# max_concurrent_requests：最多同时发送的请求数。
+# connect_timeout_ms：建立网络连接超时；read_timeout_ms：等待单次数据读取超时；
+# request_timeout_ms：单次请求从发出到接收完毕的总超时（不含本地排队等待时间）。
 max_concurrent_requests = 16
 connect_timeout_ms = 5000
 read_timeout_ms = 120000
 request_timeout_ms = 120000
 
-# proxy 填 false 或不含账号密码的 URL。额外 PEM 的相对路径从 att.exe 所在目录计算。
+# 网络代理：直连填 false；使用代理填地址（如 "http://127.0.0.1:7890"，不支持带账号密码）。
 proxy = false
+# 额外根证书（PEM 文件）路径列表，相对路径从 att.exe 所在目录算起。一般留空。
 additional_pem_files = []
 
-# retry_delays_ms 的元素个数就是最多重试次数；max_retry_after_ms 限制接受服务端
-# Retry-After 的最长时间。空数组表示不重试。
+# 失败重试：数组元素为每次重试前的等待毫秒数（如 [1000, 2000] 表示最多重试 2 次；[] 表示不重试）。
 retry_delays_ms = []
+# 遇到服务端返回 Retry-After 限流等待时间时，最多愿意等待的毫秒数。
 max_retry_after_ms = 1000
 
-# parameters 必须是 JSON object，只填写供应商明确要求的扩展；不能覆盖 model、stream、
-# messages/input 或 Responses 的 background。
+# 附加给模型接口的额外 JSON 参数（如推理强度、温度等），不需要时保持 "{}"。
+# 不能包含由 ATT 管理的 model、stream、messages、input 或 background 字段。
 parameters = '''
 {}
 '''
 
-# 服务明确限制每分钟请求数时，取消整个区块的注释；burst 是可以立即发出的请求数。
-# [llm.clients.primary.rate_limit]
+# 可选：若服务商限制每分钟请求数（RPM），取消下面三行注释以启用限速；burst 为允许瞬间并发发出的请求数。
+# [llm.clients.example.rate_limit]
 # requests_per_minute = 60
 # burst = 8
 
-# 日语规则用 id 参与 Init；minimum_kana_characters 决定残留阈值，allowed_terms 是译文中
-# 已确认可以保留的日语。
+# 源语言规则：日语（id = "ja" 对应 init 时的 --source-language ja）。
 [[languages]]
 type = "japanese"
 id = "ja"
+# 译后检查：译文中若仍残留连续达到此字数的假名，会标记提醒审校。
 minimum_kana_characters = 1
+# 允许直接保留在译文中的日文词条（列在这里的词不会触发残留提醒）。
 allowed_terms = []
 
-# 英语规则分别控制译前准入和译后残留。ignored_terms 只影响原文判断；allowed_terms 只表示
-# 译文中可以保留的英文。
+# 源语言规则：英语（id = "en" 对应 init 时的 --source-language en）。
 [[languages]]
 type = "english"
 id = "en"
+# 译前判断：原文至少包含几个英文单词且达到几个字母时，才送交模型翻译。
 minimum_word_count = 1
 minimum_letter_count = 2
+# 译前忽略词：判断原文是否需要翻译时先排除这些词（仅用于跳过无需翻译的代号，不要填普通英文）。
 ignored_terms = []
+# 译后检查：译文中若原样照搬了原文英文，且连续达到几个单词和字母数，会标记提醒审校。
 minimum_copied_word_count = 2
 minimum_copied_letter_count = 4
+# 允许直接保留在译文中的英文专名或按键名（如 ["Page Up", "Page Down"]，仍会送译但译后不报残留）。
 allowed_terms = []
 
-# 任务记录保存实际模型任务的 Markdown；省略 record_translation_tasks 时默认为 true。
+# 翻译全局设置。
 [translation]
+# 是否在项目目录下生成可读的模型任务记录（Markdown 文件），默认开启。
 record_translation_tasks = true
 
-# primary 是 Translate 选择的方案 ID，引用上面的模型服务。字符目标用于 TaskBlock 装箱，
-# 完整分组不会拆开，因此它不是最终 user message 的硬上限。
+# 翻译方案配置。运行 translate 命令时按 id 选择方案，并调用 llm_client 指定的模型服务。
 [[translation.profiles]]
 id = "primary"
-llm_client = "primary"
+llm_client = "example"
+# 单个翻译任务的原文打包目标字符数（完整语义组不会拆开，因此不是最终请求的硬上限）。
 target_task_user_message_characters = 24000
