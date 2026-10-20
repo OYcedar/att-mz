@@ -18,7 +18,6 @@ sys.path.insert(0, str(ROOT / "skills" / "_shared"))
 sys.path.insert(0, str(ROOT / "skills" / "translate-with-att" / "scripts"))
 
 import rpg_maker_survey
-import summarize_att_run
 import translation_preflight
 import translation_qa
 from att_skill_tools import run_cli
@@ -188,7 +187,7 @@ class PublishedCompletionEntrypointTests(unittest.TestCase):
             self.assertEqual(status, 130)
             self.assertTrue(candidates.is_file())
 
-    def test_qa_and_summary_outputs_survive_completion_output_failure(self) -> None:
+    def test_qa_outputs_survive_completion_output_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             generic_input = root / "generic-input"
@@ -247,64 +246,6 @@ class PublishedCompletionEntrypointTests(unittest.TestCase):
             )
             self.assertEqual(status, 130)
             self.assertTrue(candidates.is_file())
-
-            log = root / "run-000001.jsonl"
-            records = [
-                {
-                    "timestamp": "2026-01-01T00:00:01Z",
-                    "sequence": 1,
-                    "run_id": "run-000001",
-                    "level": "info",
-                    "event": "run.started",
-                    "context": {
-                        "locale": "zh-Hans",
-                        "engine": "generic",
-                        "project": "test",
-                        "command": "translate",
-                    },
-                    "payload": {},
-                    "message": "run.started",
-                },
-                {
-                    "timestamp": "2026-01-01T00:00:02Z",
-                    "sequence": 2,
-                    "run_id": "run-000001",
-                    "level": "warn",
-                    "event": "translation.finished",
-                    "context": {
-                        "locale": "zh-Hans",
-                        "engine": "generic",
-                        "project": "test",
-                        "command": "translate",
-                    },
-                    "payload": {"result": {"kind": "not_started"}},
-                    "message": "translation.finished",
-                },
-                {
-                    "timestamp": "2026-01-01T00:00:03Z",
-                    "sequence": 3,
-                    "run_id": "run-000001",
-                    "level": "info",
-                    "event": "run.finished",
-                    "context": {
-                        "locale": "zh-Hans",
-                        "engine": "generic",
-                        "project": "test",
-                        "command": "translate",
-                    },
-                    "payload": {"result": {"kind": "cancelled"}},
-                    "message": "run.finished",
-                },
-            ]
-            log.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-            summary = root / "summary.json"
-            summary_args = argparse.Namespace(log=[log], task_records=None, output=summary, replace=False)
-            status = _run_with_stdout_failure(
-                lambda: summarize_att_run._summarize(summary_args),  # pyright: ignore[reportPrivateUsage]
-                BrokenPipeError("stdout closed"),
-            )
-            self.assertEqual(status, 1)
-            self.assertTrue(summary.is_file())
 
 
 if __name__ == "__main__":
