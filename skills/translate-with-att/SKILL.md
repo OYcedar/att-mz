@@ -47,6 +47,7 @@ ATT 原生处理 RPG Maker MV、MZ 和 Generic JSONL；其他引擎通过 Generi
 | Unity / Naninovel 通过 Generic 接入，或资源已译而自定义标题、状态、弹窗仍显示原文 | [Unity / Naninovel 显示消费者与漏翻返修](references/engine-unity-naninovel-consumers.md) | 脚本与序列化界面、托管字段赋值及静态缓存、有效资源和原生调用的验证边界 |
 | RealLive（`Seen.txt`、SEEN 脚本与 `Gameexe.ini`）通过 Generic 接入 | [RealLive 原生文字与姓名回填](references/engine-reallive-native-text.md) | 姓名控制与显示值、编码与原生界面、脚本返修验证 |
 | 已确认 Escude 封包与字库布局 | [Escude 封包查找、字库与原生界面](references/engine-escude-native-text.md) | 封包索引与实际查找、字库和界面、验收记录 |
+| 需要解包重建或修改游戏运行程序、初始化、脚本解释器或资源加载逻辑 | [运行程序改动的影响分析与验收](../../docs/guides/acceptance.md#51-运行程序改动的影响分析与验收) | 改动前追踪状态依赖，改动后按受影响入口与场景取证，遵守已有操作授权 |
 
 普通汉化保留现有视觉设计；只有用户主动明确要求美化时，才进入 VX Ace 技能的界面现代化流程。
 阶段性专题在对应章节给出：命令名称消费者见调查，Unity TMP 字体见字体与封包，动态消息见实玩反馈返修。
@@ -202,6 +203,10 @@ RPG Maker MV/MZ 隔离副本用 `inspect_nwjs_runtime.py smoke` 完成启动验�
 - 术语变化更新术语表并审校受影响译文；
 - 误译和排版问题进入 Manual、QA、WriteBack 与重新封包；
 - 字体问题进入字体引用、glyph 覆盖和相关场景复查。
+
+补丁后出现图像、动画、音频缺失或剧情控制异常时，回到游戏侧适配及运行程序改动，按
+[影响分析与验收方法](../../docs/guides/acceptance.md#51-运行程序改动的影响分析与验收)核对受影响
+路径与状态的全部消费者，并更新静态证据与人工场景检查项。
 
 RPG Maker 动态消息的源字段已译、画面仍为原文，或全新存档也复现时，读取
 [动态消息的最终显示消费者](references/rpg-maker-rendered-messages.md)，核对运行时组合、
