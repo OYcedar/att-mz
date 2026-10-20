@@ -27,7 +27,7 @@ use crate::diagnostic::{
 };
 use crate::execution::isolated::{IsolatedOperationError, run_isolated_operation};
 use crate::fingerprint::{Sha256Fingerprint, Sha256FramedHasher};
-use crate::language::LanguageText;
+use crate::language::{LanguageText, LanguageTextSegment};
 
 use super::placeholder_projection::{
     LanguageTextProjectionError, PlaceholderBindingIndex, PlaceholderMultisetError,
@@ -293,7 +293,105 @@ impl CompiledPlaceholderRules {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PlaceholderService;
 
+#[derive(Debug)]
+pub(crate) enum PlaceholderCandidateError {
+    Protection(PlaceholderProtectionError),
+    Binding(SourceBoundPlaceholderError),
+}
+
 impl PlaceholderService {
+    /// token 保留源身份；裸正文以精确命中定位，再补齐不依赖译文上下文的源片段。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_candidate_with_target_and_builtins_with_cancellation<E>(
+        &self,
+        source: &ProtectedText,
+        scope: &str,
+        target_id: &str,
+        candidate: &str,
+        custom: &CompiledPlaceholderRules,
+        builtins: &[&CompiledBuiltinPlaceholderRule],
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<ProtectedText, PlaceholderCandidateError>, E> {
+        if source.placeholders().is_empty() {
+            return self
+                .protect_with_target_and_builtins_with_cancellation(
+                    scope,
+                    Some(target_id),
+                    candidate,
+                    &[],
+                    custom,
+                    builtins,
+                    ensure_running,
+                )
+                .map(|result| match result {
+                    Ok(discovered) if discovered.placeholders().is_empty() => Ok(discovered),
+                    Ok(_) => Err(PlaceholderCandidateError::Binding(
+                        SourceBoundPlaceholderError::UnexpectedPlaceholder,
+                    )),
+                    Err(source) => Err(PlaceholderCandidateError::Protection(source)),
+                });
+        }
+        let has_tokens =
+            reserved_prefix_start_with_cancellation(candidate, &mut ensure_running)?.is_some();
+        let bound = match source.bind_candidate_with_cancellation(candidate, &mut ensure_running)? {
+            Ok(bound) => Some(bound),
+            // 已能唯一归属的源片段不被部分规则命中重新编号；只用精确位置消除字面歧义。
+            Err(SourceBoundPlaceholderError::AmbiguousOriginal { .. }) if !has_tokens => None,
+            Err(source) => return Ok(Err(PlaceholderCandidateError::Binding(source))),
+        };
+        let restored;
+        let raw_candidate = if has_tokens {
+            let bound = bound.as_ref().expect("含 token 的候选已完成源绑定");
+            restored = match bound.restore_with_cancellation(bound.text(), &mut ensure_running)? {
+                Ok(restored) => restored,
+                Err(PlaceholderRestoreError::Projection(source)) => {
+                    return Ok(Err(PlaceholderCandidateError::Binding(
+                        SourceBoundPlaceholderError::Projection(source),
+                    )));
+                }
+                Err(PlaceholderRestoreError::Multiset(source)) => {
+                    return Ok(Err(PlaceholderCandidateError::Binding(
+                        SourceBoundPlaceholderError::Multiset(source),
+                    )));
+                }
+            };
+            restored.as_str()
+        } else {
+            candidate
+        };
+        let discovered = match self.protect_with_target_and_builtins_with_cancellation(
+            scope,
+            Some(target_id),
+            raw_candidate,
+            &[],
+            custom,
+            builtins,
+            &mut ensure_running,
+        )? {
+            Ok(discovered) => discovered,
+            Err(source) => return Ok(Err(PlaceholderCandidateError::Protection(source))),
+        };
+        let matched = match match_candidate_placeholder_bindings_with_cancellation(
+            source.placeholders(),
+            discovered.placeholders(),
+            &mut ensure_running,
+        )? {
+            Some(matched) => matched,
+            None => {
+                return Ok(Err(PlaceholderCandidateError::Binding(
+                    SourceBoundPlaceholderError::UnexpectedPlaceholder,
+                )));
+            }
+        };
+        if let Some(bound) = bound {
+            // 扫描只检查新增身份，不用还原后的同字正文覆盖已验证的 token 位置。
+            return Ok(Ok(bound));
+        }
+        source
+            .bind_discovered_candidate_with_cancellation(&discovered, &matched, ensure_running)
+            .map(|result| result.map_err(PlaceholderCandidateError::Binding))
+    }
+
     /// 编译调用方的内置 pattern；公共层不决定哪些引擎拥有内置规则。
     pub(crate) fn compile_builtin(
         &self,
@@ -1817,21 +1915,31 @@ impl AppliedPlaceholder {
     }
 }
 
-/// 候选规则扫描只负责发现源 binding 之外的新 Placeholder，不重新证明预期片段是否存在。
-pub(crate) fn candidate_placeholder_bindings_are_source_subset(
+/// 精确命中映射回源身份；源绑定可没有再次命中，但候选不能增加身份或数量。
+fn match_candidate_placeholder_bindings_with_cancellation<E>(
     source: &[AppliedPlaceholder],
     candidate: &[AppliedPlaceholder],
-) -> bool {
+    mut ensure_running: impl FnMut() -> Result<(), E>,
+) -> Result<Option<Vec<usize>>, E> {
     let mut matched = vec![false; source.len()];
+    let mut indices = Vec::with_capacity(candidate.len());
     for actual in candidate {
-        let Some(index) = source.iter().enumerate().position(|(index, expected)| {
-            !matched[index] && placeholder_rule_identity_eq(expected, actual)
-        }) else {
-            return false;
+        let mut found = None;
+        for (index, expected) in source.iter().enumerate() {
+            ensure_running()?;
+            if !matched[index] && placeholder_rule_identity_eq(expected, actual) {
+                found = Some(index);
+                break;
+            }
+        }
+        let Some(index) = found else {
+            return Ok(None);
         };
         matched[index] = true;
+        indices.push(index);
     }
-    true
+    ensure_running()?;
+    Ok(Some(indices))
 }
 
 fn placeholder_rule_identity_eq(left: &AppliedPlaceholder, right: &AppliedPlaceholder) -> bool {
@@ -1852,6 +1960,40 @@ pub(crate) struct ProtectedText {
 }
 
 impl ProtectedText {
+    fn bind_discovered_candidate_with_cancellation<E>(
+        &self,
+        discovered: &Self,
+        source_indices: &[usize],
+        mut ensure_running: impl FnMut() -> Result<(), E>,
+    ) -> Result<Result<Self, SourceBoundPlaceholderError>, E> {
+        if discovered.placeholders().is_empty() {
+            return self.bind_candidate_with_cancellation(discovered.text(), ensure_running);
+        }
+        let projection = match discovered.language_text_with_cancellation(&mut ensure_running)? {
+            Ok(projection) => projection,
+            Err(source) => return Ok(Err(SourceBoundPlaceholderError::Projection(source))),
+        };
+        let mut normalized = String::with_capacity(discovered.text().len());
+        let mut indices = source_indices.iter();
+        for segment in projection.segments() {
+            ensure_running()?;
+            let fragment = match segment {
+                LanguageTextSegment::NaturalText(text) => text.as_str(),
+                LanguageTextSegment::OpaqueBoundary => {
+                    let index = indices.next().expect("每个精确命中必须有对应源身份");
+                    self.placeholders[*index].token()
+                }
+            };
+            append_placeholder_text_with_cancellation(
+                &mut normalized,
+                fragment,
+                &mut ensure_running,
+            )?;
+        }
+        debug_assert!(indices.next().is_none());
+        self.bind_candidate_with_cancellation(&normalized, ensure_running)
+    }
+
     fn new_with_cancellation<E>(
         text: String,
         placeholders: Vec<AppliedPlaceholder>,
@@ -2544,6 +2686,73 @@ fn diagnostic_match_range(start: usize, end: usize) -> ByteRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_candidate_binding_distinguishes_natural_literals_and_keeps_source_identity() {
+        let service = PlaceholderService;
+        let custom = service
+            .compile_custom(
+                vec![
+                    PlaceholderRuleDefinition::new(None, r"<LC:[0-9A-F]+>"),
+                    PlaceholderRuleDefinition::new(None, r"\A[　○]"),
+                    PlaceholderRuleDefinition::new(None, r"(?<=Name: )[A-Za-z0-9-]+"),
+                ],
+                |_| true,
+            )
+            .unwrap();
+        let source = service
+            .protect(
+                "dialogue",
+                "　日本語　Name: abc-123<LC:0201>",
+                &[],
+                &custom,
+                None,
+            )
+            .unwrap();
+        let bind = |candidate: &str| {
+            service
+                .bind_candidate_with_target_and_builtins_with_cancellation(
+                    &source,
+                    "dialogue",
+                    "scene.jsonl:line1:unit1:text",
+                    candidate,
+                    &custom,
+                    &[],
+                    || Ok::<_, Infallible>(()),
+                )
+                .unwrap()
+        };
+        for candidate in [
+            "　译文　名称：abc-123<LC:0201>",
+            "⟦ATT_CUSTOM_WHOLE_0000⟧译文　名称：⟦ATT_CUSTOM_WHOLE_0001⟧⟦ATT_CUSTOM_WHOLE_0002⟧",
+        ] {
+            let bound = bind(candidate).expect("精确命中与翻译后的 lookbehind 应共同绑定源身份");
+            assert_eq!(
+                bound.text(),
+                "⟦ATT_CUSTOM_WHOLE_0000⟧译文　名称：⟦ATT_CUSTOM_WHOLE_0001⟧⟦ATT_CUSTOM_WHOLE_0002⟧",
+            );
+            assert_eq!(
+                bound.restore(bound.text()).unwrap(),
+                "　译文　名称：abc-123<LC:0201>",
+            );
+        }
+        for candidate in [
+            "译文　名称：abc-123<LC:0201><LC:0201>",
+            "　译文　名称：abc-123<LC:0202>",
+            "　译文　名称：abc-123 abc-123<LC:0201>",
+            "　译文　名称：abc-123 Name: invented<LC:0201>",
+            "⟦ATT_CUSTOM_WHOLE_0000⟧译文　名称：⟦ATT_CUSTOM_WHOLE_0002⟧⟦ATT_CUSTOM_WHOLE_0001⟧",
+            "⟦ATT_CUSTOM_WHOLE_0000⟧译文　名称：⟦ATT_CUSTOM_WHOLE_0001⟧",
+            "⟦ATT_CUSTOM_WHOLE_0000⟧译文　名称：⟦ATT_CUSTOM_WHOLE_0001⟧⟦ATT_CUSTOM_WHOLE_0002⟧⟦ATT_CUSTOM_WHOLE_0002⟧",
+            "　译文　名称：abc-123<LC:0201>⟦ATT_UNKNOWN_0000⟧",
+            "　译文　名称：abc-123<LC:0201>⟦ATT_",
+        ] {
+            assert!(
+                bind(candidate).is_err(),
+                "缺失、重复、新身份、歧义和换序必须拒绝：{candidate}"
+            );
+        }
+    }
 
     fn empty_rules() -> CompiledPlaceholderRules {
         CompiledPlaceholderRules {

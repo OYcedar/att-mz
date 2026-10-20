@@ -33,8 +33,9 @@ Review，不会拒绝候选或阻止 WriteBack。
 [WriteBack 排版规则规格](../translation/write-back-layout-rules.md)。
 
 上述处理和最终物化都使用源文已经建立的 Placeholder binding 保护候选，不要求同一规则在
-译文标签或自然语言上下文再次命中。完整候选的规则扫描仍检查新增自定义 Placeholder 和
-当前位置适用的内建控制；数量、顺序、固定槽、wrapper 或保留 token 不合法时不生成候选。
+译文标签或自然语言上下文再次命中。已还原正文的绑定及新增自定义 Placeholder、内建控制
+检查遵循 [Placeholder 规格](../translation/placeholders.md#候选验收)；数量、顺序、固定槽、
+wrapper 或保留 token 不合法时不生成候选。
 
 - 关闭标点修复时，标点逐字采用数据库译文；开启时也只替换已经存在且唯一对应的自动译文
   标点，不增删字符或复制原文空白；人工译文不做标点修复；

@@ -50,7 +50,7 @@ use super::identity::{
 };
 use super::placeholder::{
     GenericCompiledPlaceholderRules, GenericPlaceholderError, GenericPlaceholderService,
-    GenericProtectedText,
+    GenericProtectedText, GenericSourceBoundPlaceholderError,
 };
 use super::project::{
     GenericProject, GenericStoredGroup, GenericStoredSnapshot, GenericStoredTranslation,
@@ -2857,22 +2857,23 @@ fn validate_generic_candidate_fact_with_cancellation(
 > {
     ensure_generic_response_processing_running(cancellation)?;
     let service = GenericPlaceholderService::default();
-    let restored = match service.restore_with_cancellation(&fact.protected, candidate, || {
-        ensure_generic_response_processing_running(cancellation)
-    })? {
-        Ok(restored) => restored,
-        Err(source) => return Ok(Err(generic_response_placeholder_problem(&source))),
-    };
     let target_id = fact.locator.readable_id();
     let candidate_protected = match service.bind_target_candidate_with_cancellation(
         &fact.protected,
         &target_id,
         &fact.kind,
-        &restored,
+        candidate,
         placeholder_rules,
         || ensure_generic_response_processing_running(cancellation),
     )? {
         Ok(protected) => protected,
+        Err(GenericSourceBoundPlaceholderError::Multiset(source)) => {
+            return Ok(Err(
+                GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                    problem: generic_placeholder_multiset_problem(&source),
+                },
+            ));
+        }
         Err(source) => {
             return Ok(Err(generic_candidate_placeholder_problem(
                 source.into(),
@@ -3871,9 +3872,14 @@ mod tests {
             .0,
             "你好\n世界 {name}"
         );
-        assert!(
-            validate_generic_candidate(&key, "你好", &facts, &rules, &language_module).is_err(),
-            "丢失 Placeholder 的译文必须被拒绝"
+        assert_eq!(
+            validate_generic_candidate(&key, "你好", &facts, &rules, &language_module),
+            Err(
+                GenericResponseDestinationProblem::PlaceholderRestoreMultiset {
+                    problem: GenericPlaceholderMultisetProblem::Mismatch,
+                }
+            ),
+            "丢失 Placeholder 必须保留模型响应的具体拒绝原因"
         );
         assert!(
             validate_generic_candidate(

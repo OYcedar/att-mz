@@ -34,7 +34,8 @@ Partial 项目允许写回。结果明确报告使用译文的 Unit 数与保留
 WriteBack 不删除这些正文，也不把保留原文伪装成已翻译。
 
 WriteBack 重新执行当前 Placeholder 与结构强校验。Placeholder 预期使用源文已经建立的
-binding，不要求规则在译文上下文再次命中；完整候选的规则扫描只检查源 binding 之外的新身份。
+binding，不要求规则在译文上下文再次命中；已还原正文的绑定和新增身份检查遵循
+[Placeholder 规格](../translation/placeholders.md#候选验收)。
 源语言残留仍只是一项 Review，不会拒绝候选。正文随后依次执行可选的自动译文标点修复、
 规则命中的断行和独立续行补空白。开关与默认值见
 [配置规格](../runtime/configuration.md#4-writeback-正文开关)，选择器与断行边界见

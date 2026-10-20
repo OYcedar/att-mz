@@ -332,6 +332,110 @@ fn manual_export_check_and_apply_work_for_mv_and_mz() {
 }
 
 #[test]
+fn contextual_custom_placeholders_survive_rpg_model_current_and_write_back() {
+    for engine in ["mv", "mz"] {
+        let temporary = tempfile::tempdir().expect("应可建立 RPG 占位符往返目录");
+        let root = temporary.path();
+        let game = root.join("game");
+        if engine == "mv" {
+            write_minimal_mv_game(&game);
+        } else {
+            write_minimal_mz_game(&game);
+        }
+        let data = if engine == "mv" { "www/data" } else { "data" };
+        let original = "　日本語　続き<LC:0201>";
+        let translated = "　中文　后续<LC:0201>";
+        fs::write(
+            game.join(data).join("Items.json"),
+            serde_json::to_vec(&json!([null, {"id": 1, "name": "", "description": original}]))
+                .unwrap(),
+        )
+        .unwrap();
+        // MV 最小夹具另有对白，本场景只提取实际标准说明字段。
+        fs::write(
+            root.join("rules.toml"),
+            "[[rule]]\nfile = 'Items.json'\npath = '[1].description'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("placeholders.toml"),
+            "[[rule]]\norder = 'preserve'\npattern = '<LC:[0-9A-F]+>'\n\n\
+             [[rule]]\norder = 'preserve'\npattern = '\\A[　○]'\n",
+        )
+        .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        write_configuration(root, &endpoint);
+        write_rpg_maker_prompt(root);
+        assert_success(
+            "RPG 占位符 Init",
+            &run_att(root, init_arguments(engine, &game)),
+        );
+        assert_success(
+            "RPG 占位符 Extract",
+            &run_att(
+                root,
+                arguments(&[
+                    engine,
+                    "extract",
+                    "--name",
+                    PROJECT,
+                    "--rules",
+                    "rules.toml",
+                ]),
+            ),
+        );
+        let server = thread::spawn(move || {
+            serve_one_response(
+                listener,
+                json!({
+                    "0": ["⟦ATT_CUSTOM_WHOLE_0000⟧中文　后续⟦ATT_CUSTOM_WHOLE_0001⟧"]
+                }),
+            )
+        });
+        assert_success(
+            "RPG 占位符模型验收",
+            &run_att(
+                root,
+                arguments(&[
+                    engine,
+                    "translate",
+                    "--name",
+                    PROJECT,
+                    "local",
+                    "--placeholders",
+                    "placeholders.toml",
+                ]),
+            ),
+        );
+        server.join().unwrap().unwrap();
+        assert_success(
+            "RPG 占位符 Current 复验",
+            &run_att(root, arguments(&[engine, "translate", "--name", PROJECT])),
+        );
+        assert_success(
+            "RPG 占位符 WriteBack",
+            &run_att(root, arguments(&[engine, "write-back", "--name", PROJECT])),
+        );
+        let workspace = distribution_root(root)
+            .join("projects")
+            .join(engine)
+            .join(PROJECT);
+        assert_eq!(
+            read_owner_units(&workspace.join("project.db"), "rules"),
+            [(json!(original), Some(json!(translated)))],
+        );
+        assert_eq!(
+            read_items(&workspace.join("write_back").join(data).join("Items.json"))[1]["description"],
+            translated,
+        );
+    }
+}
+
+#[test]
 fn rules_standard_fields_keep_builtin_controls_across_manual_translate_and_write_back() {
     for engine in ["mv", "mz"] {
         let temporary = tempfile::tempdir().expect("应可建立 Rules 控制验收目录");

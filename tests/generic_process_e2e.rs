@@ -1062,6 +1062,170 @@ fn generic_lua_can_reopen_project_database_after_att_schema_is_destroyed() {
 }
 
 #[test]
+fn contextual_placeholders_survive_model_acceptance_current_and_write_back() {
+    let temporary = tempfile::tempdir().expect("应可建立占位符往返测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).expect("应可建立输入目录");
+    let original = "　知ってる？　と花に水を向ける。<LC:0201>";
+    let translated = "　你知道吗？　我向花搭话道。<LC:0201>";
+    let source = serde_json::json!({
+        "id": "scene",
+        "kind": "dialogue",
+        "units": [
+            {"id": "body", "text": original},
+            {"id": "repeated", "text": original},
+        ],
+    });
+    fs::write(input.join("story.jsonl"), format!("{source}\n"))
+        .expect("应可写入含自然全角空格的源文");
+    let placeholders = root.join("placeholders.toml");
+    fs::write(
+        &placeholders,
+        "[[rule]]\norder = 'preserve'\npattern = '<LC:[0-9A-F]+>'\n\n\
+         [[rule]]\norder = 'preserve'\npattern = '\\A[　○]'\n",
+    )
+    .expect("应可写入精确保护规则");
+    let provider = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型端口应可绑定");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        provider.local_addr().expect("模型地址应可读取")
+    );
+    write_client_switch_distribution(root, "local", &endpoint, "placeholder-test");
+    // 本场景覆盖正式默认的任务记录和 WriteBack 正文处理。
+    let config_path = distribution_root(root).join("config.toml");
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).expect("配置应可读取"))
+            .expect("配置应可解析");
+    config["translation"]
+        .as_table_mut()
+        .expect("翻译配置应为表")
+        .remove("record_translation_tasks");
+    fs::write(
+        &config_path,
+        toml::to_string(&config).expect("配置应可序列化"),
+    )
+    .expect("应可保存使用正式默认的配置");
+
+    assert_success(
+        "占位符项目 Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                PROJECT,
+                "--path",
+                input.to_str().expect("路径应是 Unicode"),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "占位符项目 Extract",
+        &run_att(root, &["generic", "extract", "--name", PROJECT]),
+    );
+    let server = thread::spawn(move || {
+        serve_chat_completion(
+            provider,
+            "⟦ATT_CUSTOM_WHOLE_0000⟧你知道吗？　我向花搭话道。⟦ATT_CUSTOM_WHOLE_0001⟧",
+        )
+    });
+    let translated_output = run_att(
+        root,
+        &[
+            "generic",
+            "translate",
+            "--name",
+            PROJECT,
+            "local",
+            "--placeholders",
+            placeholders.to_str().expect("路径应是 Unicode"),
+        ],
+    );
+    server.join().expect("模型线程应完成").expect("应返回候选");
+    assert_success("占位符模型验收与传播", &translated_output);
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    let database = workspace.join("project.db");
+    let assert_current = || {
+        let connection = Connection::open(&database).expect("项目数据库应可读取");
+        let rows = connection
+            .prepare("SELECT translation FROM generic_unit ORDER BY ordinal")
+            .expect("应可读取正文")
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .expect("应可查询正文")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("正文应可解码");
+        assert_eq!(
+            rows,
+            [Some(translated.to_owned()), Some(translated.to_owned())]
+        );
+        let rejected: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM generic_rejected_translation",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应可读取拒绝数量");
+        assert_eq!(rejected, 0, "正常正文空格不能导致拒收或失去 Current");
+    };
+    assert_current();
+    // 此时模型服务已退出；Current 复验与去重复用不得重新请求模型。
+    assert_success(
+        "占位符 Current 复验",
+        &run_att(root, &["generic", "translate", "--name", PROJECT]),
+    );
+    assert_current();
+    let exported = root.join("translations.jsonl");
+    assert_success(
+        "占位符完整译文导出",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "translation",
+                "export",
+                "--name",
+                PROJECT,
+                exported.to_str().unwrap(),
+            ],
+        ),
+    );
+    for line in fs::read_to_string(&exported)
+        .expect("导出应可读取")
+        .lines()
+        .skip(1)
+    {
+        let entry: serde_json::Value = serde_json::from_str(line).expect("导出应为 JSONL");
+        assert_eq!(entry["state"], "current");
+        assert_eq!(entry["translation"], serde_json::json!([translated]));
+        assert_eq!(
+            entry["natural_translation"],
+            serde_json::json!([null, "你知道吗？　我向花搭话道。", null]),
+        );
+    }
+    assert_success(
+        "占位符 WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    let mut expected = source.clone();
+    for unit in expected["units"].as_array_mut().unwrap() {
+        unit["text"] = serde_json::Value::String(translated.to_owned());
+    }
+    assert_eq!(
+        read_single_jsonl_group(&workspace.join("write_back/story.jsonl")),
+        expected,
+    );
+    assert_eq!(read_single_jsonl_group(&input.join("story.jsonl")), source);
+}
+
+#[test]
 fn generic_missing_text_capture_reports_exact_leaf_without_model_request_or_state_change() {
     let temporary = tempfile::tempdir().expect("应可建立 MissingTextCapture 进程测试目录");
     let root = temporary.path();

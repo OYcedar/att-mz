@@ -752,11 +752,12 @@ fn bind_translation_candidate(
                 source,
             })
         }
-        Err(GenericSourceBoundPlaceholderError::Mismatch) => {
-            Err(GenericWriteBackError::PlaceholderBindingMismatch {
-                unit: unit_locator(),
-            })
-        }
+        Err(
+            GenericSourceBoundPlaceholderError::Mismatch
+            | GenericSourceBoundPlaceholderError::Multiset(_),
+        ) => Err(GenericWriteBackError::PlaceholderBindingMismatch {
+            unit: unit_locator(),
+        }),
     }
 }
 

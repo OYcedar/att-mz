@@ -9,10 +9,12 @@ use std::io::{self, BufReader, Read};
 
 use crate::fingerprint::Sha256Fingerprint;
 use crate::translation::placeholder::{
-    PlaceholderProtectionError, PlaceholderRestoreError, PlaceholderRuleCompilationError,
-    PlaceholderService, candidate_placeholder_bindings_are_source_subset,
+    PlaceholderCandidateError, PlaceholderProtectionError, PlaceholderRestoreError,
+    PlaceholderRuleCompilationError, PlaceholderService,
 };
-use crate::translation::placeholder_projection::SourceBoundPlaceholderError;
+use crate::translation::placeholder_projection::{
+    PlaceholderMultisetError, SourceBoundPlaceholderError,
+};
 
 pub(crate) use crate::translation::placeholder::{
     CompiledPlaceholderRules as GenericCompiledPlaceholderRules,
@@ -26,6 +28,7 @@ const RESOURCE_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 pub(crate) enum GenericSourceBoundPlaceholderError {
     Protection(PlaceholderProtectionError),
     Projection(crate::translation::placeholder_projection::LanguageTextProjectionError),
+    Multiset(PlaceholderMultisetError),
     Mismatch,
 }
 
@@ -36,7 +39,8 @@ impl From<GenericSourceBoundPlaceholderError> for GenericPlaceholderError {
             GenericSourceBoundPlaceholderError::Projection(source) => {
                 Self::Restore(PlaceholderRestoreError::Projection(source))
             }
-            GenericSourceBoundPlaceholderError::Mismatch => Self::ManualTranslationMismatch,
+            GenericSourceBoundPlaceholderError::Multiset(_)
+            | GenericSourceBoundPlaceholderError::Mismatch => Self::ManualTranslationMismatch,
         }
     }
 }
@@ -151,7 +155,7 @@ impl GenericPlaceholderService {
         .map(|result| result.map_err(GenericPlaceholderError::Protection))
     }
 
-    /// 按源文 binding 保护候选；完整规则扫描只负责拒绝源 binding 之外的新身份。
+    /// 由公共算法绑定源身份、消除裸文歧义并拒绝新增 Placeholder。
     pub(crate) fn bind_target_candidate_with_cancellation<E>(
         &self,
         source: &GenericProtectedText,
@@ -159,61 +163,35 @@ impl GenericPlaceholderService {
         kind: &str,
         candidate: &str,
         compiled: &GenericCompiledPlaceholderRules,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
+        ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<GenericProtectedText, GenericSourceBoundPlaceholderError>, E> {
-        if source.placeholders().is_empty() {
-            let candidate = match self.protect_compiled_target_with_cancellation(
-                target_id,
+        self.common
+            .bind_candidate_with_target_and_builtins_with_cancellation(
+                source,
                 kind,
+                target_id,
                 candidate,
                 compiled,
-                &mut ensure_running,
-            )? {
-                Ok(candidate) => candidate,
-                Err(source) => {
-                    return Ok(Err(GenericSourceBoundPlaceholderError::Protection(source)));
-                }
-            };
-            if candidate.placeholders().is_empty() {
-                ensure_running()?;
-                return Ok(Ok(candidate));
-            }
-            return Ok(Err(GenericSourceBoundPlaceholderError::Mismatch));
-        }
-        let discovered = match self.protect_compiled_target_with_cancellation(
-            target_id,
-            kind,
-            candidate,
-            compiled,
-            &mut ensure_running,
-        )? {
-            Ok(discovered) => discovered,
-            Err(source) => {
-                return Ok(Err(GenericSourceBoundPlaceholderError::Protection(source)));
-            }
-        };
-        let candidate =
-            match source.bind_candidate_with_cancellation(candidate, &mut ensure_running)? {
-                Ok(candidate) => candidate,
-                Err(SourceBoundPlaceholderError::Projection(source)) => {
-                    return Ok(Err(GenericSourceBoundPlaceholderError::Projection(source)));
-                }
-                Err(
-                    SourceBoundPlaceholderError::Multiset(_)
-                    | SourceBoundPlaceholderError::AmbiguousOriginal { .. }
-                    | SourceBoundPlaceholderError::UnexpectedPlaceholder,
-                ) => {
-                    return Ok(Err(GenericSourceBoundPlaceholderError::Mismatch));
-                }
-            };
-        if !candidate_placeholder_bindings_are_source_subset(
-            source.placeholders(),
-            discovered.placeholders(),
-        ) {
-            return Ok(Err(GenericSourceBoundPlaceholderError::Mismatch));
-        }
-        ensure_running()?;
-        Ok(Ok(candidate))
+                &[],
+                ensure_running,
+            )
+            .map(|result| {
+                result.map_err(|source| match source {
+                    PlaceholderCandidateError::Protection(source) => {
+                        GenericSourceBoundPlaceholderError::Protection(source)
+                    }
+                    PlaceholderCandidateError::Binding(
+                        SourceBoundPlaceholderError::Projection(source),
+                    ) => GenericSourceBoundPlaceholderError::Projection(source),
+                    PlaceholderCandidateError::Binding(SourceBoundPlaceholderError::Multiset(
+                        source,
+                    )) => GenericSourceBoundPlaceholderError::Multiset(source),
+                    PlaceholderCandidateError::Binding(
+                        SourceBoundPlaceholderError::AmbiguousOriginal { .. }
+                        | SourceBoundPlaceholderError::UnexpectedPlaceholder,
+                    ) => GenericSourceBoundPlaceholderError::Mismatch,
+                })
+            })
     }
 
     /// 使用已经编译的规则保护文本，只暴露此阶段实际可能产生的匹配错误。
@@ -258,17 +236,6 @@ impl GenericPlaceholderService {
         protected
             .restore(candidate)
             .map_err(GenericPlaceholderError::Restore)
-    }
-
-    pub(crate) fn restore_with_cancellation<E>(
-        &self,
-        protected: &GenericProtectedText,
-        candidate: &str,
-        ensure_running: impl FnMut() -> Result<(), E>,
-    ) -> Result<Result<String, GenericPlaceholderError>, E> {
-        protected
-            .restore_with_cancellation(candidate, ensure_running)
-            .map(|result| result.map_err(GenericPlaceholderError::Restore))
     }
 }
 
@@ -674,6 +641,14 @@ mod tests {
             "名称：abc-123",
         )
         .expect("源文已经绑定的凭据不应依赖译文标签再次满足 lookbehind");
+
+        validate_manual_translation_placeholders(
+            resource,
+            "dialogue",
+            "Name: abc-123 / Name: abc-123",
+            "名称：abc-123 / Name: abc-123",
+        )
+        .expect("部分规则命中不能把后面的同字片段重绑到前一个源 token");
 
         assert!(matches!(
             validate_manual_translation_placeholders(

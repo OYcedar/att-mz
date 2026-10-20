@@ -13,14 +13,13 @@ use crate::rpg_maker::text::{
 };
 use crate::translation::placeholder::{
     CompiledBuiltinPlaceholderRule, PlaceholderOrderPolicy, PlaceholderService,
-    candidate_placeholder_bindings_are_source_subset,
 };
-use crate::translation::placeholder_projection::SourceBoundPlaceholderError;
 
 use super::pipeline::TranslationUnitIdentity;
 
 pub(crate) use crate::translation::placeholder::{
-    CompiledPlaceholderRules, Pcre2PlaceholderConstructionError, PlaceholderProtectionError,
+    CompiledPlaceholderRules, Pcre2PlaceholderConstructionError,
+    PlaceholderCandidateError as RpgMakerSourceBoundPlaceholderError, PlaceholderProtectionError,
     PlaceholderRuleCompilationError, PlaceholderRuleDefinition, ProtectedText,
 };
 
@@ -34,12 +33,6 @@ const FORMAT_ARGUMENT_PATTERN: &str = r"%[0-9]+";
 const EXTENDED_SEMANTIC_LABEL: &str = "RPG_MAKER_EXTENDED_CONTROL";
 const MESSAGE_SEMANTIC_LABEL: &str = "RPG_MAKER_MESSAGE_CONTROL";
 const FORMAT_SEMANTIC_LABEL: &str = "RPG_MAKER_FORMAT_ARGUMENT";
-
-#[derive(Debug)]
-pub(crate) enum RpgMakerSourceBoundPlaceholderError {
-    Protection(PlaceholderProtectionError),
-    Binding(SourceBoundPlaceholderError),
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RpgMakerTextConsumer {
@@ -612,6 +605,23 @@ impl Pcre2PlaceholderService {
         custom: &CompiledPlaceholderRules,
         ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<ProtectedText, PlaceholderProtectionError>, E> {
+        self.common
+            .protect_with_target_and_builtins_with_cancellation(
+                kind.storage_name(),
+                Some(target_id),
+                original,
+                line_separator_offsets,
+                custom,
+                &self.profile_builtins(engine, profile),
+                ensure_running,
+            )
+    }
+
+    fn profile_builtins(
+        &self,
+        engine: RpgMakerEngine,
+        profile: RpgMakerBuiltinPlaceholderProfile,
+    ) -> Vec<&CompiledBuiltinPlaceholderRule> {
         let mut builtins = Vec::with_capacity(3);
         if matches!(
             profile.consumer,
@@ -628,19 +638,10 @@ impl Pcre2PlaceholderService {
         if profile.format_arguments {
             builtins.push(self.format_arguments.as_ref());
         }
-        self.common
-            .protect_with_target_and_builtins_with_cancellation(
-                kind.storage_name(),
-                Some(target_id),
-                original,
-                line_separator_offsets,
-                custom,
-                &builtins,
-                ensure_running,
-            )
+        builtins
     }
 
-    /// 使用源文保护阶段的 binding 验收候选；完整规则扫描只拒绝源 binding 之外的新身份。
+    /// 使用公共源文绑定验收，当前物理字段只决定适用的内建规则。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_profile_candidate_with_cancellation<E>(
         &self,
@@ -651,64 +652,18 @@ impl Pcre2PlaceholderService {
         profile: RpgMakerBuiltinPlaceholderProfile,
         candidate: &str,
         custom: &CompiledPlaceholderRules,
-        mut ensure_running: impl FnMut() -> Result<(), E>,
+        ensure_running: impl FnMut() -> Result<(), E>,
     ) -> Result<Result<ProtectedText, RpgMakerSourceBoundPlaceholderError>, E> {
-        if source.placeholders().is_empty() {
-            let candidate = match self.protect_profile_with_cancellation(
-                engine,
-                kind,
+        self.common
+            .bind_candidate_with_target_and_builtins_with_cancellation(
+                source,
+                kind.storage_name(),
                 target_id,
-                profile,
                 candidate,
-                &[],
                 custom,
-                &mut ensure_running,
-            )? {
-                Ok(candidate) => candidate,
-                Err(source) => {
-                    return Ok(Err(RpgMakerSourceBoundPlaceholderError::Protection(source)));
-                }
-            };
-            if candidate.placeholders().is_empty() {
-                ensure_running()?;
-                return Ok(Ok(candidate));
-            }
-            return Ok(Err(RpgMakerSourceBoundPlaceholderError::Binding(
-                SourceBoundPlaceholderError::UnexpectedPlaceholder,
-            )));
-        }
-        let discovered = match self.protect_profile_with_cancellation(
-            engine,
-            kind,
-            target_id,
-            profile,
-            candidate,
-            &[],
-            custom,
-            &mut ensure_running,
-        )? {
-            Ok(discovered) => discovered,
-            Err(source) => {
-                return Ok(Err(RpgMakerSourceBoundPlaceholderError::Protection(source)));
-            }
-        };
-        let candidate =
-            match source.bind_candidate_with_cancellation(candidate, &mut ensure_running)? {
-                Ok(candidate) => candidate,
-                Err(source) => {
-                    return Ok(Err(RpgMakerSourceBoundPlaceholderError::Binding(source)));
-                }
-            };
-        if !candidate_placeholder_bindings_are_source_subset(
-            source.placeholders(),
-            discovered.placeholders(),
-        ) {
-            return Ok(Err(RpgMakerSourceBoundPlaceholderError::Binding(
-                SourceBoundPlaceholderError::UnexpectedPlaceholder,
-            )));
-        }
-        ensure_running()?;
-        Ok(Ok(candidate))
+                &self.profile_builtins(engine, profile),
+                ensure_running,
+            )
     }
 }
 
