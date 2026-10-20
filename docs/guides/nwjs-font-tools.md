@@ -27,9 +27,11 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py smoke `
   --confirm-isolated-copy
 ```
 
-`smoke` 先等待游戏离开 `Scene_Boot`。默认 75 秒足以覆盖 RPG Maker MV 常见的 60 秒字体失败
-窗口；正常启动会立即继续，不会固定等待满 75 秒。随后依次尝试标题、新游戏、对话、菜单、
-任务日志、选项和存档。任务日志只有在当前菜单存在唯一的 quest、journal、mission、task 或 log
+`smoke` 和 `observe` 都先等待本机调试连接就绪、游戏离开 `Scene_Boot`，最长等待时间由
+`--startup-timeout` 指定。默认 75 秒足以覆盖 RPG Maker MV 常见的 60 秒字体失败窗口；正常启动会
+立即继续，不会固定等待满时长；启动更慢的游戏可调大该值。`smoke` 随后依次尝试标题、新游戏、
+对话、菜单、任务日志、选项和存档，每次切换后观察 `--settle-ms` 毫秒（默认 900）再记录该场景；
+绘制较慢的场景可调大该值。任务日志只有在当前菜单存在唯一的 quest、journal、mission、task 或 log
 命令，并且该命令有实际 handler 时才会进入；
 它不会从全局类名猜测插件场景。对话只有实际观察到 `Window_Message` 绘制文本才算已验证。
 

@@ -10,14 +10,6 @@ _AUDIO_SUFFIXES = frozenset({".aac", ".flac", ".m4a", ".mid", ".midi", ".mp3", "
 _VIDEO_SUFFIXES = frozenset({".avi", ".mov", ".mp4", ".ogv", ".webm"})
 _FONT_SUFFIXES = frozenset({".eot", ".otf", ".ttf", ".woff", ".woff2"})
 _ENCRYPTED_SUFFIXES = frozenset({".m4a_", ".ogg_", ".png_", ".rpgmvm", ".rpgmvo", ".rpgmvp"})
-_ENCRYPTED_UNDERLYING_KIND = {
-    ".m4a_": "audio",
-    ".ogg_": "audio",
-    ".png_": "image",
-    ".rpgmvm": "video",
-    ".rpgmvo": "audio",
-    ".rpgmvp": "image",
-}
 _OTHER_RESOURCE_SUFFIXES = frozenset({".efkefc"})
 _RESOURCE_SUFFIXES = {
     **{suffix: "image" for suffix in _IMAGE_SUFFIXES},
@@ -146,16 +138,3 @@ def classify_resource_reference(
     if resource_kind is not None:
         return ResourceReference("whole_resource_path", resource_kind)
     return None
-
-
-def is_resource_file_suffix(suffix: str) -> bool:
-    """判断文件后缀是否属于非文本资源；文本容器后缀不在此集合。"""
-
-    return suffix.casefold() in _RESOURCE_SUFFIXES
-
-
-def resource_kind_for_suffix(suffix: str) -> str | None:
-    """返回一个资源后缀的稳定类别。"""
-
-    normalized = suffix.casefold()
-    return _ENCRYPTED_UNDERLYING_KIND.get(normalized, _RESOURCE_SUFFIXES.get(normalized))

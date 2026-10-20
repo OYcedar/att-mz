@@ -33,11 +33,22 @@
 
 暂时缺少消费者证据的位置记录为 `unresolved`，并把对应场景加入人工实机调查清单。
 
-先用 `rpg_maker_survey.py scan` 建立调查目录，再审核关系组和实际消费者。Builtin 位置由扫描结果
-单独投影；`ownership-decisions.jsonl` 中的待审核位置使用 `rules`、`generic`、`exclude` 或
-`unresolved`。填写决定时保留 `game_root` 与 `members` 来源绑定；排除项填写 `reason` 和 `evidence`。
-关系组中存在不同所有者时，用 `rpg_maker_survey.py members` 导出逐候选决定，以这些行替换原
-`group:*` 决定。
+先建立调查目录，再审核关系组和实际消费者：
+
+```powershell
+python skills/translate-with-att/scripts/rpg_maker_survey.py scan `
+  --game D:\games\original --output D:\work\survey
+```
+
+Builtin 位置由扫描结果单独投影；调查目录中的 `ownership-decisions.jsonl` 默认把待审核位置标为
+`unresolved`，审核后改为 `rules`、`generic`、`exclude`，证据不足时保留 `unresolved`。填写决定时
+保留 `game_root` 与 `members` 来源绑定；排除项填写 `reason` 和 `evidence`。关系组中存在不同所有者
+时，按 `review-groups.jsonl` 中的 `group_id` 导出逐候选决定，以这些行替换原 `group:*` 决定：
+
+```powershell
+python skills/translate-with-att/scripts/rpg_maker_survey.py members `
+  --survey D:\work\survey --group-id <group_id> --output D:\work\group-members.jsonl
+```
 
 Generic 决定的 `extract_group_unit_write_back_mapping.groups` 指定本行候选所属的语义组。
 每个候选按本行自然顺序恰好出现一次；不同决定中相关的正文填写相同 id、kind，并由 finalize
@@ -51,9 +62,17 @@ Generic 决定的 `extract_group_unit_write_back_mapping.groups` 指定本行候
 同一决定也可列出多个独立组。其余 Generic 证据说明实际消费者、可见正文及往返位置。
 组名表达[完整语境](../generic/jsonl.md#3-从源格式建立-group-与文件范围)，不由调查分组或 owner 决定。
 
-决定修改后重新运行 `rpg_maker_survey.py finalize`，生成配套的 `rules.toml`、`rules-manifest.json`、
-`coverage.json` 和 Generic 材料。计划目录由工具生成；直接修改其中的 Rules 会使 audit 报告
-Rules 与 manifest 不一致。扫描候选本身有误时，按翻译 Skill 的工具修复流程处理，再重新生成计划。
+决定修改后重新运行 finalize，生成配套的 `rules.toml`、`rules-manifest.json`、`coverage.json`，
+以及 `generic/` 下的 Generic 材料和精确映射 `generic/manifest.json`：
+
+```powershell
+python skills/translate-with-att/scripts/rpg_maker_survey.py finalize `
+  --survey D:\work\survey --output D:\work\plan
+```
+
+省略 `--decisions` 时读取调查目录中的 `ownership-decisions.jsonl`；重新生成既有计划目录时加
+`--replace`。计划目录由工具生成；直接修改其中的 Rules 会使 audit 报告 Rules 与 manifest 不一致。
+扫描候选本身有误时，按翻译 Skill 的工具修复流程处理，再重新生成计划。
 
 自行按[规则规格](../rpg-maker/rules.md)编写的 Rules 或 Placeholder 文件作为独立项目输入维护，
 通过 ATT 实际提取、导出与写回核对。修改后的规则不能继续使用未同步的 Survey 计划作为一致性证据。
@@ -99,6 +118,15 @@ Survey 路径的产物按以下依赖交接：
 
 `scan → 审核决定 → finalize → Extract → ownership export → audit → manual export --selection all`
 
+audit 使用本轮 ownership 导出和同一次 finalize 的计划目录：
+
+```powershell
+att <mv或mz> ownership export --name <项目名> D:\work\ownership.jsonl
+python skills/translate-with-att/scripts/rpg_maker_survey.py audit `
+  --survey D:\work\survey --plan D:\work\plan `
+  --ownership D:\work\ownership.jsonl --output D:\work\audit.json
+```
+
 来源、所有权、Rules、JSONL 或辅助程序变化时，从最早受影响的阶段重跑，更新后续产物、术语与 QA；
 仍与当前来源绑定一致的审核决定可继续使用。MV/MZ 游戏来源变化时先再次 Init 更新冻结副本，再 Extract。
 
@@ -117,8 +145,9 @@ Manual、Survey 或 coverage 变化后，先重新运行不带 `--decisions` 的
 ## 5. 术语
 
 使用[游戏术语表制作 Skill](../../skills/extract-game-terminology/SKILL.md)从完整 Manual 生成
-`terminology.toml`。Formic 可选初筛原文术语候选；当前负责翻译的 Agent 按该 Skill 在完整 Manual
-中核对全部出现位置和上下文，完成筛选、去重、统一定译和最终术语文件核对。
+`terminology.toml`。随包 Formic 先初筛原文术语候选，这一步不可省略；当前负责翻译的 Agent 再按
+该 Skill 在完整 Manual 中核对全部出现位置和上下文，完成筛选、去重、统一定译和最终术语文件核对。
+Formic 无法完成初筛时，按该 Skill 暂停术语阶段，修正 Formic 配置或模型服务后继续。
 
 术语完成后按[术语规格](../translation/terminology.md)交给 Translate。
 
@@ -135,20 +164,10 @@ Partial、Unavailable 和未开始 Task，以及失败或取消的运行，按
 
 ## 7. QA
 
-按[验收指南](acceptance.md)检查完整译文，重点覆盖：
-
-- 全部已声明来源和自然 ID；
-- 上下文、人物语气、叙事与目标语自然度；
-- 术语、Placeholder、控制符、结构、换行和布局；
-- 源语言残留、异常转义和模型说明；
-- Generic 外部映射与组合项目的唯一所有权。
-
-当前负责翻译的 Agent 直接对照原文、译文和相关上下文完成语义审校，外部模型工具的用途按
-[翻译 Skill 的 QA 流程](../../skills/translate-with-att/SKILL.md#5-qa)执行。
-`translation_qa.py` 提供覆盖、结构、控制符、字面术语和残留等
-静态检查。按[译文质量检查](acceptance.md#3-检查译文质量)先处理摘要中的确定状态和未验证项，
-再审核由启发式发现组成的 Review 组。独立 Generic 通过 `--generic-input` 提供同源 JSONL；
-RPG Maker 使用对应的调查与所有权证据。审核发现后用 Manual 集中修订，再重新导出和复查。
+按[验收指南](acceptance.md)检查完整译文的来源覆盖、语义、术语、结构、残留与组合项目所有权。
+当前负责翻译的 Agent 直接对照原文、译文和相关上下文完成语义审校；`translation_qa.py` 的命令、
+证据参数和结果读取顺序见[译文质量检查](acceptance.md#3-检查译文质量)。审核发现后用 Manual
+集中修订，再重新导出和复查。
 
 ## 8. WriteBack
 
@@ -165,6 +184,7 @@ RPG Maker 游戏按[字体工具指南](nwjs-font-tools.md#2-递归字体调查�
 在隔离副本中应用中文字体并验证完整译文字符集。其他引擎按其实际字体加载方式处理。
 把 WriteBack、外部转换、字体和原有资源组合为独立交付目录。
 
-静态检查完成后，把标题、菜单、主要对话、插件界面、换行、裁切、字体回退和存档列入实机检查
-清单。任务发起者指定的人工运行译本并反馈具体场景；返修从最早受影响阶段继续，随后重新 QA、
-WriteBack 和封包。
+RPG Maker MV/MZ 隔离副本的启动验收和实际绘制观察见
+[NW.js 实际界面观察](nwjs-font-tools.md#1-nwjs-实际界面观察)。静态检查完成后，按
+[人工实机验证](acceptance.md#6-人工实机验证)整理检查清单，交给任务发起者指定的人工运行译本；
+反馈返修按同一节从最早受影响阶段继续。

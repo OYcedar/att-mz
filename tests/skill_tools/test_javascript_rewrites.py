@@ -8,14 +8,12 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "skills" / "_shared"))
 sys.path.insert(0, str(ROOT / "skills" / "translate-with-att" / "scripts"))
 
-from att_skill_tools import ToolError
 from att_toolbox.font_references import FontAsset, _apply_text_patches, _scan_javascript
 from att_toolbox.js import scan_javascript
-from att_toolbox.roundtrip import replace_reviewed_javascript_literal
 
 
 class JavaScriptRewriteTests(unittest.TestCase):
-    def test_statement_regex_contents_are_not_rewriteable_literals(self) -> None:
+    def test_statement_regex_contents_are_not_string_literals(self) -> None:
         prefixes = (
             "if (ready)",
             "if /* condition */ ((ready))",
@@ -39,10 +37,6 @@ class JavaScriptRewriteTests(unittest.TestCase):
                 scan = scan_javascript(source)
                 self.assertEqual([literal.value for literal in scan.literals], ["Player text"])
                 self.assertNotIn("Old.ttf", scan.code)
-                with self.assertRaises(ToolError):
-                    replace_reviewed_javascript_literal(
-                        source, line=1, source="Old.ttf", translation="New[.ttf", reviewed=True
-                    )
         nested = '(function() { let value = 0; {} /"Old.ttf"/.test(value); drawText("Player text"); })();'
         self.assertEqual([literal.value for literal in scan_javascript(nested).literals], ["Player text"])
 
@@ -61,10 +55,11 @@ class JavaScriptRewriteTests(unittest.TestCase):
         for operand in operands:
             source = f'const result = {operand} / "2" / denominator;'
             with self.subTest(operand=operand):
-                result = replace_reviewed_javascript_literal(
-                    source, line=1, source="2", translation="3", reviewed=True
-                )
-                self.assertEqual(result.text, source.replace('"2"', '"3"'))
+                literals = scan_javascript(source).literals
+                self.assertEqual([(literal.kind, literal.value) for literal in literals], [("string", "2")])
+                start, end = literals[0].start, literals[0].end
+                assert start is not None and end is not None
+                self.assertEqual(source[start:end], '"2"')
 
     def test_font_rewrite_preserves_regex_and_updates_actual_loader(self) -> None:
         game = Path("D:/fixtures/game")

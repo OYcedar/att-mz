@@ -52,6 +52,14 @@ Set-Location 'D:\Tools\ATT'
 .\att.exe test
 ```
 
+术语初筛必须使用随包 Formic，它的模型服务单独配置。按
+[Formic 使用说明](tools/formic/README.md#2-配置模型)编辑 `tools\formic\config.toml`，
+仍在 ATT 目录执行连接自检：
+
+```powershell
+.\tools\formic\formic.exe test --config .\tools\formic\config.toml
+```
+
 ### 3. 交给 Codex
 
 按[官方文档](https://learn.chatgpt.com/docs/codex/cli)安装 Codex CLI，在上述目录运行 `codex`，
@@ -72,9 +80,8 @@ Codex 需要读取游戏目录、写入 ATT 项目与译本目录，并访问你
 
 ### 4. 实机验收
 
-按 Codex 给出的路径启动译本，检查标题、菜单、对话、换行和插件界面。
-发现问题时，把场景、截图和触发步骤发回同一任务，继续修订。
-翻译流程完成后，仍需通过[人工实机验收](docs/guides/acceptance.md)确认显示和玩法正常。
+按 Codex 给出的路径启动译本，对照[人工实机验证清单](docs/guides/acceptance.md#6-人工实机验证)
+确认显示和玩法正常。发现问题时，把场景、截图和触发步骤发回同一任务，继续修订。
 
 ## 工作原理
 
@@ -91,9 +98,8 @@ ATT 将游戏格式、翻译状态和模型请求分开处理：
 具体失败与恢复方式见[诊断与恢复指南](docs/guides/diagnosis-and-recovery.md)。
 图片文字、特殊脚本和非标准插件内容由 Agent 根据实际结构选择相应工具处理。
 
-完整流程从[翻译 Skill](skills/translate-with-att/SKILL.md)进入；大量原文的术语初筛可选用随包
-[Formic](tools/formic/README.md)，职责边界见[游戏术语表制作 Skill](skills/extract-game-terminology/SKILL.md)。
-启用 Formic 前单独配置其模型服务。
+完整流程从[翻译 Skill](skills/translate-with-att/SKILL.md)进入；术语阶段由随包
+[Formic](tools/formic/README.md)初筛原文候选，职责边界见[游戏术语表制作 Skill](skills/extract-game-terminology/SKILL.md)。
 
 ## 源码维护
 

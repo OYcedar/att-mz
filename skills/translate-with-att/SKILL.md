@@ -1,6 +1,6 @@
 ---
 name: translate-with-att
-description: 使用已打包 ATT 完成 RPG Maker MV、MZ、Generic 或组合项目的游戏翻译，从可见文本调查、Extract、术语、Translate、QA、WriteBack 一直到中文字体与封包，并根据人工实玩反馈继续返修。
+description: 使用已打包 ATT 完成 RPG Maker MV、MZ、Generic 或组合项目的游戏翻译，从可见文本调查、Extract、术语、Translate、QA、WriteBack 一直到中文字体与封包，并根据人工实玩反馈继续返修；VX Ace、Ren'Py、Kirikiri、Bakin、TyranoScript、Unity、RealLive、Escude 等引擎经 Generic 接入时同样从本技能进入。
 ---
 
 # 使用 ATT 完成游戏翻译
@@ -12,8 +12,8 @@ description: 使用已打包 ATT 完成 RPG Maker MV、MZ、Generic 或组合项
 ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agent 负责调查文本来源、确定所有者、
 制作术语、审校译文和处理游戏特有内容。命令、格式和状态以实际 `att.exe` 同目录的现行文档为准。
 
-常规游戏翻译任务中，Formic 负责从原文初筛术语候选；最终筛选、术语校验、定译、术语表核对
-和译文语义审校由当前负责翻译的 Agent 直接完成。用户明确指定 Formic 的其他用途时，按其具体
+术语阶段必须先由随包 Formic 从原文初筛术语候选；最终筛选、术语校验、定译、术语表核对和
+译文语义审校由当前负责翻译的 Agent 直接完成。用户明确指定 Formic 的其他用途时，按其具体
 要求执行。
 
 ## 使用当前发行
@@ -23,44 +23,35 @@ ATT 负责确定性提取、状态、模型任务、译文验收和写回；Agen
    `docs/guides/translation-project.md`，再读取当前引擎和阶段的规格。
 3. 继续已有项目时，以 ATT 数据库、当前输入、日志和已有译文为续跑依据。
 4. 原版游戏作为只读基线；Extract、字体应用、合并和封包使用 ATT 项目目录或隔离副本。
+5. 尚未制作术语表时，开始阶段就按术语 Skill 执行 Formic 连接自检；未通过时立即报告，
+   使用者可以在调查与 Extract 期间修正配置。
 
 随包 Python 工具在 Python 3.11 或更新环境中运行。没有 Python 时，按相应指南完成调查和对账，
 并在交付中说明实际采用的方法。
 自行编写转换器时，通过随包 `att_toolbox.translation_export.read_translation_document` 读取
 完整译文导出；项目语言首行与 Unit 记录分别处理，不把首行当作正文。
 
-RPG Maker MV 项目出现混合插件参数、内联姓名控制码、组合写回或大量 QA 候选时，
-读取[大型、插件密集的 MV 经验](references/game-type-large-plugin-heavy-mv.md)中对应的处理方法。
+## 引擎与专题经验
 
-RPG Maker VX Ace／RGSS3 项目通过 Generic 接入时，读取
-[VX Ace 汉化技能](../rpg-maker-vx-ace-localization/SKILL.md)，补充 Marshal、脚本、字体与消息排版。
-普通汉化保留现有视觉设计；仅在用户主动明确要求美化时进入该技能的界面现代化流程。
+ATT 原生处理 RPG Maker MV、MZ 和 Generic JSONL；其他引擎通过 Generic 接入。确认引擎或遇到
+下列情况时读取对应材料，它们补充调查与验证方法，不表示 ATT 原生支持该引擎：
 
-Ren'Py 项目通过 Generic JSONL 翻译时，读取 [Ren'Py 汉化技能](../renpy-localization/SKILL.md)，
-补充原生翻译模板、硬编码界面、反向转换、字体与独立补丁的检查。
+| 情况 | 读取 | 补充内容 |
+| --- | --- | --- |
+| MV 出现混合插件参数、内联姓名控制码、组合写回或大量 QA 候选 | [大型、插件密集的 MV 经验](references/game-type-large-plugin-heavy-mv.md) | 对应问题的处理方法 |
+| RPG Maker VX Ace／RGSS3 通过 Generic 接入 | [VX Ace 汉化技能](../rpg-maker-vx-ace-localization/SKILL.md) | Marshal、脚本、字体与消息排版 |
+| Ren'Py 通过 Generic JSONL 翻译 | [Ren'Py 汉化技能](../renpy-localization/SKILL.md) | 原生翻译模板、硬编码界面、反向转换、字体与独立补丁 |
+| Kirikiri / KAG / TJS 通过 Generic 接入，或标题与菜单漏翻、对象重名、控制符混排 | [Kirikiri 显示消费者与补丁加载经验](references/engine-kirikiri-kag-tjs.md) | 显示与内部身份、实际加载入口、动态表达式及游戏侧回填 |
+| RPG Developer Bakin 经外部适配器接入，或数值空白、字体模糊与布局越界 | [Bakin 原生资源往返与播放器消费者](references/engine-bakin-native-roundtrip.md) | 二进制目录、命名变量、窗口标题、原生菜单、字体绑定和布局字段 |
+| TyranoScript 场景与 Electron `app.asar` 容器 | [TyranoScript／Electron ASAR 经验](references/engine-tyrano-electron-asar.md) | 显示消费者、Generic 映射、标签拓扑、字体、流式回填和独立补丁 |
+| Unity / Naninovel 通过 Generic 接入，或资源已译而自定义标题、状态、弹窗仍显示原文 | [Unity / Naninovel 显示消费者与漏翻返修](references/engine-unity-naninovel-consumers.md) | 脚本与序列化界面、托管字段赋值及静态缓存、有效资源和原生调用的验证边界 |
+| RealLive（`Seen.txt`、SEEN 脚本与 `Gameexe.ini`）通过 Generic 接入 | [RealLive 原生文字与姓名回填](references/engine-reallive-native-text.md) | 姓名控制与显示值、编码与原生界面、脚本返修验证 |
+| 已确认 Escude 封包与字库布局 | [Escude 封包查找、字库与原生界面](references/engine-escude-native-text.md) | 封包索引与实际查找、字库和界面、验收记录 |
 
-Kirikiri / KAG / TJS 项目通过 Generic 接入，或汉化后出现标题与菜单漏翻、对象重名、控制符混排时，
-读取 [Kirikiri 显示消费者与补丁加载经验](references/engine-kirikiri-kag-tjs.md)，
-核对显示与内部身份、实际加载入口、动态表达式及游戏侧回填；该指引不表示 ATT 原生支持此引擎。
-
-RPG Developer Bakin 项目通过外部适配器接入 Generic，或汉化后出现数值空白、字体模糊与布局越界时，读取
-[Bakin 原生资源往返与播放器消费者](references/engine-bakin-native-roundtrip.md)，
-补充二进制目录、命名变量、窗口标题、原生菜单、字体绑定和布局字段的调查与验证。
-
-发现 TyranoScript 场景与 Electron `app.asar` 容器时，读取
-[TyranoScript／Electron ASAR 经验](references/engine-tyrano-electron-asar.md)，
-补充显示消费者、Generic 映射、标签拓扑、字体、流式回填和独立补丁的检查。
-
-Unity / Naninovel 项目通过 Generic 接入，或资源已译而自定义标题、状态、弹窗仍显示原文时，读取
-[Unity / Naninovel 显示消费者与漏翻返修](references/engine-unity-naninovel-consumers.md)，
-核对脚本与序列化界面、托管字段赋值及静态缓存、有效资源和原生调用的验证边界。
+普通汉化保留现有视觉设计；只有用户主动明确要求美化时，才进入 VX Ace 技能的界面现代化流程。
+阶段性专题在对应章节给出：命令名称消费者见调查，Unity TMP 字体见字体与封包，动态消息见实玩反馈返修。
 
 ## 1. 调查
-
-RealLive 项目通过 Generic 接入时，读取
-[RealLive 原生文字与姓名回填](references/engine-reallive-native-text.md)；已确认 Escude 封包与
-字库布局时，读取 [Escude 封包查找、字库与原生界面](references/engine-escude-native-text.md)。
-先用真实替换文字验证原生读取路径，再进入大批量翻译。
 
 建立声明范围内的可见非图片文本清单，记录每类文本的来源、游戏消费者、上下文、写回位置和
 唯一所有者。图片文字交给图像翻译流程，资源路径、内部键、控制符和协议外壳保留其技术含义。
@@ -102,7 +93,9 @@ MV/MZ 导出 ownership，使用 Survey 的项目继续运行 audit，核对每�
 独立 Generic 核对 JSONL 与外部来源、自然顺序和写回位置的映射，不执行 RPG Maker ownership
 或 Survey 命令。
 外部适配器采用[外部适配器验收](../../docs/generic/adapter-verification.md)的方法与证据契约。
-无修改往返之外，还要覆盖替换分支；不能通过先删除姓名标签或引用外壳掩盖消费者差异。
+无修改往返之外，还要覆盖替换分支；不能通过先删除姓名标签或引用外壳掩盖消费者差异。大批量
+翻译前，按 [Generic 项目](../../docs/guides/translation-project.md#32-generic-项目)用少量真实替换
+文本验证原生读取路径。
 
 使用 Survey 时，生成的 Manual ID、ownership 投影、audit 和 preflight 集合必须与同目录 `att.exe` 的实际
 导出逐项一致。出现缺失、多出或不匹配时，以首个不一致的物理位置为反例，追溯分类和编号规则，
@@ -128,9 +121,9 @@ Manual，并用新语料更新术语和后续 QA。
 
 ## 3. 术语
 
-读取[游戏术语表制作 Skill](../extract-game-terminology/SKILL.md)，由 Formic 从完整 Manual
-初筛原文术语候选。候选的最终筛选、全部出现位置与上下文的校验、去重、统一定译和最终
-`terminology.toml` 核对都由当前 Agent 自己完成，再交给 ATT `translate --terms`。
+按[游戏术语表制作 Skill](../extract-game-terminology/SKILL.md)从完整 Manual 制作
+`terminology.toml`，再交给 ATT `translate --terms`。Formic 初筛无法完成时按该 Skill 暂停并
+报告，不跳过术语阶段直接进入 Translate。
 
 ## 4. Translate
 
@@ -147,36 +140,32 @@ Incomplete 中的 Partial、Unavailable 和未开始 Task 按恢复指南处理�
 
 ## 5. QA
 
-按 `docs/guides/acceptance.md` 检查完整译文。当前 Agent 直接对照原文、译文和游戏上下文，审校
-原意、目标语自然度、人物语气、叙事和专名译法；缺少语境时补查相关来源或消费者。常规任务
-不另行启动 Formic 全量译文审校、多轮整库检索等付费外部模型作业。随包 `translation_qa.py`
-提供以下静态检查：
+按[验收指南](../../docs/guides/acceptance.md#3-检查译文质量)运行随包 `translation_qa.py scan`，
+并按其中顺序读取确定状态、未验证项和 Review 组。首次扫描就提供本次 Translate 使用的术语表；
+WriteBack 和运行观察完成后，带上相应证据重新扫描，仍缺少的证据保留为未验证。
 
-- 可见文本覆盖和所有权；
-- 术语表的字面匹配；
-- Placeholder、控制符、空槽、结构和换行；
-- 源语言残留、模型说明、异常转义和布局风险。
+当前 Agent 直接对照原文、译文和游戏上下文，审校原意、目标语自然度、人物语气、叙事和专名
+译法；缺少语境时补查相关来源或消费者。常规任务不另行启动 Formic 全量译文审校、多轮整库
+检索等付费外部模型作业。
 
 源语与混入文字提示来自 ATT 当前完整导出。优先审核相邻错位、内容串入和异常扩写组中的
 原译对照；选择 Review 组生成 Manual ID 时会带上相邻语境。模型响应多出编号但要求的译文
 已经全部接受时，结合任务记录 `Locations` 定位整段审校，普通续跑不会修正已经入库的误译。
 不要以自由分行数量变化直接判断串句，也不按启发式相似度自动移动译文。
 
-独立 Generic 使用 `--generic-input` 提供同源 JSONL；RPG Maker 使用相应调查与所有权证据。
-先查看 QA 摘要中的确定状态和未验证项，再按验收指南审核 Review 组。把确认的问题与语义审校发现
-合并，按自然 ID 导出到 Manual，集中修订、apply、重新导出并复查。报告分别说明静态检查、
-Agent 语义审校和仍需人工实机观察的场景。
+把确认的问题与语义审校发现合并，按自然 ID 导出到 Manual，集中修订、apply、重新导出并复查。
+报告分别说明静态检查、Agent 语义审校和仍需人工实机观察的场景。
 
 ## 6. WriteBack
 
 QA 修订完成后执行对应引擎的 WriteBack。已经确认具体位置和显示宽度时使用排版规则；规则文件
 按 `docs/translation/write-back-layout-rules.md` 编写。
 
-对白的最终续行遵循[断行与补空白](../../docs/translation/write-back-layout-rules.md#4-断行与补空白)：
-`「…」` 尚未闭合时，续行补一个 U+3000 全角空格，与首行开引号后的正文对齐；已有缩进不重复。
-计算断点时先计入这一个空格的实际宽度，闭合后新段落恢复正常起点，正常短句和末行不强行填满。
-核对 ATT 写回和游戏最终排版两个阶段；引擎或补丁若合并软换行后重新折行，须在最终换行处重建
-这个缩进，并让窗口高度与分页使用同一布局。不能把清除旧缩进后的文本直接交给绘字。
+未闭合成对符号内的续行由 ATT 按[断行与补空白](../../docs/translation/write-back-layout-rules.md#4-断行与补空白)
+补一个全角空格，`[write_back].complete_continuation_whitespace` 默认开启。核对 ATT 写回和游戏
+最终排版两个阶段：引擎或补丁若合并软换行后重新折行，须在最终换行处按同一规则重建缩进，计算
+断点时先计入缩进的实际宽度；闭合后的新段落恢复正常起点，正常短句和末行不强行填满，窗口高度
+与分页使用同一布局。不能把清除旧缩进后的文本直接交给绘字。
 
 RPG Maker 输出部署到隔离游戏副本。Generic 输出交给本任务已经确定的外部反向转换，并核对每个
 JSONL Unit 与实际来源位置。组合项目按真实加载顺序合并，确保每个位置采用唯一译文。
@@ -196,22 +185,27 @@ Unity 项目出现 TMP 中文方框、需要选择静态字体补丁或运行时
 独立 Generic 适配器在原生读取检查前用 `AdapterVerification` 固定文件基线，记录实际源文、
 最终正文、消费者检查及布局测量，再把报告通过 QA 的 `--adapter-report` 汇入。缺少真实测量
 时保留布局未验证，修订封包、字体或验证程序后重新取证；完整契约见外部适配器验收。
-交付目录完成结构解析、可见文本残留、字体覆盖和启动文件检查后，提供人工实机检查清单。
-实机验证由任务发起者指定的人工完成，重点覆盖标题、新游戏入口、菜单、主要对话、插件界面、
-换行、裁切和存档。
+
+RPG Maker MV/MZ 隔离副本用 `inspect_nwjs_runtime.py smoke` 完成启动验收，并记录实际绘制、
+英文残留、像素越界和运行时错误；工具无法连接或需要记录正常游玩时，按
+[NW.js 实际界面观察](../../docs/guides/nwjs-font-tools.md#1-nwjs-实际界面观察)处理。报告可以
+通过 QA 的 `--runtime-report` 汇入，绑定条件见[验收指南](../../docs/guides/acceptance.md#3-检查译文质量)。
+
+交付目录完成结构解析、可见文本残留、字体覆盖和启动检查后，按
+[人工实机验证清单](../../docs/guides/acceptance.md#6-人工实机验证)交给任务发起者指定的人工验证。
 
 ## 实玩反馈返修
 
 收到截图、原文、场景和触发步骤后，先定位真实来源和所有者，再从最早受影响的阶段继续：
 
-RPG Maker 动态消息的源字段已译、画面仍为原文，或全新存档也复现时，读取
-[动态消息的最终显示消费者](references/rpg-maker-rendered-messages.md)，核对运行时组合、
-姓名转义、插件覆写及最终绘字输入，区分结构验证、实际调用证据和人工画面确认。
-
 - 新来源进入调查、所有权和 Extract；
 - 术语变化更新术语表并审校受影响译文；
 - 误译和排版问题进入 Manual、QA、WriteBack 与重新封包；
 - 字体问题进入字体引用、glyph 覆盖和相关场景复查。
+
+RPG Maker 动态消息的源字段已译、画面仍为原文，或全新存档也复现时，读取
+[动态消息的最终显示消费者](references/rpg-maker-rendered-messages.md)，核对运行时组合、
+姓名转义、插件覆写及最终绘字输入，区分结构验证、实际调用证据和人工画面确认。
 
 每轮交付说明译本目录、覆盖范围、静态 QA 结果、人工实机检查项和仍待确认的翻译位置。
 

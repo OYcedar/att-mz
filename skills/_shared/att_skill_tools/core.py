@@ -11,7 +11,6 @@ import stat
 import sys
 import tomllib
 import unicodedata
-from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -52,12 +51,6 @@ class ManualEntry:
     translation_type: str
     source: tuple[str, ...]
     translation: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class TermOccurrence:
-    count: int
-    locations: tuple[tuple[str, int], ...]
 
 
 class _StrictJsonError(ValueError):
@@ -321,11 +314,6 @@ def require_file_within(path: Path, root: Path, description: str) -> Path:
     return resolved
 
 
-def stable_relative(path: Path, root: Path) -> str:
-    resolved = ensure_inside(path, root, "路径")
-    return resolved.relative_to(root.resolve(strict=True)).as_posix()
-
-
 def safe_walk_files(root: Path) -> Iterator[Path]:
     """完整枚举普通文件；任何链接或重解析点都明确失败。"""
 
@@ -408,24 +396,6 @@ def protect_outputs(
                 )
         if lexical_output.exists() and not replace:
             fail(str(lexical_output), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
-
-
-def preflight_atomic_text_outputs(outputs: Sequence[Path], *, replace: bool) -> None:
-    """在多文件命令写入前检查每个固定目标和临时文件。"""
-
-    for output in outputs:
-        target = _output_target(output, "输出路径")
-        temporary = target.with_name(f".{target.name}.tmp")
-        _output_target(temporary, "固定临时文件")
-        if target.exists() and not replace:
-            fail(str(target), "目标已存在", "换一个输出路径，或在确认可替换后传入 --replace")
-        if temporary.exists():
-            fail(str(temporary), "存在上次未清理的固定临时文件", "检查并处理该 .tmp 文件后重试")
-        ancestor = target.parent
-        while not ancestor.exists() and ancestor != ancestor.parent:
-            ancestor = ancestor.parent
-        if not ancestor.is_dir():
-            fail(str(ancestor), "输出父路径不是目录", "为输出选择可建立子文件的目录")
 
 
 def _strict_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -1614,41 +1584,6 @@ def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007F")
 
 
-def json_type(value: JsonValue) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, (int, float)):
-        return "number"
-    if isinstance(value, list):
-        return "array"
-    return "object"
-
-
-def require_list(value: JsonValue, object_name: str, field: str) -> list[JsonValue]:
-    if not isinstance(value, list):
-        fail(object_name, f"{field} 必须是 array", f"把 {field} 改为 JSON array")
-    return value
-
-
-def require_string(value: JsonValue, object_name: str, field: str) -> str:
-    if not isinstance(value, str) or value == "":
-        fail(object_name, f"{field} 必须是非空 string", f"为 {field} 提供非空字符串")
-    return value
-
-
-def strings_only(values: Sequence[JsonValue], object_name: str, field: str) -> list[str]:
-    result: list[str] = []
-    for index, value in enumerate(values, start=1):
-        if not isinstance(value, str):
-            fail(object_name, f"{field} 第 {index} 项不是 string", f"把 {field} 中的每项都改为字符串")
-        result.append(value)
-    return result
-
-
 def validate_object_keys(value: Mapping[str, JsonValue], object_name: str, allowed: set[str]) -> None:
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -1710,56 +1645,3 @@ def read_manual(path: Path) -> list[ManualEntry]:
             )
         )
     return result
-
-
-def scan_term_occurrences(terms: Sequence[str], entries: Sequence[ManualEntry]) -> dict[str, TermOccurrence]:
-    """用 Aho–Corasick 一次扫描语料，保留候选之间的重叠命中。"""
-
-    if not terms:
-        return {}
-    if any(not term for term in terms) or len(set(terms)) != len(terms):
-        fail("Formic 候选", "多模式扫描收到空值或重复候选", "先删除空值并按原值去重")
-    transitions: list[dict[str, int]] = [{}]
-    failures = [0]
-    outputs: list[list[int]] = [[]]
-    for pattern_index, term in enumerate(terms):
-        state = 0
-        for character in term:
-            next_state = transitions[state].get(character)
-            if next_state is None:
-                next_state = len(transitions)
-                transitions[state][character] = next_state
-                transitions.append({})
-                failures.append(0)
-                outputs.append([])
-            state = next_state
-        outputs[state].append(pattern_index)
-    queue: deque[int] = deque(transitions[0].values())
-    while queue:
-        state = queue.popleft()
-        for character, next_state in transitions[state].items():
-            queue.append(next_state)
-            fallback = failures[state]
-            while fallback and character not in transitions[fallback]:
-                fallback = failures[fallback]
-            failures[next_state] = transitions[fallback].get(character, 0)
-            outputs[next_state].extend(outputs[failures[next_state]])
-    totals = [0] * len(terms)
-    locations: list[list[tuple[str, int]]] = [[] for _ in terms]
-    for entry in entries:
-        entry_counts: dict[int, int] = {}
-        for line in entry.source:
-            state = 0
-            for character in line:
-                while state and character not in transitions[state]:
-                    state = failures[state]
-                state = transitions[state].get(character, 0)
-                for pattern_index in outputs[state]:
-                    entry_counts[pattern_index] = entry_counts.get(pattern_index, 0) + 1
-        for pattern_index, count in entry_counts.items():
-            totals[pattern_index] += count
-            locations[pattern_index].append((entry.readable_id, count))
-    return {
-        term: TermOccurrence(count=totals[index], locations=tuple(locations[index]))
-        for index, term in enumerate(terms)
-    }

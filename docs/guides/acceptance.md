@@ -34,9 +34,38 @@ Generic 项目同时核对外部来源、JSONL、WriteBack 和实际消费者之
 
 当前负责翻译的 Agent 按[翻译 Skill 的 QA 流程](../../skills/translate-with-att/SKILL.md#5-qa)
 直接核对原意、上下文、语气和自然度；随 Skill 的 `translation_qa.py scan` 读取完整导出和
-同源证据，提供覆盖、结构、控制符、字面术语、残留和布局风险的静态检查。独立 Generic 使用
-`--generic-input` 指定 JSONL 输入。脚本没有报告问题，只能说明已执行的检查没有发现，不能代替
-完整语义审校。
+同源证据，提供覆盖、结构、控制符、字面术语、残留和布局风险的静态检查。脚本没有报告问题，
+只能说明已执行的检查没有发现，不能代替完整语义审校。
+
+RPG Maker 项目和经 Survey 接入的 Generic 项目提供同一来源快照的调查目录，以及同一次 finalize
+的 `coverage.json`；`rules-manifest.json` 保持在 `coverage.json` 同目录：
+
+```powershell
+python skills/translate-with-att/scripts/translation_qa.py scan `
+  --translations D:\work\translations.jsonl `
+  --survey D:\work\survey --coverage D:\work\plan\coverage.json `
+  --terminology D:\work\terminology.toml `
+  --write-back <att-dir>\projects\<mv或mz>\<项目名>\write_back `
+  --runtime-report D:\review\nwjs-smoke\report.json `
+  --output D:\work\qa
+```
+
+独立 Generic 改用 `--generic-input` 指定当前 JSONL 输入根，命令见
+[外部适配器验收](../generic/adapter-verification.md#4-汇入-qa-与返修)。其余证据按实际产物提供，
+重新生成既有 QA 目录时加 `--replace`：
+
+| 参数 | 证据 | 省略时 |
+| --- | --- | --- |
+| `--terminology` | 本次 Translate 使用的 `terminology.toml`，启用字面术语检查 | 不检查术语，也不记录未验证项 |
+| `--write-back` | ATT 当前项目的实际 `write_back` 目录 | `write_back_output_missing` |
+| `--generic-manifest` | 仅 Survey 模式的 Generic 项目：finalize 生成的 `generic/manifest.json` | `generic_manifest_missing` |
+| `--runtime-report` | 仅 Survey 模式：隔离副本的 NW.js `smoke` 或 `observe` 报告 | `runtime_observation_missing` |
+| `--adapter-report` | 仅独立 Generic：外部验收报告，同时需要 `--write-back` | 外部映射、反向转换和实际消费者保持未验证 |
+
+Survey 模式提供 `--write-back` 或 `--runtime-report` 时，QA 先确认原版游戏仍与调查基线一致。
+RPG Maker 的运行报告还要与 `--write-back` 绑定：观察副本中的写回文件必须与该目录逐字节一致，
+未写回的调查来源与基线一致；缺少 `--write-back` 时记录 `runtime_write_back_binding_missing`。
+运行观察的方法见 [NW.js 实际界面观察](nwjs-font-tools.md#1-nwjs-实际界面观察)。
 
 QA 消费完整导出的项目语言对、语言 Review 和源文绑定后的自然文本投影，不重复猜测语言或
 保护段。同一 Generic 文件内的相邻 Unit，以及其他项目同一真实 Group 内的 Unit，参与相邻

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -16,12 +16,9 @@ from att_skill_tools import (
     JsonValue,
     ensure_inside,
     fail,
-    json_type,
     parse_json_text,
-    read_json,
     require_directory,
     require_file_within,
-    safe_walk_files,
 )
 
 STANDARD_DATA_FILES = (
@@ -50,7 +47,6 @@ BUILTIN_DATABASE_FIELDS: dict[str, tuple[str, ...]] = {
     "Enemies.json": ("name",),
     "States.json": ("name", "message1", "message2", "message3", "message4"),
 }
-BUILTIN_EVENT_CODES = frozenset({101, 102, 105, 320, 324, 325, 401, 402, 404, 405})
 _SYSTEM_ARRAYS = {"elements", "skillTypes", "weaponTypes", "armorTypes", "equipTypes"}
 _MAP_NAME = re.compile(r"Map([0-9]+)\.json\Z")
 _BARE_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -72,15 +68,6 @@ class PluginInfo:
     description: str
     parameters: dict[str, JsonValue]
     index: int
-
-
-@dataclass(frozen=True, slots=True)
-class EventCommand:
-    source_file: str
-    location: str
-    index: int
-    code: int
-    parameters: list[JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,19 +334,6 @@ def canonical_map_number(name: str) -> int | None:
     return value if digits == expected else None
 
 
-def canonical_map_files(data_root: Path) -> list[Path]:
-    result: list[tuple[int, Path]] = []
-    resolved_data = require_directory(data_root, "data 目录")
-    for path in safe_walk_files(resolved_data):
-        if path.parent != resolved_data:
-            continue
-        value = canonical_map_number(path.name)
-        if value is None:
-            continue
-        result.append((value, path))
-    return [path for _, path in sorted(result)]
-
-
 def is_builtin_data_path(file_name: str, path: tuple[str | int, ...], *, canonical_map: bool) -> bool:
     """判断一个字符串路径是否已由 Builtin 或事件命令扫描拥有。"""
 
@@ -407,129 +381,6 @@ def is_builtin_data_path(file_name: str, path: tuple[str | int, ...], *, canonic
             and path[5] == "parameters"
         )
     return False
-
-
-def _command_list(value: JsonValue, source_file: str, prefix: str) -> Iterator[EventCommand]:
-    if not isinstance(value, list):
-        fail(source_file, f"{prefix} 的事件列表不是 array", "修正游戏数据中的事件列表")
-    for command_index, command in enumerate(value):
-        if not isinstance(command, dict):
-            fail(
-                source_file,
-                f"{prefix} 第 {command_index + 1} 条事件命令不是 object",
-                "修正游戏数据中的事件命令",
-            )
-        code = command.get("code")
-        if not isinstance(code, int) or isinstance(code, bool):
-            fail(
-                source_file,
-                f"{prefix} 第 {command_index + 1} 条事件命令缺少有效 code",
-                "把 code 修正为整数",
-            )
-        parameters = command.get("parameters")
-        if not isinstance(parameters, list):
-            fail(
-                source_file,
-                f"{prefix} 第 {command_index + 1} 条事件命令 parameters 不是 array",
-                "修正该事件命令参数",
-            )
-        yield EventCommand(
-            source_file=source_file,
-            location=f"{prefix}:command{command_index + 1}",
-            index=command_index,
-            code=code,
-            parameters=parameters,
-        )
-
-
-def iter_event_commands(content_root: Path) -> Iterator[EventCommand]:
-    data = content_root / "data"
-    for path in canonical_map_files(data):
-        root = read_json(path, "Map JSON", allowed_root=content_root)
-        if not isinstance(root, dict):
-            fail(str(path), "Map JSON 根值不是 object", "修正 Map JSON")
-        events = root.get("events")
-        if not isinstance(events, list):
-            fail(str(path), "events 不是 array", "修正 Map JSON 的 events")
-        for event_index, event in enumerate(events):
-            if event is None:
-                continue
-            if not isinstance(event, dict):
-                fail(str(path), f"events[{event_index}] 不是 object", "修正该地图事件")
-            pages = event.get("pages")
-            if not isinstance(pages, list):
-                fail(str(path), f"event{event_index} 的 pages 不是 array", "修正该地图事件")
-            for page_index, page in enumerate(pages):
-                if not isinstance(page, dict):
-                    fail(str(path), f"event{event_index}:page{page_index + 1} 不是 object", "修正该事件页")
-                yield from _command_list(
-                    page.get("list"),
-                    path.name,
-                    f"{path.name}:event{event_index}:page{page_index + 1}",
-                )
-    common_path = data / "CommonEvents.json"
-    if common_path.exists():
-        common = read_json(common_path, "CommonEvents.json", allowed_root=content_root)
-        if not isinstance(common, list):
-            fail(str(common_path), "CommonEvents.json 根值不是 array", "修正 CommonEvents.json")
-        for event_index, event in enumerate(common):
-            if event is None:
-                continue
-            if not isinstance(event, dict):
-                fail(str(common_path), f"第 {event_index} 项不是 object", "修正 CommonEvents.json")
-            yield from _command_list(
-                event.get("list"),
-                common_path.name,
-                f"CommonEvents.json:event{event_index}",
-            )
-    troops_path = data / "Troops.json"
-    if troops_path.exists():
-        troops = read_json(troops_path, "Troops.json", allowed_root=content_root)
-        if not isinstance(troops, list):
-            fail(str(troops_path), "Troops.json 根值不是 array", "修正 Troops.json")
-        for troop_index, troop in enumerate(troops):
-            if troop is None:
-                continue
-            if not isinstance(troop, dict):
-                fail(str(troops_path), f"第 {troop_index} 项不是 object", "修正 Troops.json")
-            pages = troop.get("pages")
-            if not isinstance(pages, list):
-                fail(str(troops_path), f"troop{troop_index} 的 pages 不是 array", "修正该敌群事件")
-            for page_index, page in enumerate(pages):
-                if not isinstance(page, dict):
-                    fail(
-                        str(troops_path),
-                        f"troop{troop_index}:page{page_index + 1} 不是 object",
-                        "修正该敌群事件",
-                    )
-                yield from _command_list(
-                    page.get("list"),
-                    troops_path.name,
-                    f"Troops.json:troop{troop_index}:page{page_index + 1}",
-                )
-
-
-def iter_dialogue_first_lines(content_root: Path) -> Iterator[tuple[EventCommand, str]]:
-    commands = list(iter_event_commands(content_root))
-    for index, command in enumerate(commands):
-        if command.code != 101 or index + 1 >= len(commands):
-            continue
-        following = commands[index + 1]
-        is_first_body = (
-            following.source_file == command.source_file
-            and following.location.rsplit(":command", 1)[0] == command.location.rsplit(":command", 1)[0]
-            and following.index == command.index + 1
-            and following.code == 401
-        )
-        if not is_first_body:
-            continue
-        if not following.parameters or not isinstance(following.parameters[0], str):
-            fail(
-                following.source_file,
-                f"{following.location} 的 401 正文参数缺失或不是 string",
-                "修正损坏的 RPG Maker 对话事件命令",
-            )
-        yield command, following.parameters[0]
 
 
 def _looks_like_encoded_json(value: str) -> bool:
@@ -687,15 +538,3 @@ def actual_path(path: tuple[str | int, ...]) -> str:
         else:
             result += f"[{json.dumps(step, ensure_ascii=False)}]"
     return result
-
-
-def load_data_json(path: Path, content_root: Path) -> JsonValue:
-    return read_json(path, "RPG Maker data JSON", allowed_root=content_root)
-
-
-def type_name(value: JsonValue) -> str:
-    return json_type(value)
-
-
-def mapping_value(mapping: Mapping[str, JsonValue], key: str) -> JsonValue | None:
-    return mapping.get(key)
