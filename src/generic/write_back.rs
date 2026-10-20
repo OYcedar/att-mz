@@ -1248,7 +1248,7 @@ mod tests {
         fs::create_dir(&source_root).unwrap();
         fs::write(
             source_root.join("scene.jsonl"),
-            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"General, Misc, Audio, Toggle\"}]}\n",
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"「これは、説明です」\"}]}\n",
         )
         .unwrap();
         let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
@@ -1265,7 +1265,7 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                GenericCurrentTranslation::new("常规、杂项、声音、开关".to_owned(), false),
+                GenericCurrentTranslation::new("「这是，说明“".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
@@ -1287,7 +1287,7 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(unchanged.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规、杂项、声音、开关\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"「这是，说明“\"}]}\n"
         );
 
         let repaired = build_write_back_candidate_with_cancellation(
@@ -1302,7 +1302,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::str::from_utf8(repaired.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"常规,杂项,声音,开关\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"settings\",\"units\":[{\"id\":\"u\",\"text\":\"「这是，说明」\"}]}\n"
         );
     }
 
@@ -1355,7 +1355,7 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B],现在.\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"打开 [A,B]、现在。\"}]}\n"
         );
     }
 
@@ -1366,7 +1366,7 @@ mod tests {
         fs::create_dir(&source_root).unwrap();
         fs::write(
             source_root.join("scene.jsonl"),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>General, Misc</msg>\"}]}\n",
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>「これは、説明です」</msg>\"}]}\n",
         )
         .unwrap();
         let (store, _) = GenericProjectStore::initialize(GenericInitRequest {
@@ -1383,7 +1383,7 @@ mod tests {
         translations
             .insert_with_cancellation(
                 GenericUnitKey::new("g".to_owned(), "u".to_owned()),
-                GenericCurrentTranslation::new("<msg>常规、杂项</msg>".to_owned(), false),
+                GenericCurrentTranslation::new("<msg>「这是，说明“</msg>".to_owned(), false),
                 || Ok::<_, std::convert::Infallible>(()),
             )
             .unwrap_or_else(|never| match never {});
@@ -1408,7 +1408,7 @@ mod tests {
 
         assert_eq!(
             std::str::from_utf8(candidate.files()[0].bytes()).unwrap(),
-            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>常规,杂项</msg>\"}]}\n"
+            "{\"id\":\"g\",\"kind\":\"dialogue\",\"units\":[{\"id\":\"u\",\"text\":\"<msg>「这是，说明」</msg>\"}]}\n"
         );
     }
 

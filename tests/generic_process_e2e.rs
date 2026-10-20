@@ -802,8 +802,8 @@ fn generic_write_back_materializes_manual_translation_exactly() {
 #[test]
 fn generic_client_switch_preserves_translation_and_language_change_only_makes_it_unpublishable() {
     const PROJECT: &str = "generic-client-switch";
-    const SOURCE: &str = "こんにちは";
-    const TRANSLATION: &str = "已接受译文";
+    const SOURCE: &str = "「こんにちは」、世界。";
+    const TRANSLATION: &str = "“你好”，世界。";
 
     let temporary = tempfile::tempdir().expect("应可建立 Client 切换进程测试目录");
     let root = temporary.path();

@@ -1,4 +1,4 @@
-//! 写回前依据原文模板修复译文中能够唯一对应的符号。
+//! 写回前依据原文修复损坏的成对符号和兼容形式，保留译文的正常标点。
 
 #[cfg(test)]
 use std::convert::Infallible;
@@ -258,6 +258,7 @@ fn collect_symbols<E>(
                             structure: classification.structure,
                             structural_role: None,
                             structural_pair: None,
+                            well_formed_pair: false,
                         });
                     }
                     previous = Some(character);
@@ -286,6 +287,7 @@ struct SymbolOccurrence {
     structure: Option<StructuralDescriptor>,
     structural_role: Option<StructuralRole>,
     structural_pair: Option<usize>,
+    well_formed_pair: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -757,13 +759,51 @@ fn assign_structural_pair(
     close_index: usize,
     next_pair_index: &mut usize,
 ) -> Result<(), TranslationSymbolRepairSkipReason> {
+    let well_formed = delimiters_form_pair(occurrences[open_index], occurrences[close_index]);
     let pair_index = *next_pair_index;
     *next_pair_index = next_pair_index
         .checked_add(1)
         .ok_or(TranslationSymbolRepairSkipReason::SizeOverflow)?;
     occurrences[open_index].structural_pair = Some(pair_index);
     occurrences[close_index].structural_pair = Some(pair_index);
+    occurrences[open_index].well_formed_pair = well_formed;
+    occurrences[close_index].well_formed_pair = well_formed;
     Ok(())
+}
+
+fn delimiters_form_pair(opening: SymbolOccurrence, closing: SymbolOccurrence) -> bool {
+    let (Some(open), Some(close)) = (opening.structure, closing.structure) else {
+        return false;
+    };
+    if open.kind != close.kind {
+        return false;
+    }
+    match open.kind {
+        StructuralKind::Bracket => {
+            open.raw_role == RawStructuralRole::Open
+                && close.raw_role == RawStructuralRole::Close
+                && open.bracket_pair == close.bracket_pair
+        }
+        StructuralKind::Quote => {
+            let opening =
+                compatibility_ascii_punctuation(opening.character).unwrap_or(opening.character);
+            let closing =
+                compatibility_ascii_punctuation(closing.character).unwrap_or(closing.character);
+            (open.raw_role == RawStructuralRole::Flexible
+                && close.raw_role == RawStructuralRole::Flexible
+                && opening == closing)
+                || matches!(
+                    (opening, closing),
+                    ('“', '”')
+                        | ('‘', '’')
+                        | ('「', '」')
+                        | ('『', '』')
+                        | ('«', '»')
+                        | ('‹', '›')
+                        | ('〝', '〞' | '〟')
+                )
+        }
+    }
 }
 
 struct PlannedRepair {
@@ -794,7 +834,19 @@ fn build_plan<E>(
         }
         let source = source_symbols[source_index];
         let translation = translation_symbols[translation_index];
-        if source.character != translation.character {
+        // 逗号等正文标点可以随目标语言改变写法，唯一对齐并不能证明译文有错。
+        // 成对符号的损坏已由 structurally_confirmed_matches 确认；其他仅保留
+        // 同一符号兼容形式的恢复，例如全角斜杠和等号。
+        if source.character != translation.character
+            && matches!(
+                source.family,
+                SymbolFamily::Quote
+                    | SymbolFamily::Bracket
+                    | SymbolFamily::ForwardSlash
+                    | SymbolFamily::Backslash
+                    | SymbolFamily::Exact(_)
+            )
+        {
             if replacements.last().is_some_and(|previous| {
                 (previous.segment_index(), previous.byte_offset())
                     >= (translation.segment_index, translation.byte_offset)
@@ -823,8 +875,7 @@ fn symbols_are_compatible(source: &SymbolOccurrence, translation: &SymbolOccurre
         return false;
     }
     match source.family {
-        SymbolFamily::Quote => source.structural_pair.is_some(),
-        SymbolFamily::Bracket => source.structural_pair.is_some(),
+        SymbolFamily::Quote | SymbolFamily::Bracket => source.well_formed_pair,
         _ => true,
     }
 }
@@ -926,6 +977,12 @@ fn structurally_confirmed_matches<E>(
         ) else {
             return false;
         };
+        // 已经正确配对的译文使用自己的样式，也不能为了套用原文嵌套关系拆开它。
+        if translation[translation_open].well_formed_pair
+            || translation[translation_close].well_formed_pair
+        {
+            return false;
+        }
         let existing_pair_is_confirmed = match (
             translation[translation_open].structural_pair,
             translation[translation_close].structural_pair,
@@ -1143,13 +1200,31 @@ mod tests {
     }
 
     #[test]
-    fn restores_source_commas_without_copying_source_whitespace() {
-        let repaired = repair(
-            &natural("General, Misc, Audio, Toggle"),
-            &natural("常规、杂项、声音、开关"),
+    fn preserves_localized_punctuation_in_japanese_help_translation() {
+        let source = natural(
+            "本オンラインマニュアルにはゲームの起動法、ユーザーサポート等について記載されています。また、マニュアルには記載されていない情報等もございますので、マニュアルと合わせてご一読ください。",
+        );
+        let translation = natural(
+            "本在线说明书中记载了游戏的启动方法、用户支持等内容。此外，其中还包含纸质说明书中未记载的信息等，请结合说明书一并阅读。",
         );
 
-        assert_eq!(repaired, natural("常规,杂项,声音,开关"));
+        assert_eq!(repair(&source, &translation), translation);
+    }
+
+    #[test]
+    fn preserves_localized_sentence_marks_and_balanced_delimiters() {
+        for (source, translation) in [
+            ("General, Misc, Audio, Toggle", "常规、杂项、声音、开关"),
+            (
+                "「これは『例』です」、（説明）。",
+                "“这是‘例子’”，（说明）。",
+            ),
+            ("(A): B; C?! D… E—F.", "（甲）：乙；丙？！丁…戊—己。"),
+            ("「A」 [B] <C>", "「甲」【乙】《丙》"),
+        ] {
+            let translation = natural(translation);
+            assert_eq!(repair(&natural(source), &translation), translation);
+        }
     }
 
     #[test]
@@ -1172,13 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn repairs_outer_quotes_but_keeps_incompatible_ellipsis() {
+    fn preserves_balanced_quotes_and_localized_ellipsis() {
         let repaired = repair(
             &natural("\"Report to the Guardian...\""),
             &natural("“向守卫报告……”"),
         );
 
-        assert_eq!(repaired, natural("\"向守卫报告……\""));
+        assert_eq!(repaired, natural("“向守卫报告……”"));
     }
 
     #[test]
@@ -1194,25 +1269,25 @@ mod tests {
     }
 
     #[test]
-    fn repairs_reversed_and_symmetric_quote_pairs() {
+    fn repairs_reversed_quotes_but_preserves_symmetric_pairs() {
         assert_eq!(
             repair(&natural("「Hello」"), &natural("”你好“")),
             natural("「你好」")
         );
         assert_eq!(
-            repair(&natural("\"Hello\""), &natural("“你好”")),
+            repair(&natural("「Hello」"), &natural("\"你好\"")),
             natural("\"你好\"")
         );
     }
 
     #[test]
-    fn source_topology_assigns_nested_roles_to_symmetric_quotes() {
+    fn source_topology_does_not_reinterpret_balanced_symmetric_quotes() {
         assert_eq!(
             repair(
                 &natural("「これは『勇者』だ」"),
                 &natural("\"This is \"the hero\".\""),
             ),
-            natural("「This is 『the hero』.」")
+            natural("\"This is \"the hero\".\"")
         );
     }
 
@@ -1235,7 +1310,7 @@ mod tests {
                 &natural("「This is 『nested』.」「Again」"),
                 &natural("“这是‘嵌套’。”“再次”"),
             ),
-            natural("「这是『嵌套』.」「再次」")
+            natural("“这是‘嵌套’。”“再次”")
         );
     }
 
@@ -1246,7 +1321,7 @@ mod tests {
                 &natural("「This is 『nested』」, now."),
                 &natural("“这是”“同级”、现在。"),
             ),
-            natural("“这是”“同级”,现在.")
+            natural("“这是”“同级”、现在。")
         );
     }
 
@@ -1257,7 +1332,7 @@ mod tests {
                 &natural("「First」「Second」, now."),
                 &natural("“第一‘第二’”、现在。"),
             ),
-            natural("“第一‘第二’”,现在.")
+            natural("“第一‘第二’”、现在。")
         );
     }
 
@@ -1268,22 +1343,22 @@ mod tests {
                 &natural("([Nested]), now."),
                 &natural("（同级）（括号）、现在。"),
             ),
-            natural("（同级）（括号）,现在.")
+            natural("（同级）（括号）、现在。")
         );
         assert_eq!(
             repair(
                 &natural("(First)(Second), now."),
                 &natural("（外层【内层】）、现在。"),
             ),
-            natural("（外层【内层】）,现在.")
+            natural("（外层【内层】）、现在。")
         );
     }
 
     #[test]
-    fn ambiguous_extra_quotes_do_not_block_a_unique_comma() {
+    fn ambiguous_extra_quotes_do_not_block_an_independent_compatibility_symbol() {
         assert_eq!(
-            repair(&natural("「A」, B"), &natural("“甲”“乙”、丙")),
-            natural("“甲”“乙”,丙")
+            repair(&natural("「A」=B"), &natural("“甲”“乙”＝丙")),
+            natural("“甲”“乙”=丙")
         );
     }
 
@@ -1291,7 +1366,7 @@ mod tests {
     fn missing_quote_endpoint_is_not_inserted() {
         assert_eq!(
             repair(&natural("「A」, B"), &natural("“甲、乙")),
-            natural("“甲,乙")
+            natural("“甲、乙")
         );
     }
 
@@ -1300,12 +1375,12 @@ mod tests {
         let source = LanguageText::new(vec![
             LanguageTextSegment::NaturalText("Open ".to_owned()),
             LanguageTextSegment::OpaqueBoundary,
-            LanguageTextSegment::NaturalText(", now.".to_owned()),
+            LanguageTextSegment::NaturalText(", now=1.".to_owned()),
         ]);
         let translation = LanguageText::new(vec![
             LanguageTextSegment::NaturalText("打开 ".to_owned()),
             LanguageTextSegment::OpaqueBoundary,
-            LanguageTextSegment::NaturalText("、现在。".to_owned()),
+            LanguageTextSegment::NaturalText("，现在＝1。".to_owned()),
         ]);
 
         assert_eq!(
@@ -1313,7 +1388,7 @@ mod tests {
             LanguageText::new(vec![
                 LanguageTextSegment::NaturalText("打开 ".to_owned()),
                 LanguageTextSegment::OpaqueBoundary,
-                LanguageTextSegment::NaturalText(",现在.".to_owned()),
+                LanguageTextSegment::NaturalText("，现在=1。".to_owned()),
             ])
         );
     }
@@ -1328,7 +1403,7 @@ mod tests {
         let translation = LanguageText::new(vec![
             LanguageTextSegment::NaturalText("“你好 ".to_owned()),
             LanguageTextSegment::OpaqueBoundary,
-            LanguageTextSegment::NaturalText(" 世界”".to_owned()),
+            LanguageTextSegment::NaturalText(" 世界「".to_owned()),
         ]);
 
         assert_eq!(
@@ -1360,11 +1435,11 @@ mod tests {
     fn intraword_apostrophes_are_not_used_as_quote_topology() {
         assert_eq!(
             repair(&natural("Don't stop."), &natural("Don’t 停止。")),
-            natural("Don't 停止.")
+            natural("Don’t 停止。")
         );
         assert_eq!(
             repair(&natural("Don't stop."), &natural("Don＇t 停止。")),
-            natural("Don't 停止.")
+            natural("Don＇t 停止。")
         );
     }
 
@@ -1375,15 +1450,15 @@ mod tests {
                 &natural("Don’t, won’t."),
                 &natural("他说'你好、世界'然后走了。"),
             ),
-            natural("他说'你好,世界'然后走了.")
+            natural("他说'你好、世界'然后走了。")
         );
     }
 
     #[test]
-    fn mixed_marks_repair_in_order_and_ellipsis_does_not_match_periods() {
+    fn preserves_mixed_sentence_marks_and_multi_character_punctuation() {
         assert_eq!(
             repair(&natural("Ready?!"), &natural("准备？！")),
-            natural("准备?!")
+            natural("准备？！")
         );
         assert_eq!(
             TranslationSymbolRepairer::plan_repair(&natural("Wait..."), &natural("等等……")),
@@ -1396,31 +1471,34 @@ mod tests {
     }
 
     #[test]
-    fn semantic_punctuation_families_are_not_limited_to_cjk_forms() {
+    fn preserves_localized_punctuation_outside_cjk_forms() {
         assert_eq!(
             repair(
                 &natural("A,B.C:D;E?F!G…"),
                 &natural("甲،乙۔丙᠄丁؛戊؟己߹庚᠁"),
             ),
-            natural("甲,乙.丙:丁;戊?己!庚…")
+            natural("甲،乙۔丙᠄丁؛戊؟己߹庚᠁")
         );
     }
 
     #[test]
-    fn ambiguous_repeated_marks_do_not_block_an_independent_period() {
+    fn ambiguous_repeated_marks_do_not_block_an_independent_damaged_quote() {
         assert_eq!(
-            repair(&natural("A, B."), &natural("甲、乙、丙。")),
-            natural("甲、乙、丙.")
+            repair(&natural("「A, B」"), &natural("「甲、乙、丙“")),
+            natural("「甲、乙、丙」")
         );
     }
 
     #[test]
-    fn missing_and_added_symbols_are_preserved_while_independent_marks_repair() {
+    fn missing_and_added_sentence_marks_are_preserved() {
         assert_eq!(
             repair(&natural("A, B."), &natural("甲乙。")),
-            natural("甲乙.")
+            natural("甲乙。")
         );
-        assert_eq!(repair(&natural("A."), &natural("甲！。")), natural("甲！."));
+        assert_eq!(
+            repair(&natural("A."), &natural("甲！。")),
+            natural("甲！。")
+        );
     }
 
     #[test]
@@ -1437,10 +1515,13 @@ mod tests {
 
     #[test]
     fn compatibility_forms_use_normalized_quote_and_bracket_structure() {
-        assert_eq!(repair(&natural("(A)"), &natural("︵甲︶")), natural("(甲)"));
+        assert_eq!(
+            repair(&natural("(A)"), &natural("︵甲︶")),
+            natural("︵甲︶")
+        );
         assert_eq!(
             repair(&natural("\"A\""), &natural("＂甲＂")),
-            natural("\"甲\"")
+            natural("＂甲＂")
         );
     }
 
@@ -1454,10 +1535,10 @@ mod tests {
 
     #[test]
     fn accepted_repairs_are_idempotent() {
-        let source = natural("(A), [B]!");
-        let translation = natural("（甲）、【乙】！");
+        let source = natural("(A), [B]=1!");
+        let translation = natural("（甲】、【乙】＝1！");
         let repaired = repair(&source, &translation);
-        assert_eq!(repaired, natural("(甲),[乙]!"));
+        assert_eq!(repaired, natural("(甲)、【乙】=1！"));
         assert_eq!(
             TranslationSymbolRepairer::plan_repair(&source, &repaired),
             TranslationSymbolRepairOutcome::Unchanged
@@ -1468,8 +1549,8 @@ mod tests {
     #[test]
     fn release_stress_dense_punctuation_sequence_repairs_without_an_artificial_capacity_limit() {
         const SYMBOLS: usize = 1_024;
-        let source = natural(&",".repeat(SYMBOLS));
-        let translation = natural(&"、".repeat(SYMBOLS));
+        let source = natural(&"=".repeat(SYMBOLS));
+        let translation = natural(&"＝".repeat(SYMBOLS));
         let repaired = repair(&source, &translation);
 
         assert_eq!(repaired, source);

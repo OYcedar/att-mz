@@ -3932,14 +3932,14 @@ mod tests {
         let recipes = vec![TextProjectionRecipe::Direct(
             DirectTextRecipe::new(
                 target,
-                "General, Misc",
+                "「これは、説明です」",
                 vec![DirectTextPart::TextSlot { role: role.clone() }],
             )
             .expect("标点测试直接配方必须有效"),
         )];
         let locks = recipe_locks(TextGroupKind::DatabaseEntry, &group_location, &recipes);
-        let source = TextUnitContent::Value("General, Misc".to_owned());
-        let translation = TextUnitContent::Value("常规、杂项".to_owned());
+        let source = TextUnitContent::Value("「これは、説明です」".to_owned());
+        let translation = TextUnitContent::Value("「这是，说明“".to_owned());
         let unit = if manual {
             RpgMakerWriteBackUnit::new_manual(role, source, translation)
         } else {
@@ -3971,15 +3971,15 @@ mod tests {
     fn punctuation_repair_switch_changes_only_automatic_rpg_maker_translations() {
         let disabled =
             plan_rpg_maker_write_back_with_options(punctuation_snapshot(false), false, false);
-        assert_eq!(only_set_text_replacement(&disabled), "常规、杂项");
+        assert_eq!(only_set_text_replacement(&disabled), "「这是，说明“");
 
         let enabled =
             plan_rpg_maker_write_back_with_options(punctuation_snapshot(false), true, false);
-        assert_eq!(only_set_text_replacement(&enabled), "常规,杂项");
+        assert_eq!(only_set_text_replacement(&enabled), "「这是，说明」");
 
         let manual =
             plan_rpg_maker_write_back_with_options(punctuation_snapshot(true), true, false);
-        assert_eq!(only_set_text_replacement(&manual), "常规、杂项");
+        assert_eq!(only_set_text_replacement(&manual), "「这是，说明“");
     }
 
     #[test]
