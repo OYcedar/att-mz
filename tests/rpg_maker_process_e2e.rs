@@ -1560,6 +1560,202 @@ fn mz_write_back_rejects_manual_translation_invalidated_by_placeholder_changes()
 }
 
 #[test]
+fn empty_chat_choices_retry_per_task_and_do_not_stop_later_tasks_for_all_engines() {
+    for engine in ["mv", "mz", "generic"] {
+        let temporary = tempfile::tempdir().expect("应可建立空 choices 重试测试目录");
+        let root = temporary.path();
+        let input = root.join("input");
+        if engine == "generic" {
+            fs::create_dir(&input).expect("Generic 输入目录应可建立");
+            let groups = PARTIAL_RETRY_SOURCES
+                .iter()
+                .enumerate()
+                .map(|(index, source)| {
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": format!("scene-{index}"),
+                            "kind": "dialogue",
+                            "units": [{"id": "line", "text": source}]
+                        })
+                    )
+                })
+                .collect::<String>();
+            fs::write(input.join("story.jsonl"), groups).expect("Generic 分组输入应可写入");
+        } else {
+            let content_root = if engine == "mv" {
+                input.join("www")
+            } else {
+                input.clone()
+            };
+            write_partial_retry_mz_game(&content_root);
+            if engine == "mv" {
+                fs::remove_file(content_root.join("js/rmmz_core.js"))
+                    .expect("MV 夹具应移除 MZ core 标记");
+                fs::write(content_root.join("js/rpg_core.js"), "/* MV core */")
+                    .expect("MV core 标记应可写入");
+            }
+        }
+        write_translation_prompt(root);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("本地模型服务端口应可绑定");
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("本地模型地址应可读取")
+        );
+        write_configuration(root, &endpoint);
+        let config_path = distribution_root(root).join("config.toml");
+        let configuration = fs::read_to_string(&config_path)
+            .expect("测试配置应可读取")
+            .replace("max_concurrent_requests = 2", "max_concurrent_requests = 1")
+            .replace(
+                "target_task_user_message_characters = 10000",
+                "target_task_user_message_characters = 1",
+            );
+        fs::write(config_path, configuration).expect("单 Unit 任务配置应可写入");
+        assert_success(
+            "空 choices Init",
+            &run_att(root, init_arguments(engine, &input)),
+        );
+        let mut extract = arguments(&[engine, "extract", "--name", PROJECT]);
+        if engine != "generic" {
+            extract.push(OsString::from("--builtin"));
+        }
+        assert_success("空 choices Extract", &run_att(root, extract));
+
+        let server = thread::spawn(move || {
+            let mut attempts = [0; 4];
+            let mut first_requests: [Option<Value>; 4] = [None, None, None, None];
+            // 前两项耗尽一次重试，第三项重试成功，第四项正常完成。
+            for _ in 0..7 {
+                let (mut stream, request) =
+                    accept_request(listener.try_clone().map_err(|error| error.to_string())?)?;
+                let message = request["messages"][1]["content"]
+                    .as_str()
+                    .ok_or("模型请求必须含 user message")?;
+                let user = parse_user_message(message);
+                let source = user["groups"][0]["units"][0]["text"][0]
+                    .as_str()
+                    .ok_or("模型请求必须包含待译原文")?;
+                let index = PARTIAL_RETRY_SOURCES
+                    .iter()
+                    .position(|expected| *expected == source)
+                    .ok_or("模型请求包含未知原文")?;
+                if let Some(first) = &first_requests[index] {
+                    assert_eq!(first, &request, "空 choices 重试必须重发同一完整请求");
+                } else {
+                    first_requests[index] = Some(request);
+                }
+                attempts[index] += 1;
+                if index < 2 || (index == 2 && attempts[index] == 1) {
+                    let body = r#"{"choices":[]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .and_then(|()| stream.flush())
+                    .map_err(|error| error.to_string())?;
+                    let _ = stream.shutdown(Shutdown::Both);
+                } else {
+                    write_chat_response(
+                        &mut stream,
+                        &json!({
+                            "think": THINKING_SENTINEL,
+                            "translations": {"0": [PARTIAL_RETRY_TRANSLATIONS[index]]}
+                        })
+                        .to_string(),
+                    )?;
+                }
+            }
+            Ok::<_, String>(attempts)
+        });
+        let output = run_att(
+            root,
+            arguments(&[engine, "translate", "--name", PROJECT, "local"]),
+        );
+        let served = server.join().expect("空 choices 模型服务线程不得 panic");
+        assert_success("空 choices Translate", &output);
+        assert_eq!(
+            served.expect("空 choices 后仍须处理后续任务"),
+            [2, 2, 2, 1],
+            "{engine} 必须逐任务使用配置中的一次重试预算"
+        );
+
+        let workspace = distribution_root(root)
+            .join("projects")
+            .join(engine)
+            .join(PROJECT);
+        let database = workspace.join("project.db");
+        let actual = if engine == "generic" {
+            read_generic_units(&database)
+                .into_iter()
+                .map(|(source, translation)| (json!(source), translation.map(Value::from)))
+                .collect::<Vec<_>>()
+        } else {
+            read_owner_units(&database, "builtin")
+        };
+        assert_eq!(
+            actual,
+            vec![
+                (json!(PARTIAL_RETRY_SOURCES[0]), None),
+                (json!(PARTIAL_RETRY_SOURCES[1]), None),
+                (
+                    json!(PARTIAL_RETRY_SOURCES[2]),
+                    Some(json!(PARTIAL_RETRY_TRANSLATIONS[2])),
+                ),
+                (
+                    json!(PARTIAL_RETRY_SOURCES[3]),
+                    Some(json!(PARTIAL_RETRY_TRANSLATIONS[3])),
+                ),
+            ],
+            "{engine} 耗尽重试的任务保持待译，后续成功结果必须提交"
+        );
+        let log_path = fs::read_dir(workspace.join("logs"))
+            .expect("项目日志目录应可读取")
+            .map(|entry| entry.expect("项目日志项应可读取").path())
+            .max()
+            .expect("Translate 日志必须存在");
+        let records = read_project_log_records(&log_path);
+        let outcomes = records
+            .iter()
+            .filter(|record| record["event"] == "task.finished")
+            .map(|record| {
+                let payload = &record["payload"];
+                (
+                    payload["task"]["ordinal"].clone(),
+                    payload["attempts"].clone(),
+                    payload["outcome"]["kind"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                (json!(1), json!(2), json!("unavailable")),
+                (json!(2), json!(2), json!("unavailable")),
+                (json!(3), json!(2), json!("complete")),
+                (json!(4), json!(1), json!("complete")),
+            ],
+            "{engine} 必须按自然顺序记录每个任务的真实尝试次数和终态"
+        );
+        let result = &records
+            .iter()
+            .find(|record| record["event"] == "translation.finished")
+            .expect("Translate 必须记录最终状态")["payload"]["result"];
+        assert_eq!(result["kind"], "incomplete");
+        assert_eq!(result["tasks"]["planned"], 4);
+        assert_eq!(result["tasks"]["started"], 4);
+        assert_eq!(result["tasks"]["unavailable"], 2);
+        assert_eq!(result["tasks"]["complete"], 2);
+        assert_eq!(result["tasks"]["not_started"], 0);
+        assert_eq!(
+            result["summary"]["summary"]["request_admission_stopped"],
+            false
+        );
+    }
+}
+
+#[test]
 fn mz_partial_retry_reuses_the_complete_task_block_across_real_processes() {
     let temporary = tempfile::tempdir().expect("应可建立 MZ Partial 重试端到端测试目录");
     let root = temporary.path();

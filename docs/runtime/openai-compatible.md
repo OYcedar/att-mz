@@ -153,10 +153,10 @@ Responses 的每条 `data` 必须是带字符串 `type` 的 JSON event：
 ## 4. 失败与重试
 
 Retryable 包含 DNS/连接/发送/读取（包括 SSE chunk）/完整请求超时或中断，HTTP 408、429、500、
-502、503、504、Cloudflare 520–524，以及 HTTP 200 流式响应中无法形成完整协议终态的 JSON、
-SSE 事件或成功信封。
-后者不接受或保存任何半截正文，只重新执行完整模型请求。`Retry-After` 支持秒数和 HTTP-date，
-并受 Client `max_retry_after_ms` 约束。Translate 按 Client `retry_delays_ms` 执行有限重试；
+502、503、504、Cloudflare 520–524、HTTP 200 非流式 Chat Completions 的 `choices = []`，
+以及 HTTP 200 流式响应中无法形成完整协议终态的 JSON、SSE 事件或成功信封。
+空 choices 和无效流式响应只重新执行完整模型请求，不接受或保存任何半截正文。`Retry-After`
+支持秒数和 HTTP-date，并受 Client `max_retry_after_ms` 约束。Translate 按 Client `retry_delays_ms` 执行有限重试；
 本地等待不消耗重试次数。普通 429 的 `Retry-After` 对同一 Client 的所有请求生效：等待结束前，
 其他 worker 也不能发出下一次请求。
 冷却或活动许可等待结束后，新请求仍受当前 RPM 和 burst 约束；等待不会额外积累可同时发送的请求。
@@ -184,18 +184,20 @@ Metadata 一经读取，后续流式信封错误、读取传输失败或总超�
   准入；本次 Translate 为 Failed，退出码为 `1`；
 - 普通 429 等待超过 `max_retry_after_ms` 或重试耗尽时，当前 Task 为 Unavailable，并停止
   后续请求和 Task 准入；Translate 为 Incomplete，退出码仍为 `0`；
-- DNS、连接、读取、超时、HTTP 500、502–504 或 520–524 等普通可重试问题耗尽时，只有当前
-  Task 为 Unavailable，后续 Task 仍可继续；
-- 外部请求失败确认前已经准入且获得有效响应的 Task 仍按自然顺序验收，并在当前 CAS 仍成立时
-  提交；失败 Task 自身不提交，失败后不再补充新的 Task。数据库提交、内部验收或取消失败仍按
+- DNS、连接、读取、超时、HTTP 500、502–504 或 520–524、非流式空 choices 和无效流式响应等
+  普通可重试问题耗尽时，只有当前 Task 为 Unavailable，后续 Task 仍可继续；各 Task 独立使用
+  重试预算，不因多个 Task 耗尽而停止整批翻译；
+- 停止准入前已经准入且获得有效响应的 Task 仍按自然顺序验收，并在当前 CAS 仍成立时
+  提交；失败 Task 自身不提交，停止准入后不再补充新的 Task。数据库提交、内部验收或取消失败仍按
   各自状态边界决定是否允许后续副作用。
 
 任务准入满足 `planned = started + not_started`。服务停止后没有开始的任务计入
 `not_started`；不得把请求门拒绝误计为一次已开始任务，也不得补造完成进度。
 
 Fatal 包含请求构造失败、TLS/证书问题、其他不可重试 HTTP 状态（包括 525、526），以及非流式
-200 响应的无效 JSON 或成功信封。流式 200 的事件 JSON、核心字段、错误事件和终态问题进入上述有限重试；预算
-耗尽后该 Task 为 Unavailable，不把已经收到的增量片段交给调用方。非 200 状态诊断会说明 HTTP
+200 响应除上述 `choices = []` 外的无效 JSON 或成功信封；choices 缺失、null、类型错误，或非空
+数组中没有数值 `index = 0` 仍为 Fatal。流式 200 的事件 JSON、核心字段、错误事件和终态问题进入
+上述有限重试；预算耗尽后该 Task 为 Unavailable，不把已经收到的增量片段交给调用方。非 200 状态诊断会说明 HTTP
 状态、`Retry-After`、供应商 code/type，以及标准 `error` 信封中经过闭集替换和单行清理的
 `message`；流式失败分别说明无效 UTF-8、事件 JSON、未以空行闭合的 SSE 事件、服务错误事件、
 Chat 缺少 `finish_reason`、Responses 缺少终态、event/type 不一致、重复 choice、finish 后继续

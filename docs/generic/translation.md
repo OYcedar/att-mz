@@ -119,8 +119,8 @@ Generic 使用公共的四种 JSON 响应模式。关闭思考与原文回显时
 永久认证、授权、额度或账户错误一经类型化确认，就停止后续模型请求和 Task 准入，本次
 Translate 为 Failed 并退出 `1`。普通 429 的共享 `Retry-After` 等待超过配置上限或重试耗尽
 时，当前 Task 为 Unavailable，后续 Task 为 not_started，本次结果为 Incomplete 并退出
-`0`。普通网络、超时、HTTP 500、502–504 或 520–524 重试耗尽只使当前 Task Unavailable，
-不停止后续 Task。
+`0`。[HTTP 规格](../runtime/openai-compatible.md#4-失败与重试)定义的普通可重试问题（包括
+非流式空 choices）耗尽重试时，只使当前 Task Unavailable，不停止后续 Task。
 停止前已经准入且获得有效结果的 Task 仍按自然顺序验收，并在当前 CAS 成立时提交；单个外部
 请求失败不能让其他已经付费取得且通过验收的结果失效。
 

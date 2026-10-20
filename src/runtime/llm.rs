@@ -1847,6 +1847,12 @@ fn parse_chat_completions_response(
         .get("choices")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_response(HttpEnvelopeViolation::MissingChoices))?;
+    if choices.is_empty() {
+        return Err(retryable(OpenAiCompatibleError::InvalidResponseWire {
+            violation: HttpEnvelopeViolation::EmptyChoices,
+            provider: None,
+        }));
+    }
     let mut matching_choices = choices.iter().filter(|choice| {
         choice
             .as_object()
@@ -3700,12 +3706,21 @@ mod tests {
     }
 
     #[test]
-    fn successful_wire_rejects_missing_or_duplicate_index_zero_and_invalid_core_fields() {
+    fn successful_wire_retries_empty_choices_and_rejects_invalid_core_fields() {
+        assert!(matches!(
+            parse_success_response(br#"{"choices":[]}"#),
+            Err(LlmRequestError::Retryable {
+                source: OpenAiCompatibleError::InvalidResponseWire {
+                    violation: HttpEnvelopeViolation::EmptyChoices,
+                    ..
+                },
+                retry_after: None,
+            })
+        ));
         for body in [
             br#"[]"#.as_slice(),
             br#"{}"#.as_slice(),
             br#"{"choices":null}"#.as_slice(),
-            br#"{"choices":[]}"#.as_slice(),
             br#"{"choices":[{"index":1}]}"#.as_slice(),
             br#"{"choices":[{"index":"0"}]}"#.as_slice(),
             br#"{"choices":[{"index":0,"message":{"content":"[]"},"finish_reason":"stop"},{"index":0,"message":{"content":"[]"},"finish_reason":"stop"}]}"#.as_slice(),
