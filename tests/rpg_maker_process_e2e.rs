@@ -3281,6 +3281,12 @@ fn generic_reextract_preserves_moves_and_rejects_unextracted_changes() {
         task_record.find("## 最终结果").expect("应包含最终结果")
             < task_record.find("## User").expect("应包含 User")
     );
+    assert!(
+        task_record.find("## Assistant").expect("应包含 Assistant")
+            < task_record
+                .find("## Locations")
+                .expect("应在文末包含 Locations")
+    );
     assert!(!task_record.contains("## Thinking"));
     assert!(!task_record.contains("## Raw Assistant"));
     assert_success(

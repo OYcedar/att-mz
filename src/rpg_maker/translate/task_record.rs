@@ -531,10 +531,6 @@ fn render_translation_task_record(
     );
     render_final_result(&mut output, &localizer, api_key_redactor, document);
 
-    output.push_str(&crate::translation::task_record::task_record_locations(
-        &document.locations,
-        api_key_redactor,
-    ));
     output.push_str("\n## User\n\n");
     let user = api_key_redactor.redact_text_with_json_strings(&document.user_message);
     output.push_str(&user);
@@ -547,6 +543,10 @@ fn render_translation_task_record(
         let assistant = api_key_redactor.redact_text_with_json_strings(raw_assistant);
         output.push_str(&markdown_json_fence(&assistant));
     }
+    output.push_str(&crate::translation::task_record::task_record_locations(
+        &document.locations,
+        api_key_redactor,
+    ));
     output
 }
 
@@ -703,7 +703,10 @@ mod tests {
     #[test]
     fn task_record_renders_the_final_attempt_provider_as_markdown_plain_text() {
         let document = TranslationTaskRecordDocument {
-            locations: std::collections::BTreeMap::new(),
+            locations: std::collections::BTreeMap::from([(
+                0,
+                vec!["Items.json:1:description".to_owned()],
+            )]),
             task_index: RpgMakerTranslationTaskIndex::new(0),
             requested_outputs: 1,
             user_message: "request".to_owned(),
@@ -728,5 +731,11 @@ mod tests {
 
         assert!(rendered.contains(r"上游服务方：\<SiliconFlow\>\[route\]"));
         assert!(!rendered.contains("<SiliconFlow>[route]"));
+        assert!(
+            rendered.find("## User").expect("应包含 User")
+                < rendered
+                    .find("## Locations")
+                    .expect("缺少响应时 Locations 仍在文末")
+        );
     }
 }

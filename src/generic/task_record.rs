@@ -233,10 +233,6 @@ fn render_generic_task_record(
         output.push_str(&markdown_fence(&rendered, "text"));
     }
 
-    output.push_str(&crate::translation::task_record::task_record_locations(
-        &document.locations,
-        redactor,
-    ));
     output.push_str("\n## User\n\n");
     let user = redactor.redact_text_with_json_strings(&document.user_message);
     output.push_str(&user);
@@ -249,6 +245,10 @@ fn render_generic_task_record(
         let assistant = redactor.redact_text_with_json_strings(raw_assistant);
         output.push_str(&markdown_json_fence(&assistant));
     }
+    output.push_str(&crate::translation::task_record::task_record_locations(
+        &document.locations,
+        redactor,
+    ));
     output
 }
 
@@ -262,7 +262,7 @@ mod tests {
     };
 
     #[test]
-    fn record_keeps_only_user_assistant_and_final_result() {
+    fn record_keeps_final_result_before_body_and_locations_last() {
         let document = GenericTaskRecordDocument::new(
             0,
             1,
@@ -270,7 +270,11 @@ mod tests {
             Some(r#"{"translations":{"0":["译文"]}}"#.to_owned()),
             Some("SiliconFlow".to_owned()),
             GenericTaskRecordState::committed(true, vec![0], 1, Vec::new()),
-        );
+        )
+        .with_locations(std::collections::BTreeMap::from([(
+            0,
+            vec!["story.jsonl:line1:unit1:text".to_owned()],
+        )]));
         let rendered = document.render(
             &ApiKeyRedactor::new(SecretString::from("secret")),
             UiLocale::SimplifiedChinese,
@@ -288,6 +292,12 @@ mod tests {
         assert!(
             rendered.find("## 最终结果").expect("应包含最终结果")
                 < rendered.find("## User").expect("应包含 User")
+        );
+        assert!(
+            rendered.find("## Assistant").expect("应包含 Assistant")
+                < rendered
+                    .find("## Locations")
+                    .expect("应在文末包含 Locations")
         );
         assert!(!rendered.contains("## System"));
         assert!(!rendered.contains("Attempts"));
