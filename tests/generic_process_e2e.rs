@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -1062,6 +1062,164 @@ fn generic_lua_can_reopen_project_database_after_att_schema_is_destroyed() {
 }
 
 #[test]
+fn complete_scenes_keep_contextual_repeated_lines_through_partial_retry_and_write_back() {
+    let temporary = tempfile::tempdir().expect("应可建立剧情翻译测试目录");
+    let root = temporary.path();
+    let input = root.join("input");
+    fs::create_dir(&input).unwrap();
+    let long_narration = "雨が降る夜、二人は駅で次の列車を待っていた。".repeat(1200);
+    assert!(long_narration.chars().count() > 24000);
+    let scene = serde_json::json!({
+        "id": "station", "kind": "dialogue", "units": [
+            {"id": "narration", "text": long_narration},
+            {"id": "invitation", "text": "一緒に帰ってもいい？"},
+            {"id": "agreement", "text": "いいよ"},
+            {"id": "umbrella", "text": "傘はもう返そうか？"},
+            {"id": "decline", "text": "いいよ"}
+        ]
+    });
+    let other_scene = serde_json::json!({
+        "id": "workshop", "kind": "dialogue", "units": [
+            {"id": "request", "text": "もう一度手伝ってくれる？"},
+            {"id": "answer", "text": "いいよ"}
+        ]
+    });
+    fs::write(
+        input.join("story.jsonl"),
+        format!("{scene}\n{other_scene}\n"),
+    )
+    .unwrap();
+    let provider = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        provider.local_addr().unwrap()
+    );
+    write_client_switch_distribution(root, "local", &endpoint, "scene-test");
+    let config_path = distribution_root(root).join("config.toml");
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["translation"]
+        .as_table_mut()
+        .unwrap()
+        .remove("record_translation_tasks");
+    config["translation"]["profiles"][0]["target_task_user_message_characters"] = 24000.into();
+    fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    assert_success(
+        "剧情项目 Init",
+        &run_att(
+            root,
+            &[
+                "generic",
+                "init",
+                "--name",
+                PROJECT,
+                "--path",
+                input.to_str().unwrap(),
+                "--source-language",
+                "ja",
+                "--target-language",
+                "zh-Hans",
+            ],
+        ),
+    );
+    assert_success(
+        "剧情项目 Extract",
+        &run_att(root, &["generic", "extract", "--name", PROJECT]),
+    );
+
+    let server = thread::spawn(move || {
+        let user_message = |request: serde_json::Value| -> serde_json::Value {
+            let message = request["messages"][1]["content"].as_str().unwrap();
+            serde_json::from_str(
+                message
+                    .strip_prefix("```json\n")
+                    .unwrap()
+                    .strip_suffix("\n```")
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let first = user_message(serve_chat_response(
+            &provider,
+            serde_json::json!({
+                "0": ["下雨的夜晚，两人在车站等待下一班列车。".repeat(1200)],
+                "1": ["我可以和你一起回去吗？"], "2": ["好啊"], "3": ["现在把伞还给你？"]
+            }),
+        )?);
+        assert_eq!(
+            first["groups"].as_array().unwrap().len(),
+            1,
+            "超目标场景仍应整体独占任务"
+        );
+        let units = first["groups"][0]["units"].as_array().unwrap();
+        assert_eq!(units.len(), 5, "不能按长度截断场景");
+        for (index, unit) in units.iter().enumerate() {
+            assert_eq!(unit["text"][0], scene["units"][index]["text"]);
+            assert_eq!(unit["id"], index.to_string(), "不同对话轮次必须独立输出");
+        }
+        let second = user_message(serve_chat_response(
+            &provider,
+            serde_json::json!({
+                "0": ["能再帮我一次吗？"], "1": ["行吧"]
+            }),
+        )?);
+        assert_eq!(second["groups"][0]["units"][1]["text"][0], "いいよ");
+        assert_eq!(
+            second["groups"][0]["units"][1]["id"], "1",
+            "另一场景不能复用前一场景的同文结果"
+        );
+
+        let retry = user_message(serve_chat_response(
+            &provider,
+            serde_json::json!({"0": ["不用了"]}),
+        )?);
+        let units = retry["groups"][0]["units"].as_array().unwrap();
+        assert_eq!(units.len(), 5, "Partial 续跑必须保留完整场景");
+        assert_eq!(
+            units.iter().filter(|unit| unit.get("id").is_some()).count(),
+            1
+        );
+        assert_eq!(units[2]["text"][0], "好啊");
+        assert!(units[2].get("id").is_none());
+        assert_eq!(units[4]["text"][0], "いいよ");
+        assert_eq!(units[4]["id"], "0", "另一轮次的 Current 不能填补待译位置");
+        Ok::<_, String>(())
+    });
+
+    assert_success(
+        "剧情首次 Translate",
+        &run_att(root, &["generic", "translate", "--name", PROJECT, "local"]),
+    );
+    let workspace = distribution_root(root)
+        .join("projects/generic")
+        .join(PROJECT);
+    let pending: Option<String> = Connection::open(workspace.join("project.db")).unwrap()
+        .query_row("SELECT translation FROM generic_unit WHERE group_id = 'station' AND unit_id = 'decline'", [], |row| row.get(0)).unwrap();
+    assert_eq!(pending, None, "缺失候选不能被同场景同文自动填补");
+    assert_success(
+        "剧情 Partial 续跑",
+        &run_att(root, &["generic", "translate", "--name", PROJECT]),
+    );
+    server
+        .join()
+        .expect("剧情模型线程应完成")
+        .expect("剧情请求应成功");
+    assert_success(
+        "剧情 WriteBack",
+        &run_att(root, &["generic", "write-back", "--name", PROJECT]),
+    );
+    let output = fs::read_to_string(workspace.join("write_back/story.jsonl")).unwrap();
+    let groups = output
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["units"][2]["text"], "好啊");
+    assert_eq!(groups[0]["units"][4]["text"], "不用了");
+    assert_eq!(groups[1]["units"][1]["text"], "行吧");
+}
+
+#[test]
 fn contextual_placeholders_survive_model_acceptance_current_and_write_back() {
     let temporary = tempfile::tempdir().expect("应可建立占位符往返测试目录");
     let root = temporary.path();
@@ -1130,9 +1288,11 @@ fn contextual_placeholders_survive_model_acceptance_current_and_write_back() {
         &run_att(root, &["generic", "extract", "--name", PROJECT]),
     );
     let server = thread::spawn(move || {
-        serve_chat_completion(
-            provider,
-            "⟦ATT_CUSTOM_WHOLE_0000⟧你知道吗？　我向花搭话道。⟦ATT_CUSTOM_WHOLE_0001⟧",
+        let translation =
+            "⟦ATT_CUSTOM_WHOLE_0000⟧你知道吗？　我向花搭话道。⟦ATT_CUSTOM_WHOLE_0001⟧";
+        serve_chat_response(
+            &provider,
+            serde_json::json!({"0": [translation], "1": [translation]}),
         )
     });
     let translated_output = run_att(
@@ -1148,7 +1308,7 @@ fn contextual_placeholders_survive_model_acceptance_current_and_write_back() {
         ],
     );
     server.join().expect("模型线程应完成").expect("应返回候选");
-    assert_success("占位符模型验收与传播", &translated_output);
+    assert_success("占位符逐位置模型验收", &translated_output);
     let workspace = distribution_root(root)
         .join("projects/generic")
         .join(PROJECT);
@@ -1176,7 +1336,7 @@ fn contextual_placeholders_survive_model_acceptance_current_and_write_back() {
         assert_eq!(rejected, 0, "正常正文空格不能导致拒收或失去 Current");
     };
     assert_current();
-    // 此时模型服务已退出；Current 复验与去重复用不得重新请求模型。
+    // 此时模型服务已退出；Current 复验不得重新请求模型。
     assert_success(
         "占位符 Current 复验",
         &run_att(root, &["generic", "translate", "--name", PROJECT]),
@@ -1774,13 +1934,33 @@ fn read_single_jsonl_group(path: &Path) -> serde_json::Value {
 }
 
 fn serve_chat_completion(listener: TcpListener, translation: &str) -> Result<(), String> {
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|error| format!("接受模型请求失败：{error}"))?;
-    read_http_json(&mut stream)?;
+    serve_chat_response(&listener, serde_json::json!({"0": [translation]})).map(|_| ())
+}
+
+fn serve_chat_response(
+    listener: &TcpListener,
+    translations: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("未收到预期模型请求：{error}")),
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    let request = read_http_json(&mut stream)?;
     let content = serde_json::json!({
         "think": "已核对用户结果",
-        "translations": {"0": [translation]},
+        "translations": translations,
     })
     .to_string();
     let body = serde_json::json!({
@@ -1801,7 +1981,8 @@ fn serve_chat_completion(listener: TcpListener, translation: &str) -> Result<(),
     .map_err(|error| format!("写入模型响应失败：{error}"))?;
     stream
         .flush()
-        .map_err(|error| format!("刷新模型响应失败：{error}"))
+        .map_err(|error| format!("刷新模型响应失败：{error}"))?;
+    Ok(request)
 }
 
 #[test]

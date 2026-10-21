@@ -1,4 +1,4 @@
-//! Generic 的稳定 TaskBlock 投影、全局去重与字符串响应验收。
+//! Generic 的稳定 TaskBlock 投影、相同语境复用与字符串响应验收。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -1430,7 +1430,8 @@ fn natural_segments(language_text: &LanguageText) -> impl Iterator<Item = &str> 
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DeduplicationKey {
-    source_text: String,
+    group_context_index: usize,
+    unit_position: usize,
     protected_text: String,
     placeholder_binding_fingerprint: Sha256Fingerprint,
 }
@@ -1442,9 +1443,10 @@ fn deduplication_key_fingerprint_with_cancellation<E>(
     framed_identity_fingerprint_with_cancellation(
         b"att.generic.deduplication-key-index",
         [
-            (1, key.source_text.as_bytes()),
-            (2, key.protected_text.as_bytes()),
-            (3, key.placeholder_binding_fingerprint.as_bytes()),
+            (1, key.group_context_index.to_le_bytes().as_slice()),
+            (2, key.unit_position.to_le_bytes().as_slice()),
+            (3, key.protected_text.as_bytes()),
+            (4, key.placeholder_binding_fingerprint.as_bytes()),
         ],
         ensure_running,
     )
@@ -1455,19 +1457,38 @@ fn deduplication_keys_equal_with_cancellation(
     right: &DeduplicationKey,
     is_cancelled: &impl Fn() -> bool,
 ) -> Result<bool, GenericPlanningError> {
-    Ok(
-        left.placeholder_binding_fingerprint == right.placeholder_binding_fingerprint
-            && planning_text_equal_with_cancellation(
-                &left.source_text,
-                &right.source_text,
-                is_cancelled,
-            )?
-            && planning_text_equal_with_cancellation(
-                &left.protected_text,
-                &right.protected_text,
-                is_cancelled,
-            )?,
-    )
+    Ok(left.group_context_index == right.group_context_index
+        && left.unit_position == right.unit_position
+        && left.placeholder_binding_fingerprint == right.placeholder_binding_fingerprint
+        && planning_text_equal_with_cancellation(
+            &left.protected_text,
+            &right.protected_text,
+            is_cancelled,
+        )?)
+}
+
+/// 指纹只缩小候选范围；完整 kind 与有序原文相等才共享语境。
+/// 按 Group 建立语境索引，避免每句台词重复扫描整个场景。
+fn group_contexts_equal_with_cancellation(
+    left: &GenericStoredGroup,
+    right: &GenericStoredGroup,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<bool, GenericPlanningError> {
+    if left.units().len() != right.units().len()
+        || !planning_text_equal_with_cancellation(left.kind(), right.kind(), is_cancelled)?
+    {
+        return Ok(false);
+    }
+    for (left, right) in left.units().iter().zip(right.units()) {
+        if !planning_text_equal_with_cancellation(
+            left.source_text(),
+            right.source_text(),
+            is_cancelled,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 struct SnapshotUnitFacts<'a> {
@@ -1475,6 +1496,7 @@ struct SnapshotUnitFacts<'a> {
     locator: GenericPlanningUnitLocator,
     source_text: &'a str,
     group_context: Sha256Fingerprint,
+    group_context_index: usize,
 }
 
 struct UnitFacts<'input, 'snapshot> {
@@ -1483,6 +1505,7 @@ struct UnitFacts<'input, 'snapshot> {
     input: &'input PlanningUnit,
     source_text: &'snapshot str,
     group_context: Sha256Fingerprint,
+    group_context_index: usize,
 }
 
 fn resolve_planning_inputs<'input>(
@@ -1553,7 +1576,7 @@ struct Family {
     members: Vec<usize>,
 }
 
-/// 按完整 JSONL 层次稳定装箱，再按自然顺序计算全项目去重和块内临时 ID。
+/// 按完整 JSONL 层次稳定装箱，再按完整语境和组内位置计算复用及块内临时 ID。
 #[cfg(test)]
 pub(crate) fn plan_translation(
     snapshot: &GenericStoredSnapshot,
@@ -1613,10 +1636,30 @@ where
         pack_complete_task_blocks(&task_layout, target_task_characters, cancellation)
             .map_err(GenericPlanningError::from)?;
     let mut natural_units = Vec::with_capacity(task_layout.total_units());
+    let mut group_contexts = FingerprintBucketMap::<&GenericStoredGroup, usize>::new();
     for file in snapshot.files() {
         ensure_planning_not_cancelled(&is_cancelled)?;
         for group in file.groups() {
             ensure_planning_not_cancelled(&is_cancelled)?;
+            let group_context_index = match group_contexts.get_with(
+                group.context_fingerprint(),
+                group,
+                |left, right| group_contexts_equal_with_cancellation(left, right, &is_cancelled),
+            )? {
+                Some(index) => *index,
+                None => {
+                    let index = natural_units.len();
+                    group_contexts.insert_with(
+                        group.context_fingerprint(),
+                        group,
+                        index,
+                        |left, right| {
+                            group_contexts_equal_with_cancellation(left, right, &is_cancelled)
+                        },
+                    )?;
+                    index
+                }
+            };
             for unit in group.units() {
                 ensure_planning_not_cancelled(&is_cancelled)?;
                 let key = GenericUnitKey::new(
@@ -1634,6 +1677,7 @@ where
                     .with_natural_position(group.ordinal() + 1, unit.ordinal() + 1),
                     source_text: unit.source_text(),
                     group_context: group.context_fingerprint(),
+                    group_context_index,
                 });
             }
         }
@@ -1648,6 +1692,7 @@ where
             input,
             source_text: natural.source_text,
             group_context: natural.group_context,
+            group_context_index: natural.group_context_index,
         })
         .collect::<Vec<_>>();
 
@@ -1686,7 +1731,12 @@ where
     for (unit_index, fact) in facts.iter().enumerate() {
         ensure_planning_not_cancelled(&is_cancelled)?;
         let deduplication_key = DeduplicationKey {
-            source_text: clone_planning_text_with_cancellation(fact.source_text, &is_cancelled)?,
+            group_context_index: fact.group_context_index,
+            unit_position: fact
+                .locator
+                .natural_position()
+                .expect("数据库自然快照中的 Generic Unit 必须有自然位置")
+                .1,
             protected_text: clone_planning_text_with_cancellation(
                 &fact.input.protected_text,
                 &is_cancelled,
@@ -4034,7 +4084,11 @@ mod tests {
                 GenericStoredFile {
                     relative_path: PathBuf::from("b.jsonl"),
                     ordinal: 1,
-                    groups: vec![make_group("g3", 0, &[("u1", "同文", None)])],
+                    groups: vec![make_group(
+                        "g3",
+                        0,
+                        &[("u1", "同文", None), ("u2", "已有", Some("当前"))],
+                    )],
                 },
             ],
         }
@@ -4053,7 +4107,8 @@ mod tests {
                 id: group_id.to_owned(),
                 ordinal,
                 kind: kind.to_owned(),
-                context_fingerprint: fingerprint(40 + ordinal as u8),
+                // 强制指纹相同，验证 kind 仍由完整语境比较区分。
+                context_fingerprint: fingerprint(40),
                 units: vec![GenericStoredUnit {
                     id: "unit".to_owned(),
                     ordinal: 0,
@@ -4130,7 +4185,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_kind_dedup_validates_reuse_and_model_output_for_each_kind() {
+    fn different_kinds_have_independent_outputs_and_current_reuse() {
         let rules = GenericPlaceholderService::default()
             .compile(vec![GenericPlaceholderRuleDefinition::new(
                 Some(vec!["name".to_owned()]),
@@ -4150,10 +4205,11 @@ mod tests {
             false,
             &CooperativeCancellation::default(),
         )
-        .expect("同文应该合并为一个模型输出");
+        .expect("相同完整语境复用，其他 kind 独立请求模型");
         assert_eq!(prepared.plan().tasks().len(), 1);
+        assert_eq!(prepared.plan().tasks()[0].expected_output_ids().count(), 2);
         let parsed = parse_translation_response(
-            r#"{"0":["你好 {invented}"]}"#,
+            r#"{"0":["你好 {invented}"],"1":["你好 {invented}"]}"#,
             TranslationResponseMode::new(false, false),
         )
         .expect("响应应该可解析");
@@ -4502,7 +4558,7 @@ mod tests {
     }
 
     #[test]
-    fn global_dedup_chooses_one_representative_without_crossing_file_tasks() {
+    fn matching_complete_contexts_reuse_corresponding_units_without_crossing_file_tasks() {
         let snapshot = stored_snapshot();
         let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
             Ok(candidate.to_owned())
@@ -4513,6 +4569,43 @@ mod tests {
         assert_eq!(plan.tasks()[0].relative_path(), Path::new("a.jsonl"));
         assert_eq!(plan.tasks()[0].expected_output_ids().count(), 2);
         assert!(plan.reused().is_empty());
+    }
+
+    #[test]
+    fn different_scene_contexts_keep_model_outputs_and_current_translations_separate() {
+        for current in [None, Some("第一场景的译文")] {
+            let mut snapshot = stored_snapshot();
+            // 即使指纹碰撞且目标台词完全相同，兄弟文本不同仍是不同语境。
+            snapshot.files[1].groups[0].units[1].source_text = "別の場面".to_owned();
+            snapshot.files[0].groups[0].units[0].translation =
+                current.map(|text| GenericStoredTranslation {
+                    translation: text.to_owned(),
+                    origin: TranslationOrigin::Manual,
+                    state_fingerprint: fingerprint(9),
+                });
+            let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
+                Ok(candidate.to_owned())
+            })
+            .expect("不同场景应独立规划");
+
+            assert!(plan.reused().is_empty());
+            let task = plan
+                .tasks()
+                .iter()
+                .find(|task| task.relative_path() == Path::new("b.jsonl"))
+                .expect("第二场景必须在自己的语境中请求模型");
+            assert_eq!(task.groups()[0].units()[0].output_id(), Some(task_id(0)));
+            let acceptance = accept_response(
+                task,
+                r#"{"0":["第二场景的译文"]}"#,
+                TranslationResponseMode::new(false, false),
+                |_, _, candidate| Ok(candidate.to_owned()),
+            )
+            .expect("第二场景的候选应能独立验收");
+            assert_eq!(acceptance.accepted().len(), 1);
+            assert_eq!(acceptance.accepted()[0].key.group_id(), "g3");
+            assert_eq!(acceptance.accepted()[0].translation, "第二场景的译文");
+        }
     }
 
     #[test]
@@ -4618,19 +4711,10 @@ mod tests {
             origin: TranslationOrigin::Manual,
             state_fingerprint: fingerprint(9),
         });
-        snapshot.files[1].groups.push(GenericStoredGroup {
-            id: "g4".to_owned(),
-            ordinal: 1,
-            kind: "name".to_owned(),
-            context_fingerprint: fingerprint(14),
-            units: vec![GenericStoredUnit {
-                id: "u1".to_owned(),
-                ordinal: 0,
-                source_text: "同文".to_owned(),
-                translation: None,
-                rejected: None,
-            }],
-        });
+        let mut repeated = snapshot.files[1].groups[0].clone();
+        repeated.id = "g4".to_owned();
+        repeated.ordinal = 1;
+        snapshot.files[1].groups.push(repeated);
 
         let plan = plan_translation_with_validator_and_cancellation(
             &snapshot,
@@ -4690,19 +4774,11 @@ mod tests {
             origin: TranslationOrigin::Manual,
             state_fingerprint: fingerprint(10),
         });
-        snapshot.files[1].groups.push(GenericStoredGroup {
-            id: "g4".to_owned(),
-            ordinal: 1,
-            kind: "dialogue".to_owned(),
-            context_fingerprint: fingerprint(14),
-            units: vec![GenericStoredUnit {
-                id: "u1".to_owned(),
-                ordinal: 0,
-                source_text: "同文".to_owned(),
-                translation: None,
-                rejected: None,
-            }],
-        });
+        let mut repeated = snapshot.files[1].groups[0].clone();
+        repeated.id = "g4".to_owned();
+        repeated.ordinal = 1;
+        repeated.units[0].translation = None;
+        snapshot.files[1].groups.push(repeated);
 
         let plan = plan_translation(&snapshot, &planning(&snapshot), |_, candidate| {
             Ok(candidate.to_owned())
@@ -5264,7 +5340,9 @@ mod tests {
 
     #[test]
     fn stale_translation_is_retained_until_a_replacement_commits() {
-        let snapshot = stored_snapshot();
+        let mut snapshot = stored_snapshot();
+        // 此用例验证模型替换旧正文，不从相同完整语境的另一个位置复用。
+        snapshot.files[1].groups[0].units[1].source_text = "別の場面".to_owned();
         let mut planning_units = planning(&snapshot);
         let stale = snapshot.files()[0].groups()[0].units()[1]
             .translation()

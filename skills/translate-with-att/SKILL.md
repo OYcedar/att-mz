@@ -79,7 +79,9 @@ Manual 只编辑译文字段，条目 ID 和原文通过 ATT 重新导出。
 使用 RPG Maker Survey 时，按[项目调查指南](../../docs/guides/translation-project.md#2-调查可见文本)
 填写决定并保留来源绑定，再用同一次 finalize 产物继续 Extract、audit 与 preflight。
 独立 Generic 项目按 JSONL 规格建立外部来源映射。两种路径都分别判断所有权与翻译语境：排除
-内部键后，相关标题、说明或对白仍可组成同一语义组；独立记录使用不同组。
+内部键后，按 [Generic 分组规则](../../docs/generic/jsonl.md#3-从源格式建立-group-与文件范围)
+沿实际剧情核对完整场景和连续对话，特别检查旁白、问答、选项与前后铺垫是否被提取工具切散。
+写回位置分别保留，先修正破坏剧情关系的分组，再执行 Extract。
 
 暂时缺少消费者证据的位置标记为 `unresolved`，并列入人工实机检查清单。用户提供的截图、场景和
 触发步骤可以用于补充消费者证据和定位遗漏来源。
@@ -96,6 +98,9 @@ Manual 只编辑译文字段，条目 ID 和原文通过 ATT 重新导出。
 MV/MZ 导出 ownership，使用 Survey 的项目继续运行 audit，核对每个位置的唯一所有者。
 独立 Generic 核对 JSONL 与外部来源、自然顺序和写回位置的映射，不执行 RPG Maker ownership
 或 Survey 命令。
+抽查相同台词在不同场景和不同轮次的来源，保留每次出现的位置；按
+[相同语境复用规则](../../docs/generic/translation.md#2-相同语境复用)核对实际模型任务，不能在
+外部转换器中先按原文去重，再把一份译文填回所有位置。
 外部适配器采用[外部适配器验收](../../docs/generic/adapter-verification.md)的方法与证据契约。
 无修改往返之外，还要覆盖替换分支；不能通过先删除姓名标签或引用外壳掩盖消费者差异。大批量
 翻译前，按 [Generic 项目](../../docs/guides/translation-project.md#32-generic-项目)用少量真实替换

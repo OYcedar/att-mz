@@ -92,9 +92,10 @@ MV/MZ 来源按 [Extract](../rpg-maker/extraction.md)和 [Rules](../rpg-maker/ru
 
 ### 3.2 Generic 项目
 
-按 [Generic JSONL](../generic/jsonl.md)建立文件、Group 和 Unit。每个 Group 包含能够共同理解的
-自然语境；能够独立翻译和写回的记录使用独立 Group。记录从真实来源到 JSONL、再到最终消费者的
-完整映射。
+按 [Generic JSONL](../generic/jsonl.md)建立文件、Group 和 Unit。先沿实际剧情核对完整场景、
+连续对话、旁白与选项的关系，再确定分组；抽查场景开头、转折和结尾是否一起提供给模型。
+独立写回位置保留为 Unit，不能因此把连续剧情拆成独立 Group。记录从真实来源到 JSONL、再到
+最终消费者的完整映射。
 大批量翻译前，用少量真实替换文本验证原格式写回及原生消费者。封包后的完整观察按
 [外部适配器验收](../generic/adapter-verification.md)绑定最终资源并汇入 QA。
 

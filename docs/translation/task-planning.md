@@ -41,7 +41,7 @@ Translate 始终按以下顺序工作：
 必须得到相同的完整规划：TaskBlock 的数量、顺序、边界，以及每块的 Group、Unit 成员
 全部一致。
 
-Current、复用、全局去重、非源语、完全保护、Placeholder token、术语命中、临时 ID 和
+Current、复用、引擎去重结果、非源语、完全保护、Placeholder token、术语命中、临时 ID 和
 任务记录都不参与装箱。翻译状态只改变三件事：哪些 Unit 带 ID、无编号语境显示原文还是
 目标译文，以及哪些无 ID 块不发送。TaskBlock 无需持久化，不同状态下实际消息也可以不同。
 

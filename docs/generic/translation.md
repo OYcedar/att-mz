@@ -33,20 +33,29 @@ WriteBack。Translate 不在请求模型之前删除它；替代候选通过逐 
 源文、Group 语境和旧译文状态执行 CAS（比较并交换）原子覆盖。请求失败、取消、额度不足、Partial 或
 提交冲突都保留读取时的旧正文。
 
-## 2. 全局去重
+## 2. 相同语境复用
 
-每次 Translate 在整个 Generic 项目内计算去重族。去重键包含完整源 `text`、保护后的文本
-和实际 Placeholder 绑定，不包含文件、kind、Group 或 ID。
+每次 Translate 只在相同完整语境的对应位置之间计算复用族，以下条件必须同时成立：
+
+- Group 的 `kind`、全部 Unit 的原文、数量与自然顺序完全相同；
+- Unit 在 Group 中的位置相同；
+- 对应 Unit 保护后的文本和实际 Placeholder 绑定相同。
+
+Group 和 Unit 的 ID、文件名不用于判断语境相同。完整 Group 原文按原值比较，不忽略
+空白、标点或大小写。兄弟文本不同、kind 不同或组内位置不同都形成独立翻译责任；
+同一个 Group 内重复出现的台词需要模型翻译时，也分别获得输出 ID。即使单句原文完全
+相同，也不能跨这些语境传播模型结果或已有 Current。完整场景被重复引用且上述条件都
+相同时，才允许复用。
 
 - 一个族没有 Current：选择自然顺序最早的未译 Unit 请求模型，并向其他未译成员传播；
 - 只有一种 Current 译文：直接向未译成员传播，不请求模型；
 - 已经有多种不同 Current：全部保留；存在未译成员时，从未译成员重新选择代表；
 - 已有 Current 始终优先，任何传播都会跳过它们。
 
-去重的作用是减少请求；相同原文需要不同译文时，多种译文可以共存。已定位 Unit 的同文
-异译、质量修订或少量补译，优先使用 [Manual TOML](../manual/README.md) 精确提交，不改写
-全局去重、Placeholder 或语言规则。复杂筛选、计算生成或批量变换再使用
-[Lua](../lua/README.md)。
+复用前仍逐目标执行当前 Placeholder 与结构验收，失败目标在自己的完整语境中请求模型。
+多种 Current 译文可以共存；调整复用规则不会自动重译已经保存且仍适用的正文。已定位的
+质量修订或少量补译，使用 [Manual TOML](../manual/README.md) 精确提交；复杂筛选、计算生成
+或批量变换再使用 [Lua](../lua/README.md)。
 
 ## 3. TaskBlock
 
@@ -60,13 +69,14 @@ ATT 在这个 Group 前结束当前块，再建立下一个 TaskBlock。ATT 不�
 Group 永远作为整体进入任务。单个 Group 超过 Profile 目标字符数时仍独占一个任务，后续
 Group 继续按同一目标组合。目标字符数不是硬上限，也不决定 JSONL 的 Group 边界；建立
 Group 和文件范围时遵守 [Generic JSONL 分组规则](jsonl.md#3-从源格式建立-group-与文件范围)。
-Group 是不可拆分的最小语义整体；同一稳定 TaskBlock 内的相邻 Group 也会完整保留，
+Group 是不可拆分的完整语境；同一稳定 TaskBlock 内的相邻 Group 也会完整保留，
 使重试能够继续提供原来装箱时已经存在的语境。Group 的语义边界不能依赖相邻 Group 恰好进入同一个
 TaskBlock。完整公共规则见
 [TaskBlock 规划规格](../translation/task-planning.md)。
 
-外部转换时按真实语义边界建立 Group。不可拆的长 Group 可以独占任务；错误分组造成的
-超长任务应回到 JSONL 转换步骤修正。ATT 只在完整 Group 之间划分 TaskBlock。
+外部转换时按 JSONL 规格优先保留完整场景和连续对话。长 Group 可以独占任务；达到目标字符
+数不构成拆分理由。实际服务限制或可复现问题需要重新分组时，回到来源保留完整剧情关系。
+ATT 只在完整 Group 之间划分 TaskBlock，不自动重组外部已经切碎的场景。
 
 发送 TaskBlock 时：
 
