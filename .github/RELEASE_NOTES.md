@@ -1,12 +1,13 @@
-# ATT 1.3.9
+# ATT 1.3.10
 
-本次更新优先保留 Generic 翻译的完整剧情语境，修复相同台词在不同场景或轮次之间误用译文的问题。
+本次更新精简翻译文档与随包 Skill，并简化调查、译前检查和外部适配器验收的填写要求。
 
-- Generic 只在完整 Group 语境及组内位置相同时复用译文。兄弟文本、Group 种类或组内位置不同的同一句话分别翻译；完整场景重复引用时仍可复用对应位置的译文。
-- 需要模型翻译时，同一 Group 中重复出现的台词也按各自位置处理，保留不同轮次的人称、语气和含义。
-- JSONL 分组指南和随包翻译 Skill 明确沿实际剧情保留完整场景、连续对话、问答、选项与必要铺垫，同时保留各自写回位置。目标字符数不作为拆分场景的理由。
+- Survey 的 Generic 决定直接使用 `groups` 指定语义分组，移除嵌套的 `generic_evidence`；排除决定不再填写 `reason`、`evidence`，`members` 可省略。生成与核对流程继续校验分组覆盖、自然顺序、来源文件和 `kind`。
+- Placeholder 译前检查决定只填写 `target`、`decision` 和按需指定的 `protection`，不再填写 `reason`、`evidence`。
+- 外部适配器检查与布局测量的 `details` 可留空，文件绑定、实际文本观察和尺寸核对继续保留。
+- 精简 RPG Maker、Generic、Ren'Py、VX Ace 等翻译指南和引擎参考，集中引用现行规格；同步整理 Formic 任务设计、维护与运行档案说明。
 
-ATT 与随包 Formic 共同使用版本号 `1.3.9`，发行包为 Windows x64 静态 Release。
+ATT 与随包 Formic 共同使用版本号 `1.3.10`，发行包为 Windows x64 静态 Release。
 
 升级时保留 ATT 根目录的 `config.toml`、`tools/formic/config.toml` 和 `projects/`。
-复用规则调整不会自动重译已经保存且仍适用的译文；已有台词需要修订时，通过 Manual TOML 精确提交。
+Survey 与译前检查只接受当前决定格式。继续已有任务时，按新格式重新审核决定并运行 `finalize` 或译前检查，重新生成后续计划与 QA 产物；旧格式不自动迁移。
