@@ -88,24 +88,11 @@ WriteBack 不注册或触发发布后回调。
 
 ## 3. 一次发布
 
-全部候选完成并验证后，ATT 一次替换整个 `write_back/`。进入目录交换前失败或取消时，
-上一次成功输出保持原样。交换开始后，ATT 按实际状态报告未发布、需要恢复或结果未知；
-发布结果无法确认时保留现场并报告恢复位置。存储条件与各终态的处理方法见
-[目录发布规格](../runtime/directory-publishing.md)。
+全部候选完成并验证后，ATT 按[目录发布规格](../runtime/directory-publishing.md)一次替换整个
+`write_back/`（进入目录交换前失败或取消时保持上一次输出；交换开始后的恢复与终态处理见目录发布规格）。
 
-`write_back/` 是要部署的译后内容树。操作者需要把它按实际部署方式放进隔离游戏副本，
-再确认游戏读取了这些文件；目录本身不包含运行完整游戏所需的全部资源。
+每次命令写 `publication.started` 和唯一 `publication.finished`：成功时保存使用译文和保留原文的
+Unit 数；失败时 `result` 为 `not_published`、`recovery_required` 或 `outcome_unknown`，具体问题由
+同次可读 `diagnostic.publication` 说明。
 
-发布完成后按[翻译验收指南](../guides/acceptance.md)检查全部输出差异、源语残留、布局风险、
-组合项目覆盖和实际加载；WriteBack 成功本身不是整个翻译任务的完成证明。
-
-每次命令写 `publication.started` 和唯一 `publication.finished`。成功时 RPG Maker 汇总保存
-使用译文和保留原文的 Unit 数；失败时 result 为 `not_published`、
-`recovery_required` 或 `outcome_unknown`。具体问题由同次可读 `diagnostic.publication`
-说明，不附内部诊断引用。
-
-恢复路径固定为 `<parent>/.directory-publish/<target-name>/{stage,backup,journal}`。保持项目、
-输入、目标和这些路径不变，按[目录发布规格](../runtime/directory-publishing.md)处理诊断中的
-对象、原因、影响和处理办法。发布已经生效但只剩清理失败时，修正占用或权限后重新运行同一目标
-WriteBack，下一次准备会先恢复。journal 损坏、必要 backup 缺失或结果未知时禁止重跑试探，
-也不手工移动或删除恢复目录。
+`write_back/` 是待部署的译后内容树，操作者将其部署到隔离游戏副本后，按[翻译验收指南](../guides/acceptance.md)完成检查。

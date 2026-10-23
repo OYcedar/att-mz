@@ -34,13 +34,11 @@ from att_skill_tools import (
 )
 from att_toolbox.coverage import coverage_projection
 from att_toolbox.generic_mapping import (
-    generic_mapping_groups,
     generic_materials,
     generic_recipe,
-    validate_generic_evidence,
+    validate_generic_groups,
 )
 from att_toolbox.survey import (
-    GENERIC_EVIDENCE_FIELDS,
     json_lines,
     load_survey,
     read_jsonl,
@@ -263,7 +261,7 @@ def _decision_rows(
         validate_object_keys(
             row,
             f"{path} 第 {line_number} 行",
-            {"target", "game_root", "members", "owner", "generic_evidence", "reason", "evidence"},
+            {"target", "game_root", "members", "owner", "groups"},
         )
         target = row.get("target")
         owner = row.get("owner")
@@ -285,11 +283,13 @@ def _decision_rows(
             fail(
                 str(path), f"第 {line_number} 行 target 不存在", "只引用当前 review-groups.jsonl 中的自然 ID"
             )
-        if row.get("game_root") != game_root or row.get("members") != expected_members[target]:
+        if row.get("game_root") != game_root or (
+            "members" in row and row.get("members") != expected_members[target]
+        ):
             fail(
                 str(path),
                 f"第 {line_number} 行不属于当前 survey 的来源位置集合",
-                "从当前 ownership-decisions.jsonl 复制目标行并只填写决定与证据",
+                "从当前 ownership-decisions.jsonl 复制目标行并填写决定",
             )
         if target in output:
             fail(str(path), f"{target} 出现重复决定", "每个目标只保留一条决定")
@@ -354,31 +354,6 @@ def _members(args: argparse.Namespace) -> int:
         object_name=f"candidate 决定文件 {output_display}",
     )
     return 0
-
-
-def _non_blank(value: JsonValue) -> str | None:
-    return value if isinstance(value, str) and value.strip() else None
-
-
-def _generic_evidence(
-    row: Mapping[str, JsonValue],
-    candidate_ids: Sequence[str],
-) -> tuple[dict[str, JsonValue] | None, list[str]]:
-    value = row.get("generic_evidence")
-    if not isinstance(value, dict):
-        return None, list(GENERIC_EVIDENCE_FIELDS)
-    missing = [
-        field
-        for field in GENERIC_EVIDENCE_FIELDS
-        if (
-            not isinstance(value.get(field), dict)
-            if field == "extract_group_unit_write_back_mapping"
-            else _non_blank(value.get(field)) is None
-        )
-    ]
-    if missing:
-        return None, missing
-    return validate_generic_evidence(value, candidate_ids, "审核决定 generic_evidence"), []
 
 
 def _rules_toml(rules: Sequence[Mapping[str, JsonValue]]) -> str:
@@ -503,17 +478,16 @@ def _finalize(args: argparse.Namespace) -> int:
                     cast(set[str], accumulator["targets"]).add(target)
                 dispositions.append({"target": target, "owner": "rules", "candidate_ids": selected_ids})
             elif owner == "generic":
-                evidence, missing = _generic_evidence(row, selected_ids)
-                if missing:
+                raw_groups = row.get("groups")
+                if not isinstance(raw_groups, list) or not raw_groups:
                     unresolved.append(
                         {
                             "target": target,
-                            "reason": "generic_evidence_incomplete",
-                            "missing": missing,
+                            "reason": "generic_groups_missing",
                         }
                     )
                     continue
-                assert evidence is not None
+                normalized_groups = validate_generic_groups(raw_groups, selected_ids, f"审核决定 {target}")
                 unsupported = [
                     candidate_id
                     for candidate_id in selected_ids
@@ -533,7 +507,7 @@ def _finalize(args: argparse.Namespace) -> int:
                         "target": target,
                         "owner": "generic",
                         "candidate_ids": selected_ids,
-                        "evidence": evidence,
+                        "groups": normalized_groups,
                     }
                 )
                 generic_plan.append(
@@ -541,29 +515,22 @@ def _finalize(args: argparse.Namespace) -> int:
                         "target": target,
                         "candidate_ids": selected_ids,
                         "locations": [locations_by_id[value] for value in selected_ids],
-                        "evidence": evidence,
+                        "groups": normalized_groups,
                     }
                 )
             elif owner == "exclude":
-                reason = _non_blank(row.get("reason"))
-                evidence = _non_blank(row.get("evidence"))
-                if reason is None or evidence is None:
-                    unresolved.append({"target": target, "reason": "exclusion_evidence_incomplete"})
-                    continue
                 dispositions.append(
                     {
                         "target": target,
                         "owner": "exclude",
                         "candidate_ids": selected_ids,
-                        "reason": reason,
-                        "evidence": evidence,
                     }
                 )
             else:
                 unresolved.append(
                     {
                         "target": target,
-                        "reason": _non_blank(row.get("reason")) or "Agent 尚未确认唯一所有者",
+                        "reason": "unresolved",
                     }
                 )
 
@@ -651,7 +618,7 @@ def _finalize(args: argparse.Namespace) -> int:
                 {
                     cast(str, group["id"])
                     for plan in generic_plan
-                    for group in generic_mapping_groups(cast(dict[str, JsonValue], plan["evidence"]))
+                    for group in cast(list[dict[str, JsonValue]], plan["groups"])
                 }
             ),
             "unresolved": len(unresolved),

@@ -58,26 +58,13 @@ JSONL 解析器重新读取，并确认除 `text` 外的全部事实与当前输
 候选完成后再次确认外部输入指纹。输入在生成期间改变时，候选不发布，并明确要求重新
 Extract。
 
-项目及发布目标先满足[目录发布规格](../runtime/directory-publishing.md)的存储条件。
-所有验证成功后，ATT 一次替换整个 `write_back/`。进入目录交换前失败或取消时，上一次
-成功输出保持。发布结果无法确认时，ATT 保留恢复现场并如实报告实际影响，不宣称成功也
-不擅自回滚；恢复位置按[目录发布规格](../runtime/directory-publishing.md)说明。
+项目及发布目标满足[目录发布规格](../runtime/directory-publishing.md)的存储与恢复条件。
+所有验证成功后，ATT 一次替换整个 `write_back/`；进入目录交换前失败或取消时，上一次
+成功输出保持不变。
 
-目录发布恢复路径固定为
-`<parent>/.directory-publish/<target-name>/{stage,backup,journal}`。保持项目、输入、目标和恢复
-路径不变，按[目录发布规格](../runtime/directory-publishing.md)处理诊断中的对象、原因和修改
-方法。journal 损坏、目标与已知旧目录都缺失、必要 backup 缺失或结果未知时，不重跑试探，
-也不手工删除、改名或移动工作目录。
+Generic WriteBack 写 `publication.started` 和唯一 `publication.finished`：成功结果为
+`published`（汇总 `files`、`translated_units` 和 `retained_source_units`）；失败结果为
+`not_published`、`recovery_required` 或 `outcome_unknown`，具体问题由同次可读
+`diagnostic.publication` 说明。
 
-Generic WriteBack 必须写 `publication.started` 和唯一 `publication.finished`。成功结果为
-`published`，汇总 `files`、`translated_units` 和 `retained_source_units`；失败结果为 `not_published`、
-`recovery_required` 或 `outcome_unknown`。具体问题由同次可读 `diagnostic.publication` 说明，
-不附内部诊断引用。
-
-发布完成后，外部操作者仍需消费全部译后 JSONL，并按
-[翻译验收指南](../guides/acceptance.md)核对完整写回、源语残留、组合项目和实际消费者。
-Generic WriteBack 成功只证明 ATT 输出明确，不证明最终游戏已经采用译文。
-外部适配器按[外部适配器验收](adapter-verification.md)验证真实替换文本和最终消费者，并可将
-绑定当前文件的观察、原生检查及布局测量交给 QA 汇总。
-独立 Generic 项目可用随包 `translation_qa.py scan --generic-input <当前 JSONL 根>` 核对完整
-Translation export 和实际 `write_back`；外部来源映射、反向转换与实际消费者仍需按任务事实另行验证。
+发布完成后，外部操作者消费译后 JSONL 写回游戏原格式，并按[外部适配器验收](adapter-verification.md)和[翻译验收指南](../guides/acceptance.md)完成验证。

@@ -37,16 +37,6 @@ from .survey_rpg_data import (
 )
 from .survey_suggestions import lexical_suggestion, rule_proposal
 
-GENERIC_EVIDENCE_FIELDS = (
-    "exact_location",
-    "active_runtime_consumer",
-    "player_visible_non_image_text",
-    "builtin_not_owner",
-    "rules_cannot_map_reversibly",
-    "extract_group_unit_write_back_mapping",
-    "unique_owner",
-)
-
 _EXTERNAL_TEXT_SUFFIXES = frozenset(
     {
         ".cfg",

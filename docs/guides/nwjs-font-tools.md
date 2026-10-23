@@ -1,22 +1,12 @@
 # NW.js 运行观察与 RPG Maker 字体工具
 
-这两项随包工具用于 WriteBack 后的界面观察和字体替换，操作对象是独立游戏副本与工具报告。
-ATT 项目数据库保持不变；来源覆盖、译文质量和写回结果仍按各自验收流程检查。
+这两项随包工具用于 WriteBack 后的界面观察和字体替换，操作对象是独立游戏副本与工具报告，不修改 ATT 项目数据库。
 
-运行观察和字体工具按游戏根、内容根的顺序解析 `package.json` 中的本地 HTML 入口，
-相对路径以对应配置文件所在目录为基准。两处配置同时存在时优先采用游戏根入口，
-与从游戏根启动 `Game.exe` 的行为一致；传入 `www` 内容目录也保持这一选择。
+运行观察和字体工具按“游戏根 → 内容根”的顺序解析 `package.json` 中的本地 HTML 入口（相对路径以对应配置文件所在目录为基准）；两处配置共存时优先采用游戏根入口，与启动 `Game.exe` 的行为一致。
 
 ## 1. NW.js 实际界面观察
 
-在可丢弃的完整游戏副本上运行。工具启动并持有该副本的 `Game.exe`，使用独立的 NW.js 用户数据
-目录，通过仅监听本机回环地址的 Chrome DevTools Protocol 读取实际绘制。结束时关闭自有进程；
-不会重载页面、发送键盘事件或终止其他 NW.js 进程。
-
-同一输出目标通过旁边的固定 `.<output-name>.runtime.lock` 串行建立运行现场。
-清理会先把已确认身份的对象原子认领到对应的 `.runtime.cleanup` 或 `.lock.cleanup` 固定路径；
-遇到保留现场时，先确认对应观察任务已经结束，再按诊断指出的精确路径处理。CDP 正常关闭失败时，
-工具会继续等待并通过操作系统关闭自有进程；观察或关闭已经失败时，诊断同时保留这些关闭事实。
+在隔离游戏副本上运行。工具启动并持有该副本的 `Game.exe`，使用独立 NW.js 用户数据目录，通过仅监听本机回环地址的 Chrome DevTools Protocol 读取实际绘制，结束时关闭自有进程。同一输出目标通过旁边的 `.<output-name>.runtime.lock` 串行建立运行现场。
 
 自动检查已知场景：
 
@@ -27,13 +17,7 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py smoke `
   --confirm-isolated-copy
 ```
 
-`smoke` 和 `observe` 都先等待本机调试连接就绪、游戏离开 `Scene_Boot`，最长等待时间由
-`--startup-timeout` 指定。默认 75 秒足以覆盖 RPG Maker MV 常见的 60 秒字体失败窗口；正常启动会
-立即继续，不会固定等待满时长；启动更慢的游戏可调大该值。`smoke` 随后依次尝试标题、新游戏、
-对话、菜单、任务日志、选项和存档，每次切换后观察 `--settle-ms` 毫秒（默认 900）再记录该场景；
-绘制较慢的场景可调大该值。任务日志只有在当前菜单存在唯一的 quest、journal、mission、task 或 log
-命令，并且该命令有实际 handler 时才会进入；
-它不会从全局类名猜测插件场景。对话只有实际观察到 `Window_Message` 绘制文本才算已验证。
+`smoke` 和 `observe` 先等待调试连接就绪且游戏离开 `Scene_Boot`（最长等待 `--startup-timeout` 秒，默认 75 秒；正常启动立即继续）。`smoke` 随后依次尝试标题、新游戏、对话、菜单、任务日志、选项和存档，每次切换后等待 `--settle-ms` 毫秒（默认 900）再记录。任务日志仅在当前菜单存在唯一 quest/journal/mission/task/log 命令且具备实际 handler 时进入；对话需观察到 `Window_Message` 绘制文本才算已验证。
 
 记录正常游玩：
 
@@ -44,46 +28,27 @@ python skills/translate-with-att/scripts/inspect_nwjs_runtime.py observe `
   --confirm-isolated-copy
 ```
 
-`observe` 不自动切换场景。省略 `--duration` 时持续到游戏窗口关闭；传入秒数时按时结束并发布
-报告。按 Ctrl+C 会取消本次观察、关闭工具启动的进程、清理未发布现场并返回退出码 130；若取消
-恰好在报告目录交换完成后到达，诊断会明确说明报告已经发布并保留该报告。应使用鼠标或游戏本身
-支持的正常控制方式游玩；需要保留报告时让游戏正常关闭或预先设置观察时长。
-报告目录发布后，即使运行现场清理或最终终端提示失败，诊断仍以“报告已经发布”为终态并给出
-报告与残留现场的精确位置；此时直接保留并检查报告，不必重复观察。
+`observe` 不自动切换场景。省略 `--duration` 时持续到窗口关闭，传入秒数时按时结束并发布报告；按 Ctrl+C 取消并返回退出码 `130`（若报告目录已完成交换则保留已发布报告）。
 
-输出目录包含 `report.json`、按递增序列记录的完整 `events.jsonl`、实际绘制 `draws.jsonl`、
-英文候选、像素越界、字体加载检查、
-`runtime-errors.jsonl` 和截图。工具会记录页面未捕获异常、未处理 Promise rejection、
-`Graphics.printError`、资源加载错误和 RPG Maker 的 `ErrorPrinter` 错误画面。`qa_status` 解释如下：
+输出目录包含 `report.json`、`events.jsonl`、实际绘制 `draws.jsonl`、英文候选、像素越界、字体加载检查、`runtime-errors.jsonl` 和截图。`qa_status` 含义：
 
-- `needs_review`：启动没有完成，或实际观察到运行时错误、英文、可测的像素越界、请求的
-  font family 未加载；
-- `unverified`：没有上述发现，但仍有未访问场景，或无法证明每个 glyph 没有回退字体；
-- `clean`：`smoke` 的观察器必需 hooks 全部安装且完成过安装轮询；每个必验场景的动作受支持，
-  本场景序列边界内存在语义匹配的非空文本绘制，并有至少 64×64、可完整解码的 PNG 截图；同时
-  没有已知发现或未验证项。前一场景、启动期或场景切换期的绘制不能证明后一场景。
+- `needs_review`：启动未完成，或观察到运行时错误、英文残留候选、像素越界、请求的 font family 未加载；
+- `unverified`：无上述发现，但仍有未访问场景，或无法确认逐字符是否发生字体回退；
+- `clean`：`smoke` 必需 hooks 已安装，全部必验场景均有语义匹配的非空文本绘制与有效 PNG 截图（至少 64×64），且无发现或未验证项。
 
-英文候选仍需区分专名、资源事实和漏译。像素越界会同时检查 `Bitmap.drawText` 的实际位图
-边界与可安全测量的纯文本 `Window_Base.drawTextEx`；含控制符或换行的 `drawTextEx` 不猜测
-宽度，而是在 `layout-measurement-unverified.jsonl` 中记录为未验证。`document.fonts.check` 能
-确认请求的 family 是否加载，不能证明单个字符最终来自哪个字体，因此工具不会把未知的逐字
-回退伪装成通过。
+像素越界检查 `Bitmap.drawText` 位图边界与纯文本 `Window_Base.drawTextEx`；含控制符或换行的 `drawTextEx` 记录在 `layout-measurement-unverified.jsonl`。
 
-部分 NW.js 包装器不接受命令行调试端口，此时工具会明确失败且不发布报告。不能因此跳过启动
-验收：仍要按玩家方式正常启动隔离副本，等待出现标题或第一个可交互画面，确认没有错误画面并
-保存截图。没有这项证据时只能交付静态候选，不能称为首次可测试译本。若译本启动失败，再对
-未修改的原版隔离副本执行相同启动检查；原版通过而译本失败时，应先调查 WriteBack、字体、
-资源和配置差异，即使最先报错的插件文件本身没有改变，也不能直接归为原版缺陷。
+若自定义 NW.js 包装器不支持命令行调试端口，工具会明确失败；此时直接按玩家方式启动隔离副本，确认进入标题与首段交互界面无报错并留存截图。若译本启动报错而未修改的原版副本正常，重点排查 WriteBack、字体、资源与配置差异。
 
 ## 2. 递归字体调查、替换与恢复
 
-工具接受一个 OTF/TTF 文件，也可以直接选择三款随包字体：
+工具支持传入自定义 OTF/TTF 文件，或直接选用三款随包字体：
 
 - `noto-sans-sc`：Noto Sans CJK SC Regular 2.004；
 - `noto-serif-sc`：Noto Serif CJK SC Regular 2.003；
 - `lxgw-wenkai`：LXGW WenKai GB Regular 1.522。
 
-需要在修改前比较字体或只读调查时运行 `inspect`：
+只读调查（`inspect`）：
 
 ```powershell
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py inspect `
@@ -94,29 +59,7 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py inspect `
   --output D:\review\font-inspect.json
 ```
 
-工具递归建立“字体资产 → 已声明 family/stem → 静态消费者”关系。带字体后缀的完整资源路径、
-CSS 字体声明、已识别的加载 API、MV/MZ 标准字体字段、JSON/XML 中键名明确表示字体的完整值，
-以及 TOML 中由裸键直接赋值的单行字符串，都属于已证明引用。TOML 注释和多行字符串作为独立
-非代码区域跳过，同文件的其余单行赋值继续调查。`apply` 会一次处理这些引用，包括数字、图标和
-展示字体，不要求逐项确认。INI 候选会进入 Review，由操作者按对应程序的 INI 语法确认。
-CSS `@font-face` 和字体加载 API 已注册的运行时别名会原样保留，只把它们指向的字体资源换成
-选中字体；未注册、只由旧字体文件 stem 推导出的名称仍随文件名更新。这样引擎和插件继续使用
-`GameFont` 等既有契约，不会因为更换字体文件而失去已注册 family。
-活动 `YEP_LoadCustomFonts` 的 `Font Filenames` 与 `Font Families` 按
-[上游参数契约](https://www.yanfly.moe/wiki/Load_Custom_Fonts_%28YEP%29)分别用逗号分隔，逐项配对。
-工具保持 family 列表、次序、空白和消费方的名称，只更新每项加载文件；字体路径以实际 HTML
-入口所在目录的 `fonts/` 为基准。文件名中的 URL 特殊字符会编码，避免改变加载路径或列表项数。
-列表缺失、含空项、项数不一致、实际入口无法确认或对应资源缺失时，无法证明的值保持原样并
-进入 Review；这些 family 也不会被回退认定为可更名的文件 stem。停用插件及其他插件的逗号
-列表不作为该注册契约的证据，需要按实际加载代码复核。
-CSS 中重复的 `src` 声明和同一声明里的回退 URL 都保留原有顺序；工具更新其中能够定位到
-普通字体文件的静态 URL，并同步常规 format 提示。实际采用哪一条由游戏运行时决定，工具
-不预测浏览器的容错和加载优先级。`tech()`、特殊格式或无法解析的来源保留原值并进入 Review。
-同一注册 family 指向多个静态字体文件是正常的声明关系，替换后继续保留该 family。
-普通正文或普通字符串即使整值恰好等于字体 family/stem 也不会自动修改；动态值、部分表达式和
-无法证明消费者的字体资产进入 Review。
-
-默认直接执行可逆替换：
+执行可逆替换（`apply`）：
 
 ```powershell
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
@@ -128,31 +71,7 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py apply `
   --output D:\review\font-apply.json
 ```
 
-`inspect` 与 `apply` 都先按自然游戏根取得同一固定任务锁，再在锁内重新发现内容根、完整扫描并
-生成计划；`restore` 使用同一把锁，因此扫描不会读到并发恢复产生的中间状态。`apply` 不依赖之前的
-`inspect` 结果。它先建立包含每项替换前后完整字节和摘要的 `state`，再原子写入。
-
-`--translations` 必须是 ATT 当前
-`translation export`：工具严格校验自然 ID、状态和字段组合，并按 WriteBack 行为投影字符——
-current 使用译文，pending/rejected 使用仍会写回的原文。完整字体消费者范围由操作者联合核对
-同源 Survey、finalize coverage、实际 WriteBack 和隔离运行副本；`--translations` 提供其中的
-ATT 写回字符投影证据。
-`--coverage-text` 只是已知额外玩家文本，可以重复传入；它的覆盖结论只适用于所给文本，不能因
-含有任意一个已覆盖字符而把项目报告提升为 `clean`。选中字体缺少任一已检查字符只会进入 Review，
-不会阻止安全的已证明引用替换。未提供 Translation export、其投影没有非空字符、没有已证明引用、
-或所有引用已经指向选中字体时命令仍成功退出；报告用 `applied`、`no_op` 和 `qa_status`
-分别说明是否写入、是否无需写入和质量结论。字体工具没有发现问题时仍为 scoped `unverified`；
-缺少任一已检查字符会成为 `needs_review`，并使 `review_required` 为 true，即使静态引用 Review 为空。
-
-字符覆盖在收集字符集前保留各行、各条目和各补充文件的边界。根据
-[Unicode 变体序列的显示规则](https://www.unicode.org/faq/vs.html)，附在基础字符后的变体选择符
-不要求独立字形；工具用 Unicode cmap 4/12/13 检查基础字符，普通结合字符仍参与缺字检查。
-孤立或紧随空白、控制字符、结合字符及另一选择符的变体选择符记录在
-`coverage.unattached_variation_selectors`，并以 `unattached_variation_selector` 进入 Review，
-与 `missing_characters` 的真实缺字分开。这个静态检查没有验证 cmap format 14 或指定变体的
-实际显示；需要保持特定变体字形时，仍须在游戏运行环境中检查。
-
-恢复：
+恢复原状（`restore`）：
 
 ```powershell
 python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py restore `
@@ -161,23 +80,19 @@ python skills/translate-with-att/scripts/manage_rpg_maker_fonts.py restore `
   --output D:\review\font-restore.json
 ```
 
-`restore` 逐项接受 state 中记录的 apply 前或 apply 后字节，并在每次实际写入或删除前即时重读：
-before 直接跳过，after 恢复，第三种字节停止且保持原样。因此进程在部分写入后中断也能恢复；
-写入中途失败只回滚已经尝试的文件，不会删除或覆盖尚未尝试位置上由其他进程建立的内容。
-清单预检、提交、回滚和最终验收都按项读取快照，内存中只保留当前项的前后字节；restore 开始时
-同时绑定 state 目录与 `manifest.json`，运行中发生替换或漂移会停止提交并进入可核对终态。
-每个游戏目标都保留其自然逻辑路径，并从游戏根逐层拒绝符号链接和 Windows reparse point，
-因此 apply/restore 只会修改游戏根内的普通路径。
-字体文件和机器状态使用同一套固定临时文件发布规则。发布调用在文件已生效后发生取消或清理错误时，
-诊断会保留已发布事实和精确 `.att-font.tmp` 残留位置。最终终端提示失败不改变已经完成的 inspect
-报告、apply 游戏与 state，或 restore 游戏、state 与结果 JSON；按诊断中的完成事实继续即可。
-按 Ctrl+C 取消 apply/restore 时，工具先完成可行回滚并确认 state 事实，再以退出码 130 返回。
-`state/status.json` 记录 `prepared`、`applied`、`rolled_back`、`restored` 或 `recovery_required`。
-出现 `recovery_required` 时必须停止使用该
-游戏目录，并根据 `manifest.json` 和前后快照恢复，不得重试 apply。
+### 引用识别与替换规则
+
+- **已证明引用**：带字体后缀的资源路径、CSS 字体声明、已知加载 API、MV/MZ 标准字体字段、JSON/XML 中键名明确表示字体的完整值，以及 TOML 裸键单行字符串赋值。`apply` 自动替换这些引用指向的字体资源。
+- **保留运行时别名**：CSS `@font-face` 和字体加载 API 已注册的 family 名称（如 `GameFont`）原样保留，仅替换其指向的字体文件；未注册、仅由旧文件名 stem 推导的名称随文件名更新。
+- **`YEP_LoadCustomFonts`**：活动插件的 `Font Filenames` 与 `Font Families` 按逗号分隔逐项配对，保留 family 名称与顺序，仅更新加载文件名（以实际 HTML 入口所在目录的 `fonts/` 为基准）。列表缺失、项数不一致或资源缺失时保留原值并记入 Review。
+- **进入 Review 的情况**：INI 候选、CSS `tech()` 或无法解析的动态来源、停用插件列表及无法证明消费者的字体资产保持原值并进入 Review。
+
+### 字符覆盖与状态恢复
+
+- `--translations` 传入当前 `translation export`（按 WriteBack 行为投影字符：current 取译文，pending/rejected 取原文）；`--coverage-text` 可重复传入额外玩家可见文本。
+- 工具使用 Unicode cmap 4/12/13 检查基础字符与普通结合字符；孤立或未附着在基础字符后的变体选择符记入 `coverage.unattached_variation_selectors`，缺字记入 `missing_characters`（使 `qa_status` 为 `needs_review`）。
+- `apply` 在写入前建立包含替换前后快照的 `state` 目录。`state/status.json` 记录 `prepared`、`applied`、`rolled_back`、`restored` 或 `recovery_required`；出现 `recovery_required` 时执行 `restore` 恢复，不直接重试 `apply`。
 
 ## 3. 字体来源与许可
 
-三款字体均为上游官方 Release 的未修改文件，使用 SIL Open Font License 1.1。精确版本、
-下载地址、文件大小和 SHA-256 记录在 `licenses/fonts/SOURCES.json`；Noto CJK 与
-LXGW WenKai GB 的许可原文分别保存在同目录对应的 OFL 文件中。
+三款随包字体均为上游官方 Release 的未修改文件，使用 SIL Open Font License 1.1。版本、下载地址、文件大小和 SHA-256 记录在 `licenses/fonts/SOURCES.json`，许可原文保存在同目录对应的 OFL 文件中。

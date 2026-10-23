@@ -1,4 +1,4 @@
-"""校验 Survey Generic 决定中的语义分组与外部映射证据。"""
+"""校验 Survey Generic 决定中的语义分组与外部映射。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,6 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 from att_skill_tools import JsonValue, fail, validate_object_keys
-
-from .survey_sources import GENERIC_EVIDENCE_FIELDS
-
-_MAPPING_FIELD = "extract_group_unit_write_back_mapping"
 
 
 def generic_recipe(location: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
@@ -76,27 +72,13 @@ def generic_recipe(location: Mapping[str, JsonValue]) -> dict[str, JsonValue] | 
     return recipe
 
 
-def validate_generic_evidence(
-    value: Mapping[str, JsonValue],
+def validate_generic_groups(
+    raw_groups: JsonValue,
     candidate_ids: Sequence[str],
     object_name: str,
-) -> dict[str, JsonValue]:
-    """返回完整当前证据，并证明语义 Group 精确覆盖所选候选。"""
+) -> list[dict[str, JsonValue]]:
+    """校验语义 Group 列表并确认其按自然顺序精确覆盖所选候选。"""
 
-    evidence = dict(value)
-    validate_object_keys(evidence, object_name, set(GENERIC_EVIDENCE_FIELDS))
-    for field in GENERIC_EVIDENCE_FIELDS:
-        if field == _MAPPING_FIELD:
-            continue
-        item = evidence.get(field)
-        if not isinstance(item, str) or not item.strip():
-            fail(object_name, f"{field} 不是非空证据", "填写该 Generic 所有权证据后重新 finalize")
-
-    mapping = evidence.get(_MAPPING_FIELD)
-    if not isinstance(mapping, dict):
-        fail(object_name, f"{_MAPPING_FIELD} 不是 object", "按当前 groups 结构填写精确映射")
-    validate_object_keys(mapping, f"{object_name}.{_MAPPING_FIELD}", {"groups"})
-    raw_groups = mapping.get("groups")
     if not isinstance(raw_groups, list) or not raw_groups:
         fail(object_name, "Generic 映射缺少非空 groups", "为每个可共同理解的语义组填写一项")
 
@@ -135,26 +117,18 @@ def validate_generic_evidence(
             "Generic groups 没有按自然顺序逐项覆盖当前决定候选",
             "让 candidate_ids 与当前 target 的候选列表精确一致且每项只出现一次",
         )
-    evidence[_MAPPING_FIELD] = {"groups": normalized_groups}
-    return evidence
-
-
-def generic_mapping_groups(evidence: Mapping[str, JsonValue]) -> list[dict[str, JsonValue]]:
-    """读取已经通过 validate_generic_evidence 的规范语义组。"""
-
-    mapping = cast(dict[str, JsonValue], evidence[_MAPPING_FIELD])
-    return cast(list[dict[str, JsonValue]], mapping["groups"])
+    return normalized_groups
 
 
 def validate_generic_group_placement(
-    evidence: Mapping[str, JsonValue],
+    groups: Sequence[Mapping[str, JsonValue]],
     locations_by_id: Mapping[str, Mapping[str, JsonValue]],
     placements: dict[str, tuple[str, str]],
     object_name: str,
 ) -> None:
     """同名 Group 汇合不同所有权决定的成员，并保持同一 kind 和来源文件。"""
 
-    for group in generic_mapping_groups(evidence):
+    for group in groups:
         group_id = cast(str, group["id"])
         candidate_ids = cast(list[str], group["candidate_ids"])
         physical_values = [
@@ -211,13 +185,13 @@ def generic_materials(
             candidate_id = cast(str, recipe["candidate_id"])
             recipes_by_candidate[candidate_id] = recipe
             target_by_candidate[candidate_id] = target
+        raw_groups = cast(list[dict[str, JsonValue]], plan["groups"])
         validate_generic_group_placement(
-            cast(dict[str, JsonValue], plan["evidence"]),
+            raw_groups,
             locations_by_candidate,
             placements,
             target,
         )
-        raw_groups = generic_mapping_groups(cast(dict[str, JsonValue], plan["evidence"]))
         for raw_group in raw_groups:
             candidate_ids = cast(list[str], raw_group["candidate_ids"])
             source_recipes = [recipes_by_candidate[candidate_id] for candidate_id in candidate_ids]
@@ -235,7 +209,7 @@ def generic_materials(
             {
                 "target": target,
                 "candidate_ids": cast(list[JsonValue], plan["candidate_ids"]),
-                "evidence": cast(dict[str, JsonValue], plan["evidence"]),
+                "groups": raw_groups,
             }
         )
     order = {

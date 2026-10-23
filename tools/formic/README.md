@@ -64,7 +64,7 @@ job/
 .\formic.exe run --data job/data --plan job/plan.jsonl --task job/task.md --out job/out --worker-output-access none --config .\config.toml
 ```
 
-每个单元独立发布到 `job/out/results/`；运行档案位于 `job/out/runs/run-N/workers/`。并发窗口控制同时活动的工作，计划单元总量、普通工具调用总数和对话回合总数没有额外上限。
+每个单元独立发布到 `job/out/results/`；运行档案位于 `job/out/runs/run-000001/workers/`。并发窗口控制同时活动的工作，计划单元总量、普通工具调用总数和对话回合总数没有额外上限。
 
 首次运行和续跑都必须传 `--worker-output-access`。独立任务通常使用 `none`，worker 可读取冻结的 input；`published` 额外允许辅助查阅已经发布的单元结果。结果出现的顺序取决于完成时间，因此单元正确性必须独立于其他 worker 的结果。
 

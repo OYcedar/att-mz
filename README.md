@@ -52,7 +52,7 @@ Set-Location 'D:\Tools\ATT'
 .\att.exe test
 ```
 
-术语初筛必须使用随包 Formic，它的模型服务单独配置。按
+术语初筛使用随包 Formic，其模型服务单独配置。按
 [Formic 使用说明](tools/formic/README.md#2-配置模型)编辑 `tools\formic\config.toml`，
 仍在 ATT 目录执行连接自检：
 

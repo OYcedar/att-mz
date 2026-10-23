@@ -200,7 +200,7 @@ def _read_decisions(path: Path) -> dict[str, dict[str, JsonValue]]:
         validate_object_keys(
             row,
             f"{source} 第 {line_number} 行",
-            {"target", "decision", "protection", "reason", "evidence"},
+            {"target", "decision", "protection"},
         )
         target = row.get("target")
         action = row.get("decision")
@@ -637,11 +637,6 @@ def _apply_decisions(
             unresolved.append(target)
             continue
         action = cast(str, decision["decision"])
-        evidence = decision.get("evidence")
-        reason = decision.get("reason")
-        if action in {"protect", "ignore"} and (not isinstance(evidence, str) or not evidence.strip()):
-            unresolved.append(target)
-            continue
         if action == "protect":
             protection = decision.get("protection")
             raw_options = candidate.get("rule_options")
@@ -676,8 +671,6 @@ def _apply_decisions(
                     if action in {"protect", "ignore"}
                     else "unresolved"
                 ),
-                "reason": reason if isinstance(reason, str) else "",
-                "evidence": evidence if isinstance(evidence, str) else "",
                 **(
                     {"protection": cast(str, decision["protection"])}
                     if isinstance(decision.get("protection"), str)

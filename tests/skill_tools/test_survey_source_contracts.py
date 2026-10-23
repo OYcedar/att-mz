@@ -287,23 +287,13 @@ class CoverageProjectionTests(unittest.TestCase):
             for row in rows:
                 member = row["members"][0]
                 if member["source_text"] == "quest_key":
-                    row.update(owner="exclude", reason="内部任务键", evidence="界面读取 title 与 description")
+                    row.update(owner="exclude")
                     continue
                 candidate = member["candidate_id"]
                 expected_candidates.append(candidate)
                 row.update(
                     owner="generic",
-                    generic_evidence={
-                        "exact_location": member["location"],
-                        "active_runtime_consumer": "currentQuest 的任务界面",
-                        "player_visible_non_image_text": "任务标题与说明",
-                        "builtin_not_owner": "活动脚本中的字符串",
-                        "rules_cannot_map_reversibly": "源码字符串使用 Generic 写回位置",
-                        "unique_owner": "仅此 Generic 项目",
-                        "extract_group_unit_write_back_mapping": {
-                            "groups": [{"id": "quest-entry", "kind": "quest", "candidate_ids": [candidate]}]
-                        },
-                    },
+                    groups=[{"id": "quest-entry", "kind": "quest", "candidate_ids": [candidate]}],
                 )
             for row in (
                 json.loads(line)
@@ -312,7 +302,7 @@ class CoverageProjectionTests(unittest.TestCase):
                 .splitlines()
             ):
                 if row["target"] != "group:" + quest[0]["review_group_id"]:
-                    row.update(owner="exclude", reason="样本启动信息", evidence="任务界面只读取 quest")
+                    row.update(owner="exclude")
                     rows.append(row)
             members_path.write_text(
                 "".join(json.dumps(row) + "\n" for row in reversed(rows)), encoding="utf-8"

@@ -233,29 +233,13 @@ user message。请求沿用本规格的协议正文、认证、Endpoint 规范�
 
 ## 6. 敏感信息闭集唯一权威
 
-本节是 ATT 现行敏感信息闭集、替换语义与内容边界的唯一权威。闭集只包含本次实际选中
-LLM Client 的 API key 实际值：普通模型命令选中一个 Client，`att test` 选中它检查的全部
-Client。Prompt、原文、译文、自定义参数、
-Thinking、Assistant、Provider 正文和普通用户内容都按普通内容处理。这份清单在
-任何模块、日志、诊断、文档、测试或 Skill 中都保持原样，不增不减，也不另行复述。
+本节是 ATT 现行敏感信息闭集与脱敏替换的唯一权威。敏感信息闭集仅包含本次实际选中 LLM Client 的 `api_key` 值（普通模型命令为所选 Client，`att test` 为全部受检 Client）。Prompt、原文、译文、自定义参数、Thinking、Assistant 和 Provider 正文均按普通内容处理。
 
-运行根的 Debug、CLI 和普通 JSONL 用稳定摘要说话：Client ID、阶段、Endpoint
-对象、HTTP 状态、超时种类，以及经过处理的标准供应商错误字段都可以出现；公开诊断只用
-对象、原因、影响和处理办法呈现；
-闭集值与完整请求、原始响应、Header 不出现。`error.message` 先精确替换当前 API key，
-再删除终端控制和双向控制字符并收敛为单行；没有可见内容时省略。这是运行根职责、
-稳定 schema、控制字符和输出体积的边界，与敏感性分类无关。
-
-翻译任务记录只保存实际 User message、原始 Assistant 和最终任务结果，并在这些正文与
-诊断中应用同一个闭集替换器。每个精确匹配片段都替换为：
+- **CLI 与项目日志**：只输出 Client ID、阶段、安全 Endpoint（仅含 `scheme`、`host`、可选 `port`）、HTTP 状态、超时种类，以及经过脱敏和单行清理的标准 `error.message`（先精确替换当前 `api_key`，再移除终端控制与双向控制字符并收敛为单行；无可见内容时省略）。不输出完整请求、原始响应或请求头。
+- **翻译任务记录**：保存实际 User message、原始 Assistant 和最终任务结果（含按第 3 节投影的最终 attempt 服务方名称），并将精确命中的 `api_key` 替换为：
 
 ```text
 [REDACTED API KEY]
 ```
 
-替换器只碰命中的闭集值：所在字段、段落和相邻正文保持原样，替换标记本身也不再处理。
-配置、Endpoint、Model、parameters、Header、Provider 外层信封和非 200 原始 body 不进入
-任务记录；只有按第 3 节规则投影的最终 attempt 服务方名称进入最终结果。`Authorization` 是一个
-字段和一种认证方案，不是另一类敏感信息；诊断需要说明认证事实时，保留字段名和方案就够了。
-任务记录的其余格式契约见
-[模型任务记录现行规格](../translation/task-records.md)。
+替换器只替换命中的 `api_key` 值，保持所在字段与相邻正文原样。配置、Endpoint、Model、`parameters`、Header、Provider 外层信封和非 200 原始 body 不进入任务记录（详见[模型任务记录现行规格](../translation/task-records.md)）。

@@ -9,8 +9,8 @@ from typing import cast
 from att_skill_tools import JsonValue, fail, read_json_object, validate_object_keys
 
 from .generic_mapping import (
-    validate_generic_evidence,
     validate_generic_group_placement,
+    validate_generic_groups,
 )
 from .survey_projection import project_builtin_units, project_rule_units
 
@@ -195,8 +195,8 @@ def coverage_projection(
         owner = raw.get("owner")
         allowed_fields = {
             "rules": {"target", "owner", "candidate_ids"},
-            "generic": {"target", "owner", "candidate_ids", "evidence"},
-            "exclude": {"target", "owner", "candidate_ids", "reason", "evidence"},
+            "generic": {"target", "owner", "candidate_ids", "groups"},
+            "exclude": {"target", "owner", "candidate_ids"},
         }.get(owner if isinstance(owner, str) else "")
         if allowed_fields is None:
             fail(
@@ -225,26 +225,23 @@ def coverage_projection(
         if expected_candidates is None or typed_candidates != expected_candidates:
             fail(str(path), f"dispositions 第 {number} 项 target 与候选不一致", "重新运行 finalize")
         if owner == "generic":
-            evidence = raw.get("evidence")
-            if not isinstance(evidence, dict):
-                fail(str(path), f"dispositions 第 {number} 项缺少 Generic 证据", "重新运行 finalize")
-            normalized_evidence = validate_generic_evidence(
-                evidence,
+            normalized_groups = validate_generic_groups(
+                raw.get("groups"),
                 typed_candidates,
-                f"{path} dispositions 第 {number} 项 evidence",
+                f"{path} dispositions 第 {number} 项",
             )
             validate_generic_group_placement(
-                normalized_evidence,
+                normalized_groups,
                 locations_by_id,
                 generic_placements,
-                f"{path} dispositions 第 {number} 项 evidence",
+                f"{path} dispositions 第 {number} 项",
             )
             generic_plans.append(
                 {
                     "target": target,
                     "candidate_ids": list(typed_candidates),
                     "locations": [locations_by_id[candidate_id] for candidate_id in typed_candidates],
-                    "evidence": normalized_evidence,
+                    "groups": normalized_groups,
                 }
             )
             overlap = generic_candidates.intersection(typed_candidates)
@@ -255,12 +252,6 @@ def coverage_projection(
             if target in rules_dispositions:
                 fail(str(path), f"Rules target {target} 被重复决定", "重新运行 survey finalize")
             rules_dispositions[target] = typed_candidates
-        elif owner == "exclude":
-            if any(
-                not isinstance(raw.get(field), str) or not cast(str, raw[field]).strip()
-                for field in ("reason", "evidence")
-            ):
-                fail(str(path), f"dispositions 第 {number} 项排除证据无效", "重新运行 finalize")
         resolved_review_candidates.extend(typed_candidates)
     if counts.get("generic_groups") != len(generic_placements):
         fail(str(path), "coverage generic_groups 与结构化映射不一致", "重新运行 survey finalize")

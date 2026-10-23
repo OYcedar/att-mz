@@ -67,16 +67,9 @@ ATT 在这个 Group 前结束当前块，再建立下一个 TaskBlock。ATT 不�
 容量；一个文件可以产生多个 TaskBlock。
 
 Group 永远作为整体进入任务。单个 Group 超过 Profile 目标字符数时仍独占一个任务，后续
-Group 继续按同一目标组合。目标字符数不是硬上限，也不决定 JSONL 的 Group 边界；建立
-Group 和文件范围时遵守 [Generic JSONL 分组规则](jsonl.md#3-从源格式建立-group-与文件范围)。
-Group 是不可拆分的完整语境；同一稳定 TaskBlock 内的相邻 Group 也会完整保留，
-使重试能够继续提供原来装箱时已经存在的语境。Group 的语义边界不能依赖相邻 Group 恰好进入同一个
-TaskBlock。完整公共规则见
+Group 继续按同一目标组合。建立 Group 和文件范围时遵守
+[Generic JSONL 分组规则](jsonl.md#3-从源格式建立-group-与文件范围)，完整公共装箱规则见
 [TaskBlock 规划规格](../translation/task-planning.md)。
-
-外部转换时按 JSONL 规格优先保留完整场景和连续对话。长 Group 可以独占任务；达到目标字符
-数不构成拆分理由。实际服务限制或可复现问题需要重新分组时，回到来源保留完整剧情关系。
-ATT 只在完整 Group 之间划分 TaskBlock，不自动重组外部已经切碎的场景。
 
 发送 TaskBlock 时：
 

@@ -1,95 +1,41 @@
 # AGENTS.md
 
-> 总纲：从真实用户结果反推纵向切片，由语义所有者承担规则和状态；设计只展开到当前直接
-> 依赖，影响分析横向覆盖全部当前调用方和同语义实现；以最小完整改动保持全局一致；任何
-> 内部或外部内容都必须存在当前消费者。
+## 1. 项目定位与版本边界
 
-## 1. 知识职责与版本边界
+ATT 是聚合多个游戏引擎（`mv`、`mz`、`generic`）翻译能力的 CLI；Formic（`crates/formic/`）是同一 workspace 下的独立多轮任务执行程序，随 ATT 共享工具链、`Cargo.lock` 和版本号并一同发布。
 
-每项事实只有一个权威来源，其他材料通过链接或明确引用使用它：
+- **单一权威来源**：外部契约与状态规则以 `docs/` 现行规格为准；指南（`docs/guides/`、`maintenance/`）与 Skill（`skills/`）只组织操作流程和验证方法，不重复定义规格。发现知识缺口时先更新对应规格，再由其他入口链接引用。
+- **单一当前版本**：业务模型、输入输出协议、SQLite schema 和配置只实现当前版本，不在工作树保留历史兼容解析、迁移或双读双写；`archive/` 仅保存与当前版本无关的原始参考材料。
 
-- 现行规格定义已经确认的产品行为与外部接口契约；
-- 指南说明调查、取证、验证和发布方法，不重新定义规格；
-- 代码和测试保存已经实现的行为与验证证据，不能反向覆盖现行规格；
-- 代表性真实材料、权威说明、实际读写关系和验证记录证明领域事实；
-- Skill 组织触发、读取顺序、操作、验收和恢复，不复制产品契约或实现细节。
+## 2. 架构与工程约定
 
-文档必须能够独立阅读和审查。发现知识缺口时，先补充并验证相应权威来源，再让其他入口引用；
-缺失的契约不能藏在代码、测试或 Skill 中。
+- **在规则所有者处解决根因**：统一入口负责跨引擎进程级职责与路由，各引擎拥有自己的命令域、状态和错误语义，语义与生命周期一致的能力提炼为唯一共享实现。修改时在拥有该状态的模块直接解决根因，并同步更新全部受影响调用方、测试、配置、规格和发行内容。
+- **当前消费者原则**：CLI、配置、外部文件、协议、日志、诊断、任务记录及内部字段、状态和抽象均须存在当前产品消费者；可稳定推导或无人消费的内容不重复输入、保存或输出。
+- **配置边界**：命令行参数只表达单次运行意图；`config.toml` 只收纳部署环境、外部服务或操作者可长期选择的策略，内部并发窗口、批次和调度参数由代码负责。
+- **跨引擎规划不变量**：Extract 建立稳定的 `Semantic Scope → Group → Unit` 层次，共享 Planner 按完整原文稳定装箱，再由引擎适配器处理去重、临时 ID、候选验收和提交（详见 [TaskBlock 规划规格](docs/translation/task-planning.md)）。
+- **自然标识**：面向人的 CLI、配置、文件名、日志、错误、临时文件和恢复目录只使用源文件名、自然编号（如 `run-000001`）、字段名或简短业务名，不展示 hash、UUID、数据库随机主键或内部编码位置。
+- **保护使用者活动配置**：发行目录中已存在的 `config.toml` 与 `tools/formic/config.toml` 属于使用者状态，资源同步或更新不得覆盖或删除；缺失时才从 `config.example.toml` 首次创建。
+- **活动窗口与并发确定性**：活动窗口只限制同时在途的工作，窗口满时等待，不限制项目总文件数或总条目数。并发只改变耗时，不改变自然顺序、分组、提交顺序或持久化一致性。
+- **证据与恢复权威分离**：项目日志、指标和任务记录默认只作为事后诊断证据，不参与数据库提交或目录发布恢复判断（恢复分别以 SQLite 和目录发布 journal 为准，详见 [项目日志规格](docs/runtime/project-log.md)）。
+- **测试边界**：生产代码和自动化测试只验证产品可观察行为与数据契约，不得读取、解析或断言 Markdown 文档、Skill 或 `dist/` 发行副本。
 
-ATT 只实现当前系统版本，业务模型、输入输出协议、持久化格式和配置不建立业务版本分支。旧实现、
-协议、格式、配置、测试、Skill 和工作流只保留在版本控制历史中，不在当前工作树建立兼容解析、
-迁移、双读双写或历史权威；`archive/` 只保存与当前版本无关、用于验证领域事实和失败模式的原始材料。
+## 3. 条件性必读材料
 
-## 2. 产品与架构不变量
-
-ATT 用一个 CLI 聚合多个游戏引擎的翻译能力。统一入口只承担真正跨引擎一致的进程级职责和
-路由；每个引擎完整拥有自己的命令域、外部契约、编排、状态和错误语义，再在契约之下复用
-语义一致的能力。
-
-- 一个纵向切片从用户入口延伸到可观察结果，包含所需业务判断、状态交接和副作用；项目进度
-  以真实结果衡量，不以目录、模块、crate 或底层组件数量衡量。
-- 从当前目标定位真正拥有规则、状态和不变量的语义所有者，在所有者处解决根因，不在调用方
-  堆叠特殊分支、重复校验或局部绕过。
-- 设计只展开到当前目标的直接依赖及其公开契约；共享规则、接口、状态或实现变化时，横向检查
-  全部当前调用方和同语义实现。
-- 直接依赖只在当前模块确有独立需要、调用职责级契约、不绕过其他语义所有者、保持单向且候选
-  中间层没有额外业务责任时成立；纯改名或转发层不构成边界。
-- 语义、规则、不变量、错误语义和生命周期一致时复用同一实现；只有部分职责一致时提炼最小
-  公共能力；仅代码形状相似时保持独立。
-- 新增引擎时重新检查现有能力。相同语义在同一次改动中提炼为唯一共享实现并迁移全部受影响
-  调用方；引擎特有规则留在对应切片，不复制既有切片或在共享模块累积引擎分支。
-- 最小完整改动必须解决根因并同步受影响的实现、调用方、测试、配置、规格和发行内容；不能用
-  最小 diff 留下已确认的语义分叉、重复知识或下一处同根故障。
-- 当前消费者原则同时适用于 CLI、配置、环境变量、外部文件、协议、模型消息、输出、日志、
-  诊断、任务记录、发行内容以及内部字段、状态、缓存、接口和抽象。可稳定推导或无人消费的
-  内容不重复输入、保存或输出；测试、示例和文档自身不是产品消费者。
-- 用户入口只表达本次意图和必须当场选择的事项；统一配置只收纳部署环境、外部服务或操作者
-  能够长期选择的策略，固定产品语义、内部资源参数、调度细节和运行时数据由实现负责。
-- 除文件、计算、存储、网络和时间等环境根接口外，领域判断、状态转换和编排使用真实实现；
-  Composition Root 只负责配置转换、构造和生命周期，生产入口只连接已经验证的能力。
-- 扩展能够用核心契约表达结果时，转换后交给语义所有者统一验收；无法表达时，私有协议自行承担
-  解析、状态、一致性、事务、恢复和往返验证，未经核心契约验收不得宣称为核心受管状态。
-
-跨引擎规划保持一项长期不变量：Extract、共享 Planner 和引擎适配器分别承担规格定义的语义
-责任；语义一致的 Planner 与模型协议使用唯一共享实现和共同契约测试。文本层次、装箱、模型
-责任和临时 ID 的先后关系只由 TaskBlock 规划规格定义。
-
-## 3. 跨切片边界
-
-- 面向人的 CLI、配置、文件名、日志、错误和文档使用源文件名、自然编号、字段名或简短业务名，
-  不要求或展示 hash、UUID、数据库随机主键或编码 locator。内部身份不得泄露为普通操作凭据；
-  原始数据库 Lua 仅作为使用者主动选择的低级接口。临时文件、日志、任务记录和恢复目录也使用
-  目标文件名、命令名或自然编号；并发安全由原子创建、项目租约或目标锁保证。
-- 发行根中已经存在的活动 `config.toml` 属于使用者状态。普通资源同步或工具更新不得覆盖、删除、
-  改名或随父目录替换；缺失时才根据当前模板首次创建。配置无效时保留原文件，诊断指出无效字段、
-  原因和修改方法；完整行为由配置与发行物规格定义。
-- ATT 不自行限制项目总量。活动窗口只限制同时处理的工作，窗口满时等待，不把合法文件、目录、
-  Lua、SQLite 或业务对象数量转成容量错误。
-- 并发、批处理、队列、超时、重试、容量拒绝和磁盘暂存必须由外部硬限制、可复现故障或测量证据
-  支持；并发只能改变完成时间，不能改变自然顺序、分组、提交、错误语义或持久化一致性。
-- 日志、指标、追踪和任务记录默认只提供证据，不参与提交、恢复、重放或副作用准入；只有现行
-  契约明确规定读取者、权威性、持久化和失败语义时才能成为业务状态。具体行为由项目日志规格定义。
-- 生产代码和测试不得读取、解析或断言 Skill、Markdown 文档、文档示例标记、导航、固定文字、
-  链接或发行副本。自动化测试只验证产品可观察行为与数据契约；Skill 引导在仓库外评估。
-- 领域模型、自然顺序、关联范围和边界行为必须由代表性真实材料、权威说明和实际读写关系共同
-  验证。示例与夹具只解释已经确认的事实；需要定位、继承或写回的原始字段和原值必须可追溯。
-
-## 4. 条件性必读材料
-
-先做确定当前目标所需的最小只读定位。确认涉及下列主题后，在设计或改动前读完对应权威来源；
-同一行列出多个命令时，只读取本次实际涉及的命令规格。
-表中的翻译、模型与运行时规格针对 ATT 主程序；Formic 自身行为从其维护入口读取对应用户契约。
+涉及下列主题时，在设计或修改前读取对应现行规格（同一行列出多个命令时，只读取本次涉及的规格）：
 
 | 主题 | 必读材料 |
 | --- | --- |
 | Extract 文本层次、TaskBlock 或临时 ID | [TaskBlock 规划](docs/translation/task-planning.md) |
-| 维护共享 Planner 或新增引擎的规划实现 | 先读[TaskBlock 规划](docs/translation/task-planning.md)，再读[规划验证指南](maintenance/task-planning-validation.md) |
+| 维护共享 Planner 或新增引擎的规划实现 | [TaskBlock 规划](docs/translation/task-planning.md)、[规划验证指南](maintenance/task-planning-validation.md) |
 | Prompt、user message 或模型响应 | [Prompt 与模型协议](docs/translation/prompts.md) |
+| 译文候选验收、强不变量、Review 或 Rejected | [译文候选验收规格](docs/translation/candidate-validation.md) |
 | 模型任务记录 | [模型任务记录规格](docs/translation/task-records.md) |
 | 语言判断或语言验收 | [语言规格](docs/translation/language.md) |
 | Placeholder | [Placeholder 规格](docs/translation/placeholders.md) |
 | 术语 | [术语规格](docs/translation/terminology.md) |
+| WriteBack 排版规则、自动断行或续行补空白 | [WriteBack 排版规则规格](docs/translation/write-back-layout-rules.md) |
+| Manual TOML 导出、检查或应用 | [Manual TOML 规格](docs/manual/README.md) |
+| 项目数据库 Lua（高级 API 与 `ctx.db`） | [Lua 规格](docs/lua/README.md) |
 | CLI 语法、输出或退出码 | [CLI 规格](docs/runtime/cli.md) |
 | 配置、配置校验或固定配置目录 | [配置规格](docs/runtime/configuration.md) |
 | HTTP、模型请求协议、超时、重试、代理、限速或敏感信息 | [OpenAI-compatible HTTP 规格](docs/runtime/openai-compatible.md) |
@@ -97,33 +43,14 @@ ATT 用一个 CLI 聚合多个游戏引擎的翻译能力。统一入口只承�
 | SQLite schema、项目状态、事务或数据库诊断 | [SQLite 规格](docs/runtime/sqlite.md) |
 | 候选目录、原子发布、恢复现场或发布终态 | [目录发布规格](docs/runtime/directory-publishing.md) |
 | 性能目标、核心路径、并发或资源机制 | [性能工程要求](maintenance/performance.md) |
-| 实际测量、性能候选取舍或参数实验 | 先读[性能工程要求](maintenance/performance.md)，再读[性能验证指南](maintenance/performance-validation.md) |
+| 实际测量、性能候选取舍或参数实验 | [性能工程要求](maintenance/performance.md)、[性能验证指南](maintenance/performance-validation.md) |
 | 发行资源或 GitHub Release | [发行物规格](docs/runtime/distribution.md)、[公开发行指南](maintenance/releasing.md) |
 | Formic CLI、配置、模型与工具执行、作业状态或输出 | [Formic 维护入口](crates/formic/README.md)、[Formic 文档索引](tools/formic/docs/README.md) |
-| RPG Maker Init、Extract、Rules、Translate 或 WriteBack | 对应的 [Init](docs/rpg-maker/init.md)、[Extract](docs/rpg-maker/extraction.md)、[Rules](docs/rpg-maker/rules.md)、[Translate](docs/rpg-maker/translation.md)或[WriteBack](docs/rpg-maker/write-back.md)规格 |
-| Generic JSONL、Init、Extract、Translate 或 WriteBack | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)或[WriteBack](docs/generic/write-back.md)规格 |
-| 原子数据库 Lua | [Lua 规格](docs/lua/README.md) |
+| RPG Maker Init、Extract、Rules、Translate 或 WriteBack | 对应的 [Init](docs/rpg-maker/init.md)、[Extract](docs/rpg-maker/extraction.md)、[Rules](docs/rpg-maker/rules.md)、[Translate](docs/rpg-maker/translation.md) 或 [WriteBack](docs/rpg-maker/write-back.md) 规格 |
+| Generic JSONL、Init、Extract、Translate、WriteBack 或外部适配器验收 | 对应的 [JSONL](docs/generic/jsonl.md)、[Init](docs/generic/init.md)、[Extract](docs/generic/extraction.md)、[Translate](docs/generic/translation.md)、[WriteBack](docs/generic/write-back.md) 或 [外部适配器验收](docs/generic/adapter-verification.md) 规格 |
 
-## 5. 验证、同步与完成
+## 4. 验证与同步
 
-- 测试围绕可观察行为、业务边界和真实回归风险；不为纯字段存取、派生 trait 或枚举自身相等
-  单独写测试。重复场景仅在验证不同责任边界时保留；期望值不得照抄被测实现的分支计算。
-- 修改 Rust 生产代码时，提交前至少对受影响 crate 或 target 执行格式检查、编译或类型检查、
-  Clippy 和按行为影响确定的测试；共享 crate、公共契约或跨引擎能力变化必须覆盖全部受影响调用方。
-- 本次检查产生的新 warning、当前修改或受影响范围内的 warning 和未分类诊断必须处理；能够证明
-  与本次范围无关的既有 warning 可以保留，但交付时明确说明。
-- 任务要求入口到结果时，用最小真实样本通过生产入口验证完整路径。局部测试、单个 crate 编译
-  或底层组件完成不能单独证明纵向切片完成。
-- 进程级主成功测试和端到端测试使用正式默认；配置变更必须接通生产入口，并覆盖省略后的默认、
-  合法显式值和无效值。
-- 性能改动按性能工程要求和验证指南取证；无性能影响的文档改动不运行性能基准。
-- 外部能力、流程、权限、副作用、环境、成功失败或恢复方式变化时，同步相应权威规格、测试、
-  指南、受影响的 Skill 和发行资源；执行者工作方式未变化时不为制造差异而修改 Skill。
-- 普通翻译任务只交付译本、静态 QA 和人工实机检查项。只有任务发起者明确要求维护经验时，才
-  更新 `skills/translate-with-att/references/`：同一触发条件合并既有条目，只保存可复用的结构、
-  动作、证据和验证边界；新证据替换旧结论及边界，只在客观结构不同且需要不同动作时拆分文件，
-  不保存游戏名、安装路径、具体译文或一次性任务过程。
-- 架构图、规格和测试只描述已经实现并验证的事实，候选设计明确标注为候选；各材料在自己的
-  职责内与唯一权威一致，不复制同一事实。
-- 完成意味着约定用户结果或上游承诺成立，失败语义明确，并完成与风险相称的真实入口、状态
-  交接和副作用验证；未实现、未连接或未验证的范围必须明确说明。
+- **Rust 代码改动**：提交前对受影响包或 target 执行 `cargo fmt --check`、`cargo check`、`cargo clippy` 和按行为影响确定的测试，处理当前修改范围内的 warning。配置变更须接通生产入口并覆盖默认值、合法显式值与无效值。
+- **发行资源同步**：修改 `README.md`、`config.example.toml`、`docs/`、`prompts/`、`skills/`、`licenses/` 或 `tools/formic/` 用户资料后，运行 `scripts/sync-dist-resources.ps1` 同步 `dist/`。
+- **翻译任务经验沉淀**：普通翻译任务只交付译本、静态 QA 和人工实机检查项；仅在任务发起者明确要求维护经验时才更新 `skills/translate-with-att/references/`（只记录可复用的客观结构与操作方法，不记录具体游戏名、本机路径或单次任务过程）。

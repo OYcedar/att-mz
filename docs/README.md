@@ -49,10 +49,10 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | Init | [MV/MZ Init](rpg-maker/init.md)、[目录发布](runtime/directory-publishing.md) | [Generic Init](generic/init.md) | [SQLite](runtime/sqlite.md) |
 | Extract | [MV/MZ Extract](rpg-maker/extraction.md)、[Rules](rpg-maker/rules.md) | [Generic Extract](generic/extraction.md)、[JSONL](generic/jsonl.md) | [语言](translation/language.md)、[SQLite](runtime/sqlite.md) |
 | Translate 准备 | [MV/MZ Translate](rpg-maker/translation.md) | [Generic Translate](generic/translation.md) | [公共翻译入口](translation/README.md) |
-| 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[HTTP](runtime/openai-compatible.md)、[任务记录](translation/task-records.md) |
+| 模型请求与结果 | 对应 Translate 规格 | 对应 Translate 规格 | [TaskBlock](translation/task-planning.md)、[Prompt](translation/prompts.md)、[候选验收](translation/candidate-validation.md)、[HTTP](runtime/openai-compatible.md)、[任务记录](translation/task-records.md) |
 | 人工或 agent 查询与修订 | [Manual](manual/README.md) | [Manual](manual/README.md) | [Lua](lua/README.md)、[SQLite](runtime/sqlite.md)、[验收指南](guides/acceptance.md) |
 | WriteBack | [MV/MZ WriteBack](rpg-maker/write-back.md) | [Generic WriteBack](generic/write-back.md) | [排版规则](translation/write-back-layout-rules.md)、[目录发布](runtime/directory-publishing.md) |
-| 验收与交付 | [翻译验收指南](guides/acceptance.md) | [翻译验收指南](guides/acceptance.md) | 实际外部转换和消费者说明 |
+| 验收与交付 | [翻译验收指南](guides/acceptance.md)、[NW.js 与字体工具](guides/nwjs-font-tools.md) | [翻译验收指南](guides/acceptance.md)、[外部适配器验收](generic/adapter-verification.md) | 实际外部转换和消费者说明 |
 
 ## 4. 按观察结果进入
 
@@ -70,10 +70,6 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 | 译后 QA、WriteBack 候选或发布问题 | [诊断与恢复指南的 WriteBack 分支](guides/diagnosis-and-recovery.md#66-writeback-与目录发布) |
 | 日志、任务记录或终端呈现失败 | [项目日志](runtime/project-log.md)与[诊断与恢复指南](guides/diagnosis-and-recovery.md#67-sqlite-与可观测性) |
 
-整个游戏翻译完成需共同确认声明的文本范围、全部项目业务结果、最终组合输出和译后验收结果。
-按[翻译验收指南](guides/acceptance.md)检查输出差异、源语残留、布局风险和实际加载；退出码 `0`、
-输出目录、成功日志、Translate Complete 和单个项目完成分别作为对应阶段的证据。
-
 ## 5. 完整规格索引
 
 ### 工作指南
@@ -81,6 +77,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 - [翻译项目指南](guides/translation-project.md)
 - [诊断与恢复指南](guides/diagnosis-and-recovery.md)
 - [翻译验收指南](guides/acceptance.md)
+- [NW.js 运行观察与 RPG Maker 字体工具](guides/nwjs-font-tools.md)
 
 ### RPG Maker MV/MZ
 
@@ -99,6 +96,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 - [Extract](generic/extraction.md)
 - [Translate](generic/translation.md)
 - [WriteBack](generic/write-back.md)
+- [外部适配器验收](generic/adapter-verification.md)
 
 ### 公共翻译能力
 
@@ -107,6 +105,7 @@ Builtin → Rules → Generic 的选择顺序。具体来源、路径、捕获�
 - [语言](translation/language.md)
 - [术语](translation/terminology.md)
 - [Placeholder](translation/placeholders.md)
+- [译文候选验收](translation/candidate-validation.md)
 - [WriteBack 排版规则](translation/write-back-layout-rules.md)
 - [TaskBlock 规划](translation/task-planning.md)
 - [Prompt 与模型协议](translation/prompts.md)

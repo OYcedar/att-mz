@@ -130,7 +130,7 @@ class AdapterVerification:
         method: str,
         manual_ids: Sequence[str],
         status: str,
-        details: str,
+        details: str = "",
         source_files: Sequence[str] = (),
         output_files: Sequence[str] = (),
     ) -> None:
@@ -157,7 +157,7 @@ class AdapterVerification:
         available_width: float,
         available_height: float,
         method: str,
-        details: str,
+        details: str = "",
     ) -> None:
         self.measurements.append(
             {
@@ -379,7 +379,7 @@ def verify_report(
         ids = _strings(check.get("manual_ids"), "check.manual_ids")
         if not ids or any(identifier not in observed for identifier in ids):
             fail(name, "检查没有对应已观察 Unit", "先记录实际读取的源文和最终译文")
-        _string(check.get("details"), "check.details")
+        _string(check.get("details"), "check.details", empty=True)
         evidence_files = 0
         for side in ("source", "output"):
             files = _strings(check.get(f"{side}_files"), f"check.{side}_files")
@@ -434,7 +434,7 @@ def verify_report(
             fail(identifier, "布局测量文本不对应最终消费者文字", "重新测量最终绘制文本")
         if measurement.get("method") not in ("native_static", "runtime"):
             fail(identifier, "布局测量方法无效", "使用实际引擎布局或运行时测量")
-        _string(measurement.get("details"), "measurement.details")
+        _string(measurement.get("details"), "measurement.details", empty=True)
         dimensions: dict[str, float] = {}
         for field in ("width", "height", "available_width", "available_height"):
             value = measurement.get(field)

@@ -15,8 +15,8 @@ from att_skill_tools import ToolError
 from att_toolbox.coverage import coverage_projection
 from att_toolbox.generic_mapping import (
     generic_recipe,
-    validate_generic_evidence,
     validate_generic_group_placement,
+    validate_generic_groups,
 )
 
 
@@ -98,58 +98,38 @@ class SurveyArtifactBindingTests(unittest.TestCase):
 
     def test_shared_generic_group_keeps_its_source_and_kind(self) -> None:
         candidate_ids = ["location-000001", "location-000002"]
-        evidence = validate_generic_evidence(
-            {
-                "exact_location": "confirmed",
-                "active_runtime_consumer": "confirmed",
-                "player_visible_non_image_text": "confirmed",
-                "builtin_not_owner": "confirmed",
-                "rules_cannot_map_reversibly": "confirmed",
-                "extract_group_unit_write_back_mapping": {
-                    "groups": [{"id": "shared", "kind": "entry", "candidate_ids": candidate_ids}]
-                },
-                "unique_owner": "confirmed",
-            },
+        groups = validate_generic_groups(
+            [{"id": "shared", "kind": "entry", "candidate_ids": candidate_ids}],
             candidate_ids,
-            "test evidence",
+            "test groups",
         )
         same_file = {candidate_id: {"physical_file": "extras/data.json"} for candidate_id in candidate_ids}
         placements: dict[str, tuple[str, str]] = {}
-        validate_generic_group_placement(evidence, same_file, placements, "test evidence")
-        validate_generic_group_placement(evidence, same_file, placements, "another ownership decision")
-        changed_kind = json.loads(json.dumps(evidence))
-        changed_kind["extract_group_unit_write_back_mapping"]["groups"][0]["kind"] = "different"
+        validate_generic_group_placement(groups, same_file, placements, "test groups")
+        validate_generic_group_placement(groups, same_file, placements, "another ownership decision")
+        changed_kind = json.loads(json.dumps(groups))
+        changed_kind[0]["kind"] = "different"
         with self.assertRaises(ToolError):
-            validate_generic_group_placement(changed_kind, same_file, placements, "test evidence")
+            validate_generic_group_placement(changed_kind, same_file, placements, "test groups")
         with self.assertRaises(ToolError):
             validate_generic_group_placement(
-                evidence,
+                groups,
                 {
                     "location-000001": {"physical_file": "extras/a.json"},
                     "location-000002": {"physical_file": "extras/b.json"},
                 },
                 {},
-                "test evidence",
+                "test groups",
             )
 
     def test_generic_group_identity_allows_nonempty_whitespace_like_att_jsonl(self) -> None:
-        evidence = validate_generic_evidence(
-            {
-                "exact_location": "confirmed",
-                "active_runtime_consumer": "confirmed",
-                "player_visible_non_image_text": "confirmed",
-                "builtin_not_owner": "confirmed",
-                "rules_cannot_map_reversibly": "confirmed",
-                "extract_group_unit_write_back_mapping": {
-                    "groups": [{"id": " ", "kind": "\t", "candidate_ids": ["location-000001"]}]
-                },
-                "unique_owner": "confirmed",
-            },
+        groups = validate_generic_groups(
+            [{"id": " ", "kind": "\t", "candidate_ids": ["location-000001"]}],
             ["location-000001"],
-            "test evidence",
+            "test groups",
         )
 
-        group = evidence["extract_group_unit_write_back_mapping"]["groups"][0]
+        group = groups[0]
         self.assertEqual(group["id"], " ")
         self.assertEqual(group["kind"], "\t")
 

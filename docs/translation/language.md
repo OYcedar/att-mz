@@ -60,9 +60,7 @@ allowed_terms = ["Page Up", "Page Down"]
   但在两项译后检查中排除；它适合专名、按键名、协议词、单个字母和
   确实必须保留的短语；
 - `ignored_terms` 与 `allowed_terms` 都按 ASCII 大小写不敏感匹配，支持多词短语；以英文字母
-  开头或结尾的配置项只在对应字母边界匹配，避免短词误伤更长单词；
-- 两个列表都必须逐项表达已经确认的语义。不能把普通待译词或整类英文加入
-  `allowed_terms` 来掩盖未翻译内容，也不能用 `ignored_terms` 规避本应进入翻译的 Unit。
+  开头或结尾的配置项只在对应字母边界匹配，避免短词误伤更长单词。
 
 ## 目标书写系统检查
 
@@ -79,13 +77,8 @@ Generic、MV/MZ 的模型响应验收在 Placeholder 恢复和自然文本投影
 变体。其他主语言或显式 script 不猜测，不产生此项 Review；这不表示已经验证目标语言。
 
 本检查只统计 Unicode General_Category 为 Letter（`Lu/Ll/Lt/Lm/Lo`）的字符，再读取 Script
-属性。罗马数字 `Ⅰ`、带圈符号 `Ⓐ` 等即使具有 Alphabetic 属性，也不参与缺失判断或充当
-目标文字证据；字符类别见 [Unicode UAX #44](https://www.unicode.org/reports/tr44/#General_Category_Values)。
-本检查是保守的书写系统提示，不是语义语言识别。它不能区分
-共用汉字的中日文本、拉丁字母语言、简繁体，也不能证明混合译文的每一段均已翻译。已有源语
-残留检查独立执行，两个 Review 可以同时出现。项目日志和模型任务记录保存自然 Unit 位置
-及原因，不将疑似问题正文写入项目日志。两类 Review 均不改变 Current、Rejected、任务完成
-或 WriteBack 的语义，也不会自动重新请求模型。
+属性（罗马数字 `Ⅰ`、带圈符号 `Ⓐ` 等不参与判断；字符类别见 [Unicode UAX #44](https://www.unicode.org/reports/tr44/#General_Category_Values)）。
+源语残留检查与目标书写系统检查独立执行，两个 Review 可同时出现。项目日志和模型任务记录保存自然 Unit 位置及原因，不将疑似问题正文写入项目日志；两类 Review 均不改变 Current、Rejected、任务完成或 WriteBack 语义。
 
 ## 完整导出的译后 QA
 

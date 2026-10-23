@@ -14,12 +14,8 @@
 - `OperationFailure` 或 `Cancelled`：当前操作不能安全继续，与译文质量无关。
 
 `ReviewFinding` 不能转换成 `ProvenInvariantViolation`、Rejected、非零退出或 WriteBack 阻断。
-Translate 的 `Complete` 只说明计划内 Unit 都有结构合法的当前译文；译后 QA 另行给出
-`clean`、`needs_review` 或 `unverified`，使用者决定是否接受。
-
-一条规则只有同时写明权威依据、成立条件、确定性反例、最小拒绝范围和状态影响，才能成为
-强不变量。测试只证明实现遵守已经确认的规则，不能把测试自身当作领域依据。缺少任一项的
-判断必须成为 Review。
+Translate 的 `Complete` 表示计划内 Unit 均有结构合法的当前译文；译后 QA 另行给出
+`clean`、`needs_review` 或 `unverified`。
 
 ## 2. 强不变量
 
@@ -41,17 +37,7 @@ U+000C 是 RPG Maker Message 的换页控制字符，不属于结构空白。只
 
 ## 3. RPG Maker 内建控制
 
-MV/MZ 的标准控制语法和标准字段消费者是 ATT 已确认的默认领域事实。开发时用于确认这些
-事实的官方 core、历史实现和真实样本只属于取证依据，不进入项目运行流程；survey、Extract
-和 Translate 不为每个游戏重新扫描 core、计算函数摘要或判断活动插件是否覆写标准行为。
-
-生产实现只根据项目引擎与 Unit 的标准物理来源应用现行内建规则。Rules 捕获标准物理字段时
-继承同一事实，不能按 owner 或文件 basename 另猜一遍。插件新增语法、非标准来源和未知外形
-不升级为内建规则，只产生 Review；使用者明确确认后可由精确 Custom Placeholder 保护。
-
-具体 MV/MZ 默认语法与字段范围由
-[RPG Maker 规则规格](../rpg-maker/rules.md#68-内建控制符)负责。`\N<...>`、`\N1<...>` 等
-inline 姓名框不是 MV/MZ 通用内建语法；MZ 原生姓名来自事件命令 101 的 speaker 字段。
+生产实现直接根据项目引擎（MV/MZ）与 Unit 的标准物理来源应用内建控制规则（Rules 捕获标准物理字段时继承同一规则）。插件新增语法、非标准来源和未知外形只产生 Review，确认后可由 Custom Placeholder 保护。具体默认语法与字段范围见 [RPG Maker 规则规格](../rpg-maker/rules.md#68-内建控制符)。
 
 ## 4. 只能产生 Review 的判断
 
